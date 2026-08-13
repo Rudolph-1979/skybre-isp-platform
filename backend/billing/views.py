@@ -15,6 +15,10 @@ class TariffViewSet(CSVImportMixin, viewsets.ModelViewSet):
     queryset = Tariff.objects.all()
     filterset_fields = ["service_type", "is_active"]
     search_fields = ["name"]
+    ordering_fields = [
+        "name", "service_type", "price", "billing_period",
+        "speed_download_mbps", "tax_rate_pct", "is_active", "created_at",
+    ]
 
     import_model = Tariff
     import_fields = {
@@ -60,6 +64,19 @@ class ServiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
     filterset_fields = ["status", "customer"]
+    # DRF's OrderingFilter only accepts real queryset lookups as values for
+    # ?ordering= (a (field, label) tuple's second item is just a display
+    # label, NOT an alias) — so these are Django's actual related-field
+    # lookup paths, and the frontend must send exactly these strings.
+    ordering_fields = [
+        "customer__full_name",
+        "tariff__name",
+        "tariff__price",
+        "status",
+        "start_date",
+        "end_date",
+        "created_at",
+    ]
 
     def get_queryset(self):
         return self.get_base_queryset(Service).select_related("tariff", "customer")
@@ -73,6 +90,17 @@ class ServiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
 class InvoiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     filterset_fields = ["status", "customer"]
+    ordering_fields = [
+        "number",
+        "customer__full_name",
+        "status",
+        "date_created",
+        "date_due",
+        "subtotal",
+        "tax_total",
+        "total",
+        "paid_amount",
+    ]
 
     def get_serializer_class(self):
         if self.action == "create":

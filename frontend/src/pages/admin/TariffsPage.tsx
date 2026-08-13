@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
-import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { CSVImportModal } from "../../components/CSVImportModal";
@@ -26,11 +26,16 @@ const EMPTY: Partial<Tariff> = {
 };
 
 export function TariffsPage() {
-  const { items, loading, refetch } = useApiList<Tariff>("/tariffs/?page_size=100");
+  const [ordering, setOrdering] = useState("name");
+  const { items, loading, refetch } = useApiList<Tariff>(`/tariffs/?page_size=100&ordering=${ordering}`);
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<Partial<Tariff>>(EMPTY);
   const [saving, setSaving] = useState(false);
+
+  function toggleSort(field: string) {
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "name" : field));
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -68,12 +73,12 @@ export function TariffsPage() {
         <Table>
           <THead>
             <tr>
-              <TH>Name</TH>
-              <TH>Type</TH>
-              <TH>Speed</TH>
-              <TH>Price</TH>
-              <TH>Billing period</TH>
-              <TH>Status</TH>
+              <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
+              <SortableTH field="service_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>
+              <SortableTH field="speed_download_mbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>
+              <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>
+              <SortableTH field="billing_period" ordering={ordering} onSort={toggleSort}>Billing period</SortableTH>
+              <SortableTH field="is_active" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
             </tr>
           </THead>
           <tbody>

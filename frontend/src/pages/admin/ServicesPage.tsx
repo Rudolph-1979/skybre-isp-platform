@@ -2,14 +2,19 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
-import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import type { Service, Customer, Tariff } from "../../types";
 
 export function ServicesPage() {
-  const { items, loading, refetch } = useApiList<Service>("/services/?page_size=200&ordering=-id");
+  const [ordering, setOrdering] = useState("-created_at");
+  const { items, loading, refetch } = useApiList<Service>(`/services/?page_size=200&ordering=${ordering}`);
   const [customers, setCustomers] = useState<Customer[]>([]);
+
+  function toggleSort(field: string) {
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-created_at" : field));
+  }
   const [tariffs, setTariffs] = useState<Tariff[]>([]);
   const [showModal, setShowModal] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -57,11 +62,11 @@ export function ServicesPage() {
         <Table>
           <THead>
             <tr>
-              <TH>Customer</TH>
-              <TH>Tariff</TH>
-              <TH>Price</TH>
-              <TH>Status</TH>
-              <TH>Start date</TH>
+              <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
+              <SortableTH field="tariff__name" ordering={ordering} onSort={toggleSort}>Tariff</SortableTH>
+              <SortableTH field="tariff__price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>
+              <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
+              <SortableTH field="start_date" ordering={ordering} onSort={toggleSort}>Start date</SortableTH>
             </tr>
           </THead>
           <tbody>

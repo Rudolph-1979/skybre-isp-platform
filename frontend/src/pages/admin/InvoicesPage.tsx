@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
-import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import type { Invoice, Customer } from "../../types";
@@ -16,8 +16,13 @@ interface LineItem {
 }
 
 export function InvoicesPage() {
-  const { items, loading, refetch } = useApiList<Invoice>("/invoices/?page_size=100&ordering=-date_created");
+  const [ordering, setOrdering] = useState("-date_created");
+  const { items, loading, refetch } = useApiList<Invoice>(`/invoices/?page_size=100&ordering=${ordering}`);
   const [customers, setCustomers] = useState<Customer[]>([]);
+
+  function toggleSort(field: string) {
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-date_created" : field));
+  }
   const [showModal, setShowModal] = useState(false);
   const [saving, setSaving] = useState(false);
   const [customer, setCustomer] = useState("");
@@ -75,12 +80,12 @@ export function InvoicesPage() {
         <Table>
           <THead>
             <tr>
-              <TH>Number</TH>
-              <TH>Customer</TH>
-              <TH>Due date</TH>
-              <TH>Total</TH>
-              <TH>Paid</TH>
-              <TH>Status</TH>
+              <SortableTH field="number" ordering={ordering} onSort={toggleSort}>Number</SortableTH>
+              <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
+              <SortableTH field="date_due" ordering={ordering} onSort={toggleSort}>Due date</SortableTH>
+              <SortableTH field="total" ordering={ordering} onSort={toggleSort}>Total</SortableTH>
+              <SortableTH field="paid_amount" ordering={ordering} onSort={toggleSort}>Paid</SortableTH>
+              <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
             </tr>
           </THead>
           <tbody>
