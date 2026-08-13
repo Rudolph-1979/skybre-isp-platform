@@ -1,10 +1,16 @@
+import { useState } from "react";
 import { PageHeader } from "../../components/PageHeader";
-import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { useApiList } from "../../hooks/useApiList";
 import type { Payment } from "../../types";
 
 export function PaymentsPage() {
-  const { items, count, loading } = useApiList<Payment>("/payments/?page_size=100&ordering=-date");
+  const [ordering, setOrdering] = useState("-date");
+  const { items, count, loading } = useApiList<Payment>(`/payments/?page_size=100&ordering=${ordering}`);
+
+  function toggleSort(field: string) {
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-date" : field));
+  }
 
   return (
     <div>
@@ -15,12 +21,12 @@ export function PaymentsPage() {
         <Table>
           <THead>
             <tr>
-              <TH>Date</TH>
-              <TH>Customer</TH>
+              <SortableTH field="date" ordering={ordering} onSort={toggleSort}>Date</SortableTH>
+              <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
               <TH>Invoice</TH>
-              <TH>Amount</TH>
-              <TH>Method</TH>
-              <TH>Received by</TH>
+              <SortableTH field="amount" ordering={ordering} onSort={toggleSort}>Amount</SortableTH>
+              <SortableTH field="method" ordering={ordering} onSort={toggleSort}>Method</SortableTH>
+              <SortableTH field="received_by__username" ordering={ordering} onSort={toggleSort}>Received by</SortableTH>
             </tr>
           </THead>
           <tbody>

@@ -121,6 +121,13 @@ class PaymentViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
     serializer_class = PaymentSerializer
     permission_classes = [permissions.IsAuthenticated]
     filterset_fields = ["method", "customer", "invoice"]
+    ordering_fields = [
+        "date",
+        "customer__full_name",
+        "amount",
+        "method",
+        "received_by__username",
+    ]
 
     def get_queryset(self):
         return self.get_base_queryset(Payment).select_related("customer", "invoice")
