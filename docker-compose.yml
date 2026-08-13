@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
+    environment:
+      TZ: Africa/Johannesburg
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,6 +21,7 @@ services:
       - ./backend/.env
     environment:
       DB_HOST: db
+      TZ: Africa/Johannesburg
     depends_on:
       db:
         condition: service_healthy
@@ -28,6 +31,8 @@ services:
   frontend:
     build: ./frontend
     restart: unless-stopped
+    environment:
+      TZ: Africa/Johannesburg
     depends_on:
       - backend
     ports:
