@@ -30,7 +30,7 @@ const EMPTY: Partial<Customer> = {
 export function CustomersPage() {
   const navigate = useNavigate();
   const [page, setPage] = useState(1);
-  const [ordering, setOrdering] = useState("-created_at");
+  const [ordering, setOrdering] = useState("full_name");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
 
@@ -58,7 +58,7 @@ export function CustomersPage() {
 
   function toggleSort(field: string) {
     setPage(1);
-    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-created_at" : field));
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "full_name" : field));
   }
 
   async function handleSubmit(e: FormEvent) {
