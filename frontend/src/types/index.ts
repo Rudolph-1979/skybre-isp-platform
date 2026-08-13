@@ -182,6 +182,37 @@ export interface Ticket {
   comments: TicketComment[];
 }
 
+export interface Job {
+  id: number;
+  customer: number | null;
+  customer_name: string | null;
+  ticket: number | null;
+  ticket_number: string | null;
+  assigned_to: number | null;
+  assigned_to_name: string | null;
+  job_type: "installation" | "repair" | "maintenance" | "site_visit" | "office_task" | "other";
+  title: string;
+  description: string;
+  status: "scheduled" | "in_progress" | "completed" | "cancelled";
+  start: string;
+  end: string;
+  location: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Shift {
+  id: number;
+  staff: number;
+  staff_name: string;
+  start: string;
+  end: string;
+  role_note: string;
+  status: "planned" | "confirmed" | "cancelled";
+  notes: string;
+  created_at: string;
+}
+
 export interface DashboardSummary {
   customers_total: number;
   customers_active: number;

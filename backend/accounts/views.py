@@ -1,16 +1,29 @@
 from datetime import timedelta
 from django.utils import timezone
 from django.db.models import Sum, Count, Q
+from rest_framework import generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
+from .models import User
 from .serializers import CustomTokenObtainPairSerializer, UserSerializer
 from .permissions import IsStaffMember
 
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
+
+
+class StaffListView(generics.ListAPIView):
+    """Read-only list of staff/admin/technician users, for assignment
+    dropdowns — scheduling jobs/shifts, ticket assignment, etc."""
+
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated, IsStaffMember]
+
+    def get_queryset(self):
+        return User.objects.filter(role__in=["admin", "staff", "technician"], is_active=True).order_by("username")
 
 
 class MeView(APIView):

@@ -6,6 +6,7 @@ import { PortalLayout } from "./components/PortalLayout";
 import { LoginPage } from "./pages/LoginPage";
 
 import { DashboardPage } from "./pages/admin/DashboardPage";
+import { SchedulingPage } from "./pages/admin/SchedulingPage";
 import { CustomersPage } from "./pages/admin/CustomersPage";
 import { CustomerDetailPage } from "./pages/admin/CustomerDetailPage";
 import { TariffsPage } from "./pages/admin/TariffsPage";
@@ -40,6 +41,7 @@ export default function App() {
             }
           >
             <Route index element={<DashboardPage />} />
+            <Route path="scheduling" element={<SchedulingPage />} />
             <Route path="customers" element={<CustomersPage />} />
             <Route path="customers/:id" element={<CustomerDetailPage />} />
             <Route path="services" element={<ServicesPage />} />

@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     "billing",
     "network",
     "tickets",
+    "scheduling",
 ]
 
 MIDDLEWARE = [
