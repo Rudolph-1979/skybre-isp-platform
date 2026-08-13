@@ -1,0 +1,28 @@
+; systemd unit for running the Django backend with Gunicorn directly on the
+; VPS (bare-metal path — no Docker). Copy to /etc/systemd/system/isp-backend.service,
+; adjust User/WorkingDirectory/paths to match your setup, then:
+;
+;   sudo systemctl daemon-reload
+;   sudo systemctl enable --now isp-backend
+;   sudo systemctl status isp-backend
+;   journalctl -u isp-backend -f      # tail logs
+
+[Unit]
+Description=ISP Management Platform - Gunicorn
+After=network.target postgresql.service
+
+[Service]
+User=isp
+Group=isp
+WorkingDirectory=/opt/isp-platform/backend
+EnvironmentFile=/opt/isp-platform/backend/.env
+ExecStart=/opt/isp-platform/backend/venv/bin/gunicorn config.wsgi:application \
+    --bind 127.0.0.1:8000 \
+    --workers 3 \
+    --access-logfile /var/log/isp-backend/access.log \
+    --error-logfile /var/log/isp-backend/error.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

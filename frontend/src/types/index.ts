@@ -1,0 +1,198 @@
+export type Role = "admin" | "staff" | "technician" | "customer";
+
+export interface User {
+  id: number;
+  username: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  role: Role;
+  phone: string;
+  is_active: boolean;
+  customer_id?: number;
+}
+
+export interface Paginated<T> {
+  count: number;
+  next: string | null;
+  previous: string | null;
+  results: T[];
+}
+
+export interface Customer {
+  id: number;
+  customer_id: string;
+  customer_type: "individual" | "company";
+  category: "residential" | "business";
+  full_name: string;
+  company_name: string;
+  email: string;
+  phone: string;
+  address: string;
+  city: string;
+  zip_code: string;
+  status: "new" | "active" | "blocked" | "inactive";
+  balance: string;
+  assigned_staff: number | null;
+  assigned_staff_name: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  user: number | null;
+}
+
+export interface Tariff {
+  id: number;
+  name: string;
+  service_type: "internet" | "voice" | "bundle" | "other";
+  price: string;
+  billing_period: "monthly" | "quarterly" | "annually";
+  speed_download_mbps: number | null;
+  speed_upload_mbps: number | null;
+  data_cap_gb: number | null;
+  tax_rate_pct: string;
+  is_active: boolean;
+  description: string;
+}
+
+export interface Service {
+  id: number;
+  customer: number;
+  customer_name: string;
+  tariff: number;
+  tariff_name: string;
+  price: string;
+  status: "active" | "suspended" | "terminated" | "pending";
+  device: number | null;
+  start_date: string | null;
+  end_date: string | null;
+}
+
+export interface InvoiceItem {
+  id: number;
+  invoice: number;
+  service: number | null;
+  description: string;
+  quantity: string;
+  unit_price: string;
+  tax_rate_pct: string;
+  total: string;
+}
+
+export interface Invoice {
+  id: number;
+  number: string;
+  customer: number;
+  customer_name: string;
+  status: "draft" | "unpaid" | "paid" | "overdue" | "cancelled";
+  date_created: string;
+  date_due: string;
+  subtotal: string;
+  tax_total: string;
+  total: string;
+  paid_amount: string;
+  balance_due: string;
+  note: string;
+  items: InvoiceItem[];
+}
+
+export interface Payment {
+  id: number;
+  customer: number;
+  customer_name: string;
+  invoice: number | null;
+  amount: string;
+  method: "cash" | "card" | "bank_transfer" | "mobile_money" | "manual";
+  date: string;
+  note: string;
+  received_by: number | null;
+  received_by_name: string | null;
+}
+
+export interface Device {
+  id: number;
+  name: string;
+  device_type: "router" | "switch" | "olt" | "access_point" | "server" | "onu";
+  ip_address: string;
+  location: string;
+  vendor: string;
+  model_name: string;
+  status: "online" | "offline" | "unknown";
+  snmp_community: string;
+  snmp_version: string;
+  latest_reading: MonitoringReading | null;
+}
+
+export interface IPPool {
+  id: number;
+  name: string;
+  network_cidr: string;
+  gateway: string | null;
+  pool_type: "ipv4" | "ipv6";
+  description: string;
+  free_count: number;
+  total_count: number;
+}
+
+export interface IPAddress {
+  id: number;
+  pool: number;
+  address: string;
+  status: "free" | "assigned" | "reserved";
+  assigned_service: number | null;
+}
+
+export interface MonitoringReading {
+  id?: number;
+  device?: number;
+  timestamp: string;
+  is_up: boolean;
+  latency_ms: number | null;
+  packet_loss_pct: number | null;
+  bandwidth_in_mbps: number | null;
+  bandwidth_out_mbps: number | null;
+  cpu_pct: number | null;
+  memory_pct: number | null;
+}
+
+export interface TicketComment {
+  id: number;
+  ticket: number;
+  author: number | null;
+  author_name: string | null;
+  message: string;
+  is_internal: boolean;
+  created_at: string;
+}
+
+export interface Ticket {
+  id: number;
+  ticket_number: string;
+  customer: number;
+  customer_name: string;
+  subject: string;
+  description: string;
+  department: "support" | "billing" | "sales" | "abuse";
+  status: "open" | "pending" | "resolved" | "closed";
+  priority: "low" | "medium" | "high" | "urgent";
+  assigned_to: number | null;
+  assigned_to_name: string | null;
+  created_at: string;
+  updated_at: string;
+  comments: TicketComment[];
+}
+
+export interface DashboardSummary {
+  customers_total: number;
+  customers_active: number;
+  services_active: number;
+  revenue_this_month: number;
+  outstanding_balance: number;
+  invoices_unpaid: number;
+  invoices_overdue: number;
+  devices_total: number;
+  devices_online: number;
+  devices_offline: number;
+  tickets_open: number;
+  tickets_urgent: number;
+}
