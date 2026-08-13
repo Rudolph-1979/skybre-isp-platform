@@ -14,7 +14,7 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
     filterset_fields = ["status", "category", "customer_type"]
     search_fields = ["full_name", "company_name", "email", "phone", "customer_id"]
-    ordering_fields = ["created_at", "full_name", "balance"]
+    ordering_fields = ["created_at", "full_name", "customer_id", "category", "city", "status", "balance"]
 
     import_model = Customer
     import_fields = {

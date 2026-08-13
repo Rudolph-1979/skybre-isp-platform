@@ -1,13 +1,15 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
-import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { CSVImportModal } from "../../components/CSVImportModal";
 import type { Customer } from "../../types";
+
+const PAGE_SIZE = 50;
 
 const IMPORT_TEMPLATE_HEADERS = [
   "full_name", "company_name", "email", "phone", "address", "city", "zip_code",
@@ -27,16 +29,37 @@ const EMPTY: Partial<Customer> = {
 
 export function CustomersPage() {
   const navigate = useNavigate();
-  const { items, count, loading, refetch } = useApiList<Customer>("/customers/?page_size=100&ordering=-created_at");
+  const [page, setPage] = useState(1);
+  const [ordering, setOrdering] = useState("-created_at");
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+
+  // Debounce the search box so we're not hitting the API on every keystroke
+  // across 1000+ customers — 300ms after the user stops typing.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setDebouncedSearch(search);
+      setPage(1);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const url = `/customers/?page_size=${PAGE_SIZE}&page=${page}&ordering=${ordering}${
+    debouncedSearch ? `&search=${encodeURIComponent(debouncedSearch)}` : ""
+  }`;
+  const { items, count, loading, refetch } = useApiList<Customer>(url);
+
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<Partial<Customer>>(EMPTY);
   const [saving, setSaving] = useState(false);
-  const [search, setSearch] = useState("");
 
-  const filtered = items.filter((c) =>
-    `${c.full_name} ${c.customer_id} ${c.email}`.toLowerCase().includes(search.toLowerCase())
-  );
+  const totalPages = Math.max(1, Math.ceil(count / PAGE_SIZE));
+
+  function toggleSort(field: string) {
+    setPage(1);
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-created_at" : field));
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -78,40 +101,67 @@ export function CustomersPage() {
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
-        <Table>
-          <THead>
-            <tr>
-              <TH>Customer</TH>
-              <TH>Type</TH>
-              <TH>Contact</TH>
-              <TH>City</TH>
-              <TH>Status</TH>
-              <TH>Balance</TH>
-              <TH>Assigned to</TH>
-            </tr>
-          </THead>
-          <tbody>
-            {filtered.map((c) => (
-              <TR key={c.id} onClick={() => navigate(`/admin/customers/${c.id}`)}>
-                <TD>
-                  <div className="font-medium">{c.full_name}</div>
-                  <div className="text-xs text-[var(--text-muted)]">{c.customer_id}</div>
-                </TD>
-                <TD className="capitalize">{c.category}</TD>
-                <TD>
-                  <div>{c.email}</div>
-                  <div className="text-xs text-[var(--text-muted)]">{c.phone}</div>
-                </TD>
-                <TD>{c.city}</TD>
-                <TD>
-                  <StatusBadge status={c.status} />
-                </TD>
-                <TD className="tabular-nums">R {parseFloat(c.balance).toFixed(2)}</TD>
-                <TD>{c.assigned_staff_name ?? "—"}</TD>
-              </TR>
-            ))}
-          </tbody>
-        </Table>
+        <>
+          <Table>
+            <THead>
+              <tr>
+                <SortableTH field="full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
+                <SortableTH field="category" ordering={ordering} onSort={toggleSort}>Type</SortableTH>
+                <TH>Contact</TH>
+                <SortableTH field="city" ordering={ordering} onSort={toggleSort}>City</SortableTH>
+                <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
+                <SortableTH field="balance" ordering={ordering} onSort={toggleSort}>Balance</SortableTH>
+                <TH>Assigned to</TH>
+              </tr>
+            </THead>
+            <tbody>
+              {items.map((c) => (
+                <TR key={c.id} onClick={() => navigate(`/admin/customers/${c.id}`)}>
+                  <TD>
+                    <div className="font-medium">{c.full_name}</div>
+                    <div className="text-xs text-[var(--text-muted)]">{c.customer_id}</div>
+                  </TD>
+                  <TD className="capitalize">{c.category}</TD>
+                  <TD>
+                    <div>{c.email}</div>
+                    <div className="text-xs text-[var(--text-muted)]">{c.phone}</div>
+                  </TD>
+                  <TD>{c.city}</TD>
+                  <TD>
+                    <StatusBadge status={c.status} />
+                  </TD>
+                  <TD className="tabular-nums">R {parseFloat(c.balance).toFixed(2)}</TD>
+                  <TD>{c.assigned_staff_name ?? "—"}</TD>
+                </TR>
+              ))}
+            </tbody>
+          </Table>
+
+          <div className="mt-3 flex items-center justify-between text-sm text-[var(--text-muted)]">
+            <span>
+              Showing {items.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1}–{(page - 1) * PAGE_SIZE + items.length} of {count}
+            </span>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={page <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+              >
+                Previous
+              </button>
+              <span className="px-2 py-2">Page {page} of {totalPages}</span>
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={page >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        </>
       )}
 
       {showModal && (
