@@ -21,14 +21,31 @@ Mix `CSVImportMixin` into a `ModelViewSet`, set `import_model` and
             "type": "str" | "decimal" | "int" | "bool",   # default "str"
             "default": <value used when the cell is empty and not required>,
             "choices": [...],              # optional, list of allowed values
+            "aliases": [...],              # optional, alternate header names
+                                            # accepted for this field (e.g. a
+                                            # third-party export's own column
+                                            # names) — checked if the primary
+                                            # name isn't present/populated.
         },
         ...
     }
+
+The parser auto-detects the delimiter (comma, tab, or semicolon), so a
+tab-delimited export (e.g. Splynx's native CSV export) works without any
+manual reformatting.
+
+Decimal fields are cleaned of currency symbols/letters before parsing
+(e.g. "R975.00" or "-R0.19" both parse fine), so money columns from
+billing-system exports don't need to be pre-stripped either.
 
 Subclasses can override `extra_row_validation(cleaned, raw_row)` to do
 things a plain type/choices check can't — e.g. resolving a foreign key by
 name and erroring per-row if it doesn't exist. `cleaned` is mutated in
 place; return a list of extra error strings (or an empty list).
+`raw_row` is the original untouched dict for that row, keyed by whatever
+headers the uploaded file actually had — useful for reading extra source
+columns that don't have a slot in `import_fields` (e.g. stashing a source
+system's internal ID into a notes field for traceability).
 
 Subclasses can override `import_row_to_kwargs(cleaned)` if the cleaned
 dict needs any final reshaping before being passed to
@@ -37,10 +54,13 @@ dict needs any final reshaping before being passed to
 
 import csv
 import io
+import re
 from decimal import Decimal, InvalidOperation
 
 from rest_framework.decorators import action
 from rest_framework.response import Response
+
+_CURRENCY_STRIP_RE = re.compile(r"[^0-9.\-]")
 
 
 class CSVImportMixin:
@@ -55,14 +75,32 @@ class CSVImportMixin:
             decoded = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
             decoded = raw.decode("latin-1")
-        reader = csv.DictReader(io.StringIO(decoded))
+        sample = decoded[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel  # plain comma, the common case
+        reader = csv.DictReader(io.StringIO(decoded), dialect=dialect)
         return list(reader)
+
+    @staticmethod
+    def _raw_value(row, field, rules):
+        """Look up a cell by the field's primary name, falling back to any
+        configured aliases (for accepting a source system's own headers)."""
+        value = row.get(field)
+        if value:
+            return value
+        for alias in rules.get("aliases", ()):
+            value = row.get(alias)
+            if value:
+                return value
+        return ""
 
     def _validate_row(self, row):
         errors = []
         cleaned = {}
         for field, rules in self.import_fields.items():
-            raw = (row.get(field) or "").strip()
+            raw = (self._raw_value(row, field, rules) or "").strip()
             if not raw:
                 if rules.get("required"):
                     errors.append(f"'{field}' is required")
@@ -73,7 +111,7 @@ class CSVImportMixin:
             field_type = rules.get("type", "str")
             if field_type == "decimal":
                 try:
-                    cleaned[field] = Decimal(raw)
+                    cleaned[field] = Decimal(_CURRENCY_STRIP_RE.sub("", raw) or "0")
                 except InvalidOperation:
                     errors.append(f"'{field}' must be a number (got '{raw}')")
                     continue

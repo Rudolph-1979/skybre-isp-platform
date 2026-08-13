@@ -18,12 +18,15 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
 
     import_model = Customer
     import_fields = {
-        "full_name": {"required": True},
+        # "aliases" let this same import accept a raw Splynx customer-list
+        # export (tab-delimited, its own column names) without any manual
+        # reformatting — as well as our own plain template.
+        "full_name": {"required": True, "aliases": ["Full name"]},
         "company_name": {"default": ""},
         "email": {"default": ""},
         "phone": {"default": ""},
-        "address": {"default": ""},
-        "city": {"default": ""},
+        "address": {"default": "", "aliases": ["Street"]},
+        "city": {"default": "", "aliases": ["City"]},
         "zip_code": {"default": ""},
         "customer_type": {
             "default": Customer.CustomerType.INDIVIDUAL,
@@ -33,8 +36,11 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
             "default": Customer.Category.RESIDENTIAL,
             "choices": Customer.Category.values,
         },
+        # Deliberately NOT aliased to Splynx's "Status" column — that field
+        # is network connectivity (Online/Offline), not account/billing
+        # status, so it would be actively misleading to map it here.
         "status": {"default": Customer.Status.NEW, "choices": Customer.Status.values},
-        "balance": {"type": "decimal", "default": Decimal("0")},
+        "balance": {"type": "decimal", "default": Decimal("0"), "aliases": ["Account balance"]},
         "assigned_staff_username": {"default": ""},
         "notes": {"default": ""},
     }
@@ -50,6 +56,31 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
                 cleaned["assigned_staff"] = staff
         else:
             cleaned["assigned_staff"] = None
+
+        # If this looks like a Splynx export, preserve traceability back to
+        # the source record (its internal ID, portal login, and current
+        # plan aren't fields on our Customer model) in the notes field
+        # rather than silently dropping them. This also lets us catch the
+        # same customer appearing in more than one export file (Splynx's
+        # portal login is effectively a unique customer key) and skip the
+        # duplicate instead of creating a second record.
+        portal_login = raw_row.get("Portal login")
+        if portal_login and Customer.objects.filter(notes__icontains=f"Portal login: {portal_login}").exists():
+            errors.append(f"Already imported previously (Portal login '{portal_login}' already exists)")
+
+        if not cleaned.get("notes"):
+            splynx_id = raw_row.get("ID")
+            plan = raw_row.get("Internet plans")
+            parts = []
+            if splynx_id:
+                parts.append(f"Splynx ID: {splynx_id}")
+            if portal_login:
+                parts.append(f"Portal login: {portal_login}")
+            if plan:
+                parts.append(f"Plan at import: {plan}")
+            if parts:
+                cleaned["notes"] = " | ".join(parts)
+
         return errors
 
     def get_permissions(self):
