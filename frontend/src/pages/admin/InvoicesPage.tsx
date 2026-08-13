@@ -15,9 +15,33 @@ interface LineItem {
   tax_rate_pct: string;
 }
 
+type DateFilterMode = "all" | "30" | "60" | "90" | "custom";
+
+const DATE_FILTER_TABS: { mode: DateFilterMode; label: string }[] = [
+  { mode: "all", label: "All" },
+  { mode: "30", label: "0–30 days overdue" },
+  { mode: "60", label: "0–60 days overdue" },
+  { mode: "90", label: "0–90 days overdue" },
+  { mode: "custom", label: "Custom date range" },
+];
+
 export function InvoicesPage() {
   const [ordering, setOrdering] = useState("-date_created");
-  const { items, loading, refetch } = useApiList<Invoice>(`/invoices/?page_size=100&ordering=${ordering}`);
+  const [dateFilterMode, setDateFilterMode] = useState<DateFilterMode>("all");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+
+  let dateParams = "";
+  if (dateFilterMode === "30" || dateFilterMode === "60" || dateFilterMode === "90") {
+    dateParams = `&overdue_within_days=${dateFilterMode}`;
+  } else if (dateFilterMode === "custom") {
+    if (customFrom) dateParams += `&date_created_from=${customFrom}`;
+    if (customTo) dateParams += `&date_created_to=${customTo}`;
+  }
+
+  const { items, count, loading, refetch } = useApiList<Invoice>(
+    `/invoices/?page_size=100&ordering=${ordering}${dateParams}`
+  );
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   function toggleSort(field: string) {
@@ -66,13 +90,63 @@ export function InvoicesPage() {
     <div>
       <PageHeader
         title="Invoices"
-        subtitle="Billing history across all customers."
+        subtitle={`${count} invoice${count === 1 ? "" : "s"} matching current filter`}
         actions={
           <button className={btnPrimary} onClick={() => setShowModal(true)}>
             + New invoice
           </button>
         }
       />
+
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        {DATE_FILTER_TABS.map((tab) => (
+          <button
+            key={tab.mode}
+            type="button"
+            onClick={() => setDateFilterMode(tab.mode)}
+            className={
+              dateFilterMode === tab.mode
+                ? "rounded-md bg-[var(--series-1)] px-3 py-1.5 text-sm font-medium text-white"
+                : "rounded-md border border-[var(--baseline)] px-3 py-1.5 text-sm font-medium text-[var(--text-primary)] hover:bg-black/5"
+            }
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {dateFilterMode === "custom" && (
+        <div className="mb-4 flex flex-wrap items-end gap-3">
+          <FormField label="Invoice date from">
+            <input
+              type="date"
+              className={inputClass}
+              value={customFrom}
+              onChange={(e) => setCustomFrom(e.target.value)}
+            />
+          </FormField>
+          <FormField label="Invoice date to">
+            <input
+              type="date"
+              className={inputClass}
+              value={customTo}
+              onChange={(e) => setCustomTo(e.target.value)}
+            />
+          </FormField>
+          {(customFrom || customTo) && (
+            <button
+              type="button"
+              className={`${btnSecondary} mb-3`}
+              onClick={() => {
+                setCustomFrom("");
+                setCustomTo("");
+              }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      )}
 
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>

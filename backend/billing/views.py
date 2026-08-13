@@ -8,6 +8,7 @@ from .serializers import (
 )
 from accounts.permissions import IsStaffMember
 from config.csv_import import CSVImportMixin
+from .filters import InvoiceFilter
 
 
 class TariffViewSet(CSVImportMixin, viewsets.ModelViewSet):
@@ -89,7 +90,7 @@ class ServiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
 
 class InvoiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
-    filterset_fields = ["status", "customer"]
+    filterset_class = InvoiceFilter
     ordering_fields = [
         "number",
         "customer__full_name",
