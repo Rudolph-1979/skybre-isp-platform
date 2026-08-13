@@ -5,7 +5,14 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { CSVImportModal } from "../../components/CSVImportModal";
 import type { Tariff } from "../../types";
+
+const IMPORT_TEMPLATE_HEADERS = [
+  "name", "service_type", "price", "billing_period",
+  "speed_download_mbps", "speed_upload_mbps", "data_cap_gb",
+  "tax_rate_pct", "is_active", "description",
+];
 
 const EMPTY: Partial<Tariff> = {
   name: "",
@@ -21,6 +28,7 @@ const EMPTY: Partial<Tariff> = {
 export function TariffsPage() {
   const { items, loading, refetch } = useApiList<Tariff>("/tariffs/?page_size=100");
   const [showModal, setShowModal] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<Partial<Tariff>>(EMPTY);
   const [saving, setSaving] = useState(false);
 
@@ -43,9 +51,14 @@ export function TariffsPage() {
         title="Tariffs & Plans"
         subtitle="Internet, voice, and bundle packages offered to customers."
         actions={
-          <button className={btnPrimary} onClick={() => setShowModal(true)}>
-            + New tariff
-          </button>
+          <>
+            <button className={btnSecondary} onClick={() => setShowImport(true)}>
+              Import CSV
+            </button>
+            <button className={btnPrimary} onClick={() => setShowModal(true)}>
+              + New tariff
+            </button>
+          </>
         }
       />
 
@@ -143,6 +156,17 @@ export function TariffsPage() {
             </div>
           </form>
         </Modal>
+      )}
+
+      {showImport && (
+        <CSVImportModal
+          title="Import tariffs"
+          importUrlBase="/tariffs/"
+          templateHeaders={IMPORT_TEMPLATE_HEADERS}
+          templateFilename="tariffs_template.csv"
+          onClose={() => setShowImport(false)}
+          onImported={refetch}
+        />
       )}
     </div>
   );

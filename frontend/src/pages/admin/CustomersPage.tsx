@@ -6,7 +6,13 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { CSVImportModal } from "../../components/CSVImportModal";
 import type { Customer } from "../../types";
+
+const IMPORT_TEMPLATE_HEADERS = [
+  "full_name", "company_name", "email", "phone", "address", "city", "zip_code",
+  "customer_type", "category", "status", "balance", "assigned_staff_username", "notes",
+];
 
 const EMPTY: Partial<Customer> = {
   customer_type: "individual",
@@ -23,6 +29,7 @@ export function CustomersPage() {
   const navigate = useNavigate();
   const { items, count, loading, refetch } = useApiList<Customer>("/customers/?page_size=100&ordering=-created_at");
   const [showModal, setShowModal] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<Partial<Customer>>(EMPTY);
   const [saving, setSaving] = useState(false);
   const [search, setSearch] = useState("");
@@ -50,9 +57,14 @@ export function CustomersPage() {
         title="Customers"
         subtitle={`${count} total customers`}
         actions={
-          <button className={btnPrimary} onClick={() => setShowModal(true)}>
-            + New customer
-          </button>
+          <>
+            <button className={btnSecondary} onClick={() => setShowImport(true)}>
+              Import CSV
+            </button>
+            <button className={btnPrimary} onClick={() => setShowModal(true)}>
+              + New customer
+            </button>
+          </>
         }
       />
 
@@ -159,6 +171,17 @@ export function CustomersPage() {
             </div>
           </form>
         </Modal>
+      )}
+
+      {showImport && (
+        <CSVImportModal
+          title="Import customers"
+          importUrlBase="/customers/"
+          templateHeaders={IMPORT_TEMPLATE_HEADERS}
+          templateFilename="customers_template.csv"
+          onClose={() => setShowImport(false)}
+          onImported={refetch}
+        />
       )}
     </div>
   );

@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import viewsets, permissions
 from .models import Tariff, Service, Invoice, Payment
 from .serializers import (
@@ -5,13 +7,34 @@ from .serializers import (
     InvoiceCreateSerializer, PaymentSerializer,
 )
 from accounts.permissions import IsStaffMember
+from config.csv_import import CSVImportMixin
 
 
-class TariffViewSet(viewsets.ModelViewSet):
+class TariffViewSet(CSVImportMixin, viewsets.ModelViewSet):
     serializer_class = TariffSerializer
     queryset = Tariff.objects.all()
     filterset_fields = ["service_type", "is_active"]
     search_fields = ["name"]
+
+    import_model = Tariff
+    import_fields = {
+        "name": {"required": True},
+        "service_type": {
+            "default": Tariff.ServiceType.INTERNET,
+            "choices": Tariff.ServiceType.values,
+        },
+        "price": {"required": True, "type": "decimal"},
+        "billing_period": {
+            "default": Tariff.BillingPeriod.MONTHLY,
+            "choices": Tariff.BillingPeriod.values,
+        },
+        "speed_download_mbps": {"type": "int", "default": None},
+        "speed_upload_mbps": {"type": "int", "default": None},
+        "data_cap_gb": {"type": "int", "default": None},
+        "tax_rate_pct": {"type": "decimal", "default": Decimal("0")},
+        "is_active": {"type": "bool", "default": True},
+        "description": {"default": ""},
+    }
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
