@@ -9,6 +9,7 @@ const NAV = [
   { to: "/admin/tariffs", label: "Tariffs" },
   { to: "/admin/invoices", label: "Invoices" },
   { to: "/admin/payments", label: "Payments" },
+  { to: "/admin/inventory", label: "Stock / Inventory" },
   { to: "/admin/devices", label: "Network Devices" },
   { to: "/admin/ip-pools", label: "IP Address Pools" },
   { to: "/admin/tickets", label: "Support Tickets" },

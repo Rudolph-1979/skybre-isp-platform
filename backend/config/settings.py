@@ -31,6 +31,7 @@ INSTALLED_APPS = [
     "network",
     "tickets",
     "scheduling",
+    "inventory",
 ]
 
 MIDDLEWARE = [
@@ -85,12 +86,24 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 LANGUAGE_CODE = "en-us"
+# South African Standard Time — UTC+2, no daylight saving, so this is a
+# fixed offset year-round. USE_TZ stays True: everything is still stored
+# in the database as UTC internally, this only affects how "today"/"now"
+# get interpreted for display and for date boundaries (e.g. which day an
+# invoice's auto_now_add date lands on if created late at night).
 TIME_ZONE = "Africa/Johannesburg"
 USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
+# User-uploaded files (currently just supplier-invoice attachments on
+# stock receipts). Served via a plain Django view in config/urls.py —
+# fine at this data volume; revisit with a dedicated static host/nginx
+# location if upload volume grows significantly.
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},

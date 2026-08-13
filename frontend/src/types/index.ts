@@ -213,6 +213,92 @@ export interface Shift {
   created_at: string;
 }
 
+export interface Supplier {
+  id: number;
+  name: string;
+  contact_person: string;
+  phone: string;
+  email: string;
+  address: string;
+  notes: string;
+  created_at: string;
+}
+
+export interface Product {
+  id: number;
+  name: string;
+  sku: string;
+  category: "router" | "ont" | "cable" | "connector" | "tool" | "other";
+  tracking_type: "serialized" | "quantity";
+  unit: string;
+  low_stock_threshold: number | null;
+  description: string;
+  is_active: boolean;
+  quantity_on_hand: number;
+  is_low_stock: boolean;
+  created_at: string;
+}
+
+export interface SerializedUnit {
+  id: number;
+  product: number;
+  product_name: string;
+  serial_number: string;
+  mac_address: string;
+  status: "in_stock" | "issued" | "faulty" | "returned_to_supplier";
+  notes: string;
+  created_at: string;
+}
+
+export interface StockReceiptLine {
+  id: number;
+  receipt: number;
+  product: number;
+  product_name: string;
+  quantity: number;
+  serial_numbers: string;
+  unit_cost: string | null;
+  serial_count: number;
+  created_at: string;
+}
+
+export interface StockReceipt {
+  id: number;
+  supplier: number;
+  supplier_name: string;
+  invoice_number: string;
+  invoice_date: string;
+  attachment: string | null;
+  received_by: number | null;
+  received_by_name: string | null;
+  notes: string;
+  lines: StockReceiptLine[];
+  created_at: string;
+}
+
+export interface StockIssueLine {
+  id: number;
+  issue: number;
+  product: number;
+  product_name: string;
+  quantity: number;
+  serial_unit: number | null;
+  serial_number: string | null;
+  mac_address: string | null;
+}
+
+export interface StockIssue {
+  id: number;
+  job: number | null;
+  job_title: string | null;
+  customer_name: string | null;
+  issued_to: number | null;
+  issued_to_name: string | null;
+  issued_at: string;
+  notes: string;
+  lines: StockIssueLine[];
+}
+
 export interface DashboardSummary {
   customers_total: number;
   customers_active: number;

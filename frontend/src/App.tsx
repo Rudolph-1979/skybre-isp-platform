@@ -14,6 +14,7 @@ import { ServicesPage } from "./pages/admin/ServicesPage";
 import { InvoicesPage } from "./pages/admin/InvoicesPage";
 import { InvoiceDetailPage } from "./pages/admin/InvoiceDetailPage";
 import { PaymentsPage } from "./pages/admin/PaymentsPage";
+import { InventoryPage } from "./pages/admin/InventoryPage";
 import { DevicesPage } from "./pages/admin/DevicesPage";
 import { DeviceDetailPage } from "./pages/admin/DeviceDetailPage";
 import { IPPoolsPage } from "./pages/admin/IPPoolsPage";
@@ -49,6 +50,7 @@ export default function App() {
             <Route path="invoices" element={<InvoicesPage />} />
             <Route path="invoices/:id" element={<InvoiceDetailPage />} />
             <Route path="payments" element={<PaymentsPage />} />
+            <Route path="inventory" element={<InventoryPage />} />
             <Route path="devices" element={<DevicesPage />} />
             <Route path="devices/:id" element={<DeviceDetailPage />} />
             <Route path="ip-pools" element={<IPPoolsPage />} />
