@@ -7,9 +7,22 @@ import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { CSVImportModal } from "../../components/CSVImportModal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Customer } from "../../types";
 
 const PAGE_SIZE = 50;
+
+const COLUMNS: ColumnDef[] = [
+  { key: "customer", label: "Customer" },
+  { key: "type", label: "Type" },
+  { key: "contact", label: "Contact" },
+  { key: "email", label: "Email" },
+  { key: "city", label: "City" },
+  { key: "status", label: "Status" },
+  { key: "balance", label: "Balance" },
+  { key: "assigned", label: "Assigned to" },
+];
 
 const IMPORT_TEMPLATE_HEADERS = [
   "full_name", "company_name", "email", "phone", "address", "city", "zip_code",
@@ -33,6 +46,10 @@ export function CustomersPage() {
   const [ordering, setOrdering] = useState("full_name");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("customers", ["customer"]);
 
   // Debounce the search box so we're not hitting the API on every keystroke
   // across 1000+ customers — 300ms after the user stops typing.
@@ -44,8 +61,17 @@ export function CustomersPage() {
     return () => clearTimeout(t);
   }, [search]);
 
+  function resetToFirstPage<T>(setter: (v: T) => void) {
+    return (v: T) => {
+      setter(v);
+      setPage(1);
+    };
+  }
+
   const url = `/customers/?page_size=${PAGE_SIZE}&page=${page}&ordering=${ordering}${
     debouncedSearch ? `&search=${encodeURIComponent(debouncedSearch)}` : ""
+  }${statusFilter ? `&status=${statusFilter}` : ""}${categoryFilter ? `&category=${categoryFilter}` : ""}${
+    typeFilter ? `&customer_type=${typeFilter}` : ""
   }`;
   const { items, count, loading, refetch } = useApiList<Customer>(url);
 
@@ -91,12 +117,60 @@ export function CustomersPage() {
         }
       />
 
-      <input
-        className={`${inputClass} mb-4 max-w-xs`}
-        placeholder="Search customers…"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-      />
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <input
+          className={`${inputClass} max-w-xs`}
+          placeholder="Search customers…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <select
+          className={`${inputClass} w-auto`}
+          value={statusFilter}
+          onChange={(e) => resetToFirstPage(setStatusFilter)(e.target.value)}
+        >
+          <option value="">All statuses</option>
+          <option value="new">New</option>
+          <option value="active">Active</option>
+          <option value="suspended">Suspended</option>
+          <option value="inactive">Inactive</option>
+        </select>
+        <select
+          className={`${inputClass} w-auto`}
+          value={categoryFilter}
+          onChange={(e) => resetToFirstPage(setCategoryFilter)(e.target.value)}
+        >
+          <option value="">All categories</option>
+          <option value="residential">Residential</option>
+          <option value="business">Business</option>
+        </select>
+        <select
+          className={`${inputClass} w-auto`}
+          value={typeFilter}
+          onChange={(e) => resetToFirstPage(setTypeFilter)(e.target.value)}
+        >
+          <option value="">All types</option>
+          <option value="individual">Individual</option>
+          <option value="company">Company</option>
+        </select>
+        {(statusFilter || categoryFilter || typeFilter || search) && (
+          <button
+            type="button"
+            className={btnSecondary}
+            onClick={() => {
+              setStatusFilter("");
+              setCategoryFilter("");
+              setTypeFilter("");
+              setSearch("");
+            }}
+          >
+            Clear filters
+          </button>
+        )}
+        <div className="ml-auto">
+          <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["customer"]} />
+        </div>
+      </div>
 
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
@@ -106,12 +180,13 @@ export function CustomersPage() {
             <THead>
               <tr>
                 <SortableTH field="full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
-                <SortableTH field="category" ordering={ordering} onSort={toggleSort}>Type</SortableTH>
-                <TH>Contact</TH>
-                <SortableTH field="city" ordering={ordering} onSort={toggleSort}>City</SortableTH>
-                <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
-                <SortableTH field="balance" ordering={ordering} onSort={toggleSort}>Balance</SortableTH>
-                <TH>Assigned to</TH>
+                {isVisible("type") && <SortableTH field="category" ordering={ordering} onSort={toggleSort}>Type</SortableTH>}
+                {isVisible("contact") && <TH>Contact</TH>}
+                {isVisible("email") && <TH>Email</TH>}
+                {isVisible("city") && <SortableTH field="city" ordering={ordering} onSort={toggleSort}>City</SortableTH>}
+                {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
+                {isVisible("balance") && <SortableTH field="balance" ordering={ordering} onSort={toggleSort}>Balance</SortableTH>}
+                {isVisible("assigned") && <TH>Assigned to</TH>}
               </tr>
             </THead>
             <tbody>
@@ -121,17 +196,22 @@ export function CustomersPage() {
                     <div className="font-medium">{c.full_name}</div>
                     <div className="text-xs text-[var(--text-muted)]">{c.customer_id}</div>
                   </TD>
-                  <TD className="capitalize">{c.category}</TD>
-                  <TD>
-                    <div>{c.email}</div>
-                    <div className="text-xs text-[var(--text-muted)]">{c.phone}</div>
-                  </TD>
-                  <TD>{c.city}</TD>
-                  <TD>
-                    <StatusBadge status={c.status} />
-                  </TD>
-                  <TD className="tabular-nums">R {parseFloat(c.balance).toFixed(2)}</TD>
-                  <TD>{c.assigned_staff_name ?? "—"}</TD>
+                  {isVisible("type") && <TD className="capitalize">{c.category}</TD>}
+                  {isVisible("contact") && (
+                    <TD>
+                      <div>{c.email}</div>
+                      <div className="text-xs text-[var(--text-muted)]">{c.phone}</div>
+                    </TD>
+                  )}
+                  {isVisible("email") && <TD>{c.email || "—"}</TD>}
+                  {isVisible("city") && <TD>{c.city}</TD>}
+                  {isVisible("status") && (
+                    <TD>
+                      <StatusBadge status={c.status} />
+                    </TD>
+                  )}
+                  {isVisible("balance") && <TD className="tabular-nums">R {parseFloat(c.balance).toFixed(2)}</TD>}
+                  {isVisible("assigned") && <TD>{c.assigned_staff_name ?? "—"}</TD>}
                 </TR>
               ))}
             </tbody>
@@ -207,7 +287,7 @@ export function CustomersPage() {
               >
                 <option value="new">New</option>
                 <option value="active">Active</option>
-                <option value="blocked">Blocked</option>
+                <option value="suspended">Suspended</option>
                 <option value="inactive">Inactive</option>
               </select>
             </FormField>

@@ -5,7 +5,23 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { IPPool, IPAddress } from "../../types";
+
+const POOL_COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "cidr", label: "CIDR" },
+  { key: "gateway", label: "Gateway" },
+  { key: "type", label: "Type" },
+  { key: "free_total", label: "Free / Total" },
+];
+
+const ADDRESS_COLUMNS: ColumnDef[] = [
+  { key: "address", label: "Address" },
+  { key: "status", label: "Status" },
+  { key: "assigned_service", label: "Assigned service" },
+];
 
 export function IPPoolsPage() {
   const { items, loading, refetch } = useApiList<IPPool>("/ip-pools/?page_size=100");
@@ -14,11 +30,17 @@ export function IPPoolsPage() {
   const [form, setForm] = useState<Partial<IPPool>>({ name: "", network_cidr: "", gateway: "", pool_type: "ipv4" });
   const [selectedPool, setSelectedPool] = useState<number | null>(null);
   const [addresses, setAddresses] = useState<IPAddress[]>([]);
+  const [addressStatusFilter, setAddressStatusFilter] = useState("");
+  const { hidden: hiddenPoolCols, isVisible: isPoolColVisible, toggle: togglePoolCol } = useColumnVisibility("ip-pools", ["name"]);
+  const { hidden: hiddenAddrCols, isVisible: isAddrColVisible, toggle: toggleAddrCol } = useColumnVisibility("ip-addresses", ["address"]);
 
   useEffect(() => {
     if (selectedPool == null) return;
-    api.get<{ results: IPAddress[] }>(`/ip-addresses/?pool=${selectedPool}&page_size=200`).then((res) => setAddresses(res.data.results));
-  }, [selectedPool]);
+    const statusParam = addressStatusFilter ? `&status=${addressStatusFilter}` : "";
+    api
+      .get<{ results: IPAddress[] }>(`/ip-addresses/?pool=${selectedPool}&page_size=200${statusParam}`)
+      .then((res) => setAddresses(res.data.results));
+  }, [selectedPool, addressStatusFilter]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -40,6 +62,10 @@ export function IPPoolsPage() {
         actions={<button className={btnPrimary} onClick={() => setShowModal(true)}>+ New pool</button>}
       />
 
+      <div className="mb-4 flex justify-end">
+        <ColumnToggle columns={POOL_COLUMNS} hidden={hiddenPoolCols} onToggle={togglePoolCol} alwaysVisible={["name"]} />
+      </div>
+
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -47,10 +73,10 @@ export function IPPoolsPage() {
           <THead>
             <tr>
               <TH>Name</TH>
-              <TH>CIDR</TH>
-              <TH>Gateway</TH>
-              <TH>Type</TH>
-              <TH>Free / Total</TH>
+              {isPoolColVisible("cidr") && <TH>CIDR</TH>}
+              {isPoolColVisible("gateway") && <TH>Gateway</TH>}
+              {isPoolColVisible("type") && <TH>Type</TH>}
+              {isPoolColVisible("free_total") && <TH>Free / Total</TH>}
               <TH></TH>
             </tr>
           </THead>
@@ -58,10 +84,10 @@ export function IPPoolsPage() {
             {items.map((p) => (
               <TR key={p.id}>
                 <TD className="font-medium">{p.name}</TD>
-                <TD>{p.network_cidr}</TD>
-                <TD>{p.gateway ?? "—"}</TD>
-                <TD className="uppercase">{p.pool_type}</TD>
-                <TD className="tabular-nums">{p.free_count} / {p.total_count}</TD>
+                {isPoolColVisible("cidr") && <TD>{p.network_cidr}</TD>}
+                {isPoolColVisible("gateway") && <TD>{p.gateway ?? "—"}</TD>}
+                {isPoolColVisible("type") && <TD className="uppercase">{p.pool_type}</TD>}
+                {isPoolColVisible("free_total") && <TD className="tabular-nums">{p.free_count} / {p.total_count}</TD>}
                 <TD>
                   <button className="text-[var(--series-1)] hover:underline" onClick={() => setSelectedPool(p.id)}>
                     View addresses
@@ -75,21 +101,41 @@ export function IPPoolsPage() {
 
       {selectedPool != null && (
         <div className="mt-6">
-          <h2 className="mb-2 text-sm font-semibold">Addresses in pool</h2>
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold">Addresses in pool</h2>
+            <div className="flex items-center gap-2">
+              <select
+                className={`${inputClass} w-auto`}
+                value={addressStatusFilter}
+                onChange={(e) => setAddressStatusFilter(e.target.value)}
+              >
+                <option value="">All statuses</option>
+                <option value="free">Free</option>
+                <option value="assigned">Assigned</option>
+                <option value="reserved">Reserved</option>
+              </select>
+              {addressStatusFilter && (
+                <button type="button" className={btnSecondary} onClick={() => setAddressStatusFilter("")}>
+                  Clear
+                </button>
+              )}
+              <ColumnToggle columns={ADDRESS_COLUMNS} hidden={hiddenAddrCols} onToggle={toggleAddrCol} alwaysVisible={["address"]} />
+            </div>
+          </div>
           <Table>
             <THead>
               <tr>
                 <TH>Address</TH>
-                <TH>Status</TH>
-                <TH>Assigned service</TH>
+                {isAddrColVisible("status") && <TH>Status</TH>}
+                {isAddrColVisible("assigned_service") && <TH>Assigned service</TH>}
               </tr>
             </THead>
             <tbody>
               {addresses.map((a) => (
                 <TR key={a.id}>
                   <TD>{a.address}</TD>
-                  <TD><StatusBadge status={a.status} /></TD>
-                  <TD>{a.assigned_service ?? "—"}</TD>
+                  {isAddrColVisible("status") && <TD><StatusBadge status={a.status} /></TD>}
+                  {isAddrColVisible("assigned_service") && <TD>{a.assigned_service ?? "—"}</TD>}
                 </TR>
               ))}
             </tbody>

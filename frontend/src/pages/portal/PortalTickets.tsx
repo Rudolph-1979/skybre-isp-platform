@@ -72,7 +72,7 @@ export function PortalTickets() {
               <div className="mt-4 space-y-2 border-t border-[var(--border-hairline)] pt-4">
                 <p className="text-sm text-[var(--text-secondary)]">{t.description}</p>
                 {t.comments.map((c) => (
-                  <div key={c.id} className="rounded-md bg-black/[0.03] p-2 text-sm">
+                  <div key={c.id} className="rounded-md bg-[var(--tint-subtle)] p-2 text-sm">
                     <p className="text-xs text-[var(--text-muted)]">{c.author_name ?? "Support"} · {new Date(c.created_at).toLocaleString()}</p>
                     <p>{c.message}</p>
                   </div>

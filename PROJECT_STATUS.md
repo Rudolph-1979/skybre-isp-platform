@@ -85,6 +85,21 @@ deployed.
    Low-stock threshold + badge per product. Staff-only, same as
    Scheduling. New `/media/` uploads are stored on a dedicated Docker
    volume (`media_data`) so they survive rebuilds.
+10. **Two-factor authentication (TOTP)** — opt-in per account (any user,
+    staff or customer, via "Account settings" in the admin sidebar for
+    now). Scan a QR code with an authenticator app (Google Authenticator,
+    Authy, etc.), confirm one code to activate, get 10 one-time backup
+    codes for account recovery. Once enabled, login requires the 6-digit
+    code (or a backup code) after the password. New `accounts.TwoFactorAuth`
+    / `TwoFactorBackupCode` models; `pyotp` + `qrcode` added to
+    `requirements.txt`.
+11. **HTTPS** — moved to a host-level Nginx + Certbot in front of the
+    Docker stack (`docker-compose.yml`'s `frontend` service now binds to
+    `127.0.0.1:8080` instead of public `80`), so Let's Encrypt can
+    terminate TLS for `portal.skybre.co.za`. See "Where the code lives" /
+    `DEPLOYMENT.md` Option A step 6 for the exact commands — this needs
+    DNS to have propagated and Certbot to actually be run on the VPS
+    before it's live; check whether that's been completed.
 
 ## Data migration from Splynx (customers)
 
@@ -111,15 +126,26 @@ export files show up later:
 - [x] `ALLOWED_HOSTS` set to the VPS IP only
 - [x] `CORS_ALLOW_ALL_ORIGINS=False`, `CORS_ALLOWED_ORIGINS` set to the VPS origin
 - [x] Strong, non-default DB password
-- [ ] **HTTPS not live yet** — `SECURE_SSL_REDIRECT` / `SESSION_COOKIE_SECURE` /
-      `CSRF_COOKIE_SECURE` / `BEHIND_HTTPS_PROXY` are all `False` (correct for
-      now, since there's no domain/TLS yet — flip to `True` once Certbot is set up)
+- [ ] **HTTPS — in progress (2026-08-13).** Domain `portal.skybre.co.za`
+      chosen, DNS A record being added, host-level Nginx + Certbot setup
+      underway (see item 11 in Feature history above). Until Certbot has
+      actually run and `.env`'s `SECURE_SSL_REDIRECT` /
+      `SESSION_COOKIE_SECURE` / `CSRF_COOKIE_SECURE` / `BEHIND_HTTPS_PROXY`
+      are flipped to `True`, traffic is still plain HTTP — check
+      `PROJECT_STATUS.md`'s date above vs. today before assuming this is done.
 - [x] No demo data ever seeded against this deploy
 - [x] Automated hourly database backups — see `BACKUP.md`. Local rotation is
       live; off-site copy to Google Cloud Storage is Phase 2 in that doc,
       pending bucket/service-account setup on Rudolph's side.
 - [ ] Firewall/security group: currently allows 22, 80 (added manually to
-      fix a connection-timeout issue), 443 not yet confirmed open
+      fix a connection-timeout issue), 443 not yet confirmed open — needs
+      opening once Certbot is live. Also note: `ufw` (host-level firewall)
+      was found **inactive** during the 2026-08-13 security review — only
+      Xneelo's external firewall is in effect. Enabling `ufw` is a
+      worthwhile follow-up but must allow port 22 *before* enabling it, to
+      avoid locking out SSH access.
+- [x] Two-factor authentication (TOTP) available — opt-in per account, not
+      yet enabled on Rudolph's own admin account as of this writing.
 
 ## Known cosmetic issue (not yet fixed)
 
@@ -129,8 +155,8 @@ before customers see it.
 
 ## Explicitly deferred / future work
 
-1. **HTTPS** — need a domain pointed at 154.65.111.61, then run Certbot per
-   `DEPLOYMENT.md` Option A step 5.
+1. **HTTPS** — in progress, see Feature history item 11 and the security
+   checklist above. `DEPLOYMENT.md` Option A step 6 has the exact commands.
 2. **RADIUS integration** — Skybre runs a real FreeRADIUS system for network
    auth/accounting (see uploaded files like "Sessions - Radius - Skybre Pty
    Ltd.csv"). The platform's network monitoring is currently **simulated**
@@ -138,6 +164,23 @@ before customers see it.
    SNMP/RADIUS polling), and there's no live per-customer online/offline
    status either — both would need this RADIUS integration. Explicitly put
    on hold for now, not being worked on.
+
+   **Architecture note for when this is picked back up:** confirmed
+   (2026-08-13) that FreeRADIUS does *not* currently run on this platform's
+   VPS (154.65.111.61) — that box only runs this Django/React/Postgres
+   stack. Whichever server ends up running FreeRADIUS once this
+   integration is built, **don't co-locate it with this platform's VPS.**
+   This platform gets rebuilt/redeployed fairly often for ordinary feature
+   work, and once FreeRADIUS is live it's authenticating real customer
+   PPPoE/DHCP sessions — a routine `docker compose build` or container
+   restart for an unrelated admin feature should never carry any risk of
+   interrupting customer connectivity. Keep them on separate servers, with
+   this platform talking to RADIUS over the network (API or shared/
+   replicated database) rather than sharing infrastructure. If RADIUS ever
+   does move onto shared infrastructure with this platform, that's the
+   point where the "Tier 3: full high availability" option in
+   `SECURITY_AND_REDUNDANCY.md` (load-balanced app servers, DB replication)
+   stops being optional and starts being necessary.
 3. **GCS off-site backups (Phase 2 of BACKUP.md)** — pending Rudolph
    creating a Google Cloud bucket + service account key.
 4. Turn imported customers' Splynx plan info (currently just text in

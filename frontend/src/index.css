@@ -2,6 +2,7 @@
 
 :root {
   --surface-1: #fcfcfb;
+  --surface-2: #ffffff; /* input/field backgrounds — a step "up" from surface-1 in light mode */
   --page-plane: #f9f9f7;
   --text-primary: #0b0b0b;
   --text-secondary: #52514e;
@@ -9,6 +10,14 @@
   --gridline: #e1e0d9;
   --baseline: #c3c2b7;
   --border-hairline: rgba(11, 11, 11, 0.10);
+
+  /* Subtle tints used for hover states, table-header washes, and the
+     modal backdrop — kept as variables (rather than bg-black/5-style
+     Tailwind opacity utilities) specifically so dark mode can flip them
+     to white-based tints instead of black-based ones. */
+  --tint-subtle: rgba(11, 11, 11, 0.02);
+  --tint-hover: rgba(11, 11, 11, 0.05);
+  --overlay-scrim: rgba(11, 11, 11, 0.4);
 
   --series-1: #2a78d6; /* blue */
   --series-2: #eb6834; /* orange */
@@ -26,6 +35,40 @@
 
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   color-scheme: light;
+}
+
+:root.dark {
+  --surface-1: #1c1c1a;
+  --surface-2: #242422;
+  --page-plane: #131312;
+  --text-primary: #f3f2ef;
+  --text-secondary: #b8b6ae;
+  --text-muted: #83817a;
+  --gridline: #35342f;
+  --baseline: #46453e;
+  --border-hairline: rgba(255, 255, 255, 0.10);
+
+  --tint-subtle: rgba(255, 255, 255, 0.03);
+  --tint-hover: rgba(255, 255, 255, 0.07);
+  --overlay-scrim: rgba(0, 0, 0, 0.6);
+
+  /* Slightly brightened so the accent colors keep enough contrast against
+     dark surfaces — the hues stay recognizable, just lifted a bit. */
+  --series-1: #5b9ce6;
+  --series-2: #f08a5d;
+  --series-3: #3fcf9a;
+  --series-4: #f0b632;
+  --series-5: #ef9dc0;
+  --series-6: #3aa53a;
+  --series-7: #7566d6;
+  --series-8: #ea6e6d;
+
+  --status-good: #3ecf3e;
+  --status-warning: #fbc752;
+  --status-serious: #f0a081;
+  --status-critical: #e26969;
+
+  color-scheme: dark;
 }
 
 body {

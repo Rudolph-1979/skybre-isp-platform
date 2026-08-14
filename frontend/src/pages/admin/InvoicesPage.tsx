@@ -6,7 +6,18 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Invoice, Customer } from "../../types";
+
+const COLUMNS: ColumnDef[] = [
+  { key: "number", label: "Number" },
+  { key: "customer", label: "Customer" },
+  { key: "due_date", label: "Due date" },
+  { key: "total", label: "Total" },
+  { key: "paid", label: "Paid" },
+  { key: "status", label: "Status" },
+];
 
 interface LineItem {
   description: string;
@@ -30,6 +41,8 @@ export function InvoicesPage() {
   const [dateFilterMode, setDateFilterMode] = useState<DateFilterMode>("all");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("invoices", ["number"]);
 
   let dateParams = "";
   if (dateFilterMode === "30" || dateFilterMode === "60" || dateFilterMode === "90") {
@@ -40,7 +53,7 @@ export function InvoicesPage() {
   }
 
   const { items, count, loading, refetch } = useApiList<Invoice>(
-    `/invoices/?page_size=100&ordering=${ordering}${dateParams}`
+    `/invoices/?page_size=100&ordering=${ordering}${dateParams}${statusFilter ? `&status=${statusFilter}` : ""}`
   );
   const [customers, setCustomers] = useState<Customer[]>([]);
 
@@ -107,12 +120,28 @@ export function InvoicesPage() {
             className={
               dateFilterMode === tab.mode
                 ? "rounded-md bg-[var(--series-1)] px-3 py-1.5 text-sm font-medium text-white"
-                : "rounded-md border border-[var(--baseline)] px-3 py-1.5 text-sm font-medium text-[var(--text-primary)] hover:bg-black/5"
+                : "rounded-md border border-[var(--baseline)] px-3 py-1.5 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--tint-hover)]"
             }
           >
             {tab.label}
           </button>
         ))}
+        <select className={`${inputClass} w-auto`} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="draft">Draft</option>
+          <option value="unpaid">Unpaid</option>
+          <option value="paid">Paid</option>
+          <option value="overdue">Overdue</option>
+          <option value="cancelled">Cancelled</option>
+        </select>
+        {statusFilter && (
+          <button type="button" className={btnSecondary} onClick={() => setStatusFilter("")}>
+            Clear status
+          </button>
+        )}
+        <div className="ml-auto">
+          <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["number"]} />
+        </div>
       </div>
 
       {dateFilterMode === "custom" && (
@@ -155,11 +184,11 @@ export function InvoicesPage() {
           <THead>
             <tr>
               <SortableTH field="number" ordering={ordering} onSort={toggleSort}>Number</SortableTH>
-              <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
-              <SortableTH field="date_due" ordering={ordering} onSort={toggleSort}>Due date</SortableTH>
-              <SortableTH field="total" ordering={ordering} onSort={toggleSort}>Total</SortableTH>
-              <SortableTH field="paid_amount" ordering={ordering} onSort={toggleSort}>Paid</SortableTH>
-              <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
+              {isVisible("customer") && <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>}
+              {isVisible("due_date") && <SortableTH field="date_due" ordering={ordering} onSort={toggleSort}>Due date</SortableTH>}
+              {isVisible("total") && <SortableTH field="total" ordering={ordering} onSort={toggleSort}>Total</SortableTH>}
+              {isVisible("paid") && <SortableTH field="paid_amount" ordering={ordering} onSort={toggleSort}>Paid</SortableTH>}
+              {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
             </tr>
           </THead>
           <tbody>
@@ -170,11 +199,11 @@ export function InvoicesPage() {
                     {inv.number}
                   </Link>
                 </TD>
-                <TD>{inv.customer_name}</TD>
-                <TD>{inv.date_due}</TD>
-                <TD className="tabular-nums">R {parseFloat(inv.total).toFixed(2)}</TD>
-                <TD className="tabular-nums">R {parseFloat(inv.paid_amount).toFixed(2)}</TD>
-                <TD><StatusBadge status={inv.status} /></TD>
+                {isVisible("customer") && <TD>{inv.customer_name}</TD>}
+                {isVisible("due_date") && <TD>{inv.date_due}</TD>}
+                {isVisible("total") && <TD className="tabular-nums">R {parseFloat(inv.total).toFixed(2)}</TD>}
+                {isVisible("paid") && <TD className="tabular-nums">R {parseFloat(inv.paid_amount).toFixed(2)}</TD>}
+                {isVisible("status") && <TD><StatusBadge status={inv.status} /></TD>}
               </TR>
             ))}
           </tbody>

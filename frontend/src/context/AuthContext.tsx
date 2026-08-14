@@ -5,7 +5,7 @@ import type { User } from "../types";
 interface AuthContextValue {
   user: User | null;
   loading: boolean;
-  login: (username: string, password: string) => Promise<User>;
+  login: (username: string, password: string, totpCode?: string) => Promise<User>;
   logout: () => void;
 }
 
@@ -31,8 +31,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false));
   }, []);
 
-  async function login(username: string, password: string) {
-    const res = await api.post("/token/", { username, password });
+  async function login(username: string, password: string, totpCode?: string) {
+    // totp_code is only sent when the caller has one (2FA-enabled accounts
+    // resubmit with it after the first attempt signals it's required) —
+    // the backend treats a missing/blank code as "no 2FA code given".
+    const res = await api.post("/token/", { username, password, totp_code: totpCode || "" });
     localStorage.setItem("access_token", res.data.access);
     localStorage.setItem("refresh_token", res.data.refresh);
     const me: User = { ...res.data.user, customer_id: res.data.customer_id };

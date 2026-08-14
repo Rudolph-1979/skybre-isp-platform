@@ -6,13 +6,30 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Device } from "../../types";
 
 const EMPTY: Partial<Device> = { name: "", device_type: "router", ip_address: "", location: "", vendor: "", model_name: "" };
 
+const COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "type", label: "Type" },
+  { key: "ip_address", label: "IP Address" },
+  { key: "location", label: "Location" },
+  { key: "status", label: "Status" },
+  { key: "latency", label: "Latency" },
+  { key: "bandwidth", label: "Bandwidth (in/out)" },
+];
+
 export function DevicesPage() {
   const navigate = useNavigate();
-  const { items, loading, refetch } = useApiList<Device>("/devices/?page_size=100");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("devices", ["name"]);
+  const { items, loading, refetch } = useApiList<Device>(
+    `/devices/?page_size=100${typeFilter ? `&device_type=${typeFilter}` : ""}${statusFilter ? `&status=${statusFilter}` : ""}`
+  );
   const [showModal, setShowModal] = useState(false);
   const [form, setForm] = useState<Partial<Device>>(EMPTY);
   const [saving, setSaving] = useState(false);
@@ -40,6 +57,39 @@ export function DevicesPage() {
         }
       />
 
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <select className={`${inputClass} w-auto`} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+          <option value="">All types</option>
+          <option value="router">Router</option>
+          <option value="switch">Switch</option>
+          <option value="olt">OLT</option>
+          <option value="access_point">Access Point</option>
+          <option value="server">Server</option>
+          <option value="onu">ONU/CPE</option>
+        </select>
+        <select className={`${inputClass} w-auto`} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="online">Online</option>
+          <option value="offline">Offline</option>
+          <option value="unknown">Unknown</option>
+        </select>
+        {(typeFilter || statusFilter) && (
+          <button
+            type="button"
+            className={btnSecondary}
+            onClick={() => {
+              setTypeFilter("");
+              setStatusFilter("");
+            }}
+          >
+            Clear filters
+          </button>
+        )}
+        <div className="ml-auto">
+          <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
+        </div>
+      </div>
+
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -47,28 +97,32 @@ export function DevicesPage() {
           <THead>
             <tr>
               <TH>Name</TH>
-              <TH>Type</TH>
-              <TH>IP Address</TH>
-              <TH>Location</TH>
-              <TH>Status</TH>
-              <TH>Latency</TH>
-              <TH>Bandwidth (in/out)</TH>
+              {isVisible("type") && <TH>Type</TH>}
+              {isVisible("ip_address") && <TH>IP Address</TH>}
+              {isVisible("location") && <TH>Location</TH>}
+              {isVisible("status") && <TH>Status</TH>}
+              {isVisible("latency") && <TH>Latency</TH>}
+              {isVisible("bandwidth") && <TH>Bandwidth (in/out)</TH>}
             </tr>
           </THead>
           <tbody>
             {items.map((d) => (
               <TR key={d.id} onClick={() => navigate(`/admin/devices/${d.id}`)}>
                 <TD className="font-medium">{d.name}</TD>
-                <TD className="capitalize">{d.device_type.replace("_", " ")}</TD>
-                <TD>{d.ip_address}</TD>
-                <TD>{d.location}</TD>
-                <TD><StatusBadge status={d.status} /></TD>
-                <TD className="tabular-nums">{d.latest_reading?.latency_ms != null ? `${d.latest_reading.latency_ms} ms` : "—"}</TD>
-                <TD className="tabular-nums">
-                  {d.latest_reading?.bandwidth_in_mbps != null
-                    ? `${d.latest_reading.bandwidth_in_mbps} / ${d.latest_reading.bandwidth_out_mbps} Mbps`
-                    : "—"}
-                </TD>
+                {isVisible("type") && <TD className="capitalize">{d.device_type.replace("_", " ")}</TD>}
+                {isVisible("ip_address") && <TD>{d.ip_address}</TD>}
+                {isVisible("location") && <TD>{d.location}</TD>}
+                {isVisible("status") && <TD><StatusBadge status={d.status} /></TD>}
+                {isVisible("latency") && (
+                  <TD className="tabular-nums">{d.latest_reading?.latency_ms != null ? `${d.latest_reading.latency_ms} ms` : "—"}</TD>
+                )}
+                {isVisible("bandwidth") && (
+                  <TD className="tabular-nums">
+                    {d.latest_reading?.bandwidth_in_mbps != null
+                      ? `${d.latest_reading.bandwidth_in_mbps} / ${d.latest_reading.bandwidth_out_mbps} Mbps`
+                      : "—"}
+                  </TD>
+                )}
               </TR>
             ))}
           </tbody>

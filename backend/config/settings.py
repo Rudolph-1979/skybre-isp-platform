@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     "tickets",
     "scheduling",
     "inventory",
+    "notifications",
 ]
 
 MIDDLEWARE = [
@@ -135,6 +136,12 @@ SIMPLE_JWT = {
 CORS_ALLOW_ALL_ORIGINS = config("CORS_ALLOW_ALL_ORIGINS", default=True, cast=bool)
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=Csv())
 
+# Required by Django once the site is served over HTTPS behind a reverse
+# proxy — without this, POSTs to the Django admin (session/cookie-based,
+# unlike the JWT-authenticated API) get rejected with a CSRF failure.
+# e.g. CSRF_TRUSTED_ORIGINS=https://portal.skybre.co.za
+CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", default="", cast=Csv())
+
 # Production hardening — all off by default (dev), flip on via env in production.
 # Behind a reverse proxy (Nginx/Caddy) terminating TLS, also set:
 #   SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
@@ -144,3 +151,26 @@ SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool
 CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
 if config("BEHIND_HTTPS_PROXY", default=False, cast=bool):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Outbound email (customer notifications — welcome, statements, invoices,
+# payment reminders, suspension notices — see the notifications app).
+# Defaults to Django's console backend so uncofigured/dev environments
+# just print emails to stdout instead of failing loudly; set EMAIL_HOST in
+# .env once real SMTP credentials (your domain's mail hosting, Google
+# Workspace, or a transactional provider) are available to switch it on.
+EMAIL_HOST = config("EMAIL_HOST", default="")
+EMAIL_BACKEND = (
+    "django.core.mail.backends.smtp.EmailBackend"
+    if EMAIL_HOST
+    else "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
+EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
+EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
+DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="Skybre <no-reply@skybre.co.za>")
+COMPANY_NAME = config("COMPANY_NAME", default="Skybre")
+# Base URL for links inside emails (e.g. the customer portal login link
+# in the welcome email) — set to the real public site once DNS/HTTPS is live.
+SITE_URL = config("SITE_URL", default="https://skybre.co.za")

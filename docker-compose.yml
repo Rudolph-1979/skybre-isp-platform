@@ -38,7 +38,11 @@ services:
     depends_on:
       - backend
     ports:
-      - "80:80"
+      # Bound to localhost only — a host-level Nginx (installed outside
+      # Docker) now owns the public 80/443 and terminates HTTPS via
+      # Certbot, reverse-proxying to this container. See DEPLOYMENT.md
+      # Option A step 6 and PROJECT_STATUS.md.
+      - "127.0.0.1:8080:80"
 
 volumes:
   postgres_data:

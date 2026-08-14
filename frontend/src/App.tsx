@@ -15,11 +15,14 @@ import { InvoicesPage } from "./pages/admin/InvoicesPage";
 import { InvoiceDetailPage } from "./pages/admin/InvoiceDetailPage";
 import { PaymentsPage } from "./pages/admin/PaymentsPage";
 import { InventoryPage } from "./pages/admin/InventoryPage";
+import { AccountSettingsPage } from "./pages/admin/AccountSettingsPage";
 import { DevicesPage } from "./pages/admin/DevicesPage";
 import { DeviceDetailPage } from "./pages/admin/DeviceDetailPage";
 import { IPPoolsPage } from "./pages/admin/IPPoolsPage";
 import { TicketsPage } from "./pages/admin/TicketsPage";
 import { TicketDetailPage } from "./pages/admin/TicketDetailPage";
+import { EmailTemplatesPage } from "./pages/admin/EmailTemplatesPage";
+import { BulkEmailPage } from "./pages/admin/BulkEmailPage";
 
 import { PortalDashboard } from "./pages/portal/PortalDashboard";
 import { PortalInvoices } from "./pages/portal/PortalInvoices";
@@ -51,11 +54,14 @@ export default function App() {
             <Route path="invoices/:id" element={<InvoiceDetailPage />} />
             <Route path="payments" element={<PaymentsPage />} />
             <Route path="inventory" element={<InventoryPage />} />
+            <Route path="account" element={<AccountSettingsPage />} />
             <Route path="devices" element={<DevicesPage />} />
             <Route path="devices/:id" element={<DeviceDetailPage />} />
             <Route path="ip-pools" element={<IPPoolsPage />} />
             <Route path="tickets" element={<TicketsPage />} />
             <Route path="tickets/:id" element={<TicketDetailPage />} />
+            <Route path="email-templates" element={<EmailTemplatesPage />} />
+            <Route path="bulk-email" element={<BulkEmailPage />} />
           </Route>
 
           <Route

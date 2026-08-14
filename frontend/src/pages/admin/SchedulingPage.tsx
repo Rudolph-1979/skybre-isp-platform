@@ -316,7 +316,7 @@ export function SchedulingPage() {
       ) : (
         <div className="grid grid-cols-7 overflow-hidden rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] shadow-sm">
           {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
-            <div key={d} className="border-b border-[var(--border-hairline)] bg-black/[0.02] px-2 py-1.5 text-center text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">
+            <div key={d} className="border-b border-[var(--border-hairline)] bg-[var(--tint-subtle)] px-2 py-1.5 text-center text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">
               {d}
             </div>
           ))}
@@ -335,13 +335,13 @@ export function SchedulingPage() {
               <div
                 key={idx}
                 className={`min-h-[110px] border-b border-r border-[var(--border-hairline)] p-1.5 ${
-                  inMonth ? "" : "bg-black/[0.015]"
+                  inMonth ? "" : "bg-[var(--tint-subtle)]"
                 }`}
               >
                 <button
                   type="button"
                   onClick={() => openNewJob(day)}
-                  className={`mb-1 rounded px-1.5 py-0.5 text-xs font-medium hover:bg-black/5 ${
+                  className={`mb-1 rounded px-1.5 py-0.5 text-xs font-medium hover:bg-[var(--tint-hover)] ${
                     isToday
                       ? "bg-[var(--series-1)] text-white"
                       : inMonth

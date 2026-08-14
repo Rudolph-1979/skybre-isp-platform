@@ -118,7 +118,7 @@ class Command(BaseCommand):
             ip_addresses.append(IPAddress.objects.create(pool=pool, address=addr, status=IPAddress.Status.FREE))
 
         self.stdout.write("Creating customers, services, invoices & payments...")
-        statuses = [Customer.Status.ACTIVE] * 6 + [Customer.Status.NEW, Customer.Status.BLOCKED, Customer.Status.INACTIVE]
+        statuses = [Customer.Status.ACTIVE] * 6 + [Customer.Status.NEW, Customer.Status.SUSPENDED, Customer.Status.INACTIVE]
         customers = []
         for i in range(40):
             first = random.choice(FIRST_NAMES)

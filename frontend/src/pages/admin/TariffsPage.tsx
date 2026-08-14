@@ -6,7 +6,18 @@ import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { CSVImportModal } from "../../components/CSVImportModal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Tariff } from "../../types";
+
+const COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "type", label: "Type" },
+  { key: "speed", label: "Speed" },
+  { key: "price", label: "Price" },
+  { key: "billing_period", label: "Billing period" },
+  { key: "status", label: "Status" },
+];
 
 const IMPORT_TEMPLATE_HEADERS = [
   "name", "service_type", "price", "billing_period",
@@ -27,7 +38,14 @@ const EMPTY: Partial<Tariff> = {
 
 export function TariffsPage() {
   const [ordering, setOrdering] = useState("name");
-  const { items, loading, refetch } = useApiList<Tariff>(`/tariffs/?page_size=100&ordering=${ordering}`);
+  const [typeFilter, setTypeFilter] = useState("");
+  const [activeFilter, setActiveFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("tariffs", ["name"]);
+  const { items, loading, refetch } = useApiList<Tariff>(
+    `/tariffs/?page_size=100&ordering=${ordering}${typeFilter ? `&service_type=${typeFilter}` : ""}${
+      activeFilter ? `&is_active=${activeFilter}` : ""
+    }`
+  );
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<Partial<Tariff>>(EMPTY);
@@ -67,6 +85,36 @@ export function TariffsPage() {
         }
       />
 
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <select className={`${inputClass} w-auto`} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+          <option value="">All types</option>
+          <option value="internet">Internet</option>
+          <option value="voice">Voice</option>
+          <option value="bundle">Bundle</option>
+          <option value="other">Other</option>
+        </select>
+        <select className={`${inputClass} w-auto`} value={activeFilter} onChange={(e) => setActiveFilter(e.target.value)}>
+          <option value="">Active & inactive</option>
+          <option value="true">Active only</option>
+          <option value="false">Inactive only</option>
+        </select>
+        {(typeFilter || activeFilter) && (
+          <button
+            type="button"
+            className={btnSecondary}
+            onClick={() => {
+              setTypeFilter("");
+              setActiveFilter("");
+            }}
+          >
+            Clear filters
+          </button>
+        )}
+        <div className="ml-auto">
+          <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
+        </div>
+      </div>
+
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -74,22 +122,22 @@ export function TariffsPage() {
           <THead>
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
-              <SortableTH field="service_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>
-              <SortableTH field="speed_download_mbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>
-              <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>
-              <SortableTH field="billing_period" ordering={ordering} onSort={toggleSort}>Billing period</SortableTH>
-              <SortableTH field="is_active" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
+              {isVisible("type") && <SortableTH field="service_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>}
+              {isVisible("speed") && <SortableTH field="speed_download_mbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>}
+              {isVisible("price") && <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
+              {isVisible("billing_period") && <SortableTH field="billing_period" ordering={ordering} onSort={toggleSort}>Billing period</SortableTH>}
+              {isVisible("status") && <SortableTH field="is_active" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
             </tr>
           </THead>
           <tbody>
             {items.map((t) => (
               <TR key={t.id}>
                 <TD className="font-medium">{t.name}</TD>
-                <TD className="capitalize">{t.service_type}</TD>
-                <TD>{t.speed_download_mbps ? `${t.speed_download_mbps}/${t.speed_upload_mbps} Mbps` : "—"}</TD>
-                <TD className="tabular-nums">R {parseFloat(t.price).toFixed(2)}</TD>
-                <TD className="capitalize">{t.billing_period}</TD>
-                <TD><StatusBadge status={t.is_active ? "active" : "inactive"} /></TD>
+                {isVisible("type") && <TD className="capitalize">{t.service_type}</TD>}
+                {isVisible("speed") && <TD>{t.speed_download_mbps ? `${t.speed_download_mbps}/${t.speed_upload_mbps} Mbps` : "—"}</TD>}
+                {isVisible("price") && <TD className="tabular-nums">R {parseFloat(t.price).toFixed(2)}</TD>}
+                {isVisible("billing_period") && <TD className="capitalize">{t.billing_period}</TD>}
+                {isVisible("status") && <TD><StatusBadge status={t.is_active ? "active" : "inactive"} /></TD>}
               </TR>
             ))}
           </tbody>

@@ -70,7 +70,7 @@ export function DeviceDetailPage() {
         </div>
       </div>
 
-      <div className="mt-4 rounded-lg border border-[var(--border-hairline)] bg-black/[0.02] p-4 text-xs text-[var(--text-muted)]">
+      <div className="mt-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--tint-subtle)] p-4 text-xs text-[var(--text-muted)]">
         Monitoring data on this page is simulated for demo purposes (see <code>simulate_monitoring</code> management
         command). Wire up real SNMP polling against <code>{device.ip_address}</code> using the device's SNMP
         community string to replace this with live data.

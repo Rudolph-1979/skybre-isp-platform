@@ -31,7 +31,7 @@ export interface Customer {
   address: string;
   city: string;
   zip_code: string;
-  status: "new" | "active" | "blocked" | "inactive";
+  status: "new" | "active" | "suspended" | "inactive";
   balance: string;
   assigned_staff: number | null;
   assigned_staff_name: string | null;
@@ -297,6 +297,34 @@ export interface StockIssue {
   issued_at: string;
   notes: string;
   lines: StockIssueLine[];
+}
+
+export type EmailTemplateKey = "welcome" | "statement" | "invoice" | "payment_reminder" | "suspension";
+
+export interface EmailTemplate {
+  id: number;
+  key: EmailTemplateKey;
+  name: string;
+  subject: string;
+  body_html: string;
+  has_attachment: boolean;
+  updated_at: string;
+}
+
+export interface EmailLog {
+  id: number;
+  customer: number | null;
+  customer_name: string | null;
+  template_key: EmailTemplateKey;
+  template_name: string;
+  recipient_email: string;
+  subject: string;
+  status: "sent" | "failed";
+  error_message: string;
+  sent_by: number | null;
+  sent_by_name: string | null;
+  batch_id: string;
+  created_at: string;
 }
 
 export interface DashboardSummary {

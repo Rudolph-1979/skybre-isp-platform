@@ -1,0 +1,54 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block content %}
+  <div class="doc-title">Invoice {{ invoice.number }}</div>
+
+  <table class="meta-table">
+    <tr><td class="meta-label">Invoice date</td><td>{{ invoice.date_created }}</td></tr>
+    <tr><td class="meta-label">Due date</td><td>{{ invoice.date_due }}</td></tr>
+    <tr><td class="meta-label">Status</td><td>{{ invoice.get_status_display }}</td></tr>
+  </table>
+
+  <div class="addr-block">
+    <div class="addr-label">Bill to</div>
+    <div>{{ customer.full_name }}</div>
+    {% if customer.company_name %}<div>{{ customer.company_name }}</div>{% endif %}
+    <div>{{ customer.address }}</div>
+    <div>{{ customer.city }} {{ customer.zip_code }}</div>
+    <div>{{ customer.email }}</div>
+  </div>
+
+  <table class="items">
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th class="num">Qty</th>
+        <th class="num">Unit price</th>
+        <th class="num">Tax %</th>
+        <th class="num">Total</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td>{{ item.description }}</td>
+        <td class="num">{{ item.quantity }}</td>
+        <td class="num">R {{ item.unit_price }}</td>
+        <td class="num">{{ item.tax_rate_pct }}%</td>
+        <td class="num">R {{ item.total|floatformat:2 }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table class="totals-table">
+    <tr><td>Subtotal</td><td class="num">R {{ invoice.subtotal }}</td></tr>
+    <tr><td>Tax</td><td class="num">R {{ invoice.tax_total }}</td></tr>
+    <tr class="grand"><td>Total</td><td class="num">R {{ invoice.total }}</td></tr>
+    <tr><td>Paid</td><td class="num">R {{ invoice.paid_amount }}</td></tr>
+    <tr><td class="balance-due">Balance due</td><td class="num balance-due">R {{ balance_due }}</td></tr>
+  </table>
+
+  {% if invoice.note %}
+    <p><strong>Note:</strong> {{ invoice.note }}</p>
+  {% endif %}
+{% endblock %}

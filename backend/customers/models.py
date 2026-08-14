@@ -10,7 +10,7 @@ class Customer(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "New"
         ACTIVE = "active", "Active"
-        BLOCKED = "blocked", "Blocked"
+        SUSPENDED = "suspended", "Suspended"
         INACTIVE = "inactive", "Inactive"
 
     class Category(models.TextChoices):

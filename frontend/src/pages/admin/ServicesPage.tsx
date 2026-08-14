@@ -5,11 +5,25 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Service, Customer, Tariff } from "../../types";
+
+const COLUMNS: ColumnDef[] = [
+  { key: "customer", label: "Customer" },
+  { key: "tariff", label: "Tariff" },
+  { key: "price", label: "Price" },
+  { key: "status", label: "Status" },
+  { key: "start_date", label: "Start date" },
+];
 
 export function ServicesPage() {
   const [ordering, setOrdering] = useState("-created_at");
-  const { items, loading, refetch } = useApiList<Service>(`/services/?page_size=200&ordering=${ordering}`);
+  const [statusFilter, setStatusFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("services", ["customer"]);
+  const { items, loading, refetch } = useApiList<Service>(
+    `/services/?page_size=200&ordering=${ordering}${statusFilter ? `&status=${statusFilter}` : ""}`
+  );
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   function toggleSort(field: string) {
@@ -56,6 +70,24 @@ export function ServicesPage() {
         }
       />
 
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <select className={`${inputClass} w-auto`} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="pending">Pending Activation</option>
+          <option value="active">Active</option>
+          <option value="suspended">Suspended</option>
+          <option value="terminated">Terminated</option>
+        </select>
+        {statusFilter && (
+          <button type="button" className={btnSecondary} onClick={() => setStatusFilter("")}>
+            Clear filters
+          </button>
+        )}
+        <div className="ml-auto">
+          <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["customer"]} />
+        </div>
+      </div>
+
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -63,20 +95,20 @@ export function ServicesPage() {
           <THead>
             <tr>
               <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
-              <SortableTH field="tariff__name" ordering={ordering} onSort={toggleSort}>Tariff</SortableTH>
-              <SortableTH field="tariff__price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>
-              <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>
-              <SortableTH field="start_date" ordering={ordering} onSort={toggleSort}>Start date</SortableTH>
+              {isVisible("tariff") && <SortableTH field="tariff__name" ordering={ordering} onSort={toggleSort}>Tariff</SortableTH>}
+              {isVisible("price") && <SortableTH field="tariff__price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
+              {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
+              {isVisible("start_date") && <SortableTH field="start_date" ordering={ordering} onSort={toggleSort}>Start date</SortableTH>}
             </tr>
           </THead>
           <tbody>
             {items.map((s) => (
               <TR key={s.id}>
                 <TD>{s.customer_name}</TD>
-                <TD>{s.tariff_name}</TD>
-                <TD className="tabular-nums">R {parseFloat(s.price).toFixed(2)}</TD>
-                <TD><StatusBadge status={s.status} /></TD>
-                <TD>{s.start_date ?? "—"}</TD>
+                {isVisible("tariff") && <TD>{s.tariff_name}</TD>}
+                {isVisible("price") && <TD className="tabular-nums">R {parseFloat(s.price).toFixed(2)}</TD>}
+                {isVisible("status") && <TD><StatusBadge status={s.status} /></TD>}
+                {isVisible("start_date") && <TD>{s.start_date ?? "—"}</TD>}
               </TR>
             ))}
           </tbody>

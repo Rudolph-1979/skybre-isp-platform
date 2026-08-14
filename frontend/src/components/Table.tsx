@@ -9,7 +9,7 @@ export function Table({ children }: { children: ReactNode }) {
 }
 
 export function THead({ children }: { children: ReactNode }) {
-  return <thead className="border-b border-[var(--border-hairline)] bg-black/[0.02] text-left">{children}</thead>;
+  return <thead className="border-b border-[var(--border-hairline)] bg-[var(--tint-subtle)] text-left">{children}</thead>;
 }
 
 export function TH({ children }: { children?: ReactNode }) {
@@ -54,7 +54,7 @@ export function TR({ children, onClick }: { children: ReactNode; onClick?: () =>
   return (
     <tr
       onClick={onClick}
-      className={`border-b border-[var(--border-hairline)] last:border-0 ${onClick ? "cursor-pointer hover:bg-black/[0.02]" : ""}`}
+      className={`border-b border-[var(--border-hairline)] last:border-0 ${onClick ? "cursor-pointer hover:bg-[var(--tint-subtle)]" : ""}`}
     >
       {children}
     </tr>

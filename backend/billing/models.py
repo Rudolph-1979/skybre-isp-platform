@@ -85,6 +85,10 @@ class Invoice(models.Model):
             self.number = f"INV-{next_num:06d}"
         super().save(*args, **kwargs)
 
+    @property
+    def balance_due(self):
+        return self.total - self.paid_amount
+
     def recalc_totals(self):
         items = self.items.all()
         self.subtotal = sum((i.quantity * i.unit_price for i in items), start=0)

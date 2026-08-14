@@ -4,6 +4,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import viewsets, permissions
 from .models import Customer
 from .serializers import CustomerSerializer
+from .filters import CustomerFilter
 from accounts.permissions import IsStaffMember
 from config.csv_import import CSVImportMixin
 
@@ -12,8 +13,8 @@ User = get_user_model()
 
 class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
-    filterset_fields = ["status", "category", "customer_type"]
-    search_fields = ["full_name", "company_name", "email", "phone", "customer_id"]
+    filterset_class = CustomerFilter
+    search_fields = ["full_name", "company_name", "email", "phone", "customer_id", "city", "address", "zip_code"]
     ordering_fields = ["created_at", "full_name", "customer_id", "category", "city", "status", "balance"]
 
     import_model = Customer

@@ -5,6 +5,8 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Supplier, Product, SerializedUnit, StockReceipt, StockIssue, Job, User } from "../../types";
 
 type Tab = "products" | "suppliers" | "receipts" | "issues";
@@ -71,9 +73,26 @@ const EMPTY_PRODUCT: Partial<Product> = {
   is_active: true,
 };
 
+const PRODUCT_COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "sku", label: "SKU" },
+  { key: "category", label: "Category" },
+  { key: "tracking", label: "Tracking" },
+  { key: "on_hand", label: "On hand" },
+  { key: "status", label: "Status" },
+];
+
 function ProductsTab() {
   const [ordering, setOrdering] = useState("name");
-  const { items, loading, refetch } = useApiList<Product>(`/products/?page_size=200&ordering=${ordering}`);
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [trackingFilter, setTrackingFilter] = useState("");
+  const [activeFilter, setActiveFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-products", ["name"]);
+  const { items, loading, refetch } = useApiList<Product>(
+    `/products/?page_size=200&ordering=${ordering}${categoryFilter ? `&category=${categoryFilter}` : ""}${
+      trackingFilter ? `&tracking_type=${trackingFilter}` : ""
+    }${activeFilter ? `&is_active=${activeFilter}` : ""}`
+  );
   const [showModal, setShowModal] = useState(false);
   const [form, setForm] = useState<Partial<Product>>(EMPTY_PRODUCT);
   const [saving, setSaving] = useState(false);
@@ -118,7 +137,39 @@ function ProductsTab() {
 
   return (
     <div>
-      <div className="mb-4 flex justify-end">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <select className={`${inputClass} w-auto`} value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+            <option value="">All categories</option>
+            {Object.entries(CATEGORY_LABEL).map(([v, l]) => (
+              <option key={v} value={v}>{l}</option>
+            ))}
+          </select>
+          <select className={`${inputClass} w-auto`} value={trackingFilter} onChange={(e) => setTrackingFilter(e.target.value)}>
+            <option value="">All tracking types</option>
+            <option value="quantity">By quantity</option>
+            <option value="serialized">By serial/MAC</option>
+          </select>
+          <select className={`${inputClass} w-auto`} value={activeFilter} onChange={(e) => setActiveFilter(e.target.value)}>
+            <option value="">Active & inactive</option>
+            <option value="true">Active only</option>
+            <option value="false">Inactive only</option>
+          </select>
+          {(categoryFilter || trackingFilter || activeFilter) && (
+            <button
+              type="button"
+              className={btnSecondary}
+              onClick={() => {
+                setCategoryFilter("");
+                setTrackingFilter("");
+                setActiveFilter("");
+              }}
+            >
+              Clear filters
+            </button>
+          )}
+          <ColumnToggle columns={PRODUCT_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
+        </div>
         <button className={btnPrimary} onClick={() => setShowModal(true)}>
           + New product
         </button>
@@ -130,11 +181,11 @@ function ProductsTab() {
           <THead>
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
-              <TH>SKU</TH>
-              <SortableTH field="category" ordering={ordering} onSort={toggleSort}>Category</SortableTH>
-              <SortableTH field="tracking_type" ordering={ordering} onSort={toggleSort}>Tracking</SortableTH>
-              <TH>On hand</TH>
-              <TH>Status</TH>
+              {isVisible("sku") && <TH>SKU</TH>}
+              {isVisible("category") && <SortableTH field="category" ordering={ordering} onSort={toggleSort}>Category</SortableTH>}
+              {isVisible("tracking") && <SortableTH field="tracking_type" ordering={ordering} onSort={toggleSort}>Tracking</SortableTH>}
+              {isVisible("on_hand") && <TH>On hand</TH>}
+              {isVisible("status") && <TH>Status</TH>}
               <TH></TH>
             </tr>
           </THead>
@@ -142,20 +193,24 @@ function ProductsTab() {
             {items.map((p) => (
               <TR key={p.id}>
                 <TD className="font-medium">{p.name}</TD>
-                <TD>{p.sku || "—"}</TD>
-                <TD>{CATEGORY_LABEL[p.category]}</TD>
-                <TD className="capitalize">{p.tracking_type}</TD>
-                <TD className="tabular-nums">
-                  {p.quantity_on_hand} {p.tracking_type === "quantity" ? p.unit : ""}
-                  {p.is_low_stock && (
-                    <span className="ml-2 inline-block align-middle">
-                      <StatusBadge status="overdue" />
-                    </span>
-                  )}
-                </TD>
-                <TD>
-                  <StatusBadge status={p.is_active ? "active" : "inactive"} />
-                </TD>
+                {isVisible("sku") && <TD>{p.sku || "—"}</TD>}
+                {isVisible("category") && <TD>{CATEGORY_LABEL[p.category]}</TD>}
+                {isVisible("tracking") && <TD className="capitalize">{p.tracking_type}</TD>}
+                {isVisible("on_hand") && (
+                  <TD className="tabular-nums">
+                    {p.quantity_on_hand} {p.tracking_type === "quantity" ? p.unit : ""}
+                    {p.is_low_stock && (
+                      <span className="ml-2 inline-block align-middle">
+                        <StatusBadge status="overdue" />
+                      </span>
+                    )}
+                  </TD>
+                )}
+                {isVisible("status") && (
+                  <TD>
+                    <StatusBadge status={p.is_active ? "active" : "inactive"} />
+                  </TD>
+                )}
                 <TD>
                   {p.tracking_type === "quantity" && (
                     <button
@@ -306,9 +361,17 @@ const EMPTY_SUPPLIER: Partial<Supplier> = {
   notes: "",
 };
 
+const SUPPLIER_COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "contact_person", label: "Contact person" },
+  { key: "phone", label: "Phone" },
+  { key: "email", label: "Email" },
+];
+
 function SuppliersTab() {
   const [ordering, setOrdering] = useState("name");
   const { items, loading, refetch } = useApiList<Supplier>(`/suppliers/?page_size=200&ordering=${ordering}`);
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-suppliers", ["name"]);
   const [showModal, setShowModal] = useState(false);
   const [form, setForm] = useState<Partial<Supplier>>(EMPTY_SUPPLIER);
   const [saving, setSaving] = useState(false);
@@ -332,7 +395,8 @@ function SuppliersTab() {
 
   return (
     <div>
-      <div className="mb-4 flex justify-end">
+      <div className="mb-4 flex items-center justify-between">
+        <ColumnToggle columns={SUPPLIER_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
         <button className={btnPrimary} onClick={() => setShowModal(true)}>
           + New supplier
         </button>
@@ -344,18 +408,18 @@ function SuppliersTab() {
           <THead>
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
-              <TH>Contact person</TH>
-              <TH>Phone</TH>
-              <TH>Email</TH>
+              {isVisible("contact_person") && <TH>Contact person</TH>}
+              {isVisible("phone") && <TH>Phone</TH>}
+              {isVisible("email") && <TH>Email</TH>}
             </tr>
           </THead>
           <tbody>
             {items.map((s) => (
               <TR key={s.id}>
                 <TD className="font-medium">{s.name}</TD>
-                <TD>{s.contact_person || "—"}</TD>
-                <TD>{s.phone || "—"}</TD>
-                <TD>{s.email || "—"}</TD>
+                {isVisible("contact_person") && <TD>{s.contact_person || "—"}</TD>}
+                {isVisible("phone") && <TD>{s.phone || "—"}</TD>}
+                {isVisible("email") && <TD>{s.email || "—"}</TD>}
               </TR>
             ))}
           </tbody>
@@ -425,9 +489,26 @@ function SuppliersTab() {
 type ReceiptLineForm = { product: string; quantity: string; serial_numbers: string; unit_cost: string };
 const EMPTY_RECEIPT_LINE: ReceiptLineForm = { product: "", quantity: "1", serial_numbers: "", unit_cost: "" };
 
+const RECEIPT_COLUMNS: ColumnDef[] = [
+  { key: "date", label: "Date" },
+  { key: "invoice_number", label: "Invoice #" },
+  { key: "supplier", label: "Supplier" },
+  { key: "lines", label: "Lines" },
+  { key: "received_by", label: "Received by" },
+  { key: "attachment", label: "Attachment" },
+];
+
 function ReceiptsTab() {
   const [ordering, setOrdering] = useState("-invoice_date");
-  const { items, loading, refetch } = useApiList<StockReceipt>(`/stock-receipts/?page_size=100&ordering=${ordering}`);
+  const [supplierFilter, setSupplierFilter] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-receipts", ["invoice_number"]);
+  const { items, loading, refetch } = useApiList<StockReceipt>(
+    `/stock-receipts/?page_size=100&ordering=${ordering}${supplierFilter ? `&supplier=${supplierFilter}` : ""}${
+      dateFrom ? `&date_from=${dateFrom}` : ""
+    }${dateTo ? `&date_to=${dateTo}` : ""}`
+  );
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [showModal, setShowModal] = useState(false);
@@ -525,7 +606,35 @@ function ReceiptsTab() {
 
   return (
     <div>
-      <div className="mb-4 flex justify-end">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-end gap-2">
+          <select className={`${inputClass} w-auto`} value={supplierFilter} onChange={(e) => setSupplierFilter(e.target.value)}>
+            <option value="">All suppliers</option>
+            {suppliers.map((s) => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
+          <FormField label="Invoice date from">
+            <input type="date" className={inputClass} value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+          </FormField>
+          <FormField label="Invoice date to">
+            <input type="date" className={inputClass} value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+          </FormField>
+          {(supplierFilter || dateFrom || dateTo) && (
+            <button
+              type="button"
+              className={`${btnSecondary} mb-3`}
+              onClick={() => {
+                setSupplierFilter("");
+                setDateFrom("");
+                setDateTo("");
+              }}
+            >
+              Clear filters
+            </button>
+          )}
+          <ColumnToggle columns={RECEIPT_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["invoice_number"]} />
+        </div>
         <button className={btnPrimary} onClick={() => setShowModal(true)}>
           + New receipt
         </button>
@@ -536,23 +645,23 @@ function ReceiptsTab() {
         <Table>
           <THead>
             <tr>
-              <SortableTH field="invoice_date" ordering={ordering} onSort={toggleSort}>Date</SortableTH>
+              {isVisible("date") && <SortableTH field="invoice_date" ordering={ordering} onSort={toggleSort}>Date</SortableTH>}
               <TH>Invoice #</TH>
-              <SortableTH field="supplier__name" ordering={ordering} onSort={toggleSort}>Supplier</SortableTH>
-              <TH>Lines</TH>
-              <TH>Received by</TH>
-              <TH>Attachment</TH>
+              {isVisible("supplier") && <SortableTH field="supplier__name" ordering={ordering} onSort={toggleSort}>Supplier</SortableTH>}
+              {isVisible("lines") && <TH>Lines</TH>}
+              {isVisible("received_by") && <TH>Received by</TH>}
+              {isVisible("attachment") && <TH>Attachment</TH>}
             </tr>
           </THead>
           <tbody>
             {items.map((r) => (
               <TR key={r.id} onClick={() => setViewing(r)}>
-                <TD>{r.invoice_date}</TD>
+                {isVisible("date") && <TD>{r.invoice_date}</TD>}
                 <TD className="font-medium">{r.invoice_number}</TD>
-                <TD>{r.supplier_name}</TD>
-                <TD>{r.lines.length}</TD>
-                <TD>{r.received_by_name || "—"}</TD>
-                <TD>{r.attachment ? "Yes" : "—"}</TD>
+                {isVisible("supplier") && <TD>{r.supplier_name}</TD>}
+                {isVisible("lines") && <TD>{r.lines.length}</TD>}
+                {isVisible("received_by") && <TD>{r.received_by_name || "—"}</TD>}
+                {isVisible("attachment") && <TD>{r.attachment ? "Yes" : "—"}</TD>}
               </TR>
             ))}
           </tbody>
@@ -742,9 +851,20 @@ function ReceiptsTab() {
 type IssueLineForm = { product: string; quantity: string; serial_unit: string };
 const EMPTY_ISSUE_LINE: IssueLineForm = { product: "", quantity: "1", serial_unit: "" };
 
+const ISSUE_COLUMNS: ColumnDef[] = [
+  { key: "date", label: "Date" },
+  { key: "job", label: "Job / Customer" },
+  { key: "issued_to", label: "Issued to" },
+  { key: "items", label: "Items" },
+];
+
 function IssuesTab() {
   const [ordering, setOrdering] = useState("-issued_at");
-  const { items, loading, refetch } = useApiList<StockIssue>(`/stock-issues/?page_size=100&ordering=${ordering}`);
+  const [issuedToFilter, setIssuedToFilter] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-issues", ["date"]);
+  const { items, loading, refetch } = useApiList<StockIssue>(
+    `/stock-issues/?page_size=100&ordering=${ordering}${issuedToFilter ? `&issued_to=${issuedToFilter}` : ""}`
+  );
   const [products, setProducts] = useState<Product[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [staff, setStaff] = useState<User[]>([]);
@@ -847,7 +967,21 @@ function IssuesTab() {
 
   return (
     <div>
-      <div className="mb-4 flex justify-end">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <select className={`${inputClass} w-auto`} value={issuedToFilter} onChange={(e) => setIssuedToFilter(e.target.value)}>
+            <option value="">All staff</option>
+            {staff.map((s) => (
+              <option key={s.id} value={s.id}>{s.first_name || s.username}</option>
+            ))}
+          </select>
+          {issuedToFilter && (
+            <button type="button" className={btnSecondary} onClick={() => setIssuedToFilter("")}>
+              Clear filters
+            </button>
+          )}
+          <ColumnToggle columns={ISSUE_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["date"]} />
+        </div>
         <button className={btnPrimary} onClick={() => setShowModal(true)}>
           + New issue
         </button>
@@ -859,22 +993,24 @@ function IssuesTab() {
           <THead>
             <tr>
               <SortableTH field="issued_at" ordering={ordering} onSort={toggleSort}>Date</SortableTH>
-              <TH>Job / Customer</TH>
-              <SortableTH field="issued_to__username" ordering={ordering} onSort={toggleSort}>Issued to</SortableTH>
-              <TH>Items</TH>
+              {isVisible("job") && <TH>Job / Customer</TH>}
+              {isVisible("issued_to") && <SortableTH field="issued_to__username" ordering={ordering} onSort={toggleSort}>Issued to</SortableTH>}
+              {isVisible("items") && <TH>Items</TH>}
             </tr>
           </THead>
           <tbody>
             {items.map((iss) => (
               <TR key={iss.id} onClick={() => setViewing(iss)}>
                 <TD>{new Date(iss.issued_at).toLocaleString()}</TD>
-                <TD>
-                  {iss.job_title
-                    ? `${iss.job_title}${iss.customer_name ? ` (${iss.customer_name})` : ""}`
-                    : "Standalone"}
-                </TD>
-                <TD>{iss.issued_to_name || "—"}</TD>
-                <TD>{iss.lines.length}</TD>
+                {isVisible("job") && (
+                  <TD>
+                    {iss.job_title
+                      ? `${iss.job_title}${iss.customer_name ? ` (${iss.customer_name})` : ""}`
+                      : "Standalone"}
+                  </TD>
+                )}
+                {isVisible("issued_to") && <TD>{iss.issued_to_name || "—"}</TD>}
+                {isVisible("items") && <TD>{iss.lines.length}</TD>}
               </TR>
             ))}
           </tbody>

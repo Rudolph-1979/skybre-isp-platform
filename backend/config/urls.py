@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/", include("tickets.urls")),
     path("api/", include("scheduling.urls")),
     path("api/", include("inventory.urls")),
+    path("api/", include("notifications.urls")),
     # Serves supplier-invoice attachments etc. Auth is enforced by the
     # API when listing/creating receipts; this is just the raw file byte
     # stream, same trust level as any other file behind this VPS's IP.

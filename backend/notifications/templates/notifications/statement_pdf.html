@@ -1,0 +1,51 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block content %}
+  <div class="doc-title">Account Statement</div>
+
+  <table class="meta-table">
+    <tr><td class="meta-label">Statement date</td><td>{{ statement_date }}</td></tr>
+    <tr><td class="meta-label">Customer ID</td><td>{{ customer.customer_id }}</td></tr>
+  </table>
+
+  <div class="addr-block">
+    <div class="addr-label">Customer</div>
+    <div>{{ customer.full_name }}</div>
+    {% if customer.company_name %}<div>{{ customer.company_name }}</div>{% endif %}
+    <div>{{ customer.address }}</div>
+    <div>{{ customer.city }} {{ customer.zip_code }}</div>
+    <div>{{ customer.email }}</div>
+  </div>
+
+  <table class="items">
+    <thead>
+      <tr>
+        <th>Invoice</th>
+        <th>Date</th>
+        <th>Due</th>
+        <th class="num">Total</th>
+        <th class="num">Paid</th>
+        <th class="num">Balance</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for inv in invoices %}
+      <tr>
+        <td>{{ inv.number }}</td>
+        <td>{{ inv.date_created }}</td>
+        <td>{{ inv.date_due }}</td>
+        <td class="num">R {{ inv.total }}</td>
+        <td class="num">R {{ inv.paid_amount }}</td>
+        <td class="num">R {{ inv.balance_due }}</td>
+        <td>{{ inv.get_status_display }}</td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="7">No invoices on record.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table class="totals-table">
+    <tr class="grand"><td>Total outstanding balance</td><td class="num">R {{ balance }}</td></tr>
+  </table>
+{% endblock %}
