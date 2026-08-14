@@ -1,6 +1,8 @@
+from django.conf import settings
 from django.db import transaction
 from rest_framework import serializers
 
+from config.media_security import sign_media_path
 from .models import (
     Supplier,
     Product,
@@ -11,6 +13,21 @@ from .models import (
     StockIssueLine,
     StockMovement,
 )
+
+
+class SignedAttachmentMixin:
+    """Turns a plain FileField's raw MEDIA URL into a signed, short-lived
+    download link (see config/media_security.py) instead of the
+    unauthenticated static path DRF's default FileField would render."""
+
+    def get_attachment(self, obj):
+        if not obj.attachment:
+            return None
+        relative_path = obj.attachment.name
+        signed = sign_media_path(relative_path)
+        url = f"{settings.MEDIA_URL}{relative_path}?sig={signed}"
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request else url
 
 
 class SupplierSerializer(serializers.ModelSerializer):
@@ -78,10 +95,11 @@ class StockReceiptLineInputSerializer(serializers.ModelSerializer):
         fields = ["product", "quantity", "serial_numbers", "unit_cost"]
 
 
-class StockReceiptSerializer(serializers.ModelSerializer):
+class StockReceiptSerializer(SignedAttachmentMixin, serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
     received_by_name = serializers.CharField(source="received_by.username", read_only=True, default=None)
     lines = StockReceiptLineSerializer(many=True, read_only=True)
+    attachment = serializers.SerializerMethodField()
 
     class Meta:
         model = StockReceipt
@@ -92,10 +110,16 @@ class StockReceiptSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "received_by", "created_at"]
 
 
-class StockReceiptCreateSerializer(serializers.ModelSerializer):
+class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSerializer):
     """Accepts nested line items, creates SerializedUnit rows for
     serialized products and StockMovement rows for quantity-tracked ones,
-    all inside one transaction so a bad line rolls back the whole receipt."""
+    all inside one transaction so a bad line rolls back the whole receipt.
+
+    `attachment` stays a normal writable field so the file upload on
+    create still works — only the *response* representation is swapped
+    for a signed download link (via SignedAttachmentMixin), so the
+    receipt you just created doesn't hand back an unauthenticated raw
+    MEDIA URL that the protected media view would then reject anyway."""
 
     lines = StockReceiptLineInputSerializer(many=True)
 
@@ -103,6 +127,11 @@ class StockReceiptCreateSerializer(serializers.ModelSerializer):
         model = StockReceipt
         fields = ["id", "supplier", "invoice_number", "invoice_date", "attachment", "notes", "lines"]
         read_only_fields = ["id"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["attachment"] = self.get_attachment(instance)
+        return data
 
     def validate_lines(self, lines):
         if not lines:
