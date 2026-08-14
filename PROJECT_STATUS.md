@@ -123,27 +123,31 @@ export files show up later:
 
 - [x] `DEBUG=False`
 - [x] Real `SECRET_KEY` generated (not the example value)
-- [x] `ALLOWED_HOSTS` set to the VPS IP only
-- [x] `CORS_ALLOW_ALL_ORIGINS=False`, `CORS_ALLOWED_ORIGINS` set to the VPS origin
+- [x] `ALLOWED_HOSTS` set to the real domain (`portal.skybre.co.za`)
+- [x] `CORS_ALLOW_ALL_ORIGINS=False`, `CORS_ALLOWED_ORIGINS` set to
+      `https://portal.skybre.co.za`
 - [x] Strong, non-default DB password
-- [ ] **HTTPS — in progress (2026-08-13).** Domain `portal.skybre.co.za`
-      chosen, DNS A record being added, host-level Nginx + Certbot setup
-      underway (see item 11 in Feature history above). Until Certbot has
-      actually run and `.env`'s `SECURE_SSL_REDIRECT` /
-      `SESSION_COOKIE_SECURE` / `CSRF_COOKIE_SECURE` / `BEHIND_HTTPS_PROXY`
-      are flipped to `True`, traffic is still plain HTTP — check
-      `PROJECT_STATUS.md`'s date above vs. today before assuming this is done.
+- [x] **HTTPS — live (2026-08-14).** `portal.skybre.co.za` is up with a
+      Certbot-issued cert, HTTP redirects to HTTPS, and `.env`'s
+      `SECURE_SSL_REDIRECT` / `SESSION_COOKIE_SECURE` / `CSRF_COOKIE_SECURE`
+      / `BEHIND_HTTPS_PROXY` are all `True`. (Along the way, two separate
+      bugs had to be fixed before login actually worked end-to-end: a
+      missing `https://` scheme on `CORS_ALLOWED_ORIGINS` was crash-looping
+      the backend container, and the frontend's internal nginx was
+      overwriting `X-Forwarded-Proto` with its own hop's scheme instead of
+      passing through the outer nginx's — causing an SSL-redirect loop on
+      every `/api/` request. Both fixed and committed.)
 - [x] No demo data ever seeded against this deploy
 - [x] Automated hourly database backups — see `BACKUP.md`. Local rotation is
-      live; off-site copy to Google Cloud Storage is Phase 2 in that doc,
-      pending bucket/service-account setup on Rudolph's side.
-- [ ] Firewall/security group: currently allows 22, 80 (added manually to
-      fix a connection-timeout issue), 443 not yet confirmed open — needs
-      opening once Certbot is live. Also note: `ufw` (host-level firewall)
-      was found **inactive** during the 2026-08-13 security review — only
-      Xneelo's external firewall is in effect. Enabling `ufw` is a
-      worthwhile follow-up but must allow port 22 *before* enabling it, to
-      avoid locking out SSH access.
+      live; a restore was tested end-to-end on 2026-08-14 (latest hourly
+      backup restored into a throwaway database, row counts verified to
+      match production exactly, throwaway DB dropped). Off-site copy to
+      Google Cloud Storage is still Phase 2 in that doc, pending
+      bucket/service-account setup on Rudolph's side.
+- [x] Firewall: `ufw` enabled on 2026-08-14, allowing only 22/80/443
+      (IPv4 + IPv6), default-deny on everything else. Verified a fresh SSH
+      connection and the live site both still worked immediately after
+      enabling, before ending the session.
 - [x] Two-factor authentication (TOTP) available — opt-in per account, not
       yet enabled on Rudolph's own admin account as of this writing.
 
