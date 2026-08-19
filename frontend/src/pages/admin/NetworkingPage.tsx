@@ -11,11 +11,11 @@ import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type {
   Device, IPPool, IPAddress, PoolCategory, RadiusNasClient, RadiusNasClientPingStatus, RadAcctSession,
-  NetworkSite, Partner, OvpnSettingsConfig,
+  NetworkSite, Partner, OvpnSettingsConfig, OvpnClientConnection, OvpnClientConnectionPingStatus,
 } from "../../types";
 import { POOL_CATEGORY_LABELS, NETWORK_TYPE_LABELS } from "../../types";
 
-type Tab = "devices" | "sites" | "ip-pools" | "radius-clients" | "live-sessions" | "ovpn";
+type Tab = "devices" | "sites" | "ip-pools" | "radius-clients" | "vpn-clients" | "live-sessions" | "ovpn";
 
 type NewAction = { label: string; onClick: () => void } | null;
 
@@ -93,6 +93,7 @@ export function NetworkingPage() {
     { key: "sites", label: "Sites" },
     { key: "ip-pools", label: "IP Pools" },
     { key: "radius-clients", label: "RADIUS Clients" },
+    { key: "vpn-clients", label: "VPN Clients" },
     { key: "live-sessions", label: "Live Sessions" },
     ...(isAdmin ? [{ key: "ovpn" as Tab, label: "OVPN" }] : []),
   ];
@@ -129,6 +130,7 @@ export function NetworkingPage() {
       {tab === "sites" && <SitesTab onRegisterNewAction={setNewAction} />}
       {tab === "ip-pools" && <IPPoolsTab onRegisterNewAction={setNewAction} />}
       {tab === "radius-clients" && <RadiusClientsTab onRegisterNewAction={setNewAction} />}
+      {tab === "vpn-clients" && <VpnClientsTab onRegisterNewAction={setNewAction} />}
       {tab === "live-sessions" && <LiveSessionsTab onRegisterNewAction={setNewAction} />}
       {tab === "ovpn" && isAdmin && <OvpnSettingsTab onRegisterNewAction={setNewAction} />}
     </div>
@@ -1477,6 +1479,353 @@ function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
             <div className="mt-4 flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setPushingClient(null)}>Close</button>
               <button type="submit" disabled={pushSaving} className={btnPrimary}>{pushSaving ? "Pushing…" : "Push"}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// VPN Clients (outbound OpenVPN client tunnels this platform's own VPS
+// dials out on -- modeled on Splynx's own Config -> Tools -> VPN page)
+// ---------------------------------------------------------------------------
+
+const VPN_COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Connection name" },
+  { key: "status", label: "Status" },
+  { key: "comment", label: "Comment" },
+  { key: "remote", label: "Remote" },
+  { key: "username", label: "Username" },
+  { key: "enabled", label: "Enabled" },
+];
+
+const emptyVpnForm: Partial<OvpnClientConnection> & { password: string } = {
+  name: "",
+  comment: "",
+  remote_ip: "",
+  remote_port: 1194,
+  username: "",
+  password: "",
+  routes: "",
+  is_enabled: true,
+};
+
+function VpnClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const { items, loading, refetch } = useApiList<OvpnClientConnection>("/ovpn-client-connections/?page_size=100");
+  const [showModal, setShowModal] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState<OvpnClientConnection | null>(null);
+  const [form, setForm] = useState(emptyVpnForm);
+  const [formError, setFormError] = useState("");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("vpn-client-connections", ["name"]);
+
+  // Live online/offline status -- a ping run right now against every
+  // connection's remote_ip, not a persisted field. See
+  // OvpnClientConnectionPingStatus and the backend's ping_status action.
+  const [statusById, setStatusById] = useState<Record<number, "online" | "offline">>({});
+  const [statusChecking, setStatusChecking] = useState(false);
+
+  async function refreshStatuses() {
+    setStatusChecking(true);
+    try {
+      const res = await api.get<OvpnClientConnectionPingStatus[]>("/ovpn-client-connections/ping-status/");
+      setStatusById((prev) => {
+        const next = { ...prev };
+        res.data.forEach((entry) => {
+          next[entry.id] = entry.status;
+        });
+        return next;
+      });
+    } catch {
+      // Best-effort status indicator -- a failed check just leaves the
+      // last known status (or "Checking…") in place.
+    } finally {
+      setStatusChecking(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshStatuses();
+    const interval = setInterval(refreshStatuses, NAS_STATUS_REFRESH_MS);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    onRegisterNewAction({ label: "+ Add OpenVPN client", onClick: () => openCreate() });
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openCreate() {
+    setEditing(null);
+    setForm(emptyVpnForm);
+    setFormError("");
+    setShowModal(true);
+  }
+
+  function openEdit(conn: OvpnClientConnection) {
+    setEditing(conn);
+    setForm({
+      name: conn.name,
+      comment: conn.comment,
+      remote_ip: conn.remote_ip,
+      remote_port: conn.remote_port,
+      username: conn.username,
+      password: "",
+      routes: conn.routes,
+      is_enabled: conn.is_enabled,
+    });
+    setFormError("");
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setFormError("");
+    try {
+      if (editing) {
+        await api.patch(`/ovpn-client-connections/${editing.id}/`, form);
+      } else {
+        await api.post("/ovpn-client-connections/", form);
+      }
+      setShowModal(false);
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setFormError(typeof firstError === "string" ? firstError : "Could not save this connection — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete(conn: OvpnClientConnection) {
+    if (
+      !confirm(
+        `Delete the "${conn.name}" VPN client connection? This only removes the record here — if it's already ` +
+          "installed as a systemd service on the VPS, you'll need to remove that separately. This can't be undone."
+      )
+    )
+      return;
+    try {
+      await api.delete(`/ovpn-client-connections/${conn.id}/`);
+      if (editing?.id === conn.id) setShowModal(false);
+      refetch();
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || "Couldn't delete this connection.");
+    }
+  }
+
+  async function handleDuplicate(conn: OvpnClientConnection) {
+    try {
+      await api.post(`/ovpn-client-connections/${conn.id}/duplicate/`);
+      refetch();
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || "Couldn't duplicate this connection.");
+    }
+  }
+
+  async function handleDownloadConfig(conn: OvpnClientConnection) {
+    try {
+      const res = await api.get(`/ovpn-client-connections/${conn.id}/config/`, { responseType: "blob" });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${conn.name}.conf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch {
+      alert("Couldn't download this connection's config.");
+    }
+  }
+
+  return (
+    <div>
+      <div className="mb-3 rounded-md border border-[var(--border-hairline)] bg-[var(--tint-hover)] p-3 text-xs text-[var(--text-secondary)]">
+        Outbound OpenVPN client tunnels this platform's own VPS dials out on to reach a router's private management
+        network — modeled on Splynx's own Config → Tools → VPN page. This only stores the connection's config;
+        installing it as a real tunnel on the VPS (systemd's <code className="font-mono">openvpn-client@&lt;name&gt;</code>{" "}
+        service) is still a manual step — use "Download config" per connection for the file to install there. The
+        Status column is a live ping to the remote address (auto-refreshed every 45s), not confirmation the tunnel
+        itself is actually up.
+      </div>
+      <div className="mb-4 flex items-center justify-end gap-3">
+        <button
+          type="button"
+          className="text-sm text-[var(--series-1)] hover:underline disabled:opacity-50"
+          onClick={() => refreshStatuses()}
+          disabled={statusChecking}
+        >
+          {statusChecking ? "Checking status…" : "Refresh status"}
+        </button>
+        <ColumnToggle columns={VPN_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
+      </div>
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Connection name</TH>
+              {isVisible("status") && <TH>Status</TH>}
+              {isVisible("comment") && <TH>Comment</TH>}
+              {isVisible("remote") && <TH>Remote</TH>}
+              {isVisible("username") && <TH>Username</TH>}
+              {isVisible("enabled") && <TH>Enabled</TH>}
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((c) => (
+              <TR key={c.id}>
+                <TD className="font-medium">{c.name}</TD>
+                {isVisible("status") && (
+                  <TD>
+                    {statusById[c.id] ? <StatusBadge status={statusById[c.id]} /> : <StatusBadge status="unknown" />}
+                  </TD>
+                )}
+                {isVisible("comment") && <TD>{c.comment || "—"}</TD>}
+                {isVisible("remote") && (
+                  <TD>
+                    {c.remote_ip}:{c.remote_port}
+                  </TD>
+                )}
+                {isVisible("username") && <TD>{c.username || "—"}</TD>}
+                {isVisible("enabled") && <TD>{c.is_enabled ? "Yes" : "No"}</TD>}
+                <TD>
+                  <div className="flex items-center gap-3">
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openEdit(c)}>
+                      Edit
+                    </button>
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => handleDuplicate(c)}>
+                      Duplicate
+                    </button>
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => handleDownloadConfig(c)}>
+                      Download config
+                    </button>
+                    <button
+                      className="text-red-600 hover:underline dark:text-red-400"
+                      onClick={() => handleDelete(c)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </TD>
+              </TR>
+            ))}
+            {items.length === 0 && (
+              <TR>
+                <TD className="text-[var(--text-muted)]">No VPN client connections configured yet.</TD>
+              </TR>
+            )}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal title={editing ? "Edit OpenVPN client" : "Add OpenVPN client"} onClose={() => setShowModal(false)}>
+          <form onSubmit={handleSubmit} autoComplete="off">
+            <FormField label="Enabled">
+              <select
+                className={inputClass}
+                value={form.is_enabled ? "yes" : "no"}
+                onChange={(e) => setForm({ ...form, is_enabled: e.target.value === "yes" })}
+              >
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </FormField>
+            <FormField label="Connection name">
+              <input
+                className={inputClass}
+                required
+                placeholder="skybre"
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Comment">
+              <textarea
+                className={inputClass}
+                rows={2}
+                placeholder="Skybre Network"
+                value={form.comment}
+                onChange={(e) => setForm({ ...form, comment: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Remote IP / hostname">
+              <input
+                className={inputClass}
+                required
+                placeholder="10.250.32.2"
+                value={form.remote_ip}
+                onChange={(e) => setForm({ ...form, remote_ip: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Remote port">
+              <input
+                type="number"
+                className={inputClass}
+                value={form.remote_port}
+                onChange={(e) => setForm({ ...form, remote_port: Number(e.target.value) })}
+              />
+            </FormField>
+            <FormField label="Username">
+              <input
+                className={inputClass}
+                placeholder="Splynx"
+                value={form.username}
+                onChange={(e) => setForm({ ...form, username: e.target.value })}
+                // This looks like a login form to browsers (a plain text
+                // field right next to a password field), which prompts
+                // them to offer saving/autofilling it -- and elsewhere,
+                // autofilling that saved value into unrelated fields on
+                // the site. autoComplete="off" tells the browser this
+                // isn't a login to remember. Not a staff account, just a
+                // remote VPN server's own username -- nothing to save.
+                autoComplete="off"
+                name="vpn-client-remote-username"
+              />
+            </FormField>
+            <FormField label={`Password${editing?.password_set ? " (set — leave blank to keep)" : ""}`}>
+              <input
+                type="password"
+                className={inputClass}
+                placeholder={editing?.password_set ? "••••••••" : "Set a password"}
+                value={form.password}
+                onChange={(e) => setForm({ ...form, password: e.target.value })}
+                // "new-password" (not "off", which Chrome ignores on
+                // password fields specifically) is what actually stops
+                // Chrome from offering to save this as a login and from
+                // suggesting a previously-saved password here.
+                autoComplete="new-password"
+                name="vpn-client-remote-password"
+              />
+            </FormField>
+            <FormField label="Routes (one per line: network netmask gateway)">
+              <textarea
+                className={inputClass}
+                rows={4}
+                placeholder={"10.0.0.0 255.0.0.0 10.250.32.2\n172.16.0.0 255.255.0.0 10.250.32.2"}
+                value={form.routes}
+                onChange={(e) => setForm({ ...form, routes: e.target.value })}
+              />
+            </FormField>
+            {formError && <p className="mb-3 text-sm text-[var(--status-critical)]">{formError}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={saving} className={btnPrimary}>
+                {saving ? "Saving…" : "Save"}
+              </button>
             </div>
           </form>
         </Modal>
