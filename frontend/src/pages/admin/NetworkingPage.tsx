@@ -504,6 +504,8 @@ function DevicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                       className={inputClass}
                       value={form.api_username ?? ""}
                       onChange={(e) => setForm({ ...form, api_username: e.target.value })}
+                      autoComplete="off"
+                      name="device-api-username"
                     />
                   </FormField>
                   <FormField label={`API password${editingDevice?.api_password_set ? " (set — leave blank to keep)" : ""}`}>
@@ -513,6 +515,8 @@ function DevicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                       placeholder={editingDevice?.api_password_set ? "••••••••" : "Set a password"}
                       value={form.api_password ?? ""}
                       onChange={(e) => setForm({ ...form, api_password: e.target.value })}
+                      autoComplete="new-password"
+                      name="device-api-password"
                     />
                   </FormField>
                   <FormField label="WAN interface (for bandwidth polling)">
@@ -1411,6 +1415,8 @@ function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
                 placeholder="mikrotik-jhb"
                 value={form.shortname}
                 onChange={(e) => setForm({ ...form, shortname: e.target.value })}
+                autoComplete="off"
+                name="nas-shortname"
               />
             </FormField>
             <FormField label={`Shared secret${editing?.secret_set ? " (set — leave blank to keep)" : ""}`}>
@@ -1420,6 +1426,8 @@ function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
                 placeholder={editing?.secret_set ? "••••••••" : "Set a shared secret"}
                 value={form.secret}
                 onChange={(e) => setForm({ ...form, secret: e.target.value })}
+                autoComplete="new-password"
+                name="nas-secret"
               />
             </FormField>
             <FormField label="Realm">
