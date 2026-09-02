@@ -1,0 +1,866 @@
+Skybre ISP Platform — cumulative build
+======================================
+
+Build:  43
+Date:   2026-08-28
+Zip:    skybre-build43-2026-08-28.zip
+Files:  197
+Migrations: 11  (inventory 0004 0005 0006 · customers 0008 0009 ·
+            billing 0013 0014 0015 0016 · payroll 0006 · notifications 0008)
+            — build 16 added radiusauth 0008 (RadiusAction).
+            — build 43 adds NO migrations.
+            — build 42 added no migrations.
+            — build 41 added no migrations.
+            — build 40 added no migrations.
+            — build 39 added no migrations (safety fixes to build 38's
+              scheduled job — deploy this INSTEAD of 38, not after it).
+            — build 38 added radiusauth 0011 (speed windows) and
+              billing 0018 (fair-use fields). NOTHING CHANGES for any
+              customer until a threshold or a window is configured.
+            — build 37 added no migrations.
+            — build 36 added fleet 0004 (a vehicle being at the workshop).
+            — build 35 added billing 0017 (access device on a service).
+              Needs NO extra step; deploy/enable_apps.py is still required
+              for 33/34 if those have not gone out.
+            — build 34 added sales 0001 (leads) and accounts 0007 (the new
+              "sales" permission section), AND needs deploy/enable_apps.py
+              run once BEFORE migrating — neither new app is in settings.py
+              until that script puts it there. That one script now enables
+              BOTH the audit app (33) and the sales app (34), so running it
+              covers whichever of the two has not gone out yet.
+            — build 33 added audit 0001 (the activity log table).
+            — build 32 added no migrations.
+            — build 31 added no migrations.
+            — build 30 added customers 0013 (Bad Debt status).
+            — builds 28 and 29 added no migrations.
+            — build 27 added network 0008 (site partners, WITH a data copy).
+            — builds 24 to 26 added no migrations.
+            — build 23 added customers 0011 + 0012.
+            — build 22 added radiusauth 0010 + customers 0010.
+            — build 21 added radiusauth 0009 (UsageBucket).
+            — builds 17 to 20 added no migrations.
+            — builds 13, 14 and 15 added no migrations.
+
+This zip is CUMULATIVE. It contains every change since the last deployment,
+including the five features that were previously delivered as separate zips
+(stock VAT, customer reference, blocking dashboard, Conecto, invoice layout).
+Deploy this one; the older zips are superseded.
+
+What's in build 43 — "Sync shaper queues" is where you'd look for it
+---------------------------------------------------------------------
+  - The button now sits on the DEVICE PAGE, next to Test Connection and
+    Poll Now. It lived in a modal on the Networking list, and the only
+    thing pointing at it was a line of hint text on the device page
+    telling you to go and find it -- so you had to already know where it
+    was in order to find it.
+  - Shown only when that router's Shaper is actually on. With it off the
+    button's only effect is to REMOVE the managed queues, which is not
+    what anybody clicking "sync" is expecting.
+  - Reports what it did: how many queues were pushed, or that the router
+    could not be reached.
+  - Carries build 42 (--seed overwrites unconditionally) so this is one
+    deploy, not two.
+
+What's in build 42 — --seed could not fix what it was built to fix
+-------------------------------------------------------------------
+  - The "already correct" check ran BEFORE the seed branch, so --seed
+    skipped exactly the rows that needed re-seeding: one already holding
+    the wrong value (the boosted rate, written by build 40's seeding bug)
+    matches the target exactly, so it was skipped and never corrected.
+    Re-seeding reported success and changed nothing.
+  - The only way out was editing the database by hand, which is not a
+    thing a recovery command should require.
+  - Seeding now runs FIRST and UNCONDITIONALLY, overwriting whatever is
+    there. That is what "establish the baseline" has to mean; making it
+    conditional on the value being wrong in a way it cannot detect was the
+    whole error.
+  - Consequence worth knowing: `--seed` twice in a row now reports the
+    same count both times rather than 0 the second time. It is idempotent
+    in effect, not in its counter.
+
+What's in build 41 — two reasons the burst never arrived
+---------------------------------------------------------
+  Both found by reading a live diagnostic dump, and both silent: the
+  platform reported success at every step while the customer stayed at
+  their plan speed.
+
+  1. --seed RECORDED THE BOOSTED RATE. Seeding is meant to write down what
+     the ROUTER currently has, so the first real run only pushes genuine
+     changes. It wrote down what the POLICY WANTED instead. Seed inside an
+     open window and it recorded the doubled figure as though it had
+     already been delivered -- the next run then saw "already correct",
+     no CoA was ever sent, and the burst never happened. It now records
+     the plain plan speed, which is what the router was handed at login.
+  2. THE STATIC QUEUES WERE NEVER RE-PUSHED. Build 40 taught the shaper's
+     speed CALCULATION about windows and fair use, but nothing re-ran it:
+     sync_device_shaper_queues is only called from the device page's own
+     button. So on a shaper-enabled device the static simple queue sat at
+     the plan speed while the CoA moved the dynamic one, and the customer
+     got the more restrictive of the two -- their plan speed. The
+     scheduled run now re-syncs the shaper on any affected device right
+     after pushing, and reports (without failing the run) if that cannot
+     be reached.
+
+  Together these two meant the whole feature was inert on a device with
+  the shaper on -- which is the normal configuration here.
+
+What's in build 40 — the shaper ignored the speed policy
+---------------------------------------------------------
+  - FIXED: a burst could be sent, accepted by the router, and never felt
+    by the customer, with nothing on any screen looking wrong.
+  - There are TWO queues in play on a Mikrotik. Mikrotik-Rate-Limit from
+    RADIUS builds a DYNAMIC queue for the PPPoE session. Separately, when
+    a device has the Shaper toggle on, this platform pushes a STATIC
+    simple queue for each service. The customer gets the more restrictive
+    of the two.
+  - network.router_sync.effective_speed_kbps still read the raw plan
+    speed, so the shaper held a 4 Mbps static queue against a line RADIUS
+    had just burst to 8 Mbps. The boost went out, the router accepted it,
+    the RadiusAction row said success, and the customer stayed at 4.
+  - It now goes through radiusauth.speeds like everything else that
+    decides a speed -- which is what that module's docstring already
+    claimed, and this was the one caller not honouring it. There is a test
+    asserting the shaper and the RADIUS rate-limit string agree exactly.
+  - A tariff with no speed configured is still skipped rather than being
+    given the fallback default, so services that deliberately have no
+    queue still get none.
+  - Only relevant if a device has Shaper enabled (Networking → the device).
+    With it off, RADIUS was always the only thing setting the speed.
+
+What's in build 39 — three safety fixes to the speed-policy job
+----------------------------------------------------------------
+  Build 38's scheduled run was correct but unguarded. It fires for EVERY
+  connected customer at a window boundary, which makes each of its failure
+  modes network-wide by construction. Found by reading the first live dry
+  run, before it had ever been committed.
+
+  1. IT COULD HAVE DISCONNECTED THE ENTIRE CUSTOMER BASE. When CoA cannot
+     be delivered, apply_change's fallback is to DROP the session so it
+     reconnects on the new settings. That is a fair trade for a change
+     somebody just made and is watching for. It is not a fair trade here:
+     one network-wide CoA failure — a wrong shared secret, UDP 3799
+     blocked — would have dropped every online customer at 22:00 in order
+     to deliver an off-peak boost nobody asked for. apply_change now takes
+     allow_disconnect_fallback, and the scheduled job passes False: if CoA
+     fails, the line keeps its current speed until it next reconnects, and
+     the failure is recorded.
+  2. --seed. last_pushed_rate_limit is blank until something is pushed, so
+     on a fresh database EVERY line reads as changed and the first commit
+     would try to CoA the whole book at once. `--seed` records what each
+     line should be running at WITHOUT contacting any router, so the first
+     real run only pushes genuine changes.
+  3. --limit (default 50) and a lock. Any run wanting to touch hundreds of
+     lines at once is a mistake — a misconfigured window, or an unseeded
+     database — so the cap turns "the whole network at once" into "fifty,
+     then look at the log". The advisory lock stops a slow run and the
+     next cron tick from running over each other.
+
+What's in build 38 — FAIR USE and time-of-day bursting
+--------------------------------------------------------
+  - SPEED WINDOWS: hours when lines run faster than their plan. The point
+    is load, not generosity -- evenings are full and small hours are
+    empty, so speed given away at 02:00 costs nothing that is being used
+    and moves the big downloads off the times everyone else is working.
+  - The boost is a PERCENT OF THE PLAN, not an absolute speed, so one
+    window covers every tariff: 200% doubles a 10 Mbps line and a 50 Mbps
+    line without either needing its own row. Screens show what that works
+    out to in Mbps, because a percentage is not a number anyone can quote
+    down the phone.
+  - Windows can run THROUGH MIDNIGHT (22:00–06:00), which is the shape
+    almost every off-peak window actually has, and which a naive
+    start-to-end comparison silently turns into the empty set. Optional
+    per weekday, and "Friday night" correctly still covers 01:00 Saturday.
+  - FAIR USE: a threshold in GB per month, past which a line is SLOWED to
+    a percentage of its plan speed. Not cut off.
+  - Fair use is deliberately SEPARATE from the existing Data cap field and
+    is not a rename of it. A cap is a bundle somebody bought and can run
+    out of; fair use is a threshold on an UNCAPPED plan. The cap is also
+    what the CUSTOMER sees on their own usage page -- so shaping through
+    it would have shown people a cap on a plan sold to them as uncapped.
+  - OFF-PEAK TRAFFIC DOES NOT COUNT toward fair use by default. A window
+    whose traffic still counts gives nobody any reason to move their
+    downloads into it, which is the entire purpose of running one. Can be
+    switched on per window.
+  - THE WINDOW BEATS THE SHAPING. A customer over their threshold still
+    gets the night boost. It costs nothing -- those hours are empty -- and
+    it turns a 19:00 phone call into something they can work around at
+    01:00 themselves. Still reported as over fair use, so nobody concludes
+    the rule has stopped working.
+  - Per plan, with PER-LINE OVERRIDES: one business line or staff account
+    can be exempted, or given its own threshold, without inventing a whole
+    new tariff for them.
+  - ONE PLACE decides the speed. radiusauth/speeds.py feeds the
+    Mikrotik-Rate-Limit written into radreply for the next LOGIN and the
+    CoA pushed to a session that is ALREADY UP. Those two can never
+    disagree -- a customer whose stored answer and live session differ is
+    the hardest support call this platform can generate, because both
+    halves look correct on their own screen.
+  - A scheduled command (apply_speed_policies) pushes changes to lines
+    that are already connected, since a rate limit is otherwise only
+    applied at login -- a window opening at 22:00 would be worth nothing
+    to everybody already online. It pushes ONLY what changed; without that
+    a five-minute cron would re-send an identical limit to every session
+    twelve times an hour.
+  - "WHY IS THIS LINE SLOW" is answerable on screen. Each service row
+    shows what it is running at and why -- shaped, boosted, or boosted
+    while over fair use -- and renders NOTHING when the line is simply at
+    its plan speed, so it reads as an exception rather than a label on
+    every row.
+  - Shaping can never reduce a line to 0k. On a Mikrotik rate limit that
+    is not "very slow", it is a line that passes no traffic -- a fair-use
+    rule must not disconnect anybody.
+
+What's in build 37 — stock receipt attachments never uploaded
+--------------------------------------------------------------
+  - FIXED: attaching a supplier invoice to a stock receipt did nothing.
+    The file was accepted, silently discarded, and answered with 200. No
+    file, no error, nothing on screen to say so.
+  - TWO separate causes, either of which alone was enough to lose the file.
+
+  1. THE SERIALIZER. The receipt form creates the receipt with a JSON POST
+     (the nested line items cannot be expressed in multipart) and then
+     PATCHes the file on separately. But the viewset only used the create
+     serializer for `create` -- a PATCH landed on StockReceiptSerializer,
+     where `attachment` was a SerializerMethodField, which is READ-ONLY.
+     DRF drops unknown/read-only input without complaint, so the upload
+     was accepted and thrown away. It is now an ordinary writable
+     FileField carrying the model's validators, which also means a
+     dangerous extension or an oversized scan is now REFUSED with a
+     reason instead of vanishing.
+  2. NGINX. No client_max_body_size was set anywhere, so both nginx
+     layers used the 1 MB default. A scanned A4 invoice is routinely
+     2-6 MB, so the request was rejected with a bare 413 before it ever
+     reached Django. Now 20m — deliberately HIGHER than the app's own
+     15 MB limit, so that an oversized file is answered by Django with a
+     sentence saying what the limit is, rather than by nginx with an
+     unstyled error page.
+     NOTE: the HOST nginx needs the same line by hand — see the deploy
+     notes. It is not shipped in this zip.
+
+  - AND IT NO LONGER FAILS SILENTLY. The frontend used to ignore the
+    upload's outcome entirely. It now checks the response actually came
+    back with an attachment, and if not says so — naming the receipt,
+    saying it WAS saved, and giving the reason the file was not attached.
+    That distinction matters: the receipt exists by that point, and
+    reporting "failed to save receipt" would send somebody off to create
+    the whole thing a second time.
+  - You can now ATTACH OR REPLACE the invoice on a receipt that already
+    exists, from the receipt view. A receipt can outlive a failed upload,
+    and re-creating it to fix one missing file is not a reasonable remedy.
+
+What's in build 36 — unreadable dropdowns, and "In service"
+------------------------------------------------------------
+  - FIXED: every dropdown in the app in DARK MODE. The options were
+    white-on-white and only the one row the OS highlighted could be read.
+  - The cause is worth writing down because it looks like a theme bug and
+    isn't one. An <option> INHERITS its colour from the <select> but has no
+    background of its own -- its computed background is transparent, and
+    the popup list paints its own surface underneath. Dark mode therefore
+    paired near-white inherited text with the browser's light popup.
+    `color-scheme: dark` was already set and does NOT fix this: it darkens
+    the control itself and the scrollbars, so the CLOSED select looked
+    perfectly fine and only the opened list was broken. Options and
+    optgroups now set both colours explicitly, as an element rule rather
+    than a utility class, so it holds for every dropdown added later too.
+  - Group headings are muted with their child options at full contrast, and
+    disabled options are muted — so an unavailable choice reads as
+    unavailable instead of just being another thing you cannot see.
+  - NEW VEHICLE STATE: "In service" — the vehicle is at the workshop right
+    now. Filterable alongside OK / Due soon / Overdue.
+  - It OVERRIDES the km-derived status, which is the point of it existing.
+    A bakkie booked in this morning is still 2,000km past its due mark, so
+    the derived answer is "Overdue" — which, to whoever is scanning the
+    list deciding what to chase, means nobody has dealt with it. Somebody
+    is dealing with it right now.
+  - Stored as the DATE it went in, not a flag, because "how long has this
+    been off the road" is the question that follows immediately and a
+    boolean cannot answer it. The list shows the day count next to the
+    badge; eleven days is a different conversation from this morning.
+  - LOGGING THE SERVICE BRINGS IT BACK OUT automatically. Without that, a
+    vehicle marked in would read "In service" for the rest of its life and
+    the state would stop meaning anything inside a month.
+  - "Back from workshop" is separate from logging a service, because a
+    cancelled booking and a completed service are different events and only
+    the second should reset the km countdown.
+  - Badge is blue, not amber or red: it is the one row on that list that
+    needs no chasing, and sharing a colour with the overdue states would
+    put it back in the pile it exists to come out of.
+
+What's in build 35 — ACCESS DEVICE on a service
+------------------------------------------------
+  - Each service now records WHERE THE CLIENT CONNECTS: the AP, sector, OLT
+    or switch, picked from the devices already in Networking, plus an
+    optional port/sector/SSID ("Sector B 120°", "PON 1/3", "ether7").
+  - Under Edit service, in its own "Access — where the client connects"
+    block, deliberately separate from the "Router & shaping" block above it.
+  - THOSE TWO ARE NOT THE SAME THING, and keeping them apart is the whole
+    point. The Router field is the NAS: where the line terminates and where
+    every RADIUS, shaper and blocking action gets pushed. The access device
+    is the box the client physically connects to. On a wireless network
+    fifty customers spread across six sector radios all terminate on ONE
+    core router -- so overloading the existing field would have made "which
+    customers does this AP serve" unanswerable, and would have broken
+    enforcement the first time somebody pointed it at a radio with no RADIUS
+    relationship to the service.
+  - NOTHING IS ENFORCED against it. It documents the physical path.
+  - THE PAYOFF IS THE REVERSE VIEW, and without it this would be a field
+    staff fill in that never pays them back, so they would stop filling it
+    in. Networking → a device now lists "Customers connecting through this
+    device", WITH THEIR PHONE NUMBERS on the row -- because during an outage
+    the next action is always a call, and making somebody open each customer
+    to find the number is the difference between a list and a report.
+  - The device list carries the count, so the cost of an outage is visible
+    before anyone opens anything.
+  - The customer's own service table gained a "Connects to" column showing
+    the device, its site and the port -- an outage is exactly when nobody
+    should have to open five services one at a time to find the tower.
+  - Reseller scoping applies: a staff member restricted to one partner does
+    not learn another partner's customer names through the Networking page.
+  - Terminated lines are left off the list. Phoning somebody whose service
+    ended months ago to tell them their tower is down is worse than not
+    calling.
+  - Decommissioning a device does NOT delete the customer lines that pointed
+    at it -- the field just goes blank.
+  - Fixed along the way: adding the per-device count annotation silently
+    dropped the Devices list's ordering (annotate() introduces a GROUP BY
+    and Django stops treating the queryset as ordered), which would have let
+    a device appear on two pages of the list or on neither. Ordering is now
+    stated explicitly.
+
+What's in build 34 — LEADS (sales phase 1)
+-------------------------------------------
+  - A LEADS pipeline: New → Contacted → Qualified → Quoted → Won / Lost,
+    with a stage strip across the top showing how many deals and how much
+    monthly value are sitting at each stage. Clicking a stage filters the
+    list, so the strip is the board's real value without the board's
+    downsides (no sorting, no searching, everything below the fold hidden).
+  - FOLLOW-UPS are the point of the whole thing. Each lead carries a
+    next-follow-up date, "Follow up" is a one-click view of what is due, and
+    a dashboard tile shows the count. Overdue counts as due rather than
+    being its own list -- a separate late list is the one that stops being
+    opened.
+  - It also counts the leads with NO follow-up date at all. Those are not
+    late, they are invisible, which is worse, and nothing else on the screen
+    would ever mention them.
+  - A LEAD IS NOT A CUSTOMER, and that is deliberate. Most enquiries never
+    buy anything; filing them as customers would inflate every count, export
+    and dashboard tile with people who never became anything -- and since
+    customer deletion goes through an approval request in this platform,
+    clearing out two hundred dead enquiries would mean two hundred deletion
+    requests. So leads live in their own table, and "Convert to customer"
+    creates the Customer once, as NEW (nothing is installed yet), carrying
+    the name, contact details, address, reseller and owner across.
+  - Converting TWICE does not make two customers. Two people clicking within
+    a few seconds of each other is an ordinary Tuesday.
+  - LOSING A LEAD REQUIRES A REASON, enforced in the database and not only
+    in the form. "No coverage" is first on the list because it is the one
+    worth acting on: it is not a sales failure, it is a coverage gap, and
+    phase 2 turns those into the case for where the next tower goes.
+  - A TIMELINE per lead: calls, emails, meetings and notes, with stage
+    changes and the conversion written in automatically. Logging a call can
+    set the next follow-up date in the same keystroke, because a rep who has
+    just agreed a call-back will record it then or not at all.
+  - A NEW PERMISSION SECTION, "Sales / Leads". Its own gate rather than part
+    of Customers: a rep working enquiries has no reason to see every
+    customer's billing, and the support desk has no reason to see the
+    pipeline. Every account with an empty allowed_sections (the default)
+    gets it automatically -- only deliberately-restricted staff need it
+    ticked on under Configs → Permissions.
+  - RESELLER SCOPING applies to the pipeline exactly as it does to the
+    customer list: a staff member restricted to one reseller cannot see
+    another's prospects. Direct enquiries belong to everybody.
+  - Every lead change also lands in build 33's activity log.
+  - What is NOT here, on purpose: no coverage check yet (phase 2), no quote
+    from a lead (phase 3), no commission, no lead scoring, no email sync.
+
+What's in build 33 — user and customer change log
+--------------------------------------------------
+  - A CHANGE LOG. Every create, edit and delete on customers, services,
+    tariffs, invoices, payments, staff accounts, tickets, sites and devices,
+    recorded with WHO did it, WHEN, from WHAT ADDRESS, and the value on both
+    sides of each field that moved: "Status: Active → Suspended".
+  - SIGN-INS, failed sign-ins and sign-outs, in the same log.
+  - Read in two places, because it answers two questions: a HISTORY TAB on
+    each customer ("who changed this customer, and what was it before"), and
+    Configs → ACTIVITY LOG ("what did this staff member do on Tuesday").
+    One table behind both, so they can never disagree.
+  - A SESSION LOG on the same History tab: every time that customer's line
+    connected and disconnected, with duration, IP, data moved and why it
+    ended. This data has existed since day one -- FreeRADIUS has been writing
+    it all along -- but it was only readable through Networking, which most
+    support staff cannot open. Nothing new is collected; it is the same
+    table, asked a customer-shaped question and gated to match who needs the
+    answer.
+  - Secrets are NEVER recorded. A password change is logged as having
+    happened, with no value on either side, and not the hash either. A failed
+    sign-in records the username tried and never the password tried -- a
+    mistyped password is very often a real password with one character out of
+    place.
+  - A failed sign-in is filed against the NAME THAT WAS TRIED, not against
+    that user. Otherwise somebody guessing at a colleague's account would
+    fill that colleague's own history with failures they never made.
+  - Scheduled jobs NAME THEMSELVES. A customer cancelled overnight by
+    apply_cancellations reads as that job, not as a change nobody made.
+  - Deleting a staff account does not delete the record of what they did, and
+    deleting a customer does not delete the record of the deletion. Names on
+    both sides are snapshots taken at the time, so history never rewrites
+    itself when somebody is renamed or removed.
+  - The log is READ-ONLY by construction -- there is no write, edit or delete
+    endpoint behind it at all, for anyone including Admin. Pruning old rows
+    is `manage.py prune_audit_log`, on the server, deliberately out of reach
+    of a browser session belonging to somebody the log might be about.
+  - Where it starts: from the moment this deploys. There is no way to
+    reconstruct earlier edits, and the screens say so rather than showing an
+    empty list that reads as "nothing ever happened".
+  - Cost, stated plainly: saving a tracked record now costs one extra SELECT
+    (to read the previous values to diff against). Noticeable only in bulk
+    operations that save hundreds of rows in a loop.
+
+What's in build 32 — Customers submenu
+---------------------------------------
+  - Usage report, Recently offline and Support Tickets now sit INDENTED UNDER
+    Customers in the left-hand nav, instead of as three separate top-level
+    entries. The sidebar was thirteen flat items deep; three of them were
+    about customers and only read that way if you already knew.
+  - The group opens automatically whenever you are on one of its pages, and
+    the chevron collapses it. Customers itself is still a link -- clicking the
+    word goes to the customer list exactly as before, so nothing that used to
+    be one click is now two.
+  - Each child keeps its OWN permission gate. Support Tickets is still gated
+    on "tickets", not on "customers": nesting it is a visual grouping, not a
+    permissions change, and nobody's access widened or narrowed.
+  - The case that needed care: somebody with Tickets access but NO Customers
+    access. Hiding the group would take away a section they are entitled to;
+    showing a "Customers" heading to them would be a lie. So in that case the
+    permitted children are promoted back to top level, and they see a plain
+    "Support Tickets" entry exactly as they do today.
+  - Configs -> Permissions lists Support Tickets directly under Customers now
+    too, so the checklist reads in the same order as the sidebar.
+
+What's in build 31
+------------------
+  - Bad debt DASHBOARD TILE, clicking through to the customer list filtered to
+    bad debt.
+  - The tile's headline is the COUNT, but its sublabel is the MONEY --
+    "3 customers" says far less than "R14,200 written off", and the money is
+    what anyone actually reacts to.
+  - Counted separately from Cancelled, so a written-off customer and one who
+    simply left never blur into one figure.
+
+What's in build 30 — Bad Debt status
+-------------------------------------
+  - "Bad Debt" is now selectable wherever a customer's status is, and
+    filterable on the Customers list. Its own badge colour, not a shade of
+    Suspended.
+  - Deliberately a separate status, not a flavour of the others. Suspended is
+    temporary and reversible by paying; Inactive means they left owing
+    nothing; Bad Debt means money we have stopped expecting to collect. Three
+    different conversations, so three different labels.
+  - Setting it CUTS THEM OFF, exactly as a suspension does -- leaving somebody
+    connected after writing off what they owe is the one case where the label
+    and the reality disagree most expensively. Setting them back to Active
+    restores the lines this took down, same as un-suspending.
+  - But restoring a SERVICE by hand does NOT clear the write-off, which is
+    where it differs from Suspended. A suspension is purely about
+    connectivity, so a live service contradicts it and the badge follows. Bad
+    Debt is about money owed: a written-off customer whose line staff have
+    turned back on pending a dispute is a coherent state, and silently
+    clearing it would erase an accounting decision nobody made here.
+  - They are left off the "Recently offline" call list, for the same reason
+    suspended customers are: they're offline because we cut them off.
+
+What's in build 29 — staff invites
+-----------------------------------
+  - Creating a staff account now EMAILS THEM AN INVITE to choose their own
+    password. Leave the password field blank and that is what happens.
+  - Creating an account used to REQUIRE a password, so the admin invented one
+    and then had to get it to the person somehow -- read out over the phone,
+    sent in a chat, written on a note. Every one of those is a password chosen
+    by the wrong person, sitting somewhere it shouldn't. An invited account is
+    created with NO usable password, so it cannot be signed into at all until
+    they set one from their own mailbox.
+  - "Send invite" on each user row, next to Edit / Send reset link / Suspend,
+    to re-send it. Kept separate from "Send reset link" because the two say
+    different things to whoever opens them: an invite announces an account and
+    gives the username, a reset assumes they already know about it. Same token
+    underneath -- the wording is the point.
+  - The result is REPORTED, never assumed. A failed send does not undo the
+    account, so without saying so the admin would walk away believing an email
+    went out while the new person waits for one that never arrives.
+  - A password can still be set directly if you want to; the invite path is
+    just the default now.
+
+What's in build 28
+------------------
+  - FIX: build 27's billing end date was UNREACHABLE. Service.end_date is not
+    editable anywhere in the platform, so the whole feature was inert -- staff
+    could not set a date for it to act on. There is now a "Billing end date"
+    field on the service edit form.
+  - The form states the boundary and shows the consequence: it names the last
+    full day of service under the date you pick, and says the customer will be
+    set to Cancelled if it is their only line.
+  - The boundary is now explicit: the end date is the first day WITHOUT
+    service. Set 31 August and the line stops at 00:00 on the 31st, so their
+    last full day is the 30th.
+  - The recommended cron moves to 00:01, not 02:30 -- the cut-off and the date
+    turning should be the same moment. Running it at 02:30 hands the customer
+    two and a half hours they were not sold.
+
+What's in build 27
+------------------
+  LIVE SESSIONS
+  - FIX: Duration read acctsessiontime and IN/OUT read the accounting byte
+    counters. FreeRADIUS only writes those on an Interim-Update, and this NAS
+    is on interim-update=5m -- so EVERY session showed "0m" and "0.0 MB /
+    0.0 MB" for its first five minutes and then jumped.
+  - Duration is now computed: now minus start for a live session, start to
+    stop for a finished one. Needs nothing from the NAS and is right at every
+    instant.
+  - IN/OUT prefers the ROUTER's own counters, which are current to the
+    second. Opening the page wakes the live reader for that router, the same
+    signal the customer pages use. Where no fresh router reading exists yet it
+    falls back to the accounting counters and says "(awaiting first update)"
+    rather than showing a bare 0.0 MB.
+
+  SITES
+  - A site can now serve MULTIPLE partners. It was a single ForeignKey, so a
+    tower serving three resellers had to pick one -- and the site list could
+    not answer "which sites does this partner have customers on", which is
+    the question it exists for.
+  - The migration ADDS the new field, COPIES the data, then removes the old
+    one. The auto-generated version dropped the old column first, which would
+    have thrown away every existing site's partner in silence.
+  - Empty means all, the same convention as a router's visible_partners.
+
+  CANCELLED CUSTOMERS
+  - New dashboard tile, clicking through to the customer list filtered to
+    cancelled. The total is shown with how many went in the last 30 days
+    beside it -- the total only ever climbs and says nothing on its own.
+
+  BILLING END DATE NOW DOES SOMETHING
+  - Service.end_date was decoration: staff could set it and the date would
+    pass with the customer still connected and still billed. On its end date
+    the service is now TERMINATED, and a customer whose services have ALL
+    ended is set to Cancelled.
+  - Terminating goes through .save(), not a bulk update, because the signals
+    ARE the work -- RADIUS rewritten to reject, live session dropped, IP
+    released, router block list updated. A bulk update would leave a
+    cancelled customer online indefinitely.
+  - <= not ==, so a cancellation dated Monday still happens if the job did
+    not run until Thursday.
+  - A customer with NO services is never touched -- mid-signup is not the
+    same as finished.
+  - CUTS OFF ON the end date, not the day after. Say if you want the other
+    way; it is one constant (billing/cancellations.py DUE_FILTER).
+  - NEW: manage.py apply_cancellations (--commit, --as-of). Also runs from
+    run_recurring_billing, BEFORE invoicing, so somebody leaving today is not
+    handed one more invoice on the way out.
+
+What's in build 26
+------------------
+  - FIX: the Refresh button on Recently offline did NOTHING. It called
+    setHours(hours) -- setting state to the value it already held, which React
+    discards, so the effect keyed on it never re-ran. Now a counter.
+  - It also had no feedback even once fixed: a refresh returning in 40ms looks
+    identical to one that did nothing. There is now an "Updated HH:MM:SS"
+    stamp that visibly moves, and the button reads "Refreshing…" while in
+    flight.
+  - The list re-checks itself every 60 seconds, so somebody whose line comes
+    back drops off before an agent dials them.
+  - A refresh no longer blanks the table. Only the FIRST load shows
+    "Loading…" -- with a minute timer running, the old behaviour would have
+    wiped the list out from under whoever was working through it.
+
+What's in build 25 — Recently offline (a call list)
+----------------------------------------------------
+  - New "Offline customers" dashboard tile, clicking through to a Recently
+    offline page: who dropped in the last 24 hours and has NOT come back,
+    longest down first, with their phone number as a tel: link and a
+    pre-written mailto: beside it.
+  - Window switch: 6 hours / 24 hours / 3 days / a week.
+  - It is a CALL LIST, so the definition is narrower than "not connected":
+      * Suspended customers and suspended services are LEFT OUT. They are
+        offline because we suspended them; ringing to ask if we can help
+        would be asking a question we already know the answer to.
+      * Anyone whose line already came back is left out. A two-minute blip is
+        not worth a phone call, and a list full of them is a list nobody
+        reads.
+      * A session that died WITHOUT an Accounting-Stop still counts. A CPE
+        that loses power never sends one, so radacct shows it open forever --
+        those are the most broken lines of all, and the obvious query misses
+        every one.
+  - Each row says what happened, in words: "The line dropped — usually a
+    fault worth chasing" vs "They disconnected (often the router being
+    switched off)" vs "Stopped reporting without disconnecting — usually
+    power or a dead CPE". That changes what you say when they answer.
+  - Flapping is flagged separately: "Dropped 4 times in this period" is a
+    different fault from one clean outage.
+  - A local "Done" tick so one agent doesn't ring the same person twice in a
+    sitting. Not persisted, and the page says so -- sharing it between agents
+    needs a real "who is handling this", which is a bigger thing than a tick.
+  - TR now accepts a className, appended rather than replacing its borders.
+    Two features have already had to work around it not doing so.
+
+What's in build 24
+------------------
+  - FIX: the "Blocking tomorrow" tile did nothing when the number was 0. It
+    was wired, but gated on count_horizon > 0 -- so with nobody due to be
+    blocked, clicking it was silently inert and indistinguishable from broken.
+    It now opens whatever the number is.
+  - The panel's empty state says why: nobody currently has an invoice overdue
+    longer than their blocking period AND a balance worse than their minimum.
+    It also points out when auto-suspension is off, since a customer who DID
+    qualify would not actually be cut off.
+  - "High alert customers" had the same gate and now opens at 0 too. An empty
+    filtered list says "nobody qualifies"; a dead tile says nothing.
+
+What's in build 23
+------------------
+  - FIX: live speed was per-second on the staff page but still stuck on a
+    10-second refresh in the CUSTOMER PORTAL. The fast poll went into the
+    staff card (CustomerUsageCard) and the portal uses a different component
+    (UsagePanel), which never got it -- and the endpoint behind it was
+    staff-only, so the portal could not have used it anyway.
+  - A signed-in customer can now watch their OWN line per-second, and only
+    their own: anything else is a 404, so the endpoint can't be used to find
+    out which customer ids exist.
+  - ONE switch now governs both doors -- portal and no-login usage link. The
+    label is now "Let them see live speed". Signing in is a stronger position
+    than holding a link, but the cost to the router is identical, and a
+    customer having live figures through one door and not the other is
+    impossible to explain to whoever answers the phone.
+  - Still off by default, and a customer who is not enabled wakes no router
+    through EITHER endpoint.
+  - It also SWITCHES ITSELF OFF after 5 minutes with nobody watching. A switch
+    only a human can turn off is a switch that stays on -- this one is
+    normally flipped to help somebody debug their line for a few minutes, and
+    left on it is a customer able to hold a router connection open at will,
+    months after anyone remembers enabling it. Turning it on starts the clock,
+    so a grant nobody ever uses still lapses.
+  - Expiry is evaluated wherever the flag is READ, not by a scheduled sweep:
+    correct the moment anyone looks, nothing to schedule, and it cannot be
+    defeated by a cron job that quietly stopped running. Staff loading the
+    customer page see the true state, never a switch reading On for access
+    that has already lapsed.
+  - The idle clock is written at most every 30 seconds, not on every one of
+    the per-second polls.
+
+What's in build 22 — live bandwidth, on demand
+-----------------------------------------------
+  poll_live_traffic ran from cron EVERY MINUTE, around the clock, whether or
+  not a single person was looking at a single customer -- roughly 1,440
+  logins per router per day, nearly all of them for nobody. A router's own log
+  made it obvious: our username every minute, forever, against a comparable
+  platform's ONE six-second connection in an hour.
+
+  Six seconds an hour is not a background poller. It is a connection opened
+  because somebody opened a page, and closed when they left it.
+
+  - network/live_broker.py: one router connection, opened when a staff member
+    opens a customer page, closed within seconds of the last one leaving.
+    While open it reads once a SECOND instead of once every ten.
+  - Only ONE reader per router across the whole worker pool, held by a
+    Postgres advisory lock -- without it each gunicorn worker would open its
+    own connection.
+  - NOT server-sent events. An SSE stream holds a gunicorn worker for its
+    whole life and this box runs three SYNC workers, so three people watching
+    graphs would have blocked the entire platform. Viewers poll a cheap
+    endpoint instead; the router connection lives off the request path.
+  - The browser stops polling when the tab is hidden, so a forgotten tab can't
+    hold a router connection open all night.
+  - Staff toggle per customer: "Live graph on their link". OFF by default. The
+    usage link needs no login, so on by default anyone holding a forwarded
+    link could keep a router connection open indefinitely.
+  - REMOVE the poll_live_traffic crontab line. See the deploy notes.
+
+What's in build 21 — usage by day / week / month / year
+--------------------------------------------------------
+  Why it needed a new table: radacct holds a CUMULATIVE counter per session
+  with no timeline behind it, so a PPPoE session running from the 3rd to the
+  20th is ONE row stamped at the 3rd, holding seventeen days of traffic. The
+  old monthly figure sidestepped that by counting a session in the month it
+  STARTED -- tolerable across a month, useless across a day. Usage is now
+  accumulated hour by hour instead, from the deltas sample_session_usage
+  already computes for the live-rate figure.
+
+  - New UsageBucket table: bytes per login per clock hour. A day view is 24
+    bars, week and month roll up to days, a year to months. One table, four
+    views.
+  - The rate and the usage figure now come from the SAME measurement, so they
+    cannot disagree about how many bytes moved.
+  - Day/week/month/year on the customer page, on the customer's own no-login
+    usage link, and on a new staff-wide Usage report (Customers section) that
+    ranks every customer for a period and shows cap usage.
+  - Figures start from when this is deployed. Nothing before it can be
+    reconstructed, and the pages SAY so rather than showing an empty chart
+    that looks like a customer who used nothing.
+  - Chart colours are new --chart-1/--chart-2 tokens, kept separate from the
+    --series-* text accents, and validated per mode: lightness band, chroma,
+    colourblind separation and contrast all pass in light AND dark. Dark uses
+    genuinely different steps, not a flip.
+
+  REQUIRES: sample_session_usage on a cron, every minute. Without it nothing
+  accumulates and every chart stays empty. See the deploy notes.
+
+What's in build 20
+------------------
+  - Tariffs can be DELETED. "Delete tariff" sits bottom-left of the tariff
+    edit modal, away from Save, and asks first.
+  - It refuses, with a message naming how many and what to do instead, when
+    services are on the plan or have a change booked onto it. Service.tariff
+    is PROTECT so an unguarded delete was a 500; Service.pending_tariff is
+    SET_NULL, which was worse -- deleting a booked-onto plan would have left
+    a service with a change DATE and no tariff, the half-a-booking state the
+    serializer refuses to let staff create.
+  - FIX: the "no speed set" warning from build 17 went into
+    frontend/src/pages/admin/TariffsPage.tsx, which NOTHING IMPORTS. The live
+    tariff UI is TariffsTab inside ConfigsPage.tsx. The warning never
+    rendered. It is now in the right file, and the dead one is deleted so
+    nobody walks into it again.
+
+What's in build 19
+------------------
+  - Changing a tariff is now ONE control with an explicit "Change now" /
+    "On a date" choice, instead of a plan dropdown above a separate
+    "Schedule a tariff change" box. The old shape read as though the box was
+    where tariff changes were made, so the only apparent way to move a
+    customer was to book a future date -- there was no visible "do it now".
+  - "Change now" cancels any existing booking, so the two can't both be live
+    and disagree about which plan the customer is on.
+  - The date picker allows TODAY (the backend always did) and its minimum is
+    computed from local date, not UTC -- before 02:00 SAST a UTC-derived
+    minimum would have offered yesterday and then been rejected on save.
+
+What's in build 18
+------------------
+  - resync_radius --kick no longer disconnects anyone. It goes through the
+    same enforcement path a save does, so a rate limit is pushed to the live
+    session as a CoA -- the old version dropped a customer's connection to
+    give them a speed they could have had without noticing. It also prints
+    the outcome per service and records it, so a failure shows on the service
+    rather than only in that terminal.
+
+What's in build 17
+------------------
+  - radius_doctor now catches a tariff with NO SPEED SET. It couldn't before:
+    it compared the rate limit against a value built by the same function, so
+    a tariff with empty speed fields produced the same 10 Mbps fallback on
+    both sides and reported a cheerful "matches the tariff" while the customer
+    ran at a speed nobody chose for them.
+  - The tariff form now warns, before you save, that leaving the speeds blank
+    does not fail -- it hands everyone on the plan 10240 Kbps regardless of
+    what they pay. Internet tariffs only; a voice plan having no speed is
+    normal.
+
+What's in build 16 — the RADIUS rework
+--------------------------------------
+  The problem: RADIUS is only read at login, so a speed change, a suspension
+  or a restoration only reached a customer when their session next restarted.
+  The only mechanism for restarting it was the RouterOS API, and EVERY failure
+  of that call was swallowed into a log line in a background thread after the
+  HTTP response had gone out. The screen said Saved whether or not anything
+  reached the router. That is why this took weeks to find.
+
+  - RFC 5176 dynamic authorization (CoA + Disconnect, UDP 3799). No new pip
+    dependency; the packet builder is stdlib and signs both the Request
+    Authenticator and Message-Authenticator, and verifies the reply's
+    authenticator so a forged ACK can't be recorded as a success.
+  - A SPEED change is now a CoA: the customer's line does NOT drop. Delivering
+    an upgrade by cutting someone off was always the wrong shape.
+  - A STATUS change is a Disconnect, because suspension and restoration
+    re-address the session and a live PPPoE session can't be re-addressed.
+  - The RouterOS API is kept as a fallback. It fails for different reasons
+    (TCP 8728, API credentials) than CoA does (UDP 3799, shared secret), so
+    one covers the other's outage.
+  - Every attempt is recorded in radiusauth_radiusaction, including the ones
+    where there was correctly nothing to do. A failed push now shows on the
+    service row as "Last change didn't reach the router".
+  - NEW: manage.py radius_doctor — walks the whole chain (RADIUS rows, NAS
+    record, live session, CoA round trip) and names the broken link. --coa
+    sends a real packet, re-applying the speed the service already has.
+  - The router script now sets /radius incoming accept=yes port=3799 and
+    explains why interim-update is load-bearing.
+
+What's in build 15
+------------------
+  - Dashboard: the High alert customers panel next to the growth chart is
+    gone, and the growth chart now runs full width.
+  - The High alert tile clicks through to the Customers page filtered to
+    exactly those customers, where search, columns, the partner filter and
+    bulk-select all work on them. A removable "High alert only" chip shows
+    the filter is on.
+  - The tile's count and that filtered list share one definition of "high
+    alert" (backend/tickets/alerts.py), with a test asserting they agree.
+
+What's in build 14
+------------------
+  - Customers list: a Public IP column, showing each customer's live address.
+    Two lines shows the first plus "+1"; hover for the rest. Hide it from
+    Columns like any other.
+  - The customer search box now searches EVERY column, not just names and
+    addresses: partner, assigned staff, status, type, balance, and each
+    customer's public IP and PPPoE username. Typing an IP off the router
+    finds the customer holding it.
+
+What's in build 13
+------------------
+  - FIX: restoring a suspended customer's service now lifts the customer too.
+    The badge at the top of the page no longer says Suspended over a service
+    the same screen shows as Active. Only the line you restored comes back;
+    their other suspended services are left alone.
+  - FIX: auto_suspended_with_customer is cleared by any status change made by
+    hand. Without that, a service suspended alongside its customer, restored
+    manually, then suspended again for non-payment was still carrying the flag
+    and got handed its internet back the next time the customer was
+    reactivated — the exact case the flag exists to prevent.
+  - The service edit screen says, before you save, that Active will also lift
+    the customer.
+  - check_suspension_enforcement now spells out that --fix resolves the
+    contradiction DOWNWARD (it suspends the service and disconnects them),
+    and when to set the customer to Active instead.
+
+Everything from build 12 (deploy this if 12 never went out)
+-----------------------------------------------------------
+  - Invoice PDF matched to the reference layout (0.1pt on rules, 0.5pt on text)
+  - Company + bank + logo details on invoices (Configs -> Billing)
+  - Preview buttons for invoice / quote / pro forma / statement
+  - Serial number + MAC address on stock check-in AND on new product
+  - Inventory -> Units tab (searchable, shows which supplier each unit is from)
+  - Resell pricing on products, with cost + margin from your receipts
+  - Tariff edit button; tariff speeds corrected to Kbps
+  - Suspension actually cuts customers off (3 separate causes fixed)
+  - Finance: All documents / Quotes / Pro formas / Invoices buttons
+  - Bank statement CSV import: FNB preamble, debit/credit columns, SA number
+    formats; import modal explains what it needs
+  - Searchable customer / supplier pickers
+  - PAYSLIPS: per-employee PDF, whole-run PDF, email to the employee.
+    Deductions added to payroll (PAYE entered, UIF/SDL calculated) and a
+    Payroll settings card for the statutory rates.
+  - Dashboard tiles are clickable, each landing on its own filtered list
+  - FIX: un-suspending now restores internet without kicking the client off
+    the core by hand
+  - Tariff can be changed on an existing service, and a change can be
+    SCHEDULED for a future date (applied automatically on the day)
+  - FIX: a tariff or speed change now reaches live sessions instead of
+    waiting for the customer to reconnect
+  - resync_radius command, for rate-limit rows still in the old 'M' format
+
+To check what is deployed on the VPS
+------------------------------------
+  cat /home/ubuntu/isp-platform/BUILD.txt
+
+Post-deploy steps that are NOT automatic
+----------------------------------------
+  1. Configs -> Billing -> Company details on invoices (upload the logo too)
+  2. Inventory -> Products -> Edit: set resell prices
+  3. Customers: set each customer's payment reference to what they use on EFTs
+  4. Accountant -> Bank Feeds -> Accounts: create the bank account
+  5. docker compose exec backend python manage.py check_suspension_enforcement
+  6. docker compose exec backend python manage.py normalise_stock_identifiers --dry-run
+     (only if you already have serialized stock checked in)
+  7. docker compose exec backend python manage.py resync_radius
+     (then --commit --kick; fixes rate-limit rows left in the old 'M' format)
+  8. Add a daily cron for: manage.py apply_tariff_changes
+  9. Accountant -> Payroll -> Payroll settings: CHECK the UIF ceiling and rate
+     against the current official figures before running a real payroll, and
+     fill in the employer name, address and PAYE/UIF references.

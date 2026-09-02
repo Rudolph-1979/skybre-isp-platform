@@ -34,7 +34,7 @@ class Ticket(models.Model):
         null=True,
         blank=True,
         related_name="assigned_tickets",
-        limit_choices_to={"role__in": ["admin", "staff", "technician"]},
+        limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

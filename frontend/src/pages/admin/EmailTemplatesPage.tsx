@@ -15,6 +15,8 @@ const COMMON_PLACEHOLDERS = [
 const EXTRA_PLACEHOLDERS: Record<string, string[]> = {
   statement: ["statement_date"],
   invoice: ["invoice_number", "invoice_total", "invoice_due_date"],
+  quote: ["invoice_number", "invoice_total", "invoice_due_date (the quote's valid-until date)"],
+  proforma: ["invoice_number", "invoice_total", "invoice_due_date"],
   payment_reminder: ["invoice_number (blank if none)", "invoice_due_date (blank if none)"],
 };
 

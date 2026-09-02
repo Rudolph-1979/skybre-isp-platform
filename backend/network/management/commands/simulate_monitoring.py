@@ -1,7 +1,12 @@
 """
-Generates synthetic monitoring readings for every Device.
+Generates synthetic monitoring readings for every Device that isn't hooked
+up to a real Mikrotik API connection.
 
-This stands in for a real SNMP poller. To wire up real monitoring:
+This stands in for a real SNMP poller on devices without api_enabled=True.
+For those, poll_mikrotik_devices pulls real readings instead -- see that
+command -- so this one deliberately excludes them to avoid simulated data
+overwriting/interleaving with real data on the same device's chart. To
+wire up real (non-Mikrotik) SNMP monitoring instead of simulation:
   1. Install an SNMP client (e.g. `pysnmp` or shell out to `snmpget`/`snmpwalk`).
   2. Replace the random values below with real OID queries against
      device.ip_address using device.snmp_community / device.snmp_version
@@ -20,14 +25,14 @@ from network.models import Device, MonitoringReading
 
 
 class Command(BaseCommand):
-    help = "Simulate SNMP monitoring readings for all devices (dev/demo only)."
+    help = "Simulate SNMP monitoring readings for non-Mikrotik-API devices (dev/demo only)."
 
     def add_arguments(self, parser):
         parser.add_argument("--hours", type=int, default=24, help="How many hours of history to backfill.")
         parser.add_argument("--interval-minutes", type=int, default=5, help="Interval between readings.")
 
     def handle(self, *args, **options):
-        devices = list(Device.objects.all())
+        devices = list(Device.objects.exclude(api_enabled=True))
         if not devices:
             self.stdout.write(self.style.WARNING("No devices found. Run seed_demo_data first."))
             return

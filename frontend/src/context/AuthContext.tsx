@@ -7,6 +7,11 @@ interface AuthContextValue {
   loading: boolean;
   login: (username: string, password: string, totpCode?: string) => Promise<User>;
   logout: () => void;
+  // Re-fetches /me/ and updates the cached user in place -- used after a
+  // self-service change like patching visible_partners (see
+  // CustomersPage's partner filter) so the rest of the app picks up the
+  // new value without requiring a full page reload.
+  refreshUser: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -44,12 +49,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   function logout() {
+    // Tell the server first, while the token is still valid, so the
+    // sign-out reaches the activity log. Deliberately not awaited and
+    // deliberately swallowing failure: signing out has to work with the
+    // network down or the token already expired, and somebody unable to
+    // sign out is a far worse failure than a missing log line.
+    api.post("/sign-out/").catch(() => {});
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
     setUser(null);
   }
 
-  return <AuthContext.Provider value={{ user, loading, login, logout }}>{children}</AuthContext.Provider>;
+  async function refreshUser() {
+    const token = localStorage.getItem("access_token");
+    if (!token) return;
+    try {
+      const res = await api.get<User>("/me/");
+      setUser(res.data);
+    } catch {
+      // Ignore -- if the token's gone stale this will surface on the next
+      // real request anyway, no need to force a logout from a background
+      // refresh call.
+    }
+  }
+
+  return <AuthContext.Provider value={{ user, loading, login, logout, refreshUser }}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth() {

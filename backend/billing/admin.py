@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Tariff, Service, Invoice, InvoiceItem, Payment
+from .models import Tariff, Service, Invoice, InvoiceItem, Payment, CreditRequest
 
 
 @admin.register(Tariff)
@@ -29,3 +29,9 @@ class InvoiceAdmin(admin.ModelAdmin):
 class PaymentAdmin(admin.ModelAdmin):
     list_display = ("customer", "invoice", "amount", "method", "date")
     list_filter = ("method",)
+
+
+@admin.register(CreditRequest)
+class CreditRequestAdmin(admin.ModelAdmin):
+    list_display = ("customer", "amount", "status", "requested_by", "decided_by", "created_at")
+    list_filter = ("status",)

@@ -3,6 +3,7 @@ import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { DayScheduleGrid } from "../../components/DayScheduleGrid";
 import type { Job, Shift, Customer, User } from "../../types";
 
 const JOB_TYPE_COLOR: Record<Job["job_type"], string> = {
@@ -60,6 +61,16 @@ export function SchedulingPage() {
   const [staff, setStaff] = useState<User[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
 
+  // Month grid or a single day against the hours. Clicking a date in the
+  // month view switches to Day for that date, and Prev/Next then step one
+  // day at a time -- so the same two buttons mean "month" or "day"
+  // depending on what you're looking at.
+  const [view, setView] = useState<"month" | "day">("month");
+  const [dayAnchor, setDayAnchor] = useState(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
   const [jobModal, setJobModal] = useState<{ job: JobFormState; editingId: number | null } | null>(null);
   const [shiftModal, setShiftModal] = useState<{ shift: ShiftFormState; editingId: number | null } | null>(null);
   const [saving, setSaving] = useState(false);
@@ -84,9 +95,25 @@ export function SchedulingPage() {
   }), [gridStart]);
   const gridEnd = gridDays[gridDays.length - 1];
 
-  const rangeParams = `start_from=${gridStart.toISOString()}&start_to=${new Date(
-    gridEnd.getFullYear(), gridEnd.getMonth(), gridEnd.getDate(), 23, 59, 59
-  ).toISOString()}`;
+  // Only fetch what the current view shows. Day view asking for six weeks of
+  // jobs would be wasteful, and month view asking for one day would be
+  // wrong.
+  //
+  // Both filter on an item's START, so something that began yesterday and
+  // runs into today does not appear today. That matches how the month grid
+  // has always behaved; worth knowing rather than assuming otherwise.
+  const rangeParams = useMemo(() => {
+    if (view === "day") {
+      const from = new Date(dayAnchor);
+      from.setHours(0, 0, 0, 0);
+      const to = new Date(dayAnchor);
+      to.setHours(23, 59, 59, 999);
+      return `start_from=${from.toISOString()}&start_to=${to.toISOString()}`;
+    }
+    return `start_from=${gridStart.toISOString()}&start_to=${new Date(
+      gridEnd.getFullYear(), gridEnd.getMonth(), gridEnd.getDate(), 23, 59, 59
+    ).toISOString()}`;
+  }, [view, dayAnchor, gridStart, gridEnd]);
   const staffParam = staffFilter ? `&assigned_to=${staffFilter}` : "";
   const shiftStaffParam = staffFilter ? `&staff=${staffFilter}` : "";
 
@@ -116,13 +143,47 @@ export function SchedulingPage() {
   }, [shifts]);
 
   const monthLabel = monthAnchor.toLocaleDateString("en-ZA", { month: "long", year: "numeric" });
+  const dayLabel = dayAnchor.toLocaleDateString("en-ZA", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
+  });
+
+  /** Prev/Next move by one month or one day, depending on the view. */
+  function step(delta: number) {
+    if (view === "day") {
+      setDayAnchor((d) => {
+        const next = new Date(d);
+        next.setDate(next.getDate() + delta);
+        return next;
+      });
+    } else {
+      setMonthAnchor((d) => new Date(d.getFullYear(), d.getMonth() + delta, 1));
+    }
+  }
+
+  function goToToday() {
+    const now = new Date();
+    setMonthAnchor(new Date(now.getFullYear(), now.getMonth(), 1));
+    const d = new Date(now);
+    d.setHours(0, 0, 0, 0);
+    setDayAnchor(d);
+  }
+
+  function openDayView(day: Date) {
+    const d = new Date(day);
+    d.setHours(0, 0, 0, 0);
+    setDayAnchor(d);
+    setView("day");
+  }
 
   function openNewJob(prefillDate?: Date) {
     const base = prefillDate ?? new Date();
     const start = new Date(base);
-    start.setHours(9, 0, 0, 0);
+    // A date with no time (from the month grid) defaults to 09:00; a click
+    // on a specific hour in the day view keeps that hour.
+    if (start.getHours() === 0 && start.getMinutes() === 0) start.setHours(9, 0, 0, 0);
+    start.setSeconds(0, 0);
     const end = new Date(start);
-    end.setHours(10, 0, 0, 0);
+    end.setHours(start.getHours() + 1);
     setJobModal({
       job: { ...EMPTY_JOB, start: toDateTimeLocalInput(start.toISOString()), end: toDateTimeLocalInput(end.toISOString()) },
       editingId: null,
@@ -150,9 +211,12 @@ export function SchedulingPage() {
   function openNewShift(prefillDate?: Date) {
     const base = prefillDate ?? new Date();
     const start = new Date(base);
-    start.setHours(8, 0, 0, 0);
+    // Same rule as openNewJob: midnight means "no time given", so fall back
+    // to a normal shift start; an explicit hour is respected.
+    if (start.getHours() === 0 && start.getMinutes() === 0) start.setHours(8, 0, 0, 0);
+    start.setSeconds(0, 0);
     const end = new Date(start);
-    end.setHours(16, 0, 0, 0);
+    end.setHours(start.getHours() + 8);
     setShiftModal({
       shift: { ...EMPTY_SHIFT, start: toDateTimeLocalInput(start.toISOString()), end: toDateTimeLocalInput(end.toISOString()) },
       editingId: null,
@@ -245,6 +309,21 @@ export function SchedulingPage() {
     }
   }
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      // Don't hijack arrow keys while someone is editing a field or has a
+      // form open.
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (jobModal || shiftModal) return;
+      step(e.key === "ArrowLeft" ? -1 : 1);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, jobModal, shiftModal]);
+
   const loading = jobsLoading || shiftsLoading;
 
   return (
@@ -265,29 +344,36 @@ export function SchedulingPage() {
       />
 
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <button
-            className={btnSecondary}
-            onClick={() => setMonthAnchor((d) => new Date(d.getFullYear(), d.getMonth() - 1, 1))}
-          >
+        <div className="flex flex-wrap items-center gap-2">
+          <button className={btnSecondary} onClick={() => step(-1)} title="Previous">
             ‹ Prev
           </button>
-          <button
-            className={btnSecondary}
-            onClick={() => {
-              const now = new Date();
-              setMonthAnchor(new Date(now.getFullYear(), now.getMonth(), 1));
-            }}
-          >
+          <button className={btnSecondary} onClick={goToToday}>
             Today
           </button>
-          <button
-            className={btnSecondary}
-            onClick={() => setMonthAnchor((d) => new Date(d.getFullYear(), d.getMonth() + 1, 1))}
-          >
+          <button className={btnSecondary} onClick={() => step(1)} title="Next">
             Next ›
           </button>
-          <span className="ml-2 text-sm font-semibold text-[var(--text-primary)]">{monthLabel}</span>
+          <span className="ml-2 text-sm font-semibold text-[var(--text-primary)]">
+            {view === "day" ? dayLabel : monthLabel}
+          </span>
+
+          <div className="ml-2 inline-flex overflow-hidden rounded-md border border-[var(--border-hairline)]">
+            {(["month", "day"] as const).map((v) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => setView(v)}
+                className={`px-3 py-1.5 text-sm font-medium capitalize ${
+                  view === v
+                    ? "bg-[var(--series-1)] text-white"
+                    : "text-[var(--text-secondary)] hover:bg-[var(--tint-hover)]"
+                }`}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
         </div>
 
         <select className={`${inputClass} max-w-xs`} value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)}>
@@ -313,8 +399,21 @@ export function SchedulingPage() {
 
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : view === "day" ? (
+        <DayScheduleGrid
+          day={dayAnchor}
+          jobs={jobsByDay.get(toLocalDateKey(dayAnchor.toISOString())) ?? []}
+          shifts={shiftsByDay.get(toLocalDateKey(dayAnchor.toISOString())) ?? []}
+          jobColour={(j) => JOB_TYPE_COLOR[j.job_type]}
+          shiftColour={SHIFT_COLOR}
+          onNewJob={openNewJob}
+          onNewShift={openNewShift}
+          onEditJob={openEditJob}
+          onEditShift={openEditShift}
+        />
       ) : (
-        <div className="grid grid-cols-7 overflow-hidden rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] shadow-sm">
+        <div className="overflow-x-auto">
+        <div className="grid min-w-[640px] grid-cols-7 overflow-hidden rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] shadow-sm">
           {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
             <div key={d} className="border-b border-[var(--border-hairline)] bg-[var(--tint-subtle)] px-2 py-1.5 text-center text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">
               {d}
@@ -340,7 +439,8 @@ export function SchedulingPage() {
               >
                 <button
                   type="button"
-                  onClick={() => openNewJob(day)}
+                  onClick={() => openDayView(day)}
+                  title="Open this day's hourly schedule"
                   className={`mb-1 rounded px-1.5 py-0.5 text-xs font-medium hover:bg-[var(--tint-hover)] ${
                     isToday
                       ? "bg-[var(--series-1)] text-white"
@@ -377,12 +477,19 @@ export function SchedulingPage() {
                     </button>
                   ))}
                   {overflow > 0 && (
-                    <div className="px-1.5 text-[11px] text-[var(--text-muted)]">+{overflow} more</div>
+                    <button
+                      type="button"
+                      onClick={() => openDayView(day)}
+                      className="block w-full px-1.5 text-left text-[11px] text-[var(--text-muted)] hover:underline"
+                    >
+                      +{overflow} more
+                    </button>
                   )}
                 </div>
               </div>
             );
           })}
+        </div>
         </div>
       )}
 
@@ -435,7 +542,7 @@ export function SchedulingPage() {
                 ))}
               </select>
             </FormField>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <FormField label="Start">
                 <input
                   type="datetime-local"
@@ -514,7 +621,7 @@ export function SchedulingPage() {
                 ))}
               </select>
             </FormField>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <FormField label="Start">
                 <input
                   type="datetime-local"

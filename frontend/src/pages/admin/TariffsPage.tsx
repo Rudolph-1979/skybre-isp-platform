@@ -4,7 +4,7 @@ import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
-import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { CSVImportModal } from "../../components/CSVImportModal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
@@ -21,7 +21,7 @@ const COLUMNS: ColumnDef[] = [
 
 const IMPORT_TEMPLATE_HEADERS = [
   "name", "service_type", "price", "billing_period",
-  "speed_download_mbps", "speed_upload_mbps", "data_cap_gb",
+  "speed_download_kbps", "speed_upload_kbps", "data_cap_gb",
   "tax_rate_pct", "is_active", "description",
 ];
 
@@ -30,8 +30,8 @@ const EMPTY: Partial<Tariff> = {
   service_type: "internet",
   price: "",
   billing_period: "monthly",
-  speed_download_mbps: null,
-  speed_upload_mbps: null,
+  speed_download_kbps: null,
+  speed_upload_kbps: null,
   tax_rate_pct: "15",
   is_active: true,
 };
@@ -86,14 +86,14 @@ export function TariffsPage() {
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <select className={`${inputClass} w-auto`} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+        <select className={filterSelectClass} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
           <option value="">All types</option>
           <option value="internet">Internet</option>
           <option value="voice">Voice</option>
           <option value="bundle">Bundle</option>
           <option value="other">Other</option>
         </select>
-        <select className={`${inputClass} w-auto`} value={activeFilter} onChange={(e) => setActiveFilter(e.target.value)}>
+        <select className={filterSelectClass} value={activeFilter} onChange={(e) => setActiveFilter(e.target.value)}>
           <option value="">Active & inactive</option>
           <option value="true">Active only</option>
           <option value="false">Inactive only</option>
@@ -123,7 +123,7 @@ export function TariffsPage() {
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
               {isVisible("type") && <SortableTH field="service_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>}
-              {isVisible("speed") && <SortableTH field="speed_download_mbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>}
+              {isVisible("speed") && <SortableTH field="speed_download_kbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>}
               {isVisible("price") && <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
               {isVisible("billing_period") && <SortableTH field="billing_period" ordering={ordering} onSort={toggleSort}>Billing period</SortableTH>}
               {isVisible("status") && <SortableTH field="is_active" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
@@ -134,7 +134,7 @@ export function TariffsPage() {
               <TR key={t.id}>
                 <TD className="font-medium">{t.name}</TD>
                 {isVisible("type") && <TD className="capitalize">{t.service_type}</TD>}
-                {isVisible("speed") && <TD>{t.speed_download_mbps ? `${t.speed_download_mbps}/${t.speed_upload_mbps} Mbps` : "—"}</TD>}
+                {isVisible("speed") && <TD>{t.speed_download_kbps ? `${t.speed_download_kbps}/${t.speed_upload_kbps} Kbps` : "—"}</TD>}
                 {isVisible("price") && <TD className="tabular-nums">R {parseFloat(t.price).toFixed(2)}</TD>}
                 {isVisible("billing_period") && <TD className="capitalize">{t.billing_period}</TD>}
                 {isVisible("status") && <TD><StatusBadge status={t.is_active ? "active" : "inactive"} /></TD>}
@@ -172,22 +172,37 @@ export function TariffsPage() {
                 onChange={(e) => setForm({ ...form, price: e.target.value })}
               />
             </FormField>
-            <FormField label="Download speed (Mbps)">
+            <FormField label="Download speed (Kbps)">
               <input
                 type="number"
                 className={inputClass}
-                value={form.speed_download_mbps ?? ""}
-                onChange={(e) => setForm({ ...form, speed_download_mbps: e.target.value ? Number(e.target.value) : null })}
+                value={form.speed_download_kbps ?? ""}
+                onChange={(e) => setForm({ ...form, speed_download_kbps: e.target.value ? Number(e.target.value) : null })}
               />
             </FormField>
-            <FormField label="Upload speed (Mbps)">
+            <FormField label="Upload speed (Kbps)">
               <input
                 type="number"
                 className={inputClass}
-                value={form.speed_upload_mbps ?? ""}
-                onChange={(e) => setForm({ ...form, speed_upload_mbps: e.target.value ? Number(e.target.value) : null })}
+                value={form.speed_upload_kbps ?? ""}
+                onChange={(e) => setForm({ ...form, speed_upload_kbps: e.target.value ? Number(e.target.value) : null })}
               />
             </FormField>
+            {/* Said out loud because leaving these blank does NOT fail. The
+                rate limit falls back to 10 Mbps, so every customer on the
+                plan silently gets a speed nobody chose, at whatever price
+                this tariff charges. Only for internet plans — a voice or
+                other tariff having no speed is normal. */}
+            {form.service_type === "internet" &&
+              (!form.speed_download_kbps || !form.speed_upload_kbps) && (
+                <div className="sm:col-span-2">
+                  <p className="rounded-md border border-[var(--status-warning)] bg-[#fff6e5] p-2 text-xs text-[#a5730a]">
+                    No speed set. Saving like this doesn't fail — it hands everyone on this plan a
+                    fallback of <strong>10240 Kbps (10 Mbps)</strong> regardless of what they pay.
+                    1 Mbps is 1024, so a 4 Mbps plan is 4096.
+                  </p>
+                </div>
+              )}
             <FormField label="Billing period">
               <select
                 className={inputClass}

@@ -2,7 +2,9 @@ from rest_framework import viewsets, permissions
 from .models import Job, Shift
 from .serializers import JobSerializer, ShiftSerializer
 from .filters import JobFilter, ShiftFilter
-from accounts.permissions import IsStaffMember
+from accounts.permissions import IsStaffMember, section_permission
+
+HasSchedulingAccess = section_permission("scheduling")
 
 
 class JobViewSet(viewsets.ModelViewSet):
@@ -10,7 +12,7 @@ class JobViewSet(viewsets.ModelViewSet):
     staff/admin/technician only; customers never see this."""
 
     serializer_class = JobSerializer
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
     filterset_class = JobFilter
     ordering_fields = [
         "start", "end", "status", "job_type",
@@ -23,7 +25,7 @@ class JobViewSet(viewsets.ModelViewSet):
 
 class ShiftViewSet(viewsets.ModelViewSet):
     serializer_class = ShiftSerializer
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
     filterset_class = ShiftFilter
     ordering_fields = ["start", "end", "status", "staff__username"]
 

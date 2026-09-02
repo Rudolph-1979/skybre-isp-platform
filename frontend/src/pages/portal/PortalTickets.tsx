@@ -1,13 +1,15 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api } from "../../api/client";
-import { useAuth } from "../../context/AuthContext";
+import { useViewAs } from "../../context/ViewAsContext";
 import { PageHeader } from "../../components/PageHeader";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import type { Ticket } from "../../types";
 
 export function PortalTickets() {
-  const { user } = useAuth();
+  // The signed-in customer normally, or the customer a staff member is
+  // viewing the portal as (see ViewAsContext).
+  const { effectiveCustomerId: customerId, target: viewingAs } = useViewAs();
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [showModal, setShowModal] = useState(false);
@@ -17,10 +19,10 @@ export function PortalTickets() {
   const [sending, setSending] = useState(false);
 
   function load() {
-    if (!user?.customer_id) return;
-    api.get<{ results: Ticket[] }>(`/tickets/?customer=${user.customer_id}&ordering=-created_at`).then((res) => setTickets(res.data.results));
+    if (!customerId) return;
+    api.get<{ results: Ticket[] }>(`/tickets/?customer=${customerId}&ordering=-created_at`).then((res) => setTickets(res.data.results));
   }
-  useEffect(load, [user]);
+  useEffect(load, [customerId]);
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
@@ -52,7 +54,11 @@ export function PortalTickets() {
       <PageHeader
         title="Support Tickets"
         subtitle="Get help from our support team."
-        actions={<button className={btnPrimary} onClick={() => setShowModal(true)}>+ New ticket</button>}
+        actions={
+          viewingAs ? undefined : (
+            <button className={btnPrimary} onClick={() => setShowModal(true)}>+ New ticket</button>
+          )
+        }
       />
 
       <div className="space-y-3">
@@ -77,17 +83,24 @@ export function PortalTickets() {
                     <p>{c.message}</p>
                   </div>
                 ))}
-                <div className="flex gap-2 pt-2">
-                  <input
-                    className={inputClass}
-                    placeholder="Type a reply…"
-                    value={reply}
-                    onChange={(e) => setReply(e.target.value)}
-                  />
-                  <button className={btnPrimary} disabled={sending} onClick={() => handleReply(t.id)}>
-                    {sending ? "…" : "Send"}
-                  </button>
-                </div>
+                {viewingAs ? (
+                  <p className="pt-2 text-xs text-[var(--text-muted)]">
+                    Replying is disabled in customer view — a reply sent here would be recorded as
+                    yours, on the customer's ticket. Answer it from Tickets in the admin area instead.
+                  </p>
+                ) : (
+                  <div className="flex gap-2 pt-2">
+                    <input
+                      className={inputClass}
+                      placeholder="Type a reply…"
+                      value={reply}
+                      onChange={(e) => setReply(e.target.value)}
+                    />
+                    <button className={btnPrimary} disabled={sending} onClick={() => handleReply(t.id)}>
+                      {sending ? "…" : "Send"}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

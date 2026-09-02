@@ -1,0 +1,195 @@
+{% comment %}
+Payslip. One per employee, or several stacked with a page break between for
+the whole-run PDF.
+
+Laid out to satisfy BCEA section 33, which sets out what an employee is
+entitled to be given in writing: the employer's name and address, the
+employee's name and occupation, the period, the remuneration in money, every
+deduction, and the actual amount paid. The hours and rates are there too,
+since a wage worker cannot check the arithmetic without them.
+
+Table-based like every other PDF here -- xhtml2pdf supports a subset of CSS
+2.1, no flexbox and no grid. Table-cell padding is applied TWICE by the
+library (once to the cell, once to the paragraph inside), so every td/th
+padding here is half its intended value; see invoice_pdf.html for the longer
+note on that.
+{% endcomment %}<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: A4; margin: 20pt 24pt 24pt 24pt; }
+
+  @font-face { font-family: "DJVC"; src: url("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"); }
+  @font-face { font-family: "DJVC"; src: url("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf"); font-weight: bold; }
+
+  body { font-family: "DJVC", "DejaVu Sans", Helvetica, sans-serif; font-size: 9.5pt; color: #1c1c1c; }
+  div, p, table { margin: 0; padding: 0; }
+
+  .doc-title   { font-size: 16pt; font-weight: bold; }
+  .employer    { font-size: 11pt; font-weight: bold; }
+  .muted       { color: #5a5a5a; }
+  .small       { font-size: 8.5pt; }
+
+  table.kv        { width: 100%; }
+  table.kv td     { font-size: 9.5pt; line-height: 13pt; padding: 0; vertical-align: top; }
+  table.kv td.k   { color: #5a5a5a; width: 92pt; }
+
+  table.money     { width: 100%; border-collapse: collapse; }
+  table.money th  { font-size: 9pt; font-weight: bold; text-align: left; padding: 2pt 3pt;
+                    border-bottom: 0.75pt solid #999999; }
+  table.money td  { font-size: 9.5pt; padding: 2pt 3pt; border-bottom: 0.5pt solid #e2e2e2; }
+  table.money td.r, table.money th.r { text-align: right; }
+  table.money tr.total td { font-weight: bold; border-top: 0.75pt solid #999999; border-bottom: none; }
+
+  .net  { font-size: 12pt; font-weight: bold; }
+  .netbox { background-color: #f2f2f2; }
+  .netbox td { padding: 4pt 3pt; }
+
+  .foot { font-size: 8pt; color: #5a5a5a; line-height: 11pt; }
+</style>
+</head>
+<body>
+
+{% for slip in slips %}
+  {% if not forloop.first %}<pdf:nextpage />{% endif %}
+
+  {# ---------- who paid, and for what period ---------- #}
+  <table style="width:100%;">
+    <tr>
+      <td style="width:60%; vertical-align:top;">
+        <div class="employer">{{ slip.employer.name }}</div>
+        {% if slip.employer.address %}<div class="muted small">{{ slip.employer.address }}</div>{% endif %}
+        {% if slip.employer.paye_reference %}<div class="muted small">PAYE ref: {{ slip.employer.paye_reference }}</div>{% endif %}
+        {% if slip.employer.uif_reference %}<div class="muted small">UIF ref: {{ slip.employer.uif_reference }}</div>{% endif %}
+      </td>
+      <td style="width:40%; vertical-align:top; text-align:right;">
+        <div class="doc-title">Payslip</div>
+        <div class="muted">{{ slip.period_start|date:"d M Y" }} &ndash; {{ slip.period_end|date:"d M Y" }}</div>
+        {% if slip.is_draft %}<div class="small" style="color:#b32e2e;">DRAFT — not a final payslip</div>{% endif %}
+      </td>
+    </tr>
+  </table>
+
+  {# ---------- who was paid ---------- #}
+  <table style="width:100%; margin-top:14pt;">
+    <tr>
+      <td style="width:50%; vertical-align:top;">
+        <table class="kv">
+          <tr><td class="k">Employee</td><td><strong>{{ slip.staff_name }}</strong></td></tr>
+          <tr><td class="k">Employee no.</td><td>{{ slip.employee_number|default:"—" }}</td></tr>
+          <tr><td class="k">ID number</td><td>{{ slip.id_number|default:"—" }}</td></tr>
+        </table>
+      </td>
+      <td style="width:50%; vertical-align:top;">
+        <table class="kv">
+          <tr><td class="k">Occupation</td><td>{{ slip.occupation|default:"—" }}</td></tr>
+          <tr><td class="k">Paid as</td><td>{{ slip.pay_type_label }}</td></tr>
+          <tr><td class="k">Payment date</td><td>{{ slip.payment_date|date:"d M Y" }}</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+
+  {# ---------- earnings and deductions, side by side ---------- #}
+  <table style="width:100%; margin-top:14pt;">
+    <tr>
+      <td style="width:50%; vertical-align:top; padding-right:6pt;">
+        <table class="money">
+          <thead><tr><th>Earnings</th><th class="r">Amount</th></tr></thead>
+          <tbody>
+            {% for row in slip.earnings %}
+              <tr>
+                <td>{{ row.label }}{% if row.detail %} <span class="muted small">{{ row.detail }}</span>{% endif %}</td>
+                <td class="r">{{ row.amount|floatformat:2 }}</td>
+              </tr>
+            {% endfor %}
+            <tr class="total">
+              <td>Total earnings</td>
+              <td class="r">{{ slip.total_earnings|floatformat:2 }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </td>
+      <td style="width:50%; vertical-align:top; padding-left:6pt;">
+        <table class="money">
+          <thead><tr><th>Deductions</th><th class="r">Amount</th></tr></thead>
+          <tbody>
+            {% for row in slip.deductions %}
+              <tr>
+                <td>{{ row.label }}{% if row.detail %} <span class="muted small">{{ row.detail }}</span>{% endif %}</td>
+                <td class="r">{{ row.amount|floatformat:2 }}</td>
+              </tr>
+            {% empty %}
+              <tr><td class="muted">No deductions</td><td class="r">0.00</td></tr>
+            {% endfor %}
+            <tr class="total">
+              <td>Total deductions</td>
+              <td class="r">{{ slip.total_deductions|floatformat:2 }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </td>
+    </tr>
+  </table>
+
+  {# ---------- the figure that matters ---------- #}
+  <table class="money netbox" style="margin-top:12pt;">
+    <tr>
+      <td class="net">Net pay</td>
+      <td class="net r">R {{ slip.net_pay|floatformat:2 }}</td>
+    </tr>
+  </table>
+
+  {# ---------- hours, so a wage worker can check the arithmetic ---------- #}
+  {% if slip.show_hours %}
+    <table class="money" style="margin-top:12pt;">
+      <thead>
+        <tr>
+          <th>Hours worked</th>
+          <th class="r">Hours</th>
+          <th class="r">Rate</th>
+          <th class="r">Amount</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Normal time</td>
+          <td class="r">{{ slip.regular_hours|floatformat:2 }}</td>
+          <td class="r">{{ slip.hourly_rate|floatformat:2 }}</td>
+          <td class="r">{{ slip.base_pay|floatformat:2 }}</td>
+        </tr>
+        <tr>
+          <td>Overtime</td>
+          <td class="r">{{ slip.overtime_hours|floatformat:2 }}</td>
+          <td class="r">{{ slip.overtime_rate|floatformat:2 }}</td>
+          <td class="r">{{ slip.overtime_pay|floatformat:2 }}</td>
+        </tr>
+      </tbody>
+    </table>
+  {% endif %}
+
+  {# ---------- employer side: not deducted, shown because it is owed on their behalf ---------- #}
+  {% if slip.employer_rows %}
+    <table class="money" style="margin-top:12pt;">
+      <thead><tr><th>Contributions by the employer (not deducted from you)</th><th class="r">Amount</th></tr></thead>
+      <tbody>
+        {% for row in slip.employer_rows %}
+          <tr><td>{{ row.label }}</td><td class="r">{{ row.amount|floatformat:2 }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+
+  {% if slip.line_notes %}
+    <p class="muted small" style="margin-top:10pt;">{{ slip.line_notes }}</p>
+  {% endif %}
+
+  <p class="foot" style="margin-top:16pt;">
+    {% if slip.employer.payslip_note %}{{ slip.employer.payslip_note }}<br>{% endif %}
+    Issued {{ slip.generated_on|date:"d M Y" }}. Keep this for your records.
+    {% if slip.is_draft %}This payroll run has not been finalised, so the figures may still change.{% endif %}
+  </p>
+{% endfor %}
+
+</body>
+</html>

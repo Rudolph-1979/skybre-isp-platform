@@ -18,7 +18,7 @@ Mix `CSVImportMixin` into a `ModelViewSet`, set `import_model` and
     {
         "some_column": {
             "required": bool,             # default False
-            "type": "str" | "decimal" | "int" | "bool",   # default "str"
+            "type": "str" | "decimal" | "int" | "bool" | "date",  # default "str"
             "default": <value used when the cell is empty and not required>,
             "choices": [...],              # optional, list of allowed values
             "aliases": [...],              # optional, alternate header names
@@ -38,6 +38,12 @@ Decimal fields are cleaned of currency symbols/letters before parsing
 (e.g. "R975.00" or "-R0.19" both parse fine), so money columns from
 billing-system exports don't need to be pre-stripped either.
 
+Date fields accept the handful of formats these exports actually emit --
+ISO (2024-03-17), ISO with a time part (2024-03-17 08:31:00, the shape
+Splynx exports use), and day-first D/M/Y with either separator. Day-first
+is deliberate, not US month-first: this is a South African system, and
+"03/04/2024" from a local export means 3 April.
+
 Subclasses can override `extra_row_validation(cleaned, raw_row)` to do
 things a plain type/choices check can't — e.g. resolving a foreign key by
 name and erroring per-row if it doesn't exist. `cleaned` is mutated in
@@ -53,6 +59,7 @@ dict needs any final reshaping before being passed to
 """
 
 import csv
+import datetime
 import io
 import re
 from decimal import Decimal, InvalidOperation
@@ -61,6 +68,37 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 _CURRENCY_STRIP_RE = re.compile(r"[^0-9.\-]")
+
+# Formats these exports actually produce, tried in order. Day-first
+# (%d/%m/%Y) rather than US month-first is deliberate -- this is a South
+# African system, so "03/04/2024" in a local export means 3 April. There
+# is no month-first fallback on purpose: silently accepting both would
+# make 03/04 vs 04/03 a coin flip, and a wrong-but-plausible date is far
+# worse here than a rejected row the importer tells you about.
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+)
+
+
+def _parse_import_date(raw):
+    """Returns a datetime.date, or None if nothing matched."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    # Tolerate a trailing timezone/fractional part on ISO timestamps.
+    for candidate in (value, value.split(".")[0], value.split("+")[0].strip()):
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                continue
+    return None
 
 
 class CSVImportMixin:
@@ -123,6 +161,14 @@ class CSVImportMixin:
                     continue
             elif field_type == "bool":
                 cleaned[field] = raw.lower() in ("1", "true", "yes", "y")
+            elif field_type == "date":
+                parsed = _parse_import_date(raw)
+                if parsed is None:
+                    errors.append(
+                        f"'{field}' must be a date like 2024-03-17 or 17/03/2024 (got '{raw}')"
+                    )
+                    continue
+                cleaned[field] = parsed
             else:
                 cleaned[field] = raw
 

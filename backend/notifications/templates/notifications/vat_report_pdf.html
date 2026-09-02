@@ -1,0 +1,76 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block content %}
+  <div class="doc-title">VAT Return — {{ vat.period_start }} to {{ vat.period_end }}</div>
+
+  <table class="meta-table">
+    <tr><td class="meta-label">VAT vendor</td><td>{{ vat.company_name }}</td></tr>
+    <tr><td class="meta-label">VAT registration number</td><td>{{ vat.vat_number|default:"Not set — add it under Configs → Billing" }}</td></tr>
+    <tr><td class="meta-label">Basis</td><td>{{ vat.basis|title }}</td></tr>
+    <tr><td class="meta-label">Filing category</td><td>Category {{ vat.vat_category }} (two-monthly)</td></tr>
+  </table>
+
+  <p class="proforma-note">
+    This report is calculated from records in this platform only. Output VAT is drawn from real customer invoices
+    issued in this period; Input VAT is drawn from both Expense records and stock receipts dated in this period.
+    Approved credit notes are shown below for information only and are not automatically netted against Output
+    VAT — factor them in by hand if material. Verify all figures against your own records before submitting to SARS.
+  </p>
+
+  {% if vat.duplicate_claims %}
+  {# A supplier invoice captured as BOTH a stock receipt and an expense.
+     Printed prominently because the Input VAT below counts both, so the
+     return is overstated until one is removed. Nothing is auto-adjusted --
+     see expenses.views._find_duplicate_claims for why. #}
+  <p class="proforma-note" style="border:2px solid #b3852e; padding:8px;">
+    <strong>Warning — {{ vat.duplicate_claims|length }} invoice{{ vat.duplicate_claims|length|pluralize }} may be
+    claimed twice.</strong> The following supplier invoices were captured as a stock receipt <em>and</em> as an
+    expense, so the Input VAT below is overstated. Remove whichever record is the duplicate before filing.
+  </p>
+  <table class="totals-table" style="width:100%; margin-left:0;">
+    <tr class="grand"><td>Supplier</td><td>Invoice #</td><td class="num">Overstated by</td></tr>
+    {% for d in vat.duplicate_claims %}
+    <tr>
+      <td>{{ d.supplier }}</td>
+      <td>{{ d.invoice_number }}</td>
+      <td class="num">R {{ d.receipt_vat|floatformat:2 }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  <table class="totals-table" style="width:100%; margin-left:0;">
+    <tr class="grand"><td colspan="2">Output VAT (on sales)</td></tr>
+    <tr><td>Standard-rated supplies (excl. VAT)</td><td class="num">R {{ vat.output.standard_rated_supplies|floatformat:2 }}</td></tr>
+    <tr><td>Zero-rated supplies (excl. VAT)</td><td class="num">R {{ vat.output.zero_rated_supplies|floatformat:2 }}</td></tr>
+    <tr><td>Invoices included</td><td class="num">{{ vat.output.invoice_count }}</td></tr>
+    <tr class="grand"><td>Output VAT</td><td class="num">R {{ vat.output.output_vat|floatformat:2 }}</td></tr>
+  </table>
+
+  <table class="totals-table" style="width:100%; margin-left:0; margin-top:16px;">
+    <tr class="grand"><td colspan="2">Input VAT (on purchases/expenses)</td></tr>
+    <tr><td>Purchases (excl. VAT)</td><td class="num">R {{ vat.input.purchases_excl_vat|floatformat:2 }}</td></tr>
+    <tr><td style="padding-left:16px;">— from expenses ({{ vat.input.expenses.count }})</td><td class="num">R {{ vat.input.expenses.input_vat|floatformat:2 }}</td></tr>
+    <tr><td style="padding-left:16px;">— from stock receipts ({{ vat.input.stock.count }})</td><td class="num">R {{ vat.input.stock.input_vat|floatformat:2 }}</td></tr>
+    <tr class="grand"><td>Input VAT</td><td class="num">R {{ vat.input.input_vat|floatformat:2 }}</td></tr>
+  </table>
+  {% if vat.input.stock.receipts_missing_vat %}
+  <p class="proforma-note">
+    Note: {{ vat.input.stock.receipts_missing_vat }} stock receipt{{ vat.input.stock.receipts_missing_vat|pluralize }}
+    contain{{ vat.input.stock.receipts_missing_vat|pluralize:"s," }} lines captured before VAT was tracked against
+    stock. No VAT is claimed on those lines, so the Input VAT above may be understated.
+  </p>
+  {% endif %}
+
+  <table class="totals-table" style="width:100%; margin-left:0; margin-top:16px;">
+    <tr class="grand"><td colspan="2">Credit notes issued (informational only)</td></tr>
+    <tr><td>Approved credit requests this period</td><td class="num">R {{ vat.credit_notes.total_amount|floatformat:2 }}</td></tr>
+    <tr><td>Count</td><td class="num">{{ vat.credit_notes.count }}</td></tr>
+  </table>
+
+  <table class="totals-table" style="margin-top:20px;">
+    <tr class="grand">
+      <td>Net VAT {% if vat.net_vat_direction == "payable" %}payable to SARS{% elif vat.net_vat_direction == "refundable" %}refundable from SARS{% else %}(even){% endif %}</td>
+      <td class="num">R {{ vat.net_vat|floatformat:2 }}</td>
+    </tr>
+  </table>
+{% endblock %}

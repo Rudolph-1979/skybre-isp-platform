@@ -2,7 +2,7 @@ import { useState } from "react";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { useApiList } from "../../hooks/useApiList";
-import { inputClass, btnSecondary } from "../../components/Modal";
+import { filterSelectClass, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Payment } from "../../types";
@@ -33,7 +33,7 @@ export function PaymentsPage() {
       <PageHeader title="Payments" subtitle={`${count} payments recorded`} />
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <select className={`${inputClass} w-auto`} value={methodFilter} onChange={(e) => setMethodFilter(e.target.value)}>
+        <select className={filterSelectClass} value={methodFilter} onChange={(e) => setMethodFilter(e.target.value)}>
           <option value="">All methods</option>
           <option value="cash">Cash</option>
           <option value="card">Card</option>

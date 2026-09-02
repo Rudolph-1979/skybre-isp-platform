@@ -22,8 +22,18 @@ services:
     environment:
       DB_HOST: db
       TZ: Africa/Johannesburg
+      # Editing a RADIUS client in the admin panel writes clients.conf here;
+      # a systemd path unit on the host validates it and reloads FreeRADIUS.
+      # See radiusauth/clients_conf.py and install-radius-clients-sync.sh.
+      RADIUS_CLIENTS_SPOOL: /srv/radius/clients.conf
     volumes:
       - media_data:/app/media
+      # Host-mounted spool. FreeRADIUS runs on the host (it owns UDP
+      # 1812/1813 and reads /etc/freeradius), so this file is the handoff
+      # point -- the container writes, the host installs. Deliberately a
+      # narrow bind mount rather than giving the container the docker socket
+      # or host systemd access.
+      - /var/lib/skybre/radius:/srv/radius
     depends_on:
       db:
         condition: service_healthy

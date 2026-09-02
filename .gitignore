@@ -1,9 +1,16 @@
-backend/.env
-backend/venv/
-backend/__pycache__/
-**/__pycache__/
+# Python
+venv/
+__pycache__/
 *.pyc
+backend/db.sqlite3
+backend/.env
+backend/server.log
+
+# Node
 frontend/node_modules/
 frontend/dist/
+frontend/.env.local
+
+# OS / editor
+.DS_Store
 *.log
-*.zip

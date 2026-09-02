@@ -9,9 +9,16 @@ class ProductFilter(django_filters.FilterSet):
 
 
 class SerializedUnitFilter(django_filters.FilterSet):
+    # Which supplier a unit came from isn't a field on the unit -- it's two
+    # hops away, through the receipt line it arrived on. Exposed as a filter
+    # because "what did we buy from this supplier" is the question the Units
+    # list exists to answer.
+    supplier = django_filters.NumberFilter(field_name="received_via_line__receipt__supplier")
+    category = django_filters.CharFilter(field_name="product__category")
+
     class Meta:
         model = SerializedUnit
-        fields = ["product", "status"]
+        fields = ["product", "status", "supplier", "category"]
 
 
 class StockReceiptFilter(django_filters.FilterSet):

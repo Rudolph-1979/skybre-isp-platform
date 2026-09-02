@@ -119,6 +119,3 @@ partner layer, richer network topology (parent/child device relationships,
 outage detection from consecutive `is_up=False` readings), and a proper
 production deployment (Gunicorn/Nginx, environment-based settings, Docker
 Compose for Postgres + backend + frontend).
-
-
-test 

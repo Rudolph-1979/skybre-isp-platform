@@ -4,12 +4,27 @@ Django settings for the ISP Management Platform.
 
 from pathlib import Path
 from datetime import timedelta
+
+from django.core.exceptions import ImproperlyConfigured
 from decouple import config, Csv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = config("SECRET_KEY", default="django-insecure-dev-key-change-in-production")
+_INSECURE_DEV_SECRET_KEY = "django-insecure-dev-key-change-in-production"
+SECRET_KEY = config("SECRET_KEY", default=_INSECURE_DEV_SECRET_KEY)
 DEBUG = config("DEBUG", default=True, cast=bool)
+
+# Refuse to boot in production on the committed fallback key. SECRET_KEY
+# doesn't only sign sessions here -- config/media_security.py derives the
+# signature on every /media/ download link from it, so running on the
+# public default would let anyone forge a link to any uploaded file
+# (expense receipts, supplier invoices, staff sick notes). Failing loudly
+# at startup beats silently serving those to whoever asks.
+if not DEBUG and SECRET_KEY == _INSECURE_DEV_SECRET_KEY:
+    raise ImproperlyConfigured(
+        "SECRET_KEY is still the built-in development fallback while DEBUG=False. "
+        "Set a real, random SECRET_KEY in the environment/.env before running in production."
+    )
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*", cast=Csv())
 
 INSTALLED_APPS = [
@@ -33,6 +48,13 @@ INSTALLED_APPS = [
     "scheduling",
     "inventory",
     "notifications",
+    "payroll",
+    "fleet",
+    "radiusauth",
+    "bankfeeds",
+    "expenses",
+    "audit",
+    "sales",
 ]
 
 MIDDLEWARE = [
@@ -45,6 +67,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "audit.middleware.AuditActorMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -105,6 +128,17 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 # location if upload volume grows significantly.
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# Where to write the generated FreeRADIUS clients.conf so the HOST can pick
+# it up (see radiusauth/clients_conf.py). FreeRADIUS runs on the host, not
+# in this container, so editing a RADIUS client in the admin panel has to
+# reach it via a bind-mounted spool file that a host-side systemd path unit
+# validates and installs.
+#
+# Blank/unset disables spooling entirely and every write becomes a no-op,
+# so a dev machine -- or a deployment that hasn't added the bind mount yet
+# -- behaves exactly as it did before, rather than erroring on every save.
+RADIUS_CLIENTS_SPOOL = config("RADIUS_CLIENTS_SPOOL", default="")
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
@@ -125,6 +159,14 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "config.pagination.StandardPagination",
     "PAGE_SIZE": 25,
+    # Only the unauthenticated customer usage page uses a throttle scope.
+    # Everything else requires a JWT, so there is nothing to probe; that one
+    # is reachable by anyone holding a URL, and a wrong token must not be
+    # cheap to retry in bulk. Generous enough that a customer refreshing
+    # their own page never notices.
+    "DEFAULT_THROTTLE_RATES": {
+        "public_usage": "60/min",
+    },
 }
 
 SIMPLE_JWT = {

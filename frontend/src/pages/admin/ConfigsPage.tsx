@@ -9,13 +9,20 @@ import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSeconda
 import { CSVImportModal } from "../../components/CSVImportModal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { canAccessSection } from "../../utils/permissions";
+import { ActivityList } from "../../components/ActivityFeed";
+import { SpeedWindowsPanel } from "../../components/SpeedWindowsPanel";
 import {
   SECTION_LABELS,
+  ROLE_LABELS,
+  STAFF_ROLES,
   type Tariff,
   type EmailTemplate,
   type EmailSettingsConfig,
   type Partner,
+  type Role,
   type Section,
+  type StaffAccountEntry,
   type StaffPermissionEntry,
   type PaymentMethod,
   type BillingDefaultsConfig,
@@ -24,9 +31,25 @@ import {
   type RecurringBillingFields,
   type RecurringPaymentPeriod,
   type ProformaTarget,
+  type RadiusNasClient,
+  type RadiusNasClientPingStatus,
+  type OvpnSettingsConfig,
+  type AuditEvent,
+  type Paginated,
+  type User,
 } from "../../types";
 
-type Tab = "tariffs" | "email-templates" | "permissions" | "email-settings" | "billing";
+type Tab =
+  | "tariffs"
+  | "email-templates"
+  | "users"
+  | "permissions"
+  | "partners"
+  | "email-settings"
+  | "billing"
+  | "radius"
+  | "activity"
+  | "speed-windows";
 
 // Array-based, like Finance's Invoices tab -- Tariffs needs two buttons
 // registered at once ("Import CSV" and "+ New tariff"), while Email
@@ -48,15 +71,30 @@ export function ConfigsPage() {
 
   // Email Settings stays admin-only -- mirror the backend's
   // EmailSettingsView (IsAdmin-gated) regardless of what's rendered here.
-  // OVPN Settings moved to Networking (alongside RADIUS Clients, which
-  // already consumes it as the "Push to router" default) -- see
-  // NetworkingPage.tsx's OvpnSettingsTab.
+  //
+  // RADIUS moved here from Networking. It is gated on `networking` section
+  // access, NOT `configs`, because the endpoints behind it
+  // (/radius-nas-clients/, /ovpn-settings/) still require `networking` on
+  // the backend. Gating it on configs instead would show the tab to staff
+  // whose every request it makes would 403. So the same people see this
+  // screen as before -- only its location changed.
+  const canSeeRadius = canAccessSection(user, "networking");
   const TABS: { key: Tab; label: string }[] = [
     { key: "tariffs", label: "Tariffs" },
     { key: "email-templates", label: "Email Templates" },
+    ...(isAdmin ? [{ key: "users" as Tab, label: "Users" }] : []),
     ...(isManagement ? [{ key: "permissions" as Tab, label: "Permissions" }] : []),
+    ...(isManagement ? [{ key: "partners" as Tab, label: "Partners" }] : []),
     ...(isAdmin ? [{ key: "email-settings" as Tab, label: "Email Settings" }] : []),
     ...(isAdmin ? [{ key: "billing" as Tab, label: "Billing" }] : []),
+    ...(canSeeRadius ? [{ key: "radius" as Tab, label: "RADIUS" }] : []),
+    // Everyone with Configs access, not just Admin. Restricting it
+    // further would mean the one screen that says who did what is
+    // readable only by the account most able to do anything.
+    { key: "activity", label: "Activity log" },
+    // Next to Tariffs, because a window changes what every customer on a
+    // plan gets -- the same kind of decision as the plan's own speed.
+    ...(isAdmin ? [{ key: "speed-windows" as Tab, label: "Speed windows" }] : []),
   ];
 
   return (
@@ -93,9 +131,14 @@ export function ConfigsPage() {
       </div>
       {tab === "tariffs" && <TariffsTab onRegisterNewAction={setNewAction} />}
       {tab === "email-templates" && <EmailTemplatesTab onRegisterNewAction={setNewAction} />}
+      {tab === "users" && isAdmin && <UsersTab onRegisterNewAction={setNewAction} />}
       {tab === "permissions" && isManagement && <PermissionsTab isAdmin={isAdmin} onRegisterNewAction={setNewAction} />}
+      {tab === "partners" && isManagement && <PartnersTab onRegisterNewAction={setNewAction} />}
       {tab === "email-settings" && isAdmin && <EmailSettingsTab onRegisterNewAction={setNewAction} />}
       {tab === "billing" && isAdmin && <BillingConfigTab onRegisterNewAction={setNewAction} />}
+      {tab === "radius" && canSeeRadius && <RadiusClientsTab onRegisterNewAction={setNewAction} />}
+      {tab === "activity" && <ActivityLogTab onRegisterNewAction={setNewAction} />}
+      {tab === "speed-windows" && isAdmin && <SpeedWindowsPanel />}
     </div>
   );
 }
@@ -113,9 +156,23 @@ const TARIFF_COLUMNS: ColumnDef[] = [
   { key: "status", label: "Status" },
 ];
 
+// Speeds are stored in Kbps. Shown alongside the input so a wrong unit is
+// obvious as you type -- 4 Mbps is 4096, and "4" would be 4 Kbps.
+function mbpsHint(kbps: number | null | undefined) {
+  if (!kbps) return "";
+  const mbps = kbps / 1024;
+  const rounded = Number.isInteger(mbps) ? mbps : Math.round(mbps * 100) / 100;
+  return `${rounded} Mbps`;
+}
+
+function speedCell(down: number | null, up: number | null) {
+  if (!down) return "—";
+  return `${down}/${up ?? "?"} Kbps`;
+}
+
 const IMPORT_TEMPLATE_HEADERS = [
   "name", "service_type", "price", "billing_period",
-  "speed_download_mbps", "speed_upload_mbps", "data_cap_gb",
+  "speed_download_kbps", "speed_upload_kbps", "data_cap_gb",
   "tax_rate_pct", "is_active", "description",
 ];
 
@@ -124,8 +181,8 @@ const EMPTY_TARIFF: Partial<Tariff> = {
   service_type: "internet",
   price: "",
   billing_period: "monthly",
-  speed_download_mbps: null,
-  speed_upload_mbps: null,
+  speed_download_kbps: null,
+  speed_upload_kbps: null,
   tax_rate_pct: "15",
   is_active: true,
 };
@@ -143,29 +200,86 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState<Partial<Tariff>>(EMPTY_TARIFF);
+  // The tariff being edited, or null when the modal is creating a new one.
+  // One modal serves both so the two forms can't drift apart -- a field added
+  // to create but forgotten on edit is how you end up with a plan you can
+  // only fix by deleting and re-adding it.
+  const [editing, setEditing] = useState<Tariff | null>(null);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
 
   function toggleSort(field: string) {
     setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "name" : field));
   }
 
+  function openCreate() {
+    setEditing(null);
+    setForm(EMPTY_TARIFF);
+    setError("");
+    setShowModal(true);
+  }
+
+  function openEdit(tariff: Tariff) {
+    setEditing(tariff);
+    setForm({ ...tariff });
+    setError("");
+    setShowModal(true);
+  }
+
+  function closeModal() {
+    setShowModal(false);
+    setEditing(null);
+    setForm(EMPTY_TARIFF);
+    setError("");
+  }
+
   useEffect(() => {
     onRegisterNewAction([
       { label: "Import CSV", variant: "secondary", onClick: () => setShowImport(true) },
-      { label: "+ New tariff", onClick: () => setShowModal(true) },
+      { label: "+ New tariff", onClick: openCreate },
     ]);
     return () => onRegisterNewAction(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function handleDelete() {
+    if (!editing) return;
+    if (!confirm(`Delete the tariff "${editing.name}"? This can't be undone.`)) return;
+    setDeleting(true);
+    setError("");
+    try {
+      await api.delete(`/tariffs/${editing.id}/`);
+      closeModal();
+      refetch();
+    } catch (err) {
+      // The backend refuses when services are on the plan or have a change
+      // booked onto it, and its message names how many and what to do
+      // instead -- so it is shown verbatim rather than replaced with
+      // something vaguer.
+      const data = (err as { response?: { data?: { detail?: string } } })?.response?.data;
+      setError(data?.detail || "Could not delete this tariff.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setSaving(true);
+    setError("");
     try {
-      await api.post("/tariffs/", form);
-      setShowModal(false);
-      setForm(EMPTY_TARIFF);
+      if (editing) {
+        await api.patch(`/tariffs/${editing.id}/`, form);
+      } else {
+        await api.post("/tariffs/", form);
+      }
+      closeModal();
       refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const first = data ? Object.values(data).flat()[0] : null;
+      setError(typeof first === "string" ? first : "Could not save this tariff.");
     } finally {
       setSaving(false);
     }
@@ -203,6 +317,10 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
         </div>
       </div>
 
+      <p className="mb-3 text-sm text-[var(--text-muted)]">
+        Click a tariff to edit it — no need to delete and re-add. Speeds are in Kbps (1 Mbps = 1024).
+      </p>
+
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -211,7 +329,7 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
               {isVisible("type") && <SortableTH field="service_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>}
-              {isVisible("speed") && <SortableTH field="speed_download_mbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>}
+              {isVisible("speed") && <SortableTH field="speed_download_kbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>}
               {isVisible("price") && <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
               {isVisible("billing_period") && <SortableTH field="billing_period" ordering={ordering} onSort={toggleSort}>Billing period</SortableTH>}
               {isVisible("status") && <SortableTH field="is_active" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
@@ -219,10 +337,17 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
           </THead>
           <tbody>
             {items.map((t) => (
-              <TR key={t.id}>
+              <TR key={t.id} onClick={() => openEdit(t)}>
                 <TD className="font-medium">{t.name}</TD>
                 {isVisible("type") && <TD className="capitalize">{t.service_type}</TD>}
-                {isVisible("speed") && <TD>{t.speed_download_mbps ? `${t.speed_download_mbps}/${t.speed_upload_mbps} Mbps` : "—"}</TD>}
+                {isVisible("speed") && (
+                  <TD>
+                    {speedCell(t.speed_download_kbps, t.speed_upload_kbps)}
+                    {t.speed_download_kbps ? (
+                      <span className="ml-1 text-xs text-[var(--text-muted)]">({mbpsHint(t.speed_download_kbps)})</span>
+                    ) : null}
+                  </TD>
+                )}
                 {isVisible("price") && <TD className="tabular-nums">R {parseFloat(t.price).toFixed(2)}</TD>}
                 {isVisible("billing_period") && <TD className="capitalize">{t.billing_period}</TD>}
                 {isVisible("status") && <TD><StatusBadge status={t.is_active ? "active" : "inactive"} /></TD>}
@@ -233,8 +358,19 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       )}
 
       {showModal && (
-        <Modal title="New tariff" onClose={() => setShowModal(false)}>
+        <Modal title={editing ? `Edit tariff — ${editing.name}` : "New tariff"} onClose={closeModal}>
           <form onSubmit={handleSubmit}>
+            {editing && editing.service_count > 0 && (
+              <p className="mb-3 rounded-md border border-[var(--status-warning)] bg-[#fff6e5] p-2 text-xs text-[#a5730a]">
+                {editing.service_count} service{editing.service_count === 1 ? "" : "s"} on this plan
+                {editing.active_service_count !== editing.service_count
+                  ? ` (${editing.active_service_count} active)`
+                  : ""}
+                . Changing the <strong>price</strong> changes what they're billed on the next run; changing the{" "}
+                <strong>speed</strong> re-pushes their rate limit to the router. Neither touches invoices already
+                issued.
+              </p>
+            )}
             <FormField label="Name">
               <input className={inputClass} required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
             </FormField>
@@ -260,22 +396,120 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 onChange={(e) => setForm({ ...form, price: e.target.value })}
               />
             </FormField>
-            <FormField label="Download speed (Mbps)">
-              <input
-                type="number"
-                className={inputClass}
-                value={form.speed_download_mbps ?? ""}
-                onChange={(e) => setForm({ ...form, speed_download_mbps: e.target.value ? Number(e.target.value) : null })}
-              />
-            </FormField>
-            <FormField label="Upload speed (Mbps)">
-              <input
-                type="number"
-                className={inputClass}
-                value={form.speed_upload_mbps ?? ""}
-                onChange={(e) => setForm({ ...form, speed_upload_mbps: e.target.value ? Number(e.target.value) : null })}
-              />
-            </FormField>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <FormField label="Download speed (Kbps)">
+                <input
+                  type="number"
+                  className={inputClass}
+                  placeholder="4096"
+                  value={form.speed_download_kbps ?? ""}
+                  onChange={(e) => setForm({ ...form, speed_download_kbps: e.target.value ? Number(e.target.value) : null })}
+                />
+              </FormField>
+              <FormField label="Upload speed (Kbps)">
+                <input
+                  type="number"
+                  className={inputClass}
+                  placeholder="4096"
+                  value={form.speed_upload_kbps ?? ""}
+                  onChange={(e) => setForm({ ...form, speed_upload_kbps: e.target.value ? Number(e.target.value) : null })}
+                />
+              </FormField>
+            </div>
+            <p className="-mt-1 mb-3 text-xs text-[var(--text-muted)]">
+              In <strong>Kbps</strong> — 1 Mbps is 1024, so 4 Mbps is 4096 and 10 Mbps is 10240.
+              {form.speed_download_kbps || form.speed_upload_kbps ? (
+                <>
+                  {" "}That's{" "}
+                  <strong>
+                    {mbpsHint(form.speed_download_kbps) || "—"} down / {mbpsHint(form.speed_upload_kbps) || "—"} up
+                  </strong>
+                  .
+                </>
+              ) : null}
+            </p>
+            {/* Said out loud because leaving these blank does NOT fail: the
+                rate limit falls back to 10240 Kbps, so everyone on the plan
+                silently gets 10 Mbps at whatever price this charges. Internet
+                only -- a voice plan having no speed is normal. */}
+            {form.service_type === "internet" &&
+              (!form.speed_download_kbps || !form.speed_upload_kbps) && (
+                <p className="mb-3 rounded-md border border-[var(--status-warning)] bg-[#fff6e5] p-2 text-xs text-[#a5730a]">
+                  No speed set. Saving like this doesn't fail — it hands everyone on this plan a fallback of{" "}
+                  <strong>10240 Kbps (10 Mbps)</strong> regardless of what they pay.
+                </p>
+              )}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <FormField label="VAT rate (%)">
+                <input
+                  type="number"
+                  step="0.01"
+                  className={inputClass}
+                  value={form.tax_rate_pct ?? ""}
+                  onChange={(e) => setForm({ ...form, tax_rate_pct: e.target.value })}
+                />
+              </FormField>
+              <FormField label="Data cap (GB)">
+                <input
+                  type="number"
+                  className={inputClass}
+                  placeholder="Blank = unlimited"
+                  value={form.data_cap_gb ?? ""}
+                  onChange={(e) => setForm({ ...form, data_cap_gb: e.target.value ? Number(e.target.value) : null })}
+                />
+              </FormField>
+            </div>
+
+            {/* Fair use is NOT the data cap above, and the two are kept
+                apart on purpose. A cap is a bundle somebody bought and can
+                run out of; fair use is a threshold on an uncapped plan
+                past which heavy users are shaped so everybody else keeps
+                working. The cap is also what the CUSTOMER sees on their
+                own usage page — so shaping through it would show people a
+                cap on a plan sold to them as uncapped. */}
+            <div className="mt-4 border-t border-[var(--border-hairline)] pt-4">
+              <p className="mb-1 text-sm font-semibold text-[var(--text-primary)]">Fair use</p>
+              <p className="mb-3 text-xs text-[var(--text-muted)]">
+                For uncapped plans. Past the threshold the line is slowed, not cut off — and it
+                still gets any speed-window boost. Leave the threshold blank for no fair-use
+                shaping at all, which is how every plan behaves today.
+              </p>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <FormField label="Threshold (GB / month)" hint="Blank = no shaping, ever.">
+                  <input
+                    type="number"
+                    className={inputClass}
+                    placeholder="Blank = no fair-use shaping"
+                    value={form.fup_threshold_gb ?? ""}
+                    onChange={(e) =>
+                      setForm({ ...form, fup_threshold_gb: e.target.value ? Number(e.target.value) : null })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label="Shaped speed (% of plan)"
+                  // The percentage on its own is not a number anybody can
+                  // quote down the phone, so the resolved speed is shown
+                  // next to it.
+                  hint={
+                    form.speed_download_kbps
+                      ? `${form.name || "This plan"} would run at ${(
+                          (form.speed_download_kbps * (form.fup_speed_pct ?? 30)) / 100 / 1024
+                        ).toFixed(1)} Mbps once shaped.`
+                      : "30 = 30% of the plan speed."
+                  }
+                >
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    className={inputClass}
+                    value={form.fup_speed_pct ?? 30}
+                    onChange={(e) => setForm({ ...form, fup_speed_pct: Number(e.target.value) })}
+                  />
+                </FormField>
+              </div>
+            </div>
             <FormField label="Billing period">
               <select
                 className={inputClass}
@@ -287,13 +521,52 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 <option value="annually">Annually</option>
               </select>
             </FormField>
-            <div className="mt-4 flex justify-end gap-2">
-              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
-                Cancel
-              </button>
-              <button type="submit" disabled={saving} className={btnPrimary}>
-                {saving ? "Saving…" : "Create tariff"}
-              </button>
+            <FormField label="Description (optional)">
+              <textarea
+                className={inputClass}
+                rows={2}
+                value={form.description ?? ""}
+                onChange={(e) => setForm({ ...form, description: e.target.value })}
+              />
+            </FormField>
+            {/* Retiring a plan without breaking the customers on it: inactive
+                hides it from the "new service" dropdowns, and every existing
+                service carries on billing at it. */}
+            <label className="mb-2 flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={form.is_active ?? true}
+                onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+              />
+              <span className="text-[var(--text-secondary)]">
+                Active — offered when adding a new service. Unticking it doesn't affect services already on this plan.
+              </span>
+            </label>
+            {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+            <div className="mt-4 flex items-center justify-between gap-2">
+              {/* Far left, deliberately away from Save. Only when editing --
+                  there is nothing to delete on a plan that doesn't exist yet. */}
+              {editing ? (
+                <button
+                  type="button"
+                  disabled={deleting || saving}
+                  className="text-sm text-red-600 hover:underline disabled:opacity-50 dark:text-red-400"
+                  onClick={handleDelete}
+                >
+                  {deleting ? "Deleting…" : "Delete tariff"}
+                </button>
+              ) : (
+                <span />
+              )}
+              <div className="flex gap-2">
+                <button type="button" className={btnSecondary} onClick={closeModal}>
+                  Cancel
+                </button>
+                <button type="submit" disabled={saving} className={btnPrimary}>
+                  {saving ? "Saving…" : editing ? "Save changes" : "Create tariff"}
+                </button>
+              </div>
             </div>
           </form>
         </Modal>
@@ -450,6 +723,424 @@ function EmailTemplatesTab({ onRegisterNewAction }: { onRegisterNewAction: (acti
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Users (staff account lifecycle -- create, edit, suspend/reactivate,
+// permanently delete). Admin-only. Moved here from the Staff page
+// (2026-08-19) so all staff-account administration lives in one place --
+// distinct from Permissions just below, which only manages section access
+// on an existing account rather than the account itself.
+// ---------------------------------------------------------------------------
+
+const EMPTY_USER_FORM = {
+  username: "",
+  password: "",
+  first_name: "",
+  last_name: "",
+  email: "",
+  phone: "",
+  role: "support" as Exclude<Role, "customer">,
+  is_active: true,
+};
+
+function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const { user: currentUser } = useAuth();
+  const { items, loading, refetch } = useApiList<StaffAccountEntry>("/staff-accounts/?page_size=200");
+  const [inviteResult, setInviteResult] = useState<{ sent: boolean; detail: string } | null>(null);
+  const [inviteBusyId, setInviteBusyId] = useState<number | null>(null);
+  const [showModal, setShowModal] = useState(false);
+  const [editing, setEditing] = useState<StaffAccountEntry | null>(null);
+  const [form, setForm] = useState(EMPTY_USER_FORM);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [deleting, setDeleting] = useState<StaffAccountEntry | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [toggleBusyId, setToggleBusyId] = useState<number | null>(null);
+  const [resetBusyId, setResetBusyId] = useState<number | null>(null);
+
+  useEffect(() => {
+    onRegisterNewAction([
+      {
+        label: "+ Add user",
+        onClick: () => {
+          setEditing(null);
+          setForm(EMPTY_USER_FORM);
+          setError("");
+          setShowModal(true);
+        },
+      },
+    ]);
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openEdit(entry: StaffAccountEntry) {
+    setEditing(entry);
+    setForm({
+      username: entry.username,
+      password: "",
+      first_name: entry.first_name,
+      last_name: entry.last_name,
+      email: entry.email,
+      phone: entry.phone,
+      role: entry.role as Exclude<Role, "customer">,
+      is_active: entry.is_active,
+    });
+    setError("");
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSaving(true);
+    try {
+      const payload: Record<string, unknown> = {
+        username: form.username,
+        first_name: form.first_name,
+        last_name: form.last_name,
+        email: form.email,
+        phone: form.phone,
+        role: form.role,
+        is_active: form.is_active,
+      };
+      // Blank password on an edit means "leave it unchanged" -- only send
+      // it when the admin actually typed a new one (always sent, and
+      // always required, when creating a brand-new account).
+      if (form.password) payload.password = form.password;
+      if (editing) {
+        await api.patch(`/staff-accounts/${editing.id}/`, payload);
+      } else {
+        const res = await api.post<{ invite?: { sent: boolean; detail: string } }>(
+          "/staff-accounts/",
+          payload
+        );
+        // Reported, never assumed. An SMTP outage doesn't undo the account,
+        // so without this the admin walks away believing an invite went out
+        // and the new person waits for an email that never arrives.
+        if (res.data.invite) setInviteResult(res.data.invite);
+      }
+      setShowModal(false);
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setError(typeof firstError === "string" ? firstError : "Could not save this user — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleToggleActive(entry: StaffAccountEntry) {
+    setToggleBusyId(entry.id);
+    try {
+      await api.patch(`/staff-accounts/${entry.id}/`, { is_active: !entry.is_active });
+      refetch();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { is_active?: string[] } } })?.response?.data?.is_active;
+      alert(detail?.[0] || "Could not update this account.");
+    } finally {
+      setToggleBusyId(null);
+    }
+  }
+
+  async function handleSendInvite(entry: StaffAccountEntry) {
+    setInviteBusyId(entry.id);
+    try {
+      const res = await api.post<{ detail: string }>(`/staff-accounts/${entry.id}/send_invite/`);
+      alert(res.data.detail);
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      alert(detail || "Could not send the invite.");
+    } finally {
+      setInviteBusyId(null);
+    }
+  }
+
+  async function handleSendResetLink(entry: StaffAccountEntry) {
+    setResetBusyId(entry.id);
+    try {
+      const res = await api.post<{ detail: string }>(`/staff-accounts/${entry.id}/send_reset_link/`);
+      alert(res.data.detail);
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      alert(detail || "Could not send the reset link.");
+    } finally {
+      setResetBusyId(null);
+    }
+  }
+
+  async function handleSuspendFromDeleteModal() {
+    if (!deleting) return;
+    setDeleteBusy(true);
+    try {
+      await api.patch(`/staff-accounts/${deleting.id}/`, { is_active: false });
+      setDeleting(null);
+      refetch();
+    } catch {
+      alert("Could not suspend this account.");
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
+  async function handleDeleteConfirm() {
+    if (!deleting) return;
+    setDeleteBusy(true);
+    try {
+      await api.delete(`/staff-accounts/${deleting.id}/`);
+      setDeleting(null);
+      refetch();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      alert(detail || "Could not delete this account.");
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <p className="mb-3 text-sm text-[var(--text-secondary)]">
+        Create and manage staff logins. Suspending blocks sign-in but keeps their history intact and reversible;
+        deleting permanently removes the account and can't be undone.
+      </p>
+
+      {inviteResult && (
+        <p
+          className={`mb-3 rounded-md border p-2 text-sm ${
+            inviteResult.sent
+              ? "border-[var(--status-good)] text-[var(--text-secondary)]"
+              : "border-[var(--status-warning)] bg-[#fff6e5] text-[#a5730a]"
+          }`}
+        >
+          {inviteResult.detail}{" "}
+          <button className="underline" onClick={() => setInviteResult(null)}>Dismiss</button>
+        </p>
+      )}
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Name</TH>
+              <TH>Username</TH>
+              <TH>Email</TH>
+              <TH>Phone</TH>
+              <TH>Role</TH>
+              <TH>Status</TH>
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((entry) => {
+              const isSelf = currentUser?.id === entry.id;
+              return (
+                <TR key={entry.id}>
+                  <TD className="font-medium">
+                    {`${entry.first_name} ${entry.last_name}`.trim() || entry.username}
+                    {isSelf && <span className="ml-1 text-xs text-[var(--text-muted)]">(you)</span>}
+                  </TD>
+                  <TD className="text-[var(--text-secondary)]">{entry.username}</TD>
+                  <TD className="text-[var(--text-secondary)]">{entry.email || "—"}</TD>
+                  <TD className="text-[var(--text-secondary)]">{entry.phone || "—"}</TD>
+                  <TD>{ROLE_LABELS[entry.role]}</TD>
+                  <TD><StatusBadge status={entry.is_active ? "active" : "inactive"} /></TD>
+                  <TD>
+                    <button className="text-xs text-[var(--series-1)] hover:underline" onClick={() => openEdit(entry)}>
+                      Edit
+                    </button>
+                    {!isSelf && (
+                      <>
+                        {/* Separate from "Send reset link" because the two say
+                            different things to whoever opens them: an invite
+                            announces an account and gives the username; a
+                            reset assumes they already know about it. Same
+                            token underneath -- the wording is the point. */}
+                        <button
+                          className="ml-2 text-xs text-[var(--series-1)] hover:underline disabled:opacity-50"
+                          disabled={inviteBusyId === entry.id || !entry.email}
+                          title={entry.email ? "Email them an invite to set their password" : "Add an email address (via Edit) before sending an invite"}
+                          onClick={() => handleSendInvite(entry)}
+                        >
+                          {inviteBusyId === entry.id ? "Sending…" : "Send invite"}
+                        </button>
+                        <button
+                          className="ml-2 text-xs text-[var(--series-1)] hover:underline disabled:opacity-50"
+                          disabled={resetBusyId === entry.id || !entry.email}
+                          title={entry.email ? undefined : "Add an email address (via Edit) before sending a reset link"}
+                          onClick={() => handleSendResetLink(entry)}
+                        >
+                          {resetBusyId === entry.id ? "Sending…" : "Send reset link"}
+                        </button>
+                        <button
+                          className="ml-2 text-xs text-[var(--series-1)] hover:underline"
+                          disabled={toggleBusyId === entry.id}
+                          onClick={() => handleToggleActive(entry)}
+                        >
+                          {entry.is_active ? "Suspend" : "Reactivate"}
+                        </button>
+                        <button
+                          className="ml-2 text-xs text-[var(--status-critical)] hover:underline"
+                          onClick={() => setDeleting(entry)}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </TD>
+                </TR>
+              );
+            })}
+            {items.length === 0 && (
+              <TR>
+                <TD className="text-[var(--text-muted)]">No staff accounts yet.</TD>
+              </TR>
+            )}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal title={editing ? "Edit user" : "Add user"} onClose={() => setShowModal(false)}>
+          <form onSubmit={handleSubmit} autoComplete="off">
+            <FormField label="Username">
+              <input
+                className={inputClass}
+                required
+                value={form.username}
+                onChange={(e) => setForm({ ...form, username: e.target.value })}
+                autoComplete="off"
+                name="staff-username"
+              />
+            </FormField>
+            <FormField
+              label={
+                editing
+                  ? "New password (leave blank to keep current)"
+                  : "Password (leave blank to send them an invite)"
+              }
+            >
+              <input
+                type="password"
+                className={inputClass}
+                minLength={8}
+                value={form.password}
+                onChange={(e) => setForm({ ...form, password: e.target.value })}
+                autoComplete="new-password"
+                name="staff-password"
+              />
+            </FormField>
+            {!editing && !form.password && (
+              // The better path, so it is the default and it is explained.
+              // Setting a password here means the admin invents one and then
+              // has to get it to the person somehow -- read out, messaged,
+              // written down -- which is a password chosen by the wrong
+              // person, sitting somewhere it shouldn't.
+              <p className="-mt-2 mb-3 text-xs text-[var(--text-muted)]">
+                Leave this blank and they'll be emailed an invite to choose their own password. The
+                account can't be signed into until they do.
+              </p>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <FormField label="First name">
+                <input
+                  className={inputClass}
+                  required
+                  value={form.first_name}
+                  onChange={(e) => setForm({ ...form, first_name: e.target.value })}
+                />
+              </FormField>
+              <FormField label="Last name">
+                <input
+                  className={inputClass}
+                  required
+                  value={form.last_name}
+                  onChange={(e) => setForm({ ...form, last_name: e.target.value })}
+                />
+              </FormField>
+            </div>
+            <FormField label="Email">
+              <input
+                type="email"
+                className={inputClass}
+                value={form.email}
+                onChange={(e) => setForm({ ...form, email: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Phone">
+              <input
+                className={inputClass}
+                value={form.phone}
+                onChange={(e) => setForm({ ...form, phone: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Role">
+              <select
+                className={inputClass}
+                value={form.role}
+                onChange={(e) => setForm({ ...form, role: e.target.value as Exclude<Role, "customer"> })}
+              >
+                {STAFF_ROLES.map((r) => (
+                  <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                ))}
+              </select>
+            </FormField>
+            {editing && (
+              <label className="mb-3 flex items-center gap-2 text-sm text-[var(--text-primary)]">
+                <input
+                  type="checkbox"
+                  disabled={currentUser?.id === editing.id}
+                  checked={form.is_active}
+                  onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+                />
+                Active (can sign in)
+              </label>
+            )}
+            {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
+                Cancel
+              </button>
+              <button type="submit" className={btnPrimary} disabled={saving}>
+                {saving ? "Saving…" : editing ? "Save changes" : "Create user"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {deleting && (
+        <Modal title={`Delete ${`${deleting.first_name} ${deleting.last_name}`.trim() || deleting.username}?`} onClose={() => setDeleting(null)}>
+          <p className="mb-4 text-sm text-[var(--text-secondary)]">
+            This permanently removes the account, along with their attendance records, leave requests, payroll
+            history, and any shifts assigned to them. This can't be undone. If you just want to stop them from
+            signing in — while keeping their history intact — suspend the account instead.
+          </p>
+          <div className="flex flex-wrap justify-end gap-2">
+            <button type="button" className={btnSecondary} onClick={() => setDeleting(null)}>
+              Cancel
+            </button>
+            <button type="button" className={btnSecondary} disabled={deleteBusy} onClick={handleSuspendFromDeleteModal}>
+              {deleteBusy ? "Working…" : "Suspend instead"}
+            </button>
+            <button
+              type="button"
+              className="rounded-md bg-[var(--status-critical)] px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
+              disabled={deleteBusy}
+              onClick={handleDeleteConfirm}
+            >
+              {deleteBusy ? "Deleting…" : "Delete permanently"}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // Permissions -- section access is Admin-only; reseller-partner visibility
@@ -687,6 +1378,231 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
               </button>
             </div>
           </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Partners (reselling) -- Management/Admin. Moved here from the Staff page
+// (2026-08-19) so it lives alongside Permissions, which is where
+// reseller-partner visibility (allowed_partners) for staff is configured.
+// ---------------------------------------------------------------------------
+
+const EMPTY_PARTNER_FORM = {
+  name: "",
+  contact_person: "",
+  email: "",
+  phone: "",
+  commission_rate: "",
+  notes: "",
+  is_active: true,
+};
+
+function PartnersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const { items, loading, refetch } = useApiList<Partner>("/partners/?page_size=200&ordering=name");
+  const [showModal, setShowModal] = useState(false);
+  const [editing, setEditing] = useState<Partner | null>(null);
+  const [form, setForm] = useState(EMPTY_PARTNER_FORM);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [deleting, setDeleting] = useState<Partner | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+
+  useEffect(() => {
+    onRegisterNewAction([
+      {
+        label: "+ Add partner",
+        onClick: () => {
+          setEditing(null);
+          setForm(EMPTY_PARTNER_FORM);
+          setError("");
+          setShowModal(true);
+        },
+      },
+    ]);
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openEdit(entry: Partner) {
+    setEditing(entry);
+    setForm({
+      name: entry.name,
+      contact_person: entry.contact_person,
+      email: entry.email,
+      phone: entry.phone,
+      commission_rate: entry.commission_rate ?? "",
+      notes: entry.notes,
+      is_active: entry.is_active,
+    });
+    setError("");
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSaving(true);
+    try {
+      const payload: Record<string, unknown> = {
+        name: form.name,
+        contact_person: form.contact_person,
+        email: form.email,
+        phone: form.phone,
+        commission_rate: form.commission_rate ? form.commission_rate : null,
+        notes: form.notes,
+        is_active: form.is_active,
+      };
+      if (editing) {
+        await api.patch(`/partners/${editing.id}/`, payload);
+      } else {
+        await api.post("/partners/", payload);
+      }
+      setShowModal(false);
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setError(typeof firstError === "string" ? firstError : "Could not save this partner — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDeleteConfirm() {
+    if (!deleting) return;
+    setDeleteBusy(true);
+    setDeleteError("");
+    try {
+      await api.delete(`/partners/${deleting.id}/`);
+      setDeleting(null);
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setDeleteError(typeof firstError === "string" ? firstError : "Could not delete this partner.");
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <p className="mb-3 text-sm text-[var(--text-secondary)]">
+        Reseller partners customers can be tagged to under Customers. Deleting a partner doesn't delete its
+        customers -- they just become direct (no-partner) customers. To control which staff can see which
+        partners' customers, go to Configs → Permissions.
+      </p>
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Name</TH>
+              <TH>Contact</TH>
+              <TH>Commission</TH>
+              <TH>Customers</TH>
+              <TH>Status</TH>
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((p) => (
+              <TR key={p.id}>
+                <TD className="font-medium">{p.name}</TD>
+                <TD>
+                  <div>{p.contact_person || "—"}</div>
+                  <div className="text-xs text-[var(--text-muted)]">{p.email}{p.email && p.phone ? " · " : ""}{p.phone}</div>
+                </TD>
+                <TD>{p.commission_rate ? `${p.commission_rate}%` : "—"}</TD>
+                <TD>{p.customer_count}</TD>
+                <TD><StatusBadge status={p.is_active ? "active" : "inactive"} /></TD>
+                <TD>
+                  <div className="flex gap-2">
+                    <button type="button" className={btnSecondary} onClick={() => openEdit(p)}>Edit</button>
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-[var(--status-critical)] hover:underline"
+                      onClick={() => {
+                        setDeleting(p);
+                        setDeleteError("");
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </TD>
+              </TR>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal title={editing ? `Edit ${editing.name}` : "New partner"} onClose={() => setShowModal(false)}>
+          <form onSubmit={handleSubmit}>
+            <FormField label="Name">
+              <input className={inputClass} required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+            </FormField>
+            <FormField label="Contact person">
+              <input className={inputClass} value={form.contact_person} onChange={(e) => setForm({ ...form, contact_person: e.target.value })} />
+            </FormField>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <FormField label="Email">
+                <input type="email" className={inputClass} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              </FormField>
+              <FormField label="Phone">
+                <input className={inputClass} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+              </FormField>
+            </div>
+            <FormField label="Commission rate % (optional)">
+              <input
+                type="number"
+                step="0.01"
+                className={inputClass}
+                value={form.commission_rate}
+                onChange={(e) => setForm({ ...form, commission_rate: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Notes">
+              <textarea className={inputClass} rows={2} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+            </FormField>
+            <label className="mb-4 flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={form.is_active} onChange={(e) => setForm({ ...form, is_active: e.target.checked })} />
+              <span>Active</span>
+            </label>
+
+            {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
+              <button type="submit" disabled={saving} className={btnPrimary}>
+                {saving ? "Saving…" : editing ? "Save changes" : "Create partner"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {deleting && (
+        <Modal title={`Delete ${deleting.name}?`} onClose={() => setDeleting(null)}>
+          <p className="mb-3 text-sm text-[var(--text-secondary)]">
+            {deleting.customer_count > 0
+              ? `This partner has ${deleting.customer_count} customer${deleting.customer_count === 1 ? "" : "s"} tagged to it. They won't be deleted -- they'll just become direct (no-partner) customers.`
+              : "This partner has no customers tagged to it."}
+          </p>
+          {deleteError && <p className="mb-3 text-sm text-[var(--status-critical)]">{deleteError}</p>}
+          <div className="flex justify-end gap-2">
+            <button type="button" className={btnSecondary} onClick={() => setDeleting(null)}>Cancel</button>
+            <button type="button" disabled={deleteBusy} className={btnPrimary} onClick={handleDeleteConfirm}>
+              {deleteBusy ? "Deleting…" : "Delete partner"}
+            </button>
+          </div>
         </Modal>
       )}
     </div>
@@ -1429,6 +2345,7 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
 function BillingDefaultsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const { items: paymentMethods } = useApiList<PaymentMethod>("/payment-methods/?page_size=200&ordering=name");
   const [form, setForm] = useState<RecurringBillingFormState>(EMPTY_RECURRING_BILLING_FORM);
+  const [vatNumber, setVatNumber] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -1441,6 +2358,7 @@ function BillingDefaultsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
     setLoading(true);
     api.get<BillingDefaultsConfig>("/billing-defaults/").then((r) => {
       setForm(recurringBillingFieldsToFormState(r.data));
+      setVatNumber(r.data.vat_number ?? "");
       setLoading(false);
     });
   }
@@ -1457,8 +2375,12 @@ function BillingDefaultsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
     setSaved(false);
     setSaving(true);
     try {
-      const res = await api.patch<BillingDefaultsConfig>("/billing-defaults/", recurringBillingFormStateToPayload(form));
+      const res = await api.patch<BillingDefaultsConfig>("/billing-defaults/", {
+        ...recurringBillingFormStateToPayload(form),
+        vat_number: vatNumber,
+      });
       setForm(recurringBillingFieldsToFormState(res.data));
+      setVatNumber(res.data.vat_number ?? "");
       setSaved(true);
     } catch (err) {
       const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
@@ -1496,6 +2418,21 @@ function BillingDefaultsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
       <form onSubmit={handleSubmit} className="max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5">
         <RecurringBillingFieldsFormBody form={form} onChange={setForm} paymentMethods={paymentMethods} />
 
+        <div className="mt-4">
+          <FormField label="VAT number">
+            <input
+              type="text"
+              className={inputClass}
+              value={vatNumber}
+              onChange={(e) => setVatNumber(e.target.value)}
+              placeholder="e.g. 4123456789"
+            />
+          </FormField>
+          <p className="mt-1 text-xs text-[var(--text-muted)]">
+            Skybre's own SARS VAT registration number — shown on VAT return PDFs under Accountant → VAT Returns.
+          </p>
+        </div>
+
         {error && <p className="mb-3 mt-4 text-sm text-[var(--status-critical)]">{error}</p>}
         {saved && !error && <p className="mb-3 mt-4 text-sm text-[#0ca30c]">Defaults saved.</p>}
 
@@ -1505,6 +2442,8 @@ function BillingDefaultsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
           </button>
         </div>
       </form>
+
+      <InvoiceCompanyCard />
 
       <div className="mt-6 max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5">
         <h2 className="mb-1 text-sm font-semibold text-[var(--text-primary)]">Apply to existing customers</h2>
@@ -1532,6 +2471,188 @@ function BillingDefaultsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
         {applyResult && <p className="mt-3 text-sm text-[var(--text-secondary)]">{applyResult}</p>}
       </div>
     </div>
+  );
+}
+
+
+// --- Company details printed on invoices -------------------------------------
+//
+// Its own card, and its own PATCH, rather than more fields on the billing
+// defaults form above: those fields are a template copied onto each
+// customer's billing config, these are single company-wide facts printed on
+// a document. Mixing them would make "Apply to existing customers" read as
+// though it might touch the letterhead.
+//
+// A tax invoice is not valid without the supplier's registered name, address
+// and VAT number, so this is the difference between an invoice a customer's
+// accountant will accept and one they won't.
+
+type CompanyFieldKey =
+  | "company_legal_name" | "company_address" | "company_city" | "company_postal_code"
+  | "company_country" | "company_phone" | "company_email"
+  | "bank_name" | "bank_account_number" | "bank_branch_code";
+
+type CompanyField = { key: CompanyFieldKey; label: string; placeholder?: string };
+
+// Laid out as explicit rows: a one-field row is full width, a two-field row
+// splits. Written out rather than computed so what you read is what renders.
+const COMPANY_ROWS: CompanyField[][] = [
+  [{ key: "company_legal_name", label: "Registered company name", placeholder: "e.g. Skybre Pty Ltd" }],
+  [{ key: "company_address", label: "Street address", placeholder: "e.g. Cnr Reitz & Botha Street" }],
+  [
+    { key: "company_city", label: "City" },
+    { key: "company_postal_code", label: "Postal code" },
+  ],
+  [
+    { key: "company_country", label: "Country" },
+    { key: "company_phone", label: "Phone" },
+  ],
+  [{ key: "company_email", label: "Billing email", placeholder: "e.g. accounts@skybre.co.za" }],
+];
+
+const BANK_ROWS: CompanyField[][] = [
+  [
+    { key: "bank_name", label: "Bank", placeholder: "e.g. FNB" },
+    { key: "bank_branch_code", label: "Branch code", placeholder: "e.g. 250655" },
+  ],
+  [{ key: "bank_account_number", label: "Account number" }],
+];
+
+const ALL_COMPANY_FIELDS: CompanyField[] = [...COMPANY_ROWS, ...BANK_ROWS].flat();
+
+type CompanyForm = Record<string, string>;
+
+function InvoiceCompanyCard() {
+  const [form, setForm] = useState<CompanyForm>({});
+  const [logoUrl, setLogoUrl] = useState<string | null>(null);
+  const [logoName, setLogoName] = useState<string | null>(null);
+  const [logoFile, setLogoFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+
+  function absorb(data: BillingDefaultsConfig) {
+    const next: CompanyForm = {};
+    for (const f of ALL_COMPANY_FIELDS) next[f.key] = (data[f.key] as string) ?? "";
+    setForm(next);
+    setLogoUrl(data.logo_url ?? null);
+    setLogoName(data.logo_name ?? null);
+    setLogoFile(null);
+  }
+
+  useEffect(() => {
+    api.get<BillingDefaultsConfig>("/billing-defaults/").then((r) => {
+      absorb(r.data);
+      setLoading(false);
+    });
+  }, []);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSaved(false);
+    setSaving(true);
+    try {
+      // A chosen logo forces multipart -- a file cannot go through JSON.
+      // Without one, a plain JSON PATCH keeps the request (and the server's
+      // parser path) as simple as every other settings form here.
+      let res;
+      if (logoFile) {
+        const body = new FormData();
+        for (const [k, v] of Object.entries(form)) body.append(k, v);
+        body.append("logo", logoFile);
+        res = await api.patch<BillingDefaultsConfig>("/billing-defaults/", body);
+      } else {
+        res = await api.patch<BillingDefaultsConfig>("/billing-defaults/", form);
+      }
+      absorb(res.data);
+      setSaved(true);
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setError(typeof firstError === "string" ? firstError : "Could not save these details — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function renderRows(rows: CompanyField[][]) {
+    return rows.map((row) => {
+      const inputs = row.map((f) => (
+        <FormField key={f.key} label={f.label}>
+          <input
+            type="text"
+            className={inputClass}
+            value={form[f.key] ?? ""}
+            placeholder={f.placeholder}
+            onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+          />
+        </FormField>
+      ));
+      if (row.length === 1) return inputs[0];
+      return (
+        <div key={`row-${row[0].key}`} className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {inputs}
+        </div>
+      );
+    });
+  }
+
+  if (loading) return null;
+
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className="mt-6 max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5"
+    >
+      <h2 className="mb-1 text-sm font-semibold text-[var(--text-primary)]">Company details on invoices</h2>
+      <p className="mb-4 text-sm text-[var(--text-secondary)]">
+        Printed on every invoice, quote and pro forma. A tax invoice is only valid if it carries your registered
+        name, address and VAT number — the VAT number comes from the field above.
+      </p>
+
+      {renderRows(COMPANY_ROWS)}
+
+      <h3 className="mb-2 mt-5 text-sm font-semibold text-[var(--text-primary)]">Payment details</h3>
+      <p className="mb-3 text-sm text-[var(--text-secondary)]">
+        The one account customers should pay into. Kept separate from the accounts under Finance → Bank feeds —
+        those are for importing transactions, and not all of them are where you want money sent.
+      </p>
+      {renderRows(BANK_ROWS)}
+
+      <div className="mt-4">
+        <FormField label="Logo">
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/gif"
+            className={inputClass}
+            onChange={(e) => setLogoFile(e.target.files?.[0] ?? null)}
+          />
+        </FormField>
+        <p className="mt-1 text-xs text-[var(--text-muted)]">
+          Printed top-left, scaled to 85 × 60 pt. A PNG with a transparent background looks best.
+          {logoName && !logoFile ? ` Currently: ${logoName}.` : ""}
+          {logoFile ? " Save to replace the current logo." : ""}
+        </p>
+        {logoUrl && !logoFile && (
+          <img
+            src={logoUrl}
+            alt="Current invoice logo"
+            className="mt-3 h-16 w-auto rounded border border-[var(--border-hairline)] bg-white p-1"
+          />
+        )}
+      </div>
+
+      {error && <p className="mb-3 mt-4 text-sm text-[var(--status-critical)]">{error}</p>}
+      {saved && !error && <p className="mb-3 mt-4 text-sm text-[#0ca30c]">Company details saved.</p>}
+
+      <div className="mt-4 flex justify-end">
+        <button type="submit" disabled={saving} className={btnPrimary}>
+          {saving ? "Saving…" : "Save company details"}
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -1748,6 +2869,635 @@ function AutoSuspensionSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
 
         {error && <p className="mt-4 text-sm text-[var(--status-critical)]">{error}</p>}
         {saved && !error && !confirmingEnable && <p className="mt-4 text-sm text-[#0ca30c]">Settings saved.</p>}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RADIUS -- the Mikrotik/NAS devices allowed to authenticate against this
+// platform's FreeRADIUS server. Moved here from Networking; the API is
+// still /radius-nas-clients/ and still requires the `networking` section,
+// which is why the tab is gated on networking rather than configs access.
+// ---------------------------------------------------------------------------
+
+const NAS_COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "status", label: "Status" },
+  { key: "ip_address", label: "IP address" },
+  { key: "shortname", label: "Shortname" },
+  { key: "secret", label: "Secret" },
+  { key: "realm", label: "Realm" },
+  { key: "active", label: "Active" },
+];
+
+// How often the RADIUS Clients page re-pings every NAS on its own, in
+// addition to the manual "Refresh status" button -- a live network
+// check, not a persisted field, so it's always at most this stale.
+const NAS_STATUS_REFRESH_MS = 45_000;
+
+const emptyNasForm: Partial<RadiusNasClient> & { secret: string } = {
+  name: "",
+  ip_address: "",
+  shortname: "",
+  secret: "",
+  realm: "",
+  description: "",
+  is_active: true,
+};
+
+function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const { items, loading, refetch } = useApiList<RadiusNasClient>("/radius-nas-clients/?page_size=100");
+  const [showModal, setShowModal] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState<RadiusNasClient | null>(null);
+  const [form, setForm] = useState(emptyNasForm);
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("radius-nas-clients", ["name"]);
+
+  useEffect(() => {
+    onRegisterNewAction([{ label: "+ New RADIUS client", onClick: () => openCreate() }]);
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Live online/offline status -- a ping run right now against every
+  // client's IP, not a persisted field (see RadiusNasClientPingStatus).
+  // Keyed by client id so a row shows "Checking…" the first time and
+  // then whatever the last completed ping said, rather than flickering
+  // back to unknown on every refresh.
+  const [statusById, setStatusById] = useState<Record<number, "online" | "offline">>({});
+  const [statusChecking, setStatusChecking] = useState(false);
+
+  async function refreshStatuses() {
+    setStatusChecking(true);
+    try {
+      const res = await api.get<RadiusNasClientPingStatus[]>("/radius-nas-clients/ping-status/");
+      setStatusById((prev) => {
+        const next = { ...prev };
+        res.data.forEach((entry) => {
+          next[entry.id] = entry.status;
+        });
+        return next;
+      });
+    } catch {
+      // Best-effort status indicator -- a failed check just leaves the
+      // last known status (or "Checking…") in place rather than erroring
+      // out the whole page.
+    } finally {
+      setStatusChecking(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshStatuses();
+    const interval = setInterval(refreshStatuses, NAS_STATUS_REFRESH_MS);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openCreate() {
+    setEditing(null);
+    setForm(emptyNasForm);
+    setShowModal(true);
+  }
+
+  function openEdit(client: RadiusNasClient) {
+    setEditing(client);
+    setForm({
+      name: client.name,
+      ip_address: client.ip_address,
+      shortname: client.shortname,
+      secret: "",
+      realm: client.realm,
+      description: client.description,
+      is_active: client.is_active,
+    });
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      if (editing) {
+        await api.patch(`/radius-nas-clients/${editing.id}/`, form);
+      } else {
+        await api.post("/radius-nas-clients/", form);
+      }
+      setShowModal(false);
+      refetch();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete(client: RadiusNasClient) {
+    if (
+      !confirm(
+        `Delete the RADIUS client "${client.name}" (${client.ip_address})? FreeRADIUS will stop accepting ` +
+          "requests from this device until it's re-added and clients.conf is re-rendered. This can't be undone."
+      )
+    )
+      return;
+    try {
+      await api.delete(`/radius-nas-clients/${client.id}/`);
+      if (editing?.id === client.id) setShowModal(false);
+      refetch();
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || "Couldn't delete this RADIUS client.");
+    }
+  }
+
+  const [pushingClient, setPushingClient] = useState<RadiusNasClient | null>(null);
+  const [pushFreeradiusIp, setPushFreeradiusIp] = useState("");
+  const [pushSaving, setPushSaving] = useState(false);
+  const [pushResult, setPushResult] = useState<string | null>(null);
+  const [pushError, setPushError] = useState<string | null>(null);
+  // Stored default FreeRADIUS server IP (set in the admin-only panel at the
+  // bottom of this tab) -- pre-fills the push modal below so staff don't
+  // retype it on every push, while still leaving the field editable for a
+  // one-off/secondary server.
+  const [defaultFreeradiusIp, setDefaultFreeradiusIp] = useState("");
+
+  useEffect(() => {
+    // Admin-only endpoint -- non-admin staff can still
+    // use RADIUS Clients/push, they just won't get a pre-filled default,
+    // so a 403 here is expected and safely ignored rather than surfaced.
+    api
+      .get<OvpnSettingsConfig>("/ovpn-settings/")
+      .then((res) => setDefaultFreeradiusIp(res.data.freeradius_ip))
+      .catch(() => {});
+  }, []);
+
+  function openPush(client: RadiusNasClient) {
+    setPushingClient(client);
+    setPushFreeradiusIp(defaultFreeradiusIp);
+    setPushResult(null);
+    setPushError(null);
+  }
+
+  async function handlePushSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!pushingClient) return;
+    setPushSaving(true);
+    setPushError(null);
+    setPushResult(null);
+    try {
+      const res = await api.post<{ status: string; device: string }>(
+        `/radius-nas-clients/${pushingClient.id}/push-to-router/`,
+        { freeradius_ip: pushFreeradiusIp }
+      );
+      setPushResult(`Pushed successfully to ${res.data.device}.`);
+    } catch (err: any) {
+      setPushError(err?.response?.data?.detail ?? "Couldn't push config to the router.");
+    } finally {
+      setPushSaving(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="mb-3 rounded-md border border-[var(--border-hairline)] bg-[var(--tint-hover)] p-3 text-xs text-[var(--text-secondary)]">
+        Devices allowed to send RADIUS requests to this platform's FreeRADIUS server (the Mikrotik at Teraco JHB and
+        any others). Adding, editing or removing a client here applies to FreeRADIUS automatically within a few
+        seconds — the change is validated first, and rejected rather than applied if it would break authentication.
+        No SSH needed. The Status column is a live ping to each device's IP (auto-refreshed every 45s) — it confirms
+        the device is reachable on the network, not that FreeRADIUS or RADIUS auth itself is working.
+      </div>
+      <div className="mb-4 flex items-center justify-end gap-3">
+        <button
+          type="button"
+          className="text-sm text-[var(--series-1)] hover:underline disabled:opacity-50"
+          onClick={() => refreshStatuses()}
+          disabled={statusChecking}
+        >
+          {statusChecking ? "Checking status…" : "Refresh status"}
+        </button>
+        <ColumnToggle columns={NAS_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
+      </div>
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Name</TH>
+              {isVisible("status") && <TH>Status</TH>}
+              {isVisible("ip_address") && <TH>IP address</TH>}
+              {isVisible("shortname") && <TH>Shortname</TH>}
+              {isVisible("secret") && <TH>Secret</TH>}
+              {isVisible("realm") && <TH>Realm</TH>}
+              {isVisible("active") && <TH>Active</TH>}
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((c) => (
+              <TR key={c.id}>
+                <TD className="font-medium">{c.name}</TD>
+                {isVisible("status") && (
+                  <TD>
+                    {statusById[c.id] ? <StatusBadge status={statusById[c.id]} /> : <StatusBadge status="unknown" />}
+                  </TD>
+                )}
+                {isVisible("ip_address") && <TD>{c.ip_address}</TD>}
+                {isVisible("shortname") && <TD>{c.shortname}</TD>}
+                {isVisible("secret") && <TD>{c.secret_set ? "•••••••• (set)" : "Not set"}</TD>}
+                {isVisible("realm") && <TD>{c.realm || "—"}</TD>}
+                {isVisible("active") && <TD>{c.is_active ? "Yes" : "No"}</TD>}
+                <TD>
+                  <div className="flex items-center gap-3">
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openEdit(c)}>
+                      Edit
+                    </button>
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openPush(c)}>
+                      Push to router
+                    </button>
+                    <button
+                      className="text-red-600 hover:underline dark:text-red-400"
+                      onClick={() => handleDelete(c)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </TD>
+              </TR>
+            ))}
+            {items.length === 0 && (
+              <TR>
+                <TD className="text-[var(--text-muted)]">No RADIUS clients configured yet.</TD>
+              </TR>
+            )}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal title={editing ? "Edit RADIUS client" : "New RADIUS client"} onClose={() => setShowModal(false)}>
+          <form onSubmit={handleSubmit}>
+            <FormField label="Name">
+              <input
+                className={inputClass}
+                required
+                placeholder="Teraco JHB Mikrotik"
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </FormField>
+            <FormField label="IP address">
+              <input
+                className={inputClass}
+                required
+                placeholder="196.10.20.30"
+                value={form.ip_address}
+                onChange={(e) => setForm({ ...form, ip_address: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Shortname">
+              <input
+                className={inputClass}
+                required
+                placeholder="mikrotik-jhb"
+                value={form.shortname}
+                onChange={(e) => setForm({ ...form, shortname: e.target.value })}
+                autoComplete="off"
+                name="nas-shortname"
+              />
+            </FormField>
+            <FormField label={`Shared secret${editing?.secret_set ? " (set — leave blank to keep)" : ""}`}>
+              <input
+                type="password"
+                className={inputClass}
+                placeholder={editing?.secret_set ? "••••••••" : "Set a shared secret"}
+                value={form.secret}
+                onChange={(e) => setForm({ ...form, secret: e.target.value })}
+                autoComplete="new-password"
+                name="nas-secret"
+              />
+            </FormField>
+            <FormField label="Realm">
+              <input
+                className={inputClass}
+                placeholder="e.g. jhb (optional — reporting/segmentation tag only)"
+                value={form.realm}
+                onChange={(e) => setForm({ ...form, realm: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Description">
+              <input
+                className={inputClass}
+                value={form.description}
+                onChange={(e) => setForm({ ...form, description: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Active">
+              <select
+                className={inputClass}
+                value={form.is_active ? "yes" : "no"}
+                onChange={(e) => setForm({ ...form, is_active: e.target.value === "yes" })}
+              >
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </FormField>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
+              <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Save"}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {pushingClient && (
+        <Modal title={`Push RADIUS config to router — ${pushingClient.name}`} onClose={() => setPushingClient(null)}>
+          <form onSubmit={handlePushSubmit}>
+            <p className="mb-3 text-xs text-[var(--text-muted)]">
+              Pushes a <code className="font-mono">/radius</code> client entry (pointing at the FreeRADIUS server
+              below, using this NAS client's secret) and <code className="font-mono">/ppp aaa use-radius=yes</code>{" "}
+              directly to the router at {pushingClient.ip_address} via its Mikrotik API — only works if a router
+              under Routers has the API enabled with a matching IP address. This does not set up the OVPN server,
+              PPP profile, TLS certificate, or firewall — see deploy/radius/mikrotik_teraco_jhb.rsc for those.
+            </p>
+            <FormField label="FreeRADIUS server IP">
+              <input
+                className={inputClass}
+                required
+                placeholder="e.g. 154.65.111.61"
+                value={pushFreeradiusIp}
+                onChange={(e) => setPushFreeradiusIp(e.target.value)}
+              />
+            </FormField>
+            {pushResult && <p className="mb-3 text-sm text-green-700 dark:text-green-400">{pushResult}</p>}
+            {pushError && <p className="mb-3 text-sm text-red-700 dark:text-red-300">{pushError}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setPushingClient(null)}>Close</button>
+              <button type="submit" disabled={pushSaving} className={btnPrimary}>{pushSaving ? "Pushing…" : "Push"}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      <DefaultFreeradiusServerPanel />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Default FreeRADIUS server -- admin-only. Was its own "OVPN" tab; folded
+// into the bottom of RADIUS Clients since that's the only screen that uses
+// it (it pre-fills "Push to router"), and a whole tab for one IP field was
+// more navigation than the setting is worth.
+// ---------------------------------------------------------------------------
+
+const EMPTY_OVPN_SETTINGS_FORM = { freeradius_ip: "", notes: "" };
+
+function DefaultFreeradiusServerPanel() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [form, setForm] = useState(EMPTY_OVPN_SETTINGS_FORM);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  function load() {
+    setLoading(true);
+    api
+      .get<OvpnSettingsConfig>("/ovpn-settings/")
+      .then((r) => {
+        setForm({ freeradius_ip: r.data.freeradius_ip, notes: r.data.notes });
+        setLoading(false);
+      })
+      // Admin-only endpoint; a 403 for non-admin staff is expected. The
+      // panel isn't rendered for them anyway, but the fetch must not be
+      // left hanging on "Loading…" if roles change under it.
+      .catch(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    if (isAdmin) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSaved(false);
+    setSaving(true);
+    try {
+      await api.patch<OvpnSettingsConfig>("/ovpn-settings/", form);
+      setSaved(true);
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setError(typeof firstError === "string" ? firstError : "Could not save these settings — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!isAdmin) return null;
+
+  return (
+    <div className="mt-8 border-t border-[var(--border-hairline)] pt-5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="text-sm font-medium text-[var(--series-1)] hover:underline"
+      >
+        {open ? "Hide" : "Show"} default FreeRADIUS server
+      </button>
+
+      {!open ? null : loading ? (
+        <p className="mt-4 text-[var(--text-muted)]">Loading…</p>
+      ) : (
+      <>
+      <p className="mb-4 mt-4 max-w-2xl text-sm text-[var(--text-secondary)]">
+        The default FreeRADIUS server address that "Push to router" pre-fills, so staff don't have to type it by hand
+        every time. Individual NAS devices and their shared secrets are the client rows above — this is only the
+        default, and it stays editable per-push for a one-off or secondary server.
+      </p>
+
+      <form onSubmit={handleSubmit} className="max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5">
+        <FormField label="FreeRADIUS server IP">
+          <input
+            className={inputClass}
+            placeholder="e.g. 154.65.111.61"
+            value={form.freeradius_ip}
+            onChange={(e) => setForm({ ...form, freeradius_ip: e.target.value })}
+          />
+        </FormField>
+        <FormField label="Notes (staff-only, e.g. links or reminders)">
+          <textarea
+            className={inputClass}
+            rows={4}
+            value={form.notes}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })}
+          />
+        </FormField>
+
+        {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+        {saved && !error && <p className="mb-3 text-sm text-[#0ca30c]">Settings saved.</p>}
+
+        <div className="flex justify-end">
+          <button type="submit" disabled={saving} className={btnPrimary}>
+            {saving ? "Saving…" : "Save settings"}
+          </button>
+        </div>
+      </form>
+      </>
+      )}
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Activity log -- who did what, using which credentials.
+//
+// Read-only by construction, not by convention: there is no write endpoint
+// behind this screen at all. Pruning old rows is done on the server with
+// `prune_audit_log`, deliberately out of reach of a browser session belonging
+// to somebody the log might be about.
+// ---------------------------------------------------------------------------
+
+const ACTIVITY_KINDS: { key: string; label: string }[] = [
+  { key: "", label: "Everything" },
+  { key: "changes", label: "Changes" },
+  { key: "auth", label: "Sign-ins" },
+];
+
+function ActivityLogTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [count, setCount] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [kind, setKind] = useState("");
+  const [actor, setActor] = useState("");
+  const [search, setSearch] = useState("");
+  const [since, setSince] = useState("");
+  const [until, setUntil] = useState("");
+  const [page, setPage] = useState(1);
+  const { items: staff } = useApiList<User>("/staff-users/");
+
+  useEffect(() => {
+    onRegisterNewAction(null);
+  }, [onRegisterNewAction]);
+
+  // Any filter change puts you back on page 1. Staying on page 4 of a
+  // narrower result set shows an empty screen that reads as "nothing
+  // happened" rather than "you are past the end".
+  useEffect(() => {
+    setPage(1);
+  }, [kind, actor, search, since, until]);
+
+  useEffect(() => {
+    const params = new URLSearchParams({ page: String(page), page_size: "50" });
+    if (kind) params.set("kind", kind);
+    if (actor) params.set("actor", actor);
+    if (search) params.set("search", search);
+    if (since) params.set("since", since);
+    if (until) params.set("until", until);
+    setLoading(true);
+    api
+      .get<Paginated<AuditEvent>>(`/audit-events/?${params.toString()}`)
+      .then((res) => {
+        setEvents(res.data.results);
+        setCount(res.data.count);
+      })
+      .catch(() => setEvents([]))
+      .finally(() => setLoading(false));
+  }, [kind, actor, search, since, until, page]);
+
+  const pages = Math.max(1, Math.ceil(count / 50));
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-end gap-2">
+        <div className="flex gap-1 rounded-md bg-[var(--tint-subtle)] p-0.5">
+          {ACTIVITY_KINDS.map((k) => (
+            <button
+              key={k.key}
+              type="button"
+              onClick={() => setKind(k.key)}
+              className={`rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+                kind === k.key
+                  ? "bg-[var(--surface-1)] text-[var(--text-primary)] shadow-sm"
+                  : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              }`}
+            >
+              {k.label}
+            </button>
+          ))}
+        </div>
+
+        <select className={filterSelectClass} value={actor} onChange={(e) => setActor(e.target.value)}>
+          <option value="">Everyone</option>
+          {staff.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.first_name || s.last_name ? `${s.first_name} ${s.last_name}`.trim() : s.username}
+            </option>
+          ))}
+        </select>
+
+        <label className="flex items-center gap-1 text-xs text-[var(--text-muted)]">
+          From
+          <input type="date" className={filterSelectClass} value={since} onChange={(e) => setSince(e.target.value)} />
+        </label>
+        <label className="flex items-center gap-1 text-xs text-[var(--text-muted)]">
+          To
+          <input type="date" className={filterSelectClass} value={until} onChange={(e) => setUntil(e.target.value)} />
+        </label>
+
+        <input
+          className={inputClass}
+          style={{ maxWidth: 240 }}
+          placeholder="Search name or record…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </div>
+
+      <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]">
+        <ActivityList
+          events={events}
+          loading={loading}
+          emptyMessage={
+            since || until || actor || search || kind
+              ? "Nothing matches those filters."
+              : "Nothing recorded yet. Activity is logged from the moment this went live — anything done before that isn't here."
+          }
+        />
+      </div>
+
+      <div className="mt-3 flex items-center justify-between text-xs text-[var(--text-muted)]">
+        <span>
+          {count} event{count === 1 ? "" : "s"}
+        </span>
+        {pages > 1 && (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className={btnSecondary}
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              Previous
+            </button>
+            <span className="tabular-nums">
+              Page {page} of {pages}
+            </span>
+            <button
+              type="button"
+              className={btnSecondary}
+              disabled={page >= pages}
+              onClick={() => setPage((p) => Math.min(pages, p + 1))}
+            >
+              Next
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

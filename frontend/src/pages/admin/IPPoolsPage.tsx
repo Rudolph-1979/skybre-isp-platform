@@ -4,7 +4,7 @@ import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
-import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { IPPool, IPAddress } from "../../types";
@@ -105,7 +105,7 @@ export function IPPoolsPage() {
             <h2 className="text-sm font-semibold">Addresses in pool</h2>
             <div className="flex items-center gap-2">
               <select
-                className={`${inputClass} w-auto`}
+                className={filterSelectClass}
                 value={addressStatusFilter}
                 onChange={(e) => setAddressStatusFilter(e.target.value)}
               >

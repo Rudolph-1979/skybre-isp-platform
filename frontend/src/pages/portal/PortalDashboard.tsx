@@ -1,26 +1,29 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../api/client";
-import { useAuth } from "../../context/AuthContext";
+import { useViewAs } from "../../context/ViewAsContext";
 import { StatCard } from "../../components/StatCard";
 import { StatusBadge } from "../../components/StatusBadge";
 import { PageHeader } from "../../components/PageHeader";
+import { UsagePanel } from "../../components/UsagePanel";
 import type { Customer, Service, Invoice } from "../../types";
 
 export function PortalDashboard() {
-  const { user } = useAuth();
+  // The signed-in customer normally, or the customer a staff member is
+  // viewing the portal as (see ViewAsContext).
+  const { effectiveCustomerId: customerId } = useViewAs();
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [services, setServices] = useState<Service[]>([]);
   const [latestInvoice, setLatestInvoice] = useState<Invoice | null>(null);
 
   useEffect(() => {
-    if (!user?.customer_id) return;
-    api.get<Customer>(`/customers/${user.customer_id}/`).then((res) => setCustomer(res.data));
-    api.get<{ results: Service[] }>(`/services/?customer=${user.customer_id}`).then((res) => setServices(res.data.results));
+    if (!customerId) return;
+    api.get<Customer>(`/customers/${customerId}/`).then((res) => setCustomer(res.data));
+    api.get<{ results: Service[] }>(`/services/?customer=${customerId}`).then((res) => setServices(res.data.results));
     api
-      .get<{ results: Invoice[] }>(`/invoices/?customer=${user.customer_id}&ordering=-date_created&page_size=1`)
+      .get<{ results: Invoice[] }>(`/invoices/?customer=${customerId}&ordering=-date_created&page_size=1`)
       .then((res) => setLatestInvoice(res.data.results[0] ?? null));
-  }, [user]);
+  }, [customerId]);
 
   if (!customer) return <p className="text-[var(--text-muted)]">Loading…</p>;
 
@@ -28,11 +31,15 @@ export function PortalDashboard() {
     <div>
       <PageHeader title={`Welcome back, ${customer.full_name.split(" ")[0]}`} subtitle={`Account ${customer.customer_id}`} />
 
-      <div className="mb-6 grid grid-cols-3 gap-4">
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
         <StatCard label="Account status" value={customer.status} accent={customer.status === "active" ? "status-good" : "status-warning"} />
         <StatCard label="Balance owed" value={`R ${parseFloat(customer.balance).toFixed(2)}`} accent={parseFloat(customer.balance) > 0 ? "status-warning" : "status-good"} />
         <StatCard label="Active services" value={services.filter((s) => s.status === "active").length} />
       </div>
+
+      {/* Usage sits above services: "how much have I used / how fast am
+          I going" is the most common reason a customer opens this. */}
+      {customerId != null && <UsagePanel customerId={customerId} />}
 
       <h2 className="mb-2 text-sm font-semibold">Your services</h2>
       <div className="mb-6 space-y-2">

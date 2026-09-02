@@ -1,54 +1,272 @@
-{% extends "notifications/_pdf_base.html" %}
-{% block content %}
-  <div class="doc-title">Invoice {{ invoice.number }}</div>
+{% comment %}
+Tax invoice / quote / pro forma.
 
-  <table class="meta-table">
-    <tr><td class="meta-label">Invoice date</td><td>{{ invoice.date_created }}</td></tr>
-    <tr><td class="meta-label">Due date</td><td>{{ invoice.date_due }}</td></tr>
-    <tr><td class="meta-label">Status</td><td>{{ invoice.get_status_display }}</td></tr>
-  </table>
+Every measurement here was taken from a reference PDF with a geometry probe
+(page size, margins, column widths, rule positions, font sizes, alignments)
+rather than estimated by eye. Notes on the values that look arbitrary but
+aren't:
 
-  <div class="addr-block">
-    <div class="addr-label">Bill to</div>
-    <div>{{ customer.full_name }}</div>
-    {% if customer.company_name %}<div>{{ customer.company_name }}</div>{% endif %}
-    <div>{{ customer.address }}</div>
-    <div>{{ customer.city }} {{ customer.zip_code }}</div>
-    <div>{{ customer.email }}</div>
-  </div>
+  * Page is 592.44 x 792.28pt -- NOT A4. The reference used that size, and
+    changing it shifts every column.
+  * Side margins are 15.4pt, making the content exactly 561.6pt wide. Both
+    tables are that width, so the column percentages below map to whole
+    points.
+  * Rules are #dfdfdf at 0.75pt, horizontal only. There is no vertical rule
+    (an early look at the reference suggested one; its vector layer has none).
+  * DejaVu Sans Condensed throughout -- a narrow face, so substituting
+    Helvetica visibly changes every column's fit. fonts-dejavu-extra is
+    installed in the backend image for exactly this reason.
+  * Column alignments are deliberately not uniform: # and Description left,
+    Qty / prices / tax / excl-total centred, Incl. total right-aligned + bold.
 
-  <table class="items">
+xhtml2pdf supports a subset of CSS 2.1 -- no flexbox, no grid -- so layout is
+tables throughout, which is also what keeps it stable across page breaks.
+{% endcomment %}<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page {
+    size: 592.44pt 792.28pt;
+    margin: 14pt 15.4pt 26pt 15.4pt;
+    @frame footer {
+      -pdf-frame-content: pageFooter;
+      left: 15.4pt; width: 561.6pt;
+      /* xhtml2pdf only draws a static frame whose top edge reaches the
+         content area, i.e. bottom + height must be >= the 26pt bottom
+         margin. A shorter frame silently renders nothing. */
+      bottom: 0pt; height: 26pt;
+    }
+  }
+
+  /* Referenced by absolute path and resolved by
+     notifications.pdf._link_callback. The stack falls back to plain DejaVu
+     Sans then Helvetica, so a missing font degrades instead of failing. */
+  @font-face { font-family: "DJVC"; src: url("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"); }
+  @font-face { font-family: "DJVC"; src: url("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf"); font-weight: bold; }
+  @font-face { font-family: "DJVC"; src: url("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Oblique.ttf"); font-style: italic; }
+
+  /* xhtml2pdf gives div/p a default margin, which loosened every address
+     line by several points and pushed the document onto a second page.
+     Zeroed, then spacing is controlled only by explicit line-height --
+     measured at 14.7pt between baselines in the reference.
+
+     IMPORTANT, and the reason the padding numbers below look wrong: on a
+     TABLE CELL xhtml2pdf applies the padding twice -- once to the cell frame
+     and again to the paragraph inside it -- so a declared 2.8pt renders as
+     5.6pt. Padding on a plain div is applied once, normally. Every td/th
+     padding here is therefore HALF the measured value; every div padding is
+     the measured value. Verified by measuring rule positions in the output.
+
+     Padding is also asymmetric top/bottom on purpose. In the reference the
+     cell text is vertically centred, which puts the ink well below the top
+     of the cell; xhtml2pdf instead starts the ink at the top of the content
+     box. Rather than fight that, the top padding carries the offset and the
+     bottom padding takes what is left, so the row keeps its measured height
+     AND the text lands on the reference's baselines. */
+  body { font-family: "DJVC", "DejaVu Sans", Helvetica, sans-serif;
+         font-size: 10.5pt; color: #212121; }
+  div, p, table { margin: 0; padding: 0; }
+
+  .doc-title  { font-size: 19.5pt; font-weight: bold; color: #212121; line-height: 21pt; padding-top: 7.7pt; }
+  .meta td    { font-size: 10.5pt; color: #000000; line-height: 14.7pt; padding: 0; }
+  .meta .v    { text-align: right; }
+  .meta .due-l, .meta .due-v { font-weight: bold; padding-top: 5.5pt; }  /* renders 11pt */
+  .meta .v    { text-align: right; }
+
+  .party-name { font-size: 12pt; font-weight: bold; color: #212121; line-height: 17.7pt; }
+  .co-line    { font-size: 10.5pt; color: #212121; line-height: 14.7pt; }
+  .cu-line    { font-size: 10.5pt; color: #000000; line-height: 14.7pt; }
+  .bank-line  { font-size: 10.5pt; color: #212121; font-weight: bold; line-height: 14.7pt; }
+  .reference  { font-size: 13.5pt; font-weight: bold; color: #ff0000; line-height: 24pt; }
+  .logo-cell  { padding-top: 1.2pt; }  /* renders 2.4pt */
+
+  table.items { width: 561.6pt; border-collapse: collapse; table-layout: fixed; }
+  /* Header band: 22.4pt tall (reference rules at y 323.4 and 345.8) with
+     the label ink 7.08pt below the top rule. 12 + 7.08 + 3.32 = 22.4. */
+  table.items th, table.rel th {
+    font-size: 10.5pt; font-weight: bold; color: #000000; line-height: 12pt;
+    border-top: 0.75pt solid #dfdfdf; border-bottom: 0.75pt solid #dfdfdf;
+    padding: 3.54pt 2.8pt 1.66pt 2.8pt;
+  }
+  /* Item rows: 38.5pt (rules 345.8 / 384.3 / 422.9), two lines of 9pt text
+     14.4pt apart -- description, then its service period.
+     28.8 + 8.67 + 1.03 = 38.5. */
+  table.items td {
+    font-size: 9pt; color: #000000; line-height: 14.4pt;
+    border-bottom: 0.75pt solid #dfdfdf;
+    padding: 4.335pt 2.8pt 0.515pt 2.8pt;
+  }
+  /* Related items: one line per row, 27pt tall (rules 628.0 / 655.0 /
+     682.0), so 14.4 + 9.91 + 2.69. A separate class rather than a second
+     class on the same element -- xhtml2pdf matches only one class per
+     element, so `class="items rel"` silently ignored the overrides. */
+  table.rel    { width: 561.6pt; border-collapse: collapse; table-layout: fixed; }
+  table.rel td {
+    font-size: 9pt; color: #000000; line-height: 14.4pt;
+    border-bottom: 0.75pt solid #dfdfdf;
+    padding: 4.955pt 2.8pt 1.345pt 2.8pt;
+  }
+  .l { text-align: left; }
+  .c { text-align: center; }
+  .r { text-align: right; }
+  .desc { font-style: italic; }
+  .incl { font-weight: bold; text-align: right; }
+
+  table.tot    { width: 218.1pt; }
+  table.tot td { font-size: 10.5pt; color: #000000; line-height: 19.5pt; padding: 0; }
+  table.tot .v { text-align: right; font-weight: bold; }
+  table.tot .due-l, table.tot .due-v { font-weight: bold; padding-top: 4.2pt; }  /* renders 8.4pt */
+
+  .related-h  { font-size: 9.1pt; font-weight: bold; color: #000000; text-align: center; line-height: 11pt; }
+  /* padding-right is 7.1pt (the reference's right edge) less the width of
+     the trailing nbsp that has to be there -- see the footer div below. */
+  .pageno     { font-size: 9pt; font-weight: bold; text-align: right; color: #000000;
+                padding-right: 2.04pt; padding-top: 3pt; }
+  .note       { font-size: 8.5pt; color: #7a5c12; font-style: italic; }
+</style>
+</head>
+<body>
+
+{# <pdf:pagenumber> must be self-closed, AND the paragraph needs at least one #}
+{# literal character or xhtml2pdf discards the whole footer frame -- hence the #}
+{# trailing nbsp, which padding-right above compensates for. #}
+<div id="pageFooter"><div class="pageno"><pdf:pagenumber />&nbsp;</div></div>
+
+{# ---------- header: logo left, document block right ---------- #}
+<table style="width:561.6pt; border-collapse:collapse;">
+  <tr>
+    <td class="logo-cell" style="width:378.6pt; vertical-align:top;">
+      {% if logo_path %}
+        <img src="{{ logo_path }}" style="width:84.7pt; height:60pt;">
+      {% else %}
+        <div style="font-size:17pt; font-weight:bold; color:#212121;">{{ company.name }}</div>
+      {% endif %}
+    </td>
+    <td style="width:183pt; vertical-align:top; padding:0;">
+      <div class="doc-title">{{ doc_title }}</div>
+      <table class="meta" style="width:181.3pt; margin-top:3.7pt;">
+        <tr><td>Number:</td><td class="v">{{ invoice.number }}</td></tr>
+        <tr><td>Date:</td><td class="v">{{ invoice.date_created|date:"d/m/Y" }}</td></tr>
+        <tr><td>{{ due_label }}:</td><td class="v">{{ invoice.date_due|date:"d/m/Y" }}</td></tr>
+        <tr>
+          <td class="due-l">Total due:</td>
+          <td class="due-v v">R{{ balance_due|floatformat:2 }}</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+
+{% if invoice.status == "proforma" %}
+  <p class="note">This is a pro forma invoice — not a tax invoice or a demand for payment.</p>
+{% endif %}
+
+{# ---------- parties: us left, customer right ---------- #}
+<table style="width:561.6pt; border-collapse:collapse; margin-top:3.9pt;">
+  <tr>
+    <td style="width:378.6pt; vertical-align:top; padding:0;">
+      <div class="party-name">{{ company.name }}</div>
+      {% if company.address %}<div class="co-line">{{ company.address }}</div>{% endif %}
+      {% if company.city %}<div class="co-line">{{ company.city }}</div>{% endif %}
+      {% if company.postal_line %}<div class="co-line">{{ company.postal_line }}</div>{% endif %}
+      {% if company.vat_number %}<div class="co-line">VAT number: {{ company.vat_number }}</div>{% endif %}
+      {% if company.phone %}<div class="co-line">Phone: {{ company.phone }}</div>{% endif %}
+      {% if company.email %}<div class="co-line">Email: {{ company.email }}</div>{% endif %}
+
+      {% if company.bank_account_number %}
+        <div class="bank-line" style="padding-top:8.5pt;">Account number: {{ company.bank_account_number }}</div>
+      {% endif %}
+      {% if company.bank_name %}<div class="bank-line">Bank: {{ company.bank_name }}</div>{% endif %}
+      {% if company.bank_branch_code %}<div class="bank-line">Branch: {{ company.bank_branch_code }}</div>{% endif %}
+    </td>
+    <td style="width:183pt; vertical-align:top; padding:0;">
+      <div class="party-name">{{ customer_display_name }}</div>
+      {% if customer.address %}<div class="cu-line">{{ customer.address }}</div>{% endif %}
+      {% if customer.city %}<div class="cu-line">{{ customer.city }}</div>{% endif %}
+      {% if customer.zip_code %}<div class="cu-line">{{ customer.zip_code }}</div>{% endif %}
+      <div class="cu-line">ID:{% if customer.id_number %} {{ customer.id_number }}{% endif %}</div>
+      <div class="cu-line">VAT ID:{% if customer.vat_number %} {{ customer.vat_number }}{% endif %}</div>
+      {% if customer.customer_id %}
+        <div class="reference">Reference #: {{ customer.customer_id }}</div>
+      {% endif %}
+    </td>
+  </tr>
+</table>
+
+{# ---------- line items ---------- #}
+<table class="items" style="margin-top:44.9pt;">
+  <thead>
+    <tr>
+      <th class="l" width="19.9pt" style="width:19.9pt;">#</th>
+      <th class="l" width="205pt" style="width:205pt;">Description</th>
+      <th class="c" width="67.5pt" style="width:67.5pt;">Qty</th>
+      <th class="c" width="67.5pt" style="width:67.5pt;">Excl. price</th>
+      <th class="c" width="67.5pt" style="width:67.5pt;">Tax %</th>
+      <th class="c" width="67.5pt" style="width:67.5pt;">Excl. total</th>
+      <th class="r" width="66.7pt" style="width:66.7pt;">Incl. total</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td class="l" style="vertical-align:top;">{{ forloop.counter }}</td>
+      <td class="l" style="vertical-align:top;">
+        <span class="desc">{{ row.item.description }}</span>
+        {% if row.period %}<br><span class="desc">({{ row.period }})</span>{% endif %}
+      </td>
+      <td class="c">{{ row.item.quantity|floatformat }}</td>
+      <td class="c">R{{ row.excl_price|floatformat:2 }}</td>
+      <td class="c">{{ row.item.tax_rate_pct|floatformat:2 }}</td>
+      <td class="c">R{{ row.excl_total|floatformat:2 }}</td>
+      <td class="incl">R{{ row.incl_total|floatformat:2 }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{# ---------- totals ---------- #}
+<table style="width:561.6pt; border-collapse:collapse; table-layout:fixed; margin-top:22pt;">
+  <tr>
+    <td width="330.9pt" style="width:330.9pt; padding:0;"></td>
+    <td width="218.1pt" style="width:218.1pt; padding:0; vertical-align:top;">
+      <table class="tot">
+        <tr><td>Total exclusive:</td><td class="v">R{{ total_exclusive|floatformat:2 }}</td></tr>
+        <tr><td>Total tax:</td><td class="v">R{{ total_tax|floatformat:2 }}</td></tr>
+        <tr><td>Total:</td><td class="v">R{{ invoice.total|floatformat:2 }}</td></tr>
+        <tr>
+          <td class="due-l">Total due:</td>
+          <td class="due-v v">R{{ balance_due|floatformat:2 }}</td>
+        </tr>
+      </table>
+    </td>
+    <td width="12.6pt" style="width:12.6pt; padding:0;"></td>
+  </tr>
+</table>
+
+{# ---------- related items: payments applied to this invoice ---------- #}
+{% if related %}
+  <div class="related-h" style="margin-top:49.3pt;">Related items</div>
+  <table class="rel" style="margin-top:12.05pt;">
     <thead>
       <tr>
-        <th>Description</th>
-        <th class="num">Qty</th>
-        <th class="num">Unit price</th>
-        <th class="num">Tax %</th>
-        <th class="num">Total</th>
+        <th class="l" width="47.8pt" style="width:47.8pt;">Type</th>
+        <th class="l" width="379.6pt" style="width:379.6pt;">Description</th>
+        <th class="c" width="67.5pt" style="width:67.5pt;">Date</th>
+        <th class="c" width="66.7pt" style="width:66.7pt;">Amount</th>
       </tr>
     </thead>
     <tbody>
-      {% for item in items %}
+      {% for r in related %}
       <tr>
-        <td>{{ item.description }}</td>
-        <td class="num">{{ item.quantity }}</td>
-        <td class="num">R {{ item.unit_price }}</td>
-        <td class="num">{{ item.tax_rate_pct }}%</td>
-        <td class="num">R {{ item.total|floatformat:2 }}</td>
+        <td class="l">{{ r.type }}</td>
+        <td class="l"><span class="desc">{{ r.description }}</span></td>
+        <td class="c">{{ r.date|date:"Y-m-d" }}</td>
+        <td class="c">R{{ r.amount|floatformat:2 }}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+{% endif %}
 
-  <table class="totals-table">
-    <tr><td>Subtotal</td><td class="num">R {{ invoice.subtotal }}</td></tr>
-    <tr><td>Tax</td><td class="num">R {{ invoice.tax_total }}</td></tr>
-    <tr class="grand"><td>Total</td><td class="num">R {{ invoice.total }}</td></tr>
-    <tr><td>Paid</td><td class="num">R {{ invoice.paid_amount }}</td></tr>
-    <tr><td class="balance-due">Balance due</td><td class="num balance-due">R {{ balance_due }}</td></tr>
-  </table>
-
-  {% if invoice.note %}
-    <p><strong>Note:</strong> {{ invoice.note }}</p>
-  {% endif %}
-{% endblock %}
+</body>
+</html>

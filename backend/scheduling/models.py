@@ -38,7 +38,7 @@ class Job(models.Model):
         null=True,
         blank=True,
         related_name="scheduled_jobs",
-        limit_choices_to={"role__in": ["admin", "staff", "technician"]},
+        limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
     )
     job_type = models.CharField(max_length=20, choices=JobType.choices, default=JobType.SITE_VISIT)
     title = models.CharField(max_length=255)
@@ -72,7 +72,7 @@ class Shift(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="shifts",
-        limit_choices_to={"role__in": ["admin", "staff", "technician"]},
+        limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
     )
     start = models.DateTimeField()
     end = models.DateTimeField()

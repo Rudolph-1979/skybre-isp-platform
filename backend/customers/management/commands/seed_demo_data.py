@@ -53,9 +53,11 @@ class Command(BaseCommand):
 
         staff_members = []
         for uname, first, role in [
-            ("jsupport", "Jordan", User.Role.STAFF),
-            ("nbilling", "Naledi", User.Role.STAFF),
+            ("jsupport", "Jordan", User.Role.SUPPORT),
+            ("nbilling", "Naledi", User.Role.ACCOUNTS),
             ("ttech", "Thabo", User.Role.TECHNICIAN),
+            ("ssales", "Sipho", User.Role.SALES),
+            ("mmanage", "Mpho", User.Role.MANAGEMENT),
         ]:
             u, _ = User.objects.get_or_create(
                 username=uname, defaults={"email": f"{uname}@isp.local", "role": role, "is_staff": True,
@@ -81,7 +83,7 @@ class Command(BaseCommand):
                 defaults=dict(
                     service_type=Tariff.ServiceType.VOICE if "Voice" in name else Tariff.ServiceType.INTERNET,
                     price=price, billing_period=Tariff.BillingPeriod.MONTHLY,
-                    speed_download_mbps=down or None, speed_upload_mbps=up or None,
+                    speed_download_kbps=down or None, speed_upload_kbps=up or None,
                     data_cap_gb=cap, tax_rate_pct=15, is_active=True,
                     description=f"{name} package.",
                 ),
@@ -221,6 +223,7 @@ class Command(BaseCommand):
             f"{Invoice.objects.count()} invoices, {Payment.objects.count()} payments, {Ticket.objects.count()} tickets."
         ))
         self.stdout.write(self.style.SUCCESS(
-            "Login as staff: admin/admin12345, jsupport/staff12345, nbilling/staff12345, ttech/staff12345"
+            "Login as staff: admin/admin12345, jsupport/staff12345, nbilling/staff12345, ttech/staff12345, "
+            "ssales/staff12345, mmanage/staff12345"
         ))
         self.stdout.write(self.style.SUCCESS("Customer portal logins: cust000..cust0XX / customer12345"))

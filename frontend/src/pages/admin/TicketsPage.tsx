@@ -1,11 +1,12 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { SearchableSelect } from "../../components/SearchableSelect";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
-import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Ticket, Customer } from "../../types";
@@ -22,7 +23,12 @@ const COLUMNS: ColumnDef[] = [
 
 export function TicketsPage() {
   const navigate = useNavigate();
-  const [statusFilter, setStatusFilter] = useState("");
+  // Seeded from the URL so a dashboard tile can land you on a filtered view
+  // rather than the unfiltered page, leaving you to re-apply the filter you
+  // just clicked. Lazy initialiser: read once on mount, then it's ordinary
+  // state the user is free to change.
+  const [searchParams] = useSearchParams();
+  const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") ?? "");
   const [priorityFilter, setPriorityFilter] = useState("");
   const [departmentFilter, setDepartmentFilter] = useState("");
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("tickets", ["ticket"]);
@@ -37,7 +43,7 @@ export function TicketsPage() {
   const [form, setForm] = useState({ customer: "", subject: "", description: "", department: "support", priority: "medium" });
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=200").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
   }, []);
 
   async function handleSubmit(e: FormEvent) {
@@ -61,21 +67,21 @@ export function TicketsPage() {
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <select className={`${inputClass} w-auto`} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+        <select className={filterSelectClass} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           <option value="">All statuses</option>
           <option value="open">Open</option>
           <option value="pending">Pending</option>
           <option value="resolved">Resolved</option>
           <option value="closed">Closed</option>
         </select>
-        <select className={`${inputClass} w-auto`} value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
+        <select className={filterSelectClass} value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
           <option value="">All priorities</option>
           <option value="low">Low</option>
           <option value="medium">Medium</option>
           <option value="high">High</option>
           <option value="urgent">Urgent</option>
         </select>
-        <select className={`${inputClass} w-auto`} value={departmentFilter} onChange={(e) => setDepartmentFilter(e.target.value)}>
+        <select className={filterSelectClass} value={departmentFilter} onChange={(e) => setDepartmentFilter(e.target.value)}>
           <option value="">All departments</option>
           <option value="support">Technical Support</option>
           <option value="billing">Billing</option>
@@ -135,12 +141,19 @@ export function TicketsPage() {
         <Modal title="New ticket" onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
             <FormField label="Customer">
-              <select className={inputClass} required value={form.customer} onChange={(e) => setForm({ ...form, customer: e.target.value })}>
-                <option value="">Select customer…</option>
-                {customers.map((c) => (
-                  <option key={c.id} value={c.id}>{c.full_name} ({c.customer_id})</option>
-                ))}
-              </select>
+<SearchableSelect
+                options={customers.map((c) => ({
+                  value: String(c.id),
+                  label: c.full_name,
+                  meta: c.customer_id,
+                  searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
+                }))}
+                value={form.customer}
+                onChange={(v) => setForm({ ...form, customer: v })}
+                placeholder="Select customer…"
+                hint="Search by name or payment reference."
+                required
+              />
             </FormField>
             <FormField label="Subject">
               <input className={inputClass} required value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} />

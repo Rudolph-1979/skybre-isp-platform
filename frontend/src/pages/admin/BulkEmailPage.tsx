@@ -4,13 +4,15 @@ import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
-import { inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import type { Customer, EmailTemplateKey, EmailLog } from "../../types";
 
 const PAGE_SIZE = 50;
 
-// "invoice" is deliberately excluded — it's tied to one specific invoice,
-// which doesn't make sense picked once across many different customers.
+// "invoice", "quote", "proforma", and "payment_received" are deliberately
+// excluded from the Send tab's own dropdown — each is tied to one specific
+// document/payment, which doesn't make sense picked once across many
+// different customers.
 const TEMPLATE_OPTIONS: { key: EmailTemplateKey; label: string }[] = [
   { key: "welcome", label: "Welcome message" },
   { key: "statement", label: "Statement" },
@@ -18,7 +20,62 @@ const TEMPLATE_OPTIONS: { key: EmailTemplateKey; label: string }[] = [
   { key: "suspension", label: "Suspension notification" },
 ];
 
+// The full set, for the Sent Email tab's filter -- that log includes every
+// kind of email sent platform-wide (bulk sends and individual document
+// sends alike), not just the bulk-eligible ones above.
+const ALL_TEMPLATE_LABELS: Record<EmailTemplateKey, string> = {
+  welcome: "Welcome message",
+  quote: "Quote",
+  proforma: "Pro forma invoice",
+  statement: "Statement",
+  invoice: "Invoice",
+  payment_reminder: "Payment reminder",
+  suspension: "Suspension notification",
+  payment_received: "Payment received",
+};
+
+type Tab = "send" | "sent-email";
+
 export function BulkEmailPage() {
+  const [tab, setTab] = useState<Tab>("send");
+
+  const TABS: { key: Tab; label: string }[] = [
+    { key: "send", label: "Send" },
+    { key: "sent-email", label: "Sent Email" },
+  ];
+
+  return (
+    <div>
+      <PageHeader
+        title="Email"
+        subtitle="Send templated emails to customers and review everything that's gone out."
+      />
+      <div className="mb-4 flex gap-1 border-b border-[var(--border-hairline)]">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => setTab(t.key)}
+            className={`px-4 py-2 text-sm font-medium ${
+              tab === t.key
+                ? "border-b-2 border-[var(--series-1)] text-[var(--text-primary)]"
+                : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === "send" && <SendTab />}
+      {tab === "sent-email" && <SentEmailTab />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Send (bulk send to filtered/selected customers)
+// ---------------------------------------------------------------------------
+
+function SendTab() {
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -135,11 +192,6 @@ export function BulkEmailPage() {
 
   return (
     <div>
-      <PageHeader
-        title="Bulk Email"
-        subtitle="Send a templated email to many customers at once — filter the list, select recipients, then send."
-      />
-
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <input
           className={`${inputClass} max-w-xs`}
@@ -147,19 +199,19 @@ export function BulkEmailPage() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-        <select className={`${inputClass} w-auto`} value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}>
+        <select className={filterSelectClass} value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}>
           <option value="">All statuses</option>
           <option value="new">New</option>
           <option value="active">Active</option>
           <option value="suspended">Suspended</option>
           <option value="inactive">Inactive</option>
         </select>
-        <select className={`${inputClass} w-auto`} value={categoryFilter} onChange={(e) => { setCategoryFilter(e.target.value); setPage(1); }}>
+        <select className={filterSelectClass} value={categoryFilter} onChange={(e) => { setCategoryFilter(e.target.value); setPage(1); }}>
           <option value="">All categories</option>
           <option value="residential">Residential</option>
           <option value="business">Business</option>
         </select>
-        <select className={`${inputClass} w-auto`} value={typeFilter} onChange={(e) => { setTypeFilter(e.target.value); setPage(1); }}>
+        <select className={filterSelectClass} value={typeFilter} onChange={(e) => { setTypeFilter(e.target.value); setPage(1); }}>
           <option value="">All types</option>
           <option value="individual">Individual</option>
           <option value="company">Company</option>
@@ -315,6 +367,123 @@ export function BulkEmailPage() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sent Email (platform-wide log of every email ever sent -- bulk sends and
+// individual document sends alike). Restores the "Sent Email" view that
+// used to live in the old Email dropdown before Bulk Email and Email
+// Templates were split out.
+// ---------------------------------------------------------------------------
+
+const LOG_PAGE_SIZE = 50;
+
+function SentEmailTab() {
+  const [page, setPage] = useState(1);
+  const [templateFilter, setTemplateFilter] = useState<EmailTemplateKey | "">("");
+  const [statusFilter, setStatusFilter] = useState("");
+
+  const filterQuery = `${templateFilter ? `&template_key=${templateFilter}` : ""}${
+    statusFilter ? `&status=${statusFilter}` : ""
+  }`;
+  const url = `/email-logs/?page_size=${LOG_PAGE_SIZE}&page=${page}${filterQuery}`;
+  const { items, count, loading } = useApiList<EmailLog>(url);
+
+  const totalPages = Math.max(1, Math.ceil(count / LOG_PAGE_SIZE));
+
+  function formatDate(iso: string) {
+    return new Date(iso).toLocaleString("en-ZA", { dateStyle: "medium", timeStyle: "short" });
+  }
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <select
+          className={filterSelectClass}
+          value={templateFilter}
+          onChange={(e) => { setTemplateFilter(e.target.value as EmailTemplateKey | ""); setPage(1); }}
+        >
+          <option value="">All templates</option>
+          {Object.entries(ALL_TEMPLATE_LABELS).map(([key, label]) => (
+            <option key={key} value={key}>{label}</option>
+          ))}
+        </select>
+        <select className={filterSelectClass} value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}>
+          <option value="">All statuses</option>
+          <option value="sent">Sent</option>
+          <option value="failed">Failed</option>
+        </select>
+        {(templateFilter || statusFilter) && (
+          <button
+            type="button"
+            className={btnSecondary}
+            onClick={() => { setTemplateFilter(""); setStatusFilter(""); setPage(1); }}
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <>
+          <Table>
+            <THead>
+              <tr>
+                <TH>Recipient</TH>
+                <TH>Template</TH>
+                <TH>Subject</TH>
+                <TH>Status</TH>
+                <TH>Sent by</TH>
+                <TH>Date</TH>
+              </tr>
+            </THead>
+            <tbody>
+              {items.map((log) => (
+                <TR key={log.id}>
+                  <TD>
+                    <div className="font-medium">{log.customer_name ?? log.recipient_email}</div>
+                    {log.customer_name && <div className="text-xs text-[var(--text-muted)]">{log.recipient_email}</div>}
+                  </TD>
+                  <TD>{log.template_name}</TD>
+                  <TD className="max-w-xs truncate text-[var(--text-secondary)]">{log.subject || "—"}</TD>
+                  <TD>
+                    <StatusBadge status={log.status} />
+                    {log.status === "failed" && log.error_message && (
+                      <div className="mt-1 max-w-xs text-xs text-[var(--text-muted)]">{log.error_message}</div>
+                    )}
+                  </TD>
+                  <TD>{log.sent_by_name ?? "—"}</TD>
+                  <TD className="whitespace-nowrap text-[var(--text-secondary)]">{formatDate(log.created_at)}</TD>
+                </TR>
+              ))}
+              {items.length === 0 && (
+                <TR>
+                  <TD className="text-[var(--text-muted)]">No emails sent yet.</TD>
+                </TR>
+              )}
+            </tbody>
+          </Table>
+
+          <div className="mt-3 flex items-center justify-between text-sm text-[var(--text-muted)]">
+            <span>
+              Showing {items.length === 0 ? 0 : (page - 1) * LOG_PAGE_SIZE + 1}–{(page - 1) * LOG_PAGE_SIZE + items.length} of {count}
+            </span>
+            <div className="flex gap-2">
+              <button type="button" className={btnSecondary} disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
+                Previous
+              </button>
+              <span className="px-2 py-2">Page {page} of {totalPages}</span>
+              <button type="button" className={btnSecondary} disabled={page >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>
+                Next
+              </button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

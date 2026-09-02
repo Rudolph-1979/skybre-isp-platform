@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { SearchableSelect } from "../../components/SearchableSelect";
 import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
@@ -12,11 +13,14 @@ import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type {
   Invoice, Customer, Product, Tariff, InvoiceItemType, Payment, CreditRequest, InvoiceDeletionRequest,
   Partner, RecurringBillingCounts, RecurringBillingRun, SuspensionSettingsConfig,
-  BankAccount, BankTransaction, BankTransactionStatus, BankFeedSyncLog,
-  BankStatementImportPreview, BankStatementImportResult,
 } from "../../types";
 
-type Tab = "invoices" | "payments" | "credits" | "recurring-billing" | "bank-feeds";
+// Bank Feeds moved to the Accountant page (2026-08-19) -- see
+// AccountantPage.tsx's BankFeedsTab and friends. Confirming a bank
+// transaction there now creates either a Payment (credit) or an Expense
+// (debit), both of which feed the VAT Returns report, so it made more
+// sense to live alongside VAT Returns/Expenses than here.
+type Tab = "invoices" | "payments" | "credits" | "recurring-billing";
 
 // Unlike the single-button NewAction used elsewhere (Networking, Staff),
 // Invoices needs to register two buttons at once ("+ New quote" and
@@ -27,18 +31,25 @@ type NewAction = ActionButton[] | null;
 
 export function FinancePage() {
   const { user } = useAuth();
-  const [tab, setTab] = useState<Tab>("invoices");
+  // Seeded from the URL so a dashboard tile lands on the right tab with the
+  // right filter already applied, instead of dropping you on Invoices/All and
+  // leaving you to redo the click you just made.
+  const [searchParams] = useSearchParams();
+  const [tab, setTab] = useState<Tab>(() => {
+    const wanted = searchParams.get("tab");
+    return (["invoices", "payments", "credits", "recurring-billing"] as Tab[]).includes(wanted as Tab)
+      ? (wanted as Tab)
+      : "invoices";
+  });
   const [newAction, setNewAction] = useState<NewAction>(null);
 
   const canSeeCredits = user?.role === "admin" || user?.role === "accounts" || user?.role === "management";
-  const isAdmin = user?.role === "admin";
 
   const TABS: { key: Tab; label: string }[] = [
     { key: "invoices", label: "Invoices" },
     { key: "payments", label: "Payments" },
     ...(canSeeCredits ? [{ key: "credits" as Tab, label: "Credits" }] : []),
     { key: "recurring-billing", label: "Recurring Billing" },
-    { key: "bank-feeds", label: "Bank Feeds" },
   ];
 
   return (
@@ -77,7 +88,6 @@ export function FinancePage() {
       {tab === "payments" && <PaymentsTab onRegisterNewAction={setNewAction} />}
       {tab === "credits" && canSeeCredits && <CreditsTab onRegisterNewAction={setNewAction} />}
       {tab === "recurring-billing" && <RecurringBillingTab onRegisterNewAction={setNewAction} />}
-      {tab === "bank-feeds" && <BankFeedsTab onRegisterNewAction={setNewAction} isAdmin={isAdmin} />}
     </div>
   );
 }
@@ -117,6 +127,26 @@ const BLANK_LINE_ITEM: LineItem = {
   tax_rate_pct: "15",
   period_start: "",
   period_end: "",
+};
+
+// Which kind of document the list is showing. Separate from the overdue/date
+// tabs below, and from the status dropdown, because they answer different
+// questions: "show me quotes" vs "show me things overdue by up to 60 days" vs
+// "show me exactly the cancelled ones". All three compose.
+type DocTypeMode = "" | "quote" | "proforma" | "invoice";
+
+const DOC_TYPE_TABS: { mode: DocTypeMode; label: string }[] = [
+  { mode: "", label: "All documents" },
+  { mode: "quote", label: "Quotes" },
+  { mode: "proforma", label: "Pro formas" },
+  { mode: "invoice", label: "Invoices" },
+];
+
+const DOC_TYPE_NOUN: Record<DocTypeMode, string> = {
+  "": "quotes, pro formas, and invoices",
+  quote: "quotes only",
+  proforma: "pro formas only",
+  invoice: "invoices only — quotes and pro formas excluded",
 };
 
 type DateFilterMode = "all" | "30" | "60" | "90" | "custom";
@@ -240,8 +270,19 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [dateFilterMode, setDateFilterMode] = useState<DateFilterMode>("all");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
+  const [searchParams] = useSearchParams();
+  const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") ?? "");
+  const [docType, setDocType] = useState<DocTypeMode>(() => {
+    const wanted = searchParams.get("doc");
+    return (["quote", "proforma", "invoice"] as DocTypeMode[]).includes(wanted as DocTypeMode)
+      ? (wanted as DocTypeMode)
+      : "";
+  });
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("invoices", ["number"]);
+
+  // Quotes and pro formas can never be "overdue" -- nothing is owed on them
+  // yet -- so the overdue presets are hidden while one of those is selected.
+  const preInvoiceView = docType === "quote" || docType === "proforma";
 
   let dateParams = "";
   if (dateFilterMode === "30" || dateFilterMode === "60" || dateFilterMode === "90") {
@@ -252,7 +293,9 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   }
 
   const { items, count, loading, refetch } = useApiList<Invoice>(
-    `/invoices/?page_size=100&ordering=${ordering}${dateParams}${statusFilter ? `&status=${statusFilter}` : ""}`
+    `/invoices/?page_size=100&ordering=${ordering}${dateParams}${
+      statusFilter ? `&status=${statusFilter}` : ""
+    }${docType ? `&document_type=${docType}` : ""}`
   );
   const [customers, setCustomers] = useState<Customer[]>([]);
 
@@ -274,7 +317,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [tariffs, setTariffs] = useState<Tariff[]>([]);
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=200&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
     api.get<{ results: Product[] }>("/products/?page_size=200&ordering=name").then((res) => setProducts(res.data.results));
     api.get<{ results: Tariff[] }>("/tariffs/?page_size=200&ordering=name&is_active=true").then((res) => setTariffs(res.data.results));
   }, []);
@@ -320,7 +363,20 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
 
   function selectProduct(idx: number, productId: string) {
     const p = products.find((pr) => String(pr.id) === productId);
-    updateItem(idx, { product: productId, description: p ? p.name : "" });
+    // Fills the price from the product's resell price, the same way
+    // selectTariff fills it from the tariff. It used to fill only the
+    // description, so every stock line's price had to be typed from memory --
+    // which is how the same item ends up quoted at three different prices.
+    //
+    // A product with no resell price set leaves unit_price blank rather than
+    // putting a 0 in: 0 is a real price (a giveaway), and quietly inventing
+    // one is worse than an empty field the person has to look at.
+    updateItem(idx, {
+      product: productId,
+      description: p ? p.name : "",
+      unit_price: p?.sell_price ?? "",
+      tax_rate_pct: p?.sell_tax_rate_pct ?? "15",
+    });
   }
 
   function selectTariff(idx: number, tariffId: string) {
@@ -366,11 +422,50 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       {canDecideDeletion && <PendingInvoiceDeletionRequestsPanel />}
 
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        {count} document{count === 1 ? "" : "s"} matching current filter (quotes, pro formas, and invoices)
+        {count} document{count === 1 ? "" : "s"} matching current filter ({DOC_TYPE_NOUN[docType]})
       </p>
 
+      {/* Document type first, on its own row: it's the question people ask
+          most ("show me the quotes"), and it was previously buried in a
+          status dropdown below the overdue buttons. */}
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        {DOC_TYPE_TABS.map((tab) => (
+          <button
+            key={tab.mode || "all"}
+            type="button"
+            onClick={() => {
+              setDocType(tab.mode);
+              // An overdue preset would guarantee an empty list for a quote
+              // or pro forma, so drop back to All when switching to one.
+              if ((tab.mode === "quote" || tab.mode === "proforma") &&
+                  ["30", "60", "90"].includes(dateFilterMode)) {
+                setDateFilterMode("all");
+              }
+              // An exact-status filter left over from a previous look would
+              // fight this one -- status=paid with Quotes selected returns
+              // nothing, and it isn't obvious why. Clearing it keeps the
+              // buttons honest; the dropdown is still there to narrow again.
+              setStatusFilter("");
+            }}
+            className={
+              docType === tab.mode
+                ? "rounded-md bg-[var(--series-1)] px-3 py-1.5 text-sm font-medium text-white"
+                : "rounded-md border border-[var(--baseline)] px-3 py-1.5 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--tint-hover)]"
+            }
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        {DATE_FILTER_TABS.map((tab) => (
+        {DATE_FILTER_TABS.filter(
+          // The overdue presets match only unpaid/overdue documents, so they
+          // can never return a quote or a pro forma -- offering them here
+          // would just be a way to get an empty list and wonder why. The
+          // custom date range works on date_created, so it stays.
+          (tab) => !(preInvoiceView && ["30", "60", "90"].includes(tab.mode))
+        ).map((tab) => (
           <button
             key={tab.mode}
             type="button"
@@ -466,6 +561,20 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 {isVisible("status") && <TD><StatusBadge status={inv.status} /></TD>}
               </TR>
             ))}
+            {/* An empty list should say WHY it's empty. "No documents" while
+                the Quotes button is lit had people wondering whether the
+                listing was broken rather than whether any quotes existed. */}
+            {items.length === 0 && (
+              <TR>
+                <TD className="text-[var(--text-muted)]">
+                  {docType === "quote"
+                    ? "No quotes on the system yet — create one with “+ New quote” above."
+                    : docType === "proforma"
+                      ? "No pro formas. One is created by converting a quote, on the quote's own page."
+                      : "No documents match the current filters."}
+                </TD>
+              </TR>
+            )}
           </tbody>
         </Table>
       )}
@@ -474,18 +583,33 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
         <Modal title={modalKind === "quote" ? "New quote" : "New invoice"} onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
             <FormField label="Customer">
-              <select className={inputClass} required value={customer} onChange={(e) => setCustomer(e.target.value)}>
-                <option value="">Select customer…</option>
-                {customers.map((c) => (
-                  <option key={c.id} value={c.id}>{c.full_name} ({c.customer_id})</option>
-                ))}
-              </select>
+<SearchableSelect
+                options={customers.map((c) => ({
+                  value: String(c.id),
+                  label: c.full_name,
+                  meta: c.customer_id,
+                  searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
+                }))}
+                value={customer}
+                onChange={(v) => setCustomer(v)}
+                placeholder="Select customer…"
+                hint="Search by name or payment reference."
+                required
+              />
             </FormField>
             <FormField label={modalKind === "quote" ? "Valid until" : "Due date"}>
               <input type="date" className={inputClass} required value={dateDue} onChange={(e) => setDateDue(e.target.value)} />
             </FormField>
 
-            <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">Line items</p>
+            <p className="mb-1 text-sm font-medium text-[var(--text-secondary)]">Line items</p>
+            {/* Each line picks its own type, so one document can carry a
+                recurring plan and the hardware it needs together -- which is
+                what a real installation quote looks like. */}
+            <p className="mb-2 text-xs text-[var(--text-muted)]">
+              Mix freely: a <strong>Tariff plan</strong> line for the recurring subscription, <strong>Stock item</strong>
+              {" "}lines for the hardware, <strong>Custom</strong> for anything else — all on the same document. Stock
+              items price themselves from their resell price (Inventory → Products).
+            </p>
             {lineItems.map((item, idx) => (
               <div key={idx} className="mb-3 rounded-md border border-[var(--border-hairline)] p-3">
                 <div className="mb-2 grid grid-cols-[130px_1fr] gap-2">
@@ -508,7 +632,11 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                     >
                       <option value="">Select stock item…</option>
                       {products.map((p) => (
-                        <option key={p.id} value={p.id}>{p.name}{p.sku ? ` (${p.sku})` : ""}</option>
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                          {p.sku ? ` (${p.sku})` : ""}
+                          {p.sell_price ? ` — R ${parseFloat(p.sell_price).toFixed(2)}` : " — no resell price set"}
+                        </option>
                       ))}
                     </select>
                   ) : item.itemType === "tariff" ? (
@@ -724,7 +852,7 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const [decisionNote, setDecisionNote] = useState("");
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=200&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
   }, []);
 
   useEffect(() => {
@@ -918,12 +1046,19 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
         <Modal title="Request credit" onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
             <FormField label="Customer">
-              <select className={inputClass} required value={form.customer} onChange={(e) => setForm({ ...form, customer: e.target.value })}>
-                <option value="">Select customer…</option>
-                {customers.map((c) => (
-                  <option key={c.id} value={c.id}>{c.full_name} ({c.customer_id})</option>
-                ))}
-              </select>
+<SearchableSelect
+                options={customers.map((c) => ({
+                  value: String(c.id),
+                  label: c.full_name,
+                  meta: c.customer_id,
+                  searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
+                }))}
+                value={form.customer}
+                onChange={(v) => setForm({ ...form, customer: v })}
+                placeholder="Select customer…"
+                hint="Search by name or payment reference."
+                required
+              />
             </FormField>
             <FormField label="Amount (R)">
               <input
@@ -1195,627 +1330,3 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
   );
 }
 
-// ---------------------------------------------------------------------------
-// Bank Feeds -- FNB accounts (Admin-only), the transaction review queue
-// (assign/confirm/ignore/unmatch, CSV import), and sync History. Direct
-// API access to FNB isn't confirmed yet (see the backend's fnb_client.py
-// docstring) -- CSV import is the practical way to use this today; the
-// same review queue and every action works identically regardless of
-// which source a transaction came from.
-// ---------------------------------------------------------------------------
-
-type BankFeedsSubTab = "review" | "accounts" | "history";
-
-function BankFeedsTab({ onRegisterNewAction, isAdmin }: { onRegisterNewAction: (action: NewAction) => void; isAdmin: boolean }) {
-  const [subTab, setSubTab] = useState<BankFeedsSubTab>("review");
-
-  const SUB_TABS: { key: BankFeedsSubTab; label: string }[] = [
-    { key: "review", label: "Review" },
-    ...(isAdmin ? [{ key: "accounts" as BankFeedsSubTab, label: "Accounts" }] : []),
-    { key: "history", label: "History" },
-  ];
-
-  return (
-    <div>
-      <div className="mb-4 flex gap-1 border-b border-[var(--border-hairline)]">
-        {SUB_TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setSubTab(t.key)}
-            className={`px-3 py-1.5 text-sm font-medium ${
-              subTab === t.key
-                ? "border-b-2 border-[var(--series-1)] text-[var(--text-primary)]"
-                : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-      {subTab === "review" && <BankFeedsReviewSubTab onRegisterNewAction={onRegisterNewAction} />}
-      {subTab === "accounts" && isAdmin && <BankFeedsAccountsSubTab onRegisterNewAction={onRegisterNewAction} />}
-      {subTab === "history" && <BankFeedsHistorySubTab onRegisterNewAction={onRegisterNewAction} />}
-    </div>
-  );
-}
-
-// --- Accounts (Admin-only) --------------------------------------------------
-
-const EMPTY_BANK_ACCOUNT_FORM = {
-  name: "", account_number: "", branch_code: "", is_active: true,
-  api_base_url: "", api_client_id: "", api_client_secret: "",
-};
-
-function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
-  const { items, loading, refetch } = useApiList<BankAccount>("/bank-accounts/?page_size=50&ordering=name");
-  const [editing, setEditing] = useState<BankAccount | null>(null);
-  const [showModal, setShowModal] = useState(false);
-  const [form, setForm] = useState(EMPTY_BANK_ACCOUNT_FORM);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const [syncingId, setSyncingId] = useState<number | null>(null);
-
-  useEffect(() => {
-    onRegisterNewAction([
-      {
-        label: "+ New account",
-        onClick: () => {
-          setEditing(null);
-          setForm(EMPTY_BANK_ACCOUNT_FORM);
-          setError("");
-          setShowModal(true);
-        },
-      },
-    ]);
-    return () => onRegisterNewAction(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  function openEdit(acc: BankAccount) {
-    setEditing(acc);
-    setForm({
-      name: acc.name, account_number: acc.account_number, branch_code: acc.branch_code, is_active: acc.is_active,
-      api_base_url: acc.api_base_url, api_client_id: acc.api_client_id, api_client_secret: "",
-    });
-    setError("");
-    setShowModal(true);
-  }
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setSaving(true);
-    setError("");
-    try {
-      const payload: Record<string, unknown> = { ...form };
-      if (!form.api_client_secret) delete payload.api_client_secret;
-      if (editing) {
-        await api.patch(`/bank-accounts/${editing.id}/`, payload);
-      } else {
-        await api.post("/bank-accounts/", payload);
-      }
-      setShowModal(false);
-      refetch();
-    } catch (err) {
-      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
-      const firstError = data ? Object.values(data).flat()[0] : null;
-      setError(typeof firstError === "string" ? firstError : "Could not save this account — please try again.");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleSyncNow(id: number) {
-    setSyncingId(id);
-    try {
-      await api.post(`/bank-accounts/${id}/sync-now/`);
-      refetch();
-    } finally {
-      setSyncingId(null);
-    }
-  }
-
-  return (
-    <div>
-      <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        Up to a handful of FNB accounts to read incoming payments from. Direct API access from FNB isn't confirmed
-        yet — leave "API base URL" blank and use CSV import on the Review tab in the meantime; "Sync now" only works
-        once that's filled in.
-      </p>
-
-      {loading ? (
-        <p className="text-[var(--text-muted)]">Loading…</p>
-      ) : (
-        <Table>
-          <THead>
-            <tr>
-              <TH>Name</TH>
-              <TH>Account number</TH>
-              <TH>Status</TH>
-              <TH>API connection</TH>
-              <TH>Last sync</TH>
-              <TH></TH>
-            </tr>
-          </THead>
-          <tbody>
-            {items.map((acc) => (
-              <TR key={acc.id}>
-                <TD className="font-medium">{acc.name}</TD>
-                <TD className="text-[var(--text-secondary)]">{acc.account_number || "—"}</TD>
-                <TD><StatusBadge status={acc.is_active ? "active" : "inactive"} /></TD>
-                <TD className="text-[var(--text-secondary)]">{acc.api_base_url ? "Configured" : "Not configured (CSV import only)"}</TD>
-                <TD className="text-[var(--text-secondary)]">
-                  {acc.last_synced_at ? (
-                    <>
-                      {new Date(acc.last_synced_at).toLocaleString()}
-                      {acc.last_sync_status === "failed" && (
-                        <span className="ml-2 text-[var(--status-critical)]" title={acc.last_sync_message}>failed</span>
-                      )}
-                    </>
-                  ) : "Never"}
-                </TD>
-                <TD>
-                  <div className="flex gap-2">
-                    <button type="button" className={btnSecondary} disabled={syncingId === acc.id} onClick={() => handleSyncNow(acc.id)}>
-                      {syncingId === acc.id ? "Syncing…" : "Sync now"}
-                    </button>
-                    <button type="button" className={btnSecondary} onClick={() => openEdit(acc)}>
-                      Edit
-                    </button>
-                  </div>
-                </TD>
-              </TR>
-            ))}
-            {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No bank accounts configured yet.</TD></TR>}
-          </tbody>
-        </Table>
-      )}
-
-      {showModal && (
-        <Modal title={editing ? "Edit bank account" : "New bank account"} onClose={() => setShowModal(false)}>
-          <form onSubmit={handleSubmit} autoComplete="off">
-            <FormField label="Name">
-              <input className={inputClass} required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-            </FormField>
-            <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
-              <FormField label="Account number">
-                <input className={inputClass} value={form.account_number} onChange={(e) => setForm({ ...form, account_number: e.target.value })} />
-              </FormField>
-              <FormField label="Branch code">
-                <input className={inputClass} placeholder="e.g. 250655" value={form.branch_code} onChange={(e) => setForm({ ...form, branch_code: e.target.value })} />
-              </FormField>
-            </div>
-            <label className="mb-4 flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={form.is_active} onChange={(e) => setForm({ ...form, is_active: e.target.checked })} />
-              <span>Active (included in the hourly sync)</span>
-            </label>
-
-            <div className="my-4 border-t border-[var(--border-hairline)]" />
-            <p className="mb-3 text-xs text-[var(--text-muted)]">
-              Only needed once FNB confirms direct API access for this account — leave blank to rely on CSV import.
-            </p>
-            <FormField label="API base URL">
-              <input className={inputClass} placeholder="https://…" value={form.api_base_url} onChange={(e) => setForm({ ...form, api_base_url: e.target.value })} />
-            </FormField>
-            <FormField label="API client ID">
-              <input
-                className={inputClass}
-                value={form.api_client_id}
-                onChange={(e) => setForm({ ...form, api_client_id: e.target.value })}
-                autoComplete="off"
-                name="bank-api-client-id"
-              />
-            </FormField>
-            <FormField label={editing?.api_client_secret_set ? "API client secret (a secret is set — leave blank to keep it)" : "API client secret"}>
-              <input
-                type="password"
-                className={inputClass}
-                value={form.api_client_secret}
-                onChange={(e) => setForm({ ...form, api_client_secret: e.target.value })}
-                autoComplete="new-password"
-                name="bank-api-client-secret"
-              />
-            </FormField>
-
-            {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
-
-            <div className="mt-4 flex justify-end gap-2">
-              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
-                Cancel
-              </button>
-              <button type="submit" disabled={saving} className={btnPrimary}>
-                {saving ? "Saving…" : editing ? "Save changes" : "Create account"}
-              </button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  );
-}
-
-// --- Review queue ------------------------------------------------------
-
-const BANK_STATUS_FILTERS: { key: BankTransactionStatus | ""; label: string }[] = [
-  { key: "unmatched", label: "Unmatched" },
-  { key: "matched", label: "Matched (awaiting confirmation)" },
-  { key: "confirmed", label: "Confirmed" },
-  { key: "ignored", label: "Ignored" },
-  { key: "", label: "All" },
-];
-
-function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
-  const [statusFilter, setStatusFilter] = useState<BankTransactionStatus | "">("unmatched");
-  const { items, loading, refetch } = useApiList<BankTransaction>(
-    `/bank-transactions/?page_size=100&ordering=-date${statusFilter ? `&status=${statusFilter}` : ""}`
-  );
-  const [accounts, setAccounts] = useState<BankAccount[]>([]);
-  const [customers, setCustomers] = useState<Customer[]>([]);
-  const [selectedCustomer, setSelectedCustomer] = useState<Record<number, string>>({});
-  const [busyId, setBusyId] = useState<number | null>(null);
-  const [rowError, setRowError] = useState<Record<number, string>>({});
-  const [showImport, setShowImport] = useState(false);
-
-  useEffect(() => {
-    api.get<{ results: BankAccount[] }>("/bank-accounts/?page_size=50&ordering=name").then((res) => setAccounts(res.data.results));
-    api.get<{ results: Customer[] }>("/customers/?page_size=500&ordering=full_name").then((res) => setCustomers(res.data.results));
-  }, []);
-
-  useEffect(() => {
-    onRegisterNewAction([{ label: "Import statement CSV", onClick: () => setShowImport(true) }]);
-    return () => onRegisterNewAction(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function handleAssign(txn: BankTransaction) {
-    const customerId = selectedCustomer[txn.id];
-    if (!customerId) return;
-    setBusyId(txn.id);
-    setRowError((prev) => ({ ...prev, [txn.id]: "" }));
-    try {
-      await api.post(`/bank-transactions/${txn.id}/assign/`, { customer: customerId });
-      refetch();
-    } catch (err) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setRowError((prev) => ({ ...prev, [txn.id]: detail || "Could not assign this customer." }));
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function handleConfirm(txn: BankTransaction) {
-    setBusyId(txn.id);
-    setRowError((prev) => ({ ...prev, [txn.id]: "" }));
-    try {
-      const customerId = selectedCustomer[txn.id];
-      await api.post(`/bank-transactions/${txn.id}/confirm/`, customerId ? { customer: customerId } : {});
-      refetch();
-    } catch (err) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setRowError((prev) => ({ ...prev, [txn.id]: detail || "Could not confirm this transaction." }));
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function handleIgnore(txn: BankTransaction) {
-    setBusyId(txn.id);
-    try {
-      await api.post(`/bank-transactions/${txn.id}/ignore/`);
-      refetch();
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function handleUnmatch(txn: BankTransaction) {
-    setBusyId(txn.id);
-    try {
-      await api.post(`/bank-transactions/${txn.id}/unmatch/`);
-      refetch();
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  return (
-    <div>
-      <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        Incoming bank transactions, matched to a customer by the reference number in the description where possible.
-        Nothing becomes a real Payment (or changes a customer's balance) until you click Confirm.
-      </p>
-
-      <div className="mb-4 flex flex-wrap gap-2">
-        {BANK_STATUS_FILTERS.map((f) => (
-          <button
-            key={f.key}
-            type="button"
-            onClick={() => setStatusFilter(f.key)}
-            className={statusFilter === f.key ? btnPrimary : btnSecondary}
-          >
-            {f.label}
-          </button>
-        ))}
-      </div>
-
-      {loading ? (
-        <p className="text-[var(--text-muted)]">Loading…</p>
-      ) : (
-        <Table>
-          <THead>
-            <tr>
-              <TH>Date</TH>
-              <TH>Account</TH>
-              <TH>Description</TH>
-              <TH>Amount</TH>
-              <TH>Customer</TH>
-              <TH>Status</TH>
-              <TH></TH>
-            </tr>
-          </THead>
-          <tbody>
-            {items.map((txn) => (
-              <TR key={txn.id}>
-                <TD>{txn.date}</TD>
-                <TD className="text-[var(--text-secondary)]">{txn.account_name}</TD>
-                <TD className="max-w-xs truncate"><span title={txn.description}>{txn.description}</span></TD>
-                <TD className={`tabular-nums ${parseFloat(txn.amount) < 0 ? "text-[var(--text-muted)]" : ""}`}>
-                  R {parseFloat(txn.amount).toFixed(2)}
-                </TD>
-                <TD>
-                  {txn.status === "confirmed" || txn.status === "ignored" ? (
-                    txn.matched_customer_name || <span className="text-[var(--text-muted)]">—</span>
-                  ) : (
-                    <select
-                      className={filterSelectClass}
-                      value={selectedCustomer[txn.id] ?? (txn.matched_customer ? String(txn.matched_customer) : "")}
-                      onChange={(e) => setSelectedCustomer((prev) => ({ ...prev, [txn.id]: e.target.value }))}
-                    >
-                      <option value="">Select customer…</option>
-                      {customers.map((c) => (
-                        <option key={c.id} value={c.id}>{c.full_name} ({c.customer_id})</option>
-                      ))}
-                    </select>
-                  )}
-                  {txn.match_method === "reference" && txn.status === "matched" && (
-                    <span className="ml-2 text-xs text-[var(--status-good)]">auto-matched</span>
-                  )}
-                </TD>
-                <TD><StatusBadge status={txn.status === "confirmed" ? "active" : txn.status === "ignored" ? "inactive" : txn.status} /></TD>
-                <TD>
-                  <div className="flex flex-wrap gap-2">
-                    {(txn.status === "unmatched" || txn.status === "matched") && (
-                      <>
-                        {(selectedCustomer[txn.id] && selectedCustomer[txn.id] !== String(txn.matched_customer)) && (
-                          <button type="button" className={btnSecondary} disabled={busyId === txn.id} onClick={() => handleAssign(txn)}>
-                            Assign
-                          </button>
-                        )}
-                        <button
-                          type="button" className={btnPrimary} disabled={busyId === txn.id || (!txn.matched_customer && !selectedCustomer[txn.id])}
-                          onClick={() => handleConfirm(txn)}
-                        >
-                          Confirm
-                        </button>
-                        {txn.status === "matched" && (
-                          <button type="button" className={btnSecondary} disabled={busyId === txn.id} onClick={() => handleUnmatch(txn)}>
-                            Unmatch
-                          </button>
-                        )}
-                        <button type="button" className={btnSecondary} disabled={busyId === txn.id} onClick={() => handleIgnore(txn)}>
-                          Ignore
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  {rowError[txn.id] && <p className="mt-1 text-xs text-[var(--status-critical)]">{rowError[txn.id]}</p>}
-                </TD>
-              </TR>
-            ))}
-            {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No transactions in this filter.</TD></TR>}
-          </tbody>
-        </Table>
-      )}
-
-      {showImport && (
-        <BankStatementImportModal accounts={accounts} onClose={() => setShowImport(false)} onImported={refetch} />
-      )}
-    </div>
-  );
-}
-
-// --- CSV import modal (bespoke -- needs an account selector alongside the
-// file, which the generic CSVImportModal doesn't support) --------------
-
-function BankStatementImportModal({
-  accounts, onClose, onImported,
-}: {
-  accounts: BankAccount[]; onClose: () => void; onImported: () => void;
-}) {
-  const [accountId, setAccountId] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<BankStatementImportPreview | null>(null);
-  const [result, setResult] = useState<BankStatementImportResult | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  async function handlePreview() {
-    if (!file || !accountId) return;
-    setLoading(true);
-    setError("");
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("account", accountId);
-      const res = await api.post<BankStatementImportPreview>("/bank-transactions/import-preview/", formData);
-      setPreview(res.data);
-    } catch {
-      setError("Could not read that file. Make sure it's a CSV with Date/Description/Amount columns.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleCommit() {
-    if (!file || !accountId) return;
-    setLoading(true);
-    setError("");
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("account", accountId);
-      const res = await api.post<BankStatementImportResult>("/bank-transactions/import-commit/", formData);
-      setResult(res.data);
-      onImported();
-    } catch {
-      setError("Import failed. Nothing was changed — please try again.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  const importableCount = preview ? preview.valid_count - preview.already_imported_count : 0;
-
-  return (
-    <Modal title="Import bank statement CSV" onClose={onClose}>
-      {!result ? (
-        <>
-          <p className="mb-3 text-sm text-[var(--text-secondary)]">
-            Expects columns Date, Description, and a single signed Amount (positive = money in, negative = money
-            out). Export this from FNB Online Banking for the account below.
-          </p>
-
-          <FormField label="Bank account">
-            <select className={inputClass} required value={accountId} onChange={(e) => { setAccountId(e.target.value); setPreview(null); setResult(null); }}>
-              <option value="">Select account…</option>
-              {accounts.map((a) => (
-                <option key={a.id} value={a.id}>{a.name}</option>
-              ))}
-            </select>
-          </FormField>
-
-          <input
-            type="file"
-            accept=".csv,text/csv"
-            className="mb-4 block w-full text-sm"
-            onChange={(e) => { setFile(e.target.files?.[0] ?? null); setPreview(null); setResult(null); }}
-          />
-
-          {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
-
-          {preview && (
-            <div className="mb-4 max-h-64 overflow-y-auto rounded-md border border-[var(--border-hairline)] p-3 text-sm">
-              <p className="mb-2 font-medium text-[var(--text-primary)]">
-                {preview.total_rows} row{preview.total_rows === 1 ? "" : "s"} found —{" "}
-                <span className="text-[var(--status-good)]">{importableCount} new row{importableCount === 1 ? "" : "s"} to import</span>
-                {preview.already_imported_count > 0 && <>, {preview.already_imported_count} already imported</>}
-                {preview.invalid_count > 0 && (
-                  <>, <span className="text-[var(--status-critical)]">{preview.invalid_count} with problems</span></>
-                )}
-              </p>
-              {preview.invalid_count > 0 && (
-                <ul className="space-y-1">
-                  {preview.rows.filter((r) => r.errors.length > 0).slice(0, 30).map((r) => (
-                    <li key={r.row} className="text-[var(--text-secondary)]">
-                      <span className="font-medium">Row {r.row}:</span> {r.errors.join("; ")}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
-
-          <div className="mt-4 flex justify-end gap-2">
-            <button type="button" className={btnSecondary} onClick={onClose}>
-              Cancel
-            </button>
-            {!preview ? (
-              <button type="button" disabled={!file || !accountId || loading} className={btnPrimary} onClick={handlePreview}>
-                {loading ? "Reading…" : "Preview"}
-              </button>
-            ) : (
-              <button type="button" disabled={loading || importableCount === 0} className={btnPrimary} onClick={handleCommit}>
-                {loading ? "Importing…" : `Import ${importableCount} row${importableCount === 1 ? "" : "s"}`}
-              </button>
-            )}
-          </div>
-        </>
-      ) : (
-        <>
-          <p className="mb-3 text-sm text-[var(--text-primary)]">
-            <span className="font-medium text-[var(--status-good)]">{result.created} imported</span>
-            {result.matched > 0 && <>, {result.matched} auto-matched to a customer</>}
-            {result.duplicates_skipped > 0 && <>, {result.duplicates_skipped} already-imported duplicates skipped</>}
-            {result.invalid_skipped > 0 && (
-              <span className="text-[var(--status-critical)]">, {result.invalid_skipped} skipped (see below)</span>
-            )}
-            .
-          </p>
-          {result.skipped.length > 0 && (
-            <ul className="mb-4 max-h-48 space-y-1 overflow-y-auto text-sm text-[var(--text-secondary)]">
-              {result.skipped.slice(0, 30).map((r) => (
-                <li key={r.row}><span className="font-medium">Row {r.row}:</span> {r.errors.join("; ")}</li>
-              ))}
-            </ul>
-          )}
-          <div className="mt-4 flex justify-end">
-            <button type="button" className={btnPrimary} onClick={onClose}>
-              Done
-            </button>
-          </div>
-        </>
-      )}
-    </Modal>
-  );
-}
-
-// --- History -------------------------------------------------------------
-
-function BankFeedsHistorySubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
-  const { items, loading } = useApiList<BankFeedSyncLog>("/bank-feed-sync-logs/?page_size=50&ordering=-created_at");
-
-  useEffect(() => {
-    onRegisterNewAction(null);
-  }, [onRegisterNewAction]);
-
-  return (
-    <div>
-      <h2 className="mb-2 text-sm font-semibold">Sync history</h2>
-      {loading ? (
-        <p className="text-[var(--text-muted)]">Loading…</p>
-      ) : (
-        <Table>
-          <THead>
-            <tr>
-              <TH>Account</TH>
-              <TH>Status</TH>
-              <TH>Fetched</TH>
-              <TH>New</TH>
-              <TH>Auto-matched</TH>
-              <TH>Triggered by</TH>
-              <TH>When</TH>
-            </tr>
-          </THead>
-          <tbody>
-            {items.map((log) => (
-              <TR key={log.id}>
-                <TD>{log.account_name ?? "—"}</TD>
-                <TD>
-                  <StatusBadge status={log.status === "success" ? "active" : "failed"} />
-                  {log.status === "failed" && log.status_message && (
-                    <span className="ml-2 text-xs text-[var(--text-muted)]">{log.status_message}</span>
-                  )}
-                </TD>
-                <TD>{log.transactions_fetched}</TD>
-                <TD>{log.transactions_new}</TD>
-                <TD>{log.transactions_matched}</TD>
-                <TD>{log.triggered_by_name ?? "Scheduled sync"}</TD>
-                <TD>{new Date(log.created_at).toLocaleString()}</TD>
-              </TR>
-            ))}
-            {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No syncs logged yet.</TD></TR>}
-          </tbody>
-        </Table>
-      )}
-    </div>
-  );
-}

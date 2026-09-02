@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { ThemeToggle } from "../components/ThemeToggle";
 import skybreIcon from "../assets/skybre-icon.png";
@@ -20,7 +20,7 @@ export function LoginPage() {
     setLoading(true);
     try {
       const user = await login(username, password, needsCode ? totpCode : undefined);
-      const isStaff = ["admin", "staff", "technician"].includes(user.role);
+      const isStaff = user.role !== "customer";
       navigate(isStaff ? "/admin" : "/portal");
     } catch (err) {
       const data = (err as { response?: { data?: { code?: string } } })?.response?.data;
@@ -60,7 +60,7 @@ export function LoginPage() {
                   autoFocus
                 />
               </label>
-              <label className="mb-4 block text-sm">
+              <label className="mb-2 block text-sm">
                 <span className="mb-1 block font-medium text-[var(--text-secondary)]">Password</span>
                 <input
                   type="password"
@@ -69,6 +69,12 @@ export function LoginPage() {
                   onChange={(e) => setPassword(e.target.value)}
                 />
               </label>
+              <Link
+                to="/forgot-password"
+                className="mb-4 block text-right text-xs font-medium text-[var(--series-1)] hover:underline"
+              >
+                Forgot password?
+              </Link>
             </>
           ) : (
             <>

@@ -1,11 +1,18 @@
 from rest_framework import viewsets, permissions
 from .models import Ticket, TicketComment
 from .serializers import TicketSerializer, TicketCommentSerializer
+from accounts.permissions import section_permission
+
+HasTicketsAccess = section_permission("tickets")
 
 
 class TicketViewSet(viewsets.ModelViewSet):
     serializer_class = TicketSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # Shared with the customer portal -- HasTicketsAccess passes straight
+    # through for customers (section restrictions are a staff-only
+    # concept, see accounts.permissions.user_can_access_section), so this
+    # only narrows things for staff who lack the Support Tickets section.
+    permission_classes = [permissions.IsAuthenticated, HasTicketsAccess]
     filterset_fields = ["status", "priority", "department", "customer"]
     search_fields = ["subject", "ticket_number"]
 
@@ -30,7 +37,7 @@ class TicketViewSet(viewsets.ModelViewSet):
 
 class TicketCommentViewSet(viewsets.ModelViewSet):
     serializer_class = TicketCommentSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, HasTicketsAccess]
     filterset_fields = ["ticket"]
 
     def get_queryset(self):

@@ -21,6 +21,15 @@
 
   --series-1: #2a78d6; /* blue */
   --series-2: #eb6834; /* orange */
+  /* Chart fills, kept SEPARATE from --series-* above. Those double as text
+     accent colours (link ink, "scheduled change" notes), where the constraint
+     is 4.5:1 against body text; these are marks on a chart surface, where the
+     constraint is the dataviz lightness band plus colourblind separation from
+     each other. One token can't satisfy both, and the dark steps below are
+     genuinely different values -- validated per mode, not flipped.
+     Verified with the dataviz validator: all six checks pass in both modes. */
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
   --series-3: #1baf7a; /* aqua */
   --series-4: #eda100; /* yellow */
   --series-5: #e87ba4; /* magenta */
@@ -56,6 +65,8 @@
      dark surfaces — the hues stay recognizable, just lifted a bit. */
   --series-1: #5b9ce6;
   --series-2: #f08a5d;
+  --chart-1: #4a8fdb;
+  --chart-2: #d2703c;
   --series-3: #3fcf9a;
   --series-4: #f0b632;
   --series-5: #ef9dc0;
@@ -75,6 +86,45 @@ body {
   margin: 0;
   background: var(--page-plane);
   color: var(--text-primary);
+}
+
+/* Native <select> dropdowns.
+ *
+ * An <option> INHERITS `color` from its <select> but has no background of
+ * its own -- its computed background-color is transparent, and the popup
+ * list paints its own surface underneath. In dark mode that pairs
+ * near-white inherited text with the browser's light popup, which is the
+ * "I can't read the options" bug: every option is white-on-white except
+ * the one row the OS highlights for you.
+ *
+ * `color-scheme: dark` on :root (set above) does NOT fix this on its own,
+ * which is the trap -- it darkens the control itself and the scrollbars,
+ * so the closed select looks perfectly fine and only the opened list is
+ * broken. Setting both properties on the option is the only thing that
+ * reliably reaches the popup.
+ *
+ * Deliberately an element selector rather than a utility class: this has
+ * to hold for every <select> in the app, including ones added later by
+ * somebody who has never read this comment. */
+option {
+  background-color: var(--surface-1);
+  color: var(--text-primary);
+}
+
+/* The group heading is a label, not a choice -- muted, with its child
+ * options put back to full contrast (they'd otherwise inherit the muted
+ * colour through the optgroup). */
+optgroup {
+  background-color: var(--surface-1);
+  color: var(--text-muted);
+}
+
+optgroup option {
+  color: var(--text-primary);
+}
+
+option:disabled {
+  color: var(--text-muted);
 }
 
 .tabular-nums {

@@ -5,7 +5,7 @@ import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
-import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type { Device } from "../../types";
@@ -58,7 +58,7 @@ export function DevicesPage() {
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <select className={`${inputClass} w-auto`} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+        <select className={filterSelectClass} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
           <option value="">All types</option>
           <option value="router">Router</option>
           <option value="switch">Switch</option>
@@ -67,7 +67,7 @@ export function DevicesPage() {
           <option value="server">Server</option>
           <option value="onu">ONU/CPE</option>
         </select>
-        <select className={`${inputClass} w-auto`} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+        <select className={filterSelectClass} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           <option value="">All statuses</option>
           <option value="online">Online</option>
           <option value="offline">Offline</option>

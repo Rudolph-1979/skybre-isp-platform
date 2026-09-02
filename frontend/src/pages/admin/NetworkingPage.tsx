@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
-import { useAuth } from "../../context/AuthContext";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
@@ -10,12 +9,12 @@ import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSeconda
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import type {
-  Device, IPPool, IPAddress, PoolCategory, RadiusNasClient, RadiusNasClientPingStatus, RadAcctSession,
-  NetworkSite, Partner, OvpnSettingsConfig, OvpnClientConnection, OvpnClientConnectionPingStatus,
+  Device, IPPool, IPAddress, PoolCategory, RadiusNasClient, RadAcctSession,
+  NetworkSite, Partner, OvpnClientConnection, OvpnClientConnectionPingStatus,
 } from "../../types";
 import { POOL_CATEGORY_LABELS, NETWORK_TYPE_LABELS } from "../../types";
 
-type Tab = "devices" | "sites" | "ip-pools" | "radius-clients" | "vpn-clients" | "live-sessions" | "ovpn";
+type Tab = "devices" | "sites" | "ip-pools" | "vpn-clients" | "live-sessions";
 
 type NewAction = { label: string; onClick: () => void } | null;
 
@@ -80,22 +79,27 @@ function PartnerMultiSelect({
 }
 
 export function NetworkingPage() {
-  const { user } = useAuth();
-  const isAdmin = user?.role === "admin";
-  const [tab, setTab] = useState<Tab>("devices");
+  // Seeded from the URL, same reason as Finance -- a dashboard tile should
+  // land on the tab it's talking about.
+  const [searchParams] = useSearchParams();
+  const [tab, setTab] = useState<Tab>(() => {
+    const wanted = searchParams.get("tab");
+    return (["devices", "sites", "ip-pools", "vpn-clients", "live-sessions"] as Tab[]).includes(wanted as Tab)
+      ? (wanted as Tab)
+      : "devices";
+  });
   const [newAction, setNewAction] = useState<NewAction>(null);
-  // OVPN Settings stays admin-only -- mirrors the backend's
-  // OvpnSettingsView (IsAdmin-gated) regardless of what's rendered here.
-  // Moved here from Configs since it's network infrastructure config that
-  // already feeds RADIUS Clients' "Push to router" default.
+  // RADIUS Clients (and the default-FreeRADIUS-server setting that used to
+  // be the "OVPN" tab) now live under Configs -> RADIUS. The endpoint still
+  // requires the `networking` section, so the tab there is gated on
+  // networking access rather than configs access -- moving the screen
+  // deliberately did not change who can see it.
   const TABS: { key: Tab; label: string }[] = [
     { key: "devices", label: "Routers" },
     { key: "sites", label: "Sites" },
     { key: "ip-pools", label: "IP Pools" },
-    { key: "radius-clients", label: "RADIUS Clients" },
-    { key: "vpn-clients", label: "VPN Clients" },
+    { key: "vpn-clients", label: "OpenVPN" },
     { key: "live-sessions", label: "Live Sessions" },
-    ...(isAdmin ? [{ key: "ovpn" as Tab, label: "OVPN" }] : []),
   ];
 
   return (
@@ -129,10 +133,8 @@ export function NetworkingPage() {
       {tab === "devices" && <DevicesTab onRegisterNewAction={setNewAction} />}
       {tab === "sites" && <SitesTab onRegisterNewAction={setNewAction} />}
       {tab === "ip-pools" && <IPPoolsTab onRegisterNewAction={setNewAction} />}
-      {tab === "radius-clients" && <RadiusClientsTab onRegisterNewAction={setNewAction} />}
       {tab === "vpn-clients" && <VpnClientsTab onRegisterNewAction={setNewAction} />}
       {tab === "live-sessions" && <LiveSessionsTab onRegisterNewAction={setNewAction} />}
-      {tab === "ovpn" && isAdmin && <OvpnSettingsTab onRegisterNewAction={setNewAction} />}
     </div>
   );
 }
@@ -183,6 +185,7 @@ const DEVICE_COLUMNS: ColumnDef[] = [
 
 function DevicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const navigate = useNavigate();
+  const [pollingDevice, setPollingDevice] = useState<number | null>(null);
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("devices", ["name"]);
@@ -302,6 +305,21 @@ function DevicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
     }
   }
 
+  async function pollNow(device: Device) {
+    setPollingDevice(device.id);
+    try {
+      await api.post(`/devices/${device.id}/poll-now/`);
+      refetch();
+    } catch (err: any) {
+      // A router that can't be reached is a real answer, not a bug -- show
+      // what RouterOS/the network said rather than a generic failure.
+      alert(err?.response?.data?.detail || "Couldn't reach this router.");
+      refetch();
+    } finally {
+      setPollingDevice(null);
+    }
+  }
+
   async function handleDelete(device: Device) {
     if (
       !confirm(
@@ -398,6 +416,23 @@ function DevicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 <TD>{d.api_enabled ? "Enabled" : "—"}</TD>
                 <TD>
                   <div className="flex gap-3">
+                    {d.api_enabled && (
+                      // Status/latency/bandwidth are written by the
+                      // poll_mikrotik_devices cron, so a router configured
+                      // a minute ago reads "Unknown" until the next run.
+                      // This asks for a reading now rather than waiting.
+                      <button
+                        className="text-[var(--series-1)] hover:underline disabled:opacity-50"
+                        disabled={pollingDevice === d.id}
+                        title="Read status, CPU and bandwidth from this router now"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          pollNow(d);
+                        }}
+                      >
+                        {pollingDevice === d.id ? "Polling…" : "Poll now"}
+                      </button>
+                    )}
                     <button
                       className="text-[var(--series-1)] hover:underline"
                       onClick={(e) => {
@@ -669,7 +704,7 @@ const EMPTY_SITE_FORM: Partial<NetworkSite> = {
   phone: "",
   address: "",
   location: "",
-  partner: null,
+  partners: [],
   notes: "",
 };
 
@@ -705,7 +740,7 @@ function SitesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
       phone: site.phone,
       address: site.address,
       location: site.location,
-      partner: site.partner,
+      partners: site.partners,
       notes: site.notes,
     });
     setError("");
@@ -780,7 +815,7 @@ function SitesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
                 {isVisible("contact") && <TD>{s.contact_person || "—"}</TD>}
                 {isVisible("phone") && <TD>{s.phone || "—"}</TD>}
                 {isVisible("address") && <TD>{s.address || "—"}</TD>}
-                {isVisible("partner") && <TD>{s.partner_name ?? "—"}</TD>}
+                {isVisible("partner") && <TD>{s.partner_names.length ? s.partner_names.join(", ") : "All"}</TD>}
                 {isVisible("hardware") && <TD className="tabular-nums">{s.hardware_count}</TD>}
                 <TD>
                   <div className="flex gap-3">
@@ -818,17 +853,17 @@ function SitesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
               <input className={inputClass} value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} />
             </FormField>
             {partners.length > 0 && (
-              <FormField label="Partner">
-                <select
-                  className={inputClass}
-                  value={form.partner ?? ""}
-                  onChange={(e) => setForm({ ...form, partner: e.target.value ? Number(e.target.value) : null })}
-                >
-                  <option value="">None</option>
-                  {partners.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
+              <FormField label="Partners served from this site">
+                {/* A tower routinely serves more than one reseller. Forcing a
+                    choice between them meant the site list couldn't answer
+                    "which sites does this partner have customers on", which
+                    is the question it exists for. Same control and the same
+                    empty-means-all convention as a router's partners. */}
+                <PartnerMultiSelect
+                  allPartners={partners}
+                  selected={form.partners ?? []}
+                  onChange={(ids) => setForm({ ...form, partners: ids })}
+                />
               </FormField>
             )}
             <FormField label="Notes">
@@ -889,6 +924,9 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const { items, loading, refetch } = useApiList<IPPool>(`/ip-pools/?page_size=100${categoryParam}`);
   const [showModal, setShowModal] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState<IPPool | null>(null);
+  const [formError, setFormError] = useState("");
+  const [busyPool, setBusyPool] = useState<number | null>(null);
   const [form, setForm] = useState<Partial<IPPool>>({
     name: "", network_cidr: "", gateway: "", pool_type: "ipv4", category: "customer",
     network_type: "endnet", root_net: null,
@@ -900,10 +938,12 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const { hidden: hiddenAddrCols, isVisible: isAddrColVisible, toggle: toggleAddrCol } = useColumnVisibility("ip-addresses", ["address"]);
 
   useEffect(() => {
-    onRegisterNewAction({ label: "+ New pool", onClick: () => setShowModal(true) });
+    onRegisterNewAction({ label: "+ New pool", onClick: () => openCreate() });
     return () => onRegisterNewAction(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const [addressReload, setAddressReload] = useState(0);
 
   useEffect(() => {
     if (selectedPool == null) return;
@@ -911,17 +951,106 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
     api
       .get<{ results: IPAddress[] }>(`/ip-addresses/?pool=${selectedPool}&page_size=200${statusParam}`)
       .then((res) => setAddresses(res.data.results));
-  }, [selectedPool, addressStatusFilter]);
+  }, [selectedPool, addressStatusFilter, addressReload]);
+
+  function openCreate() {
+    setEditing(null);
+    setFormError("");
+    setForm({
+      name: "", network_cidr: "", gateway: "", pool_type: "ipv4", category: "customer",
+      network_type: "endnet", root_net: null,
+    });
+    setShowModal(true);
+  }
+
+  function openEdit(pool: IPPool) {
+    setEditing(pool);
+    setFormError("");
+    setForm({
+      name: pool.name, network_cidr: pool.network_cidr, gateway: pool.gateway ?? "",
+      pool_type: pool.pool_type, category: pool.category, network_type: pool.network_type,
+      root_net: pool.root_net, description: pool.description,
+    });
+    setShowModal(true);
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
+    setFormError("");
     setSaving(true);
     try {
-      await api.post("/ip-pools/", { ...form, gateway: form.gateway || null });
+      const payload = { ...form, gateway: form.gateway || null };
+      if (editing) {
+        await api.patch(`/ip-pools/${editing.id}/`, payload);
+      } else {
+        await api.post("/ip-pools/", payload);
+      }
       setShowModal(false);
       refetch();
+    } catch (err: any) {
+      const data = err?.response?.data;
+      const message = data && typeof data === "object" ? Object.values(data).flat().join(" ") : null;
+      setFormError(message || "Couldn't save this pool.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  // Creating a pool only records its CIDR -- the individual addresses have
+  // to be generated before anything can be handed out of it. A pool sitting
+  // at 0 / 0 authenticates customers and then gives them no address at all,
+  // so this is the step that makes a new pool actually usable.
+  async function handleGenerate(pool: IPPool) {
+    if (
+      !confirm(
+        `Generate the addresses in ${pool.network_cidr} for "${pool.name}"?\n\n` +
+          (pool.gateway ? `The gateway ${pool.gateway} is skipped. ` : "") +
+          "Existing addresses are left alone, so this is safe to re-run."
+      )
+    )
+      return;
+    setBusyPool(pool.id);
+    try {
+      const res = await api.post<{
+        created: number; already_in_this_pool: number; in_another_pool: number; total_in_pool: number;
+      }>(`/ip-pools/${pool.id}/generate-addresses/`, {});
+      const d = res.data;
+      const notes = [`${d.created} address(es) created`];
+      if (d.already_in_this_pool) notes.push(`${d.already_in_this_pool} already here`);
+      if (d.in_another_pool) notes.push(`${d.in_another_pool} skipped — already in another pool (overlapping ranges?)`);
+      alert(`${notes.join("\n")}\n\nThis pool now holds ${d.total_in_pool}.`);
+      refetch();
+      setAddressReload((n) => n + 1);
+    } catch (err: any) {
+      const data = err?.response?.data;
+      const message = data && typeof data === "object" ? Object.values(data).flat().join(" ") : null;
+      alert(message || "Couldn't generate addresses for this pool.");
+    } finally {
+      setBusyPool(null);
+    }
+  }
+
+  async function handleClearFree(pool: IPPool) {
+    if (
+      !confirm(
+        `Delete the unused addresses in "${pool.name}"?\n\n` +
+          "Assigned and reserved addresses are kept — a customer's live address is never removed. " +
+          "Use this to shrink a pool or undo a range generated too wide."
+      )
+    )
+      return;
+    setBusyPool(pool.id);
+    try {
+      const res = await api.post<{ deleted: number; kept_in_use: number }>(
+        `/ip-pools/${pool.id}/clear-free-addresses/`, {}
+      );
+      alert(`${res.data.deleted} removed, ${res.data.kept_in_use} kept because they're in use.`);
+      refetch();
+      setAddressReload((n) => n + 1);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || "Couldn't clear addresses for this pool.");
+    } finally {
+      setBusyPool(null);
     }
   }
 
@@ -995,7 +1124,21 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 {isPoolColVisible("cidr") && <TD>{p.network_cidr}</TD>}
                 {isPoolColVisible("gateway") && <TD>{p.gateway ?? "—"}</TD>}
                 {isPoolColVisible("type") && <TD className="uppercase">{p.pool_type}</TD>}
-                {isPoolColVisible("free_total") && <TD className="tabular-nums">{p.free_count} / {p.total_count}</TD>}
+                {isPoolColVisible("free_total") && (
+                  <TD className="tabular-nums">
+                    {p.free_count} / {p.total_count}
+                    {p.total_count === 0 && (
+                      // An empty pool is the quiet failure mode: logins are
+                      // accepted and then handed no address at all.
+                      <span
+                        className="ml-2 whitespace-nowrap rounded bg-[var(--tint-hover)] px-1.5 py-0.5 text-xs font-normal text-[var(--status-critical)]"
+                        title="This pool has no addresses yet — use Generate addresses, or nothing can be handed out of it"
+                      >
+                        not generated
+                      </span>
+                    )}
+                  </TD>
+                )}
                 {isPoolColVisible("usage") && (
                   <TD>
                     <div className="flex items-center gap-2">
@@ -1009,6 +1152,27 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                     <button className="text-[var(--series-1)] hover:underline" onClick={() => setSelectedPool(p.id)}>
                       View addresses
                     </button>
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openEdit(p)}>
+                      Edit
+                    </button>
+                    <button
+                      className="text-[var(--series-1)] hover:underline disabled:opacity-50"
+                      disabled={busyPool === p.id}
+                      onClick={() => handleGenerate(p)}
+                      title="Create the individual addresses in this pool's range so they can be handed out"
+                    >
+                      {busyPool === p.id ? "Working…" : "Generate addresses"}
+                    </button>
+                    {p.total_count > 0 && (
+                      <button
+                        className="text-[var(--text-muted)] hover:underline disabled:opacity-50"
+                        disabled={busyPool === p.id}
+                        onClick={() => handleClearFree(p)}
+                        title="Delete the unused addresses, keeping any that are assigned or reserved"
+                      >
+                        Clear unused
+                      </button>
+                    )}
                     <button
                       className="text-red-600 hover:underline dark:text-red-400"
                       onClick={() => handleDelete(p)}
@@ -1073,7 +1237,7 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       )}
 
       {showModal && (
-        <Modal title="New IP pool" onClose={() => setShowModal(false)}>
+        <Modal title={editing ? `Edit IP pool — ${editing.name}` : "New IP pool"} onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
             <FormField label="Name">
               <input className={inputClass} required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
@@ -1086,7 +1250,20 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
               </select>
             </FormField>
             <FormField label="Network CIDR">
-              <input className={inputClass} required placeholder="10.20.0.0/24" value={form.network_cidr} onChange={(e) => setForm({ ...form, network_cidr: e.target.value })} />
+              <input
+                className={inputClass}
+                required
+                placeholder="10.20.0.0/24"
+                value={form.network_cidr}
+                disabled={!!editing && editing.total_count > 0}
+                onChange={(e) => setForm({ ...form, network_cidr: e.target.value })}
+              />
+              {!!editing && editing.total_count > 0 && (
+                <p className="mt-1 text-xs text-[var(--text-muted)]">
+                  Locked — this pool holds {editing.total_count} generated address(es). Changing the range would
+                  leave them outside it. Clear the unused ones (and release any assigned) first, then edit.
+                </p>
+              )}
             </FormField>
             <FormField label="Gateway">
               <input className={inputClass} placeholder="10.20.0.1" value={form.gateway ?? ""} onChange={(e) => setForm({ ...form, gateway: e.target.value })} />
@@ -1107,7 +1284,7 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 <option value="rootnet">RootNet</option>
               </select>
             </FormField>
-            {items.length > 0 && (
+            {items.filter((p) => p.id !== editing?.id).length > 0 && (
               <FormField label="RootNet (optional parent network)">
                 <select
                   className={inputClass}
@@ -1115,15 +1292,20 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                   onChange={(e) => setForm({ ...form, root_net: e.target.value ? Number(e.target.value) : null })}
                 >
                   <option value="">None</option>
-                  {items.map((p) => (
+                  {/* A pool can't be its own parent -- the backend rejects it,
+                      so don't offer it. */}
+                  {items.filter((p) => p.id !== editing?.id).map((p) => (
                     <option key={p.id} value={p.id}>{p.name} ({p.network_cidr})</option>
                   ))}
                 </select>
               </FormField>
             )}
+            {formError && <p className="mb-3 text-sm text-[var(--status-critical)]">{formError}</p>}
             <div className="mt-4 flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
-              <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Create pool"}</button>
+              <button type="submit" disabled={saving} className={btnPrimary}>
+                {saving ? "Saving…" : editing ? "Save changes" : "Create pool"}
+              </button>
             </div>
           </form>
         </Modal>
@@ -1132,372 +1314,11 @@ function IPPoolsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   );
 }
 
-// ---------------------------------------------------------------------------
-// RADIUS Clients (Mikrotik/NAS devices)
-// ---------------------------------------------------------------------------
-
-const NAS_COLUMNS: ColumnDef[] = [
-  { key: "name", label: "Name" },
-  { key: "status", label: "Status" },
-  { key: "ip_address", label: "IP address" },
-  { key: "shortname", label: "Shortname" },
-  { key: "secret", label: "Secret" },
-  { key: "realm", label: "Realm" },
-  { key: "active", label: "Active" },
-];
-
-// How often the RADIUS Clients page re-pings every NAS on its own, in
-// addition to the manual "Refresh status" button -- a live network
-// check, not a persisted field, so it's always at most this stale.
-const NAS_STATUS_REFRESH_MS = 45_000;
-
-const emptyNasForm: Partial<RadiusNasClient> & { secret: string } = {
-  name: "",
-  ip_address: "",
-  shortname: "",
-  secret: "",
-  realm: "",
-  description: "",
-  is_active: true,
-};
-
-function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
-  const { items, loading, refetch } = useApiList<RadiusNasClient>("/radius-nas-clients/?page_size=100");
-  const [showModal, setShowModal] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [editing, setEditing] = useState<RadiusNasClient | null>(null);
-  const [form, setForm] = useState(emptyNasForm);
-  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("radius-nas-clients", ["name"]);
-
-  useEffect(() => {
-    onRegisterNewAction({ label: "+ New RADIUS client", onClick: () => openCreate() });
-    return () => onRegisterNewAction(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Live online/offline status -- a ping run right now against every
-  // client's IP, not a persisted field (see RadiusNasClientPingStatus).
-  // Keyed by client id so a row shows "Checking…" the first time and
-  // then whatever the last completed ping said, rather than flickering
-  // back to unknown on every refresh.
-  const [statusById, setStatusById] = useState<Record<number, "online" | "offline">>({});
-  const [statusChecking, setStatusChecking] = useState(false);
-
-  async function refreshStatuses() {
-    setStatusChecking(true);
-    try {
-      const res = await api.get<RadiusNasClientPingStatus[]>("/radius-nas-clients/ping-status/");
-      setStatusById((prev) => {
-        const next = { ...prev };
-        res.data.forEach((entry) => {
-          next[entry.id] = entry.status;
-        });
-        return next;
-      });
-    } catch {
-      // Best-effort status indicator -- a failed check just leaves the
-      // last known status (or "Checking…") in place rather than erroring
-      // out the whole page.
-    } finally {
-      setStatusChecking(false);
-    }
-  }
-
-  useEffect(() => {
-    refreshStatuses();
-    const interval = setInterval(refreshStatuses, NAS_STATUS_REFRESH_MS);
-    return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  function openCreate() {
-    setEditing(null);
-    setForm(emptyNasForm);
-    setShowModal(true);
-  }
-
-  function openEdit(client: RadiusNasClient) {
-    setEditing(client);
-    setForm({
-      name: client.name,
-      ip_address: client.ip_address,
-      shortname: client.shortname,
-      secret: "",
-      realm: client.realm,
-      description: client.description,
-      is_active: client.is_active,
-    });
-    setShowModal(true);
-  }
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setSaving(true);
-    try {
-      if (editing) {
-        await api.patch(`/radius-nas-clients/${editing.id}/`, form);
-      } else {
-        await api.post("/radius-nas-clients/", form);
-      }
-      setShowModal(false);
-      refetch();
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleDelete(client: RadiusNasClient) {
-    if (
-      !confirm(
-        `Delete the RADIUS client "${client.name}" (${client.ip_address})? FreeRADIUS will stop accepting ` +
-          "requests from this device until it's re-added and clients.conf is re-rendered. This can't be undone."
-      )
-    )
-      return;
-    try {
-      await api.delete(`/radius-nas-clients/${client.id}/`);
-      if (editing?.id === client.id) setShowModal(false);
-      refetch();
-    } catch (err: any) {
-      alert(err?.response?.data?.detail || "Couldn't delete this RADIUS client.");
-    }
-  }
-
-  const [pushingClient, setPushingClient] = useState<RadiusNasClient | null>(null);
-  const [pushFreeradiusIp, setPushFreeradiusIp] = useState("");
-  const [pushSaving, setPushSaving] = useState(false);
-  const [pushResult, setPushResult] = useState<string | null>(null);
-  const [pushError, setPushError] = useState<string | null>(null);
-  // Stored default FreeRADIUS server IP (Configs -> OVPN) -- pre-fills the
-  // push modal below so staff don't retype it on every single push, while
-  // still leaving the field editable for a one-off/secondary server.
-  const [defaultFreeradiusIp, setDefaultFreeradiusIp] = useState("");
-
-  useEffect(() => {
-    // Admin-only endpoint (Configs -> OVPN) -- non-admin staff can still
-    // use RADIUS Clients/push, they just won't get a pre-filled default,
-    // so a 403 here is expected and safely ignored rather than surfaced.
-    api
-      .get<OvpnSettingsConfig>("/ovpn-settings/")
-      .then((res) => setDefaultFreeradiusIp(res.data.freeradius_ip))
-      .catch(() => {});
-  }, []);
-
-  function openPush(client: RadiusNasClient) {
-    setPushingClient(client);
-    setPushFreeradiusIp(defaultFreeradiusIp);
-    setPushResult(null);
-    setPushError(null);
-  }
-
-  async function handlePushSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (!pushingClient) return;
-    setPushSaving(true);
-    setPushError(null);
-    setPushResult(null);
-    try {
-      const res = await api.post<{ status: string; device: string }>(
-        `/radius-nas-clients/${pushingClient.id}/push-to-router/`,
-        { freeradius_ip: pushFreeradiusIp }
-      );
-      setPushResult(`Pushed successfully to ${res.data.device}.`);
-    } catch (err: any) {
-      setPushError(err?.response?.data?.detail ?? "Couldn't push config to the router.");
-    } finally {
-      setPushSaving(false);
-    }
-  }
-
-  return (
-    <div>
-      <div className="mb-3 rounded-md border border-[var(--border-hairline)] bg-[var(--tint-hover)] p-3 text-xs text-[var(--text-secondary)]">
-        Devices allowed to send RADIUS requests to this platform's FreeRADIUS server (the Mikrotik at Teraco JHB and
-        any others). After adding or editing a client here, run <code className="font-mono">python manage.py render_clients_conf</code>{" "}
-        on the RADIUS server and reload FreeRADIUS to apply the change — see RADIUS_SETUP.md. The Status column is a
-        live ping to each device's IP (auto-refreshed every 45s) — it confirms the device is reachable on the
-        network, not that FreeRADIUS or RADIUS auth itself is working.
-      </div>
-      <div className="mb-4 flex items-center justify-end gap-3">
-        <button
-          type="button"
-          className="text-sm text-[var(--series-1)] hover:underline disabled:opacity-50"
-          onClick={() => refreshStatuses()}
-          disabled={statusChecking}
-        >
-          {statusChecking ? "Checking status…" : "Refresh status"}
-        </button>
-        <ColumnToggle columns={NAS_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
-      </div>
-
-      {loading ? (
-        <p className="text-[var(--text-muted)]">Loading…</p>
-      ) : (
-        <Table>
-          <THead>
-            <tr>
-              <TH>Name</TH>
-              {isVisible("status") && <TH>Status</TH>}
-              {isVisible("ip_address") && <TH>IP address</TH>}
-              {isVisible("shortname") && <TH>Shortname</TH>}
-              {isVisible("secret") && <TH>Secret</TH>}
-              {isVisible("realm") && <TH>Realm</TH>}
-              {isVisible("active") && <TH>Active</TH>}
-              <TH></TH>
-            </tr>
-          </THead>
-          <tbody>
-            {items.map((c) => (
-              <TR key={c.id}>
-                <TD className="font-medium">{c.name}</TD>
-                {isVisible("status") && (
-                  <TD>
-                    {statusById[c.id] ? <StatusBadge status={statusById[c.id]} /> : <StatusBadge status="unknown" />}
-                  </TD>
-                )}
-                {isVisible("ip_address") && <TD>{c.ip_address}</TD>}
-                {isVisible("shortname") && <TD>{c.shortname}</TD>}
-                {isVisible("secret") && <TD>{c.secret_set ? "•••••••• (set)" : "Not set"}</TD>}
-                {isVisible("realm") && <TD>{c.realm || "—"}</TD>}
-                {isVisible("active") && <TD>{c.is_active ? "Yes" : "No"}</TD>}
-                <TD>
-                  <div className="flex items-center gap-3">
-                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openEdit(c)}>
-                      Edit
-                    </button>
-                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openPush(c)}>
-                      Push to router
-                    </button>
-                    <button
-                      className="text-red-600 hover:underline dark:text-red-400"
-                      onClick={() => handleDelete(c)}
-                    >
-                      Delete
-                    </button>
-                  </div>
-                </TD>
-              </TR>
-            ))}
-            {items.length === 0 && (
-              <TR>
-                <TD className="text-[var(--text-muted)]">No RADIUS clients configured yet.</TD>
-              </TR>
-            )}
-          </tbody>
-        </Table>
-      )}
-
-      {showModal && (
-        <Modal title={editing ? "Edit RADIUS client" : "New RADIUS client"} onClose={() => setShowModal(false)}>
-          <form onSubmit={handleSubmit}>
-            <FormField label="Name">
-              <input
-                className={inputClass}
-                required
-                placeholder="Teraco JHB Mikrotik"
-                value={form.name}
-                onChange={(e) => setForm({ ...form, name: e.target.value })}
-              />
-            </FormField>
-            <FormField label="IP address">
-              <input
-                className={inputClass}
-                required
-                placeholder="196.10.20.30"
-                value={form.ip_address}
-                onChange={(e) => setForm({ ...form, ip_address: e.target.value })}
-              />
-            </FormField>
-            <FormField label="Shortname">
-              <input
-                className={inputClass}
-                required
-                placeholder="mikrotik-jhb"
-                value={form.shortname}
-                onChange={(e) => setForm({ ...form, shortname: e.target.value })}
-                autoComplete="off"
-                name="nas-shortname"
-              />
-            </FormField>
-            <FormField label={`Shared secret${editing?.secret_set ? " (set — leave blank to keep)" : ""}`}>
-              <input
-                type="password"
-                className={inputClass}
-                placeholder={editing?.secret_set ? "••••••••" : "Set a shared secret"}
-                value={form.secret}
-                onChange={(e) => setForm({ ...form, secret: e.target.value })}
-                autoComplete="new-password"
-                name="nas-secret"
-              />
-            </FormField>
-            <FormField label="Realm">
-              <input
-                className={inputClass}
-                placeholder="e.g. jhb (optional — reporting/segmentation tag only)"
-                value={form.realm}
-                onChange={(e) => setForm({ ...form, realm: e.target.value })}
-              />
-            </FormField>
-            <FormField label="Description">
-              <input
-                className={inputClass}
-                value={form.description}
-                onChange={(e) => setForm({ ...form, description: e.target.value })}
-              />
-            </FormField>
-            <FormField label="Active">
-              <select
-                className={inputClass}
-                value={form.is_active ? "yes" : "no"}
-                onChange={(e) => setForm({ ...form, is_active: e.target.value === "yes" })}
-              >
-                <option value="yes">Yes</option>
-                <option value="no">No</option>
-              </select>
-            </FormField>
-            <div className="mt-4 flex justify-end gap-2">
-              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
-              <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Save"}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-
-      {pushingClient && (
-        <Modal title={`Push RADIUS config to router — ${pushingClient.name}`} onClose={() => setPushingClient(null)}>
-          <form onSubmit={handlePushSubmit}>
-            <p className="mb-3 text-xs text-[var(--text-muted)]">
-              Pushes a <code className="font-mono">/radius</code> client entry (pointing at the FreeRADIUS server
-              below, using this NAS client's secret) and <code className="font-mono">/ppp aaa use-radius=yes</code>{" "}
-              directly to the router at {pushingClient.ip_address} via its Mikrotik API — only works if a router
-              under Routers has the API enabled with a matching IP address. This does not set up the OVPN server,
-              PPP profile, TLS certificate, or firewall — see deploy/radius/mikrotik_teraco_jhb.rsc for those.
-            </p>
-            <FormField label="FreeRADIUS server IP">
-              <input
-                className={inputClass}
-                required
-                placeholder="e.g. 154.65.111.61"
-                value={pushFreeradiusIp}
-                onChange={(e) => setPushFreeradiusIp(e.target.value)}
-              />
-            </FormField>
-            {pushResult && <p className="mb-3 text-sm text-green-700 dark:text-green-400">{pushResult}</p>}
-            {pushError && <p className="mb-3 text-sm text-red-700 dark:text-red-300">{pushError}</p>}
-            <div className="mt-4 flex justify-end gap-2">
-              <button type="button" className={btnSecondary} onClick={() => setPushingClient(null)}>Close</button>
-              <button type="submit" disabled={pushSaving} className={btnPrimary}>{pushSaving ? "Pushing…" : "Push"}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
-// VPN Clients (outbound OpenVPN client tunnels this platform's own VPS
-// dials out on -- modeled on Splynx's own Config -> Tools -> VPN page)
+// OpenVPN (outbound OpenVPN client tunnels this platform's own VPS dials
+// out on). Tab key stays "vpn-clients" and the API stays
+// /ovpn-client-connections/ -- only the visible label changed.
 // ---------------------------------------------------------------------------
 
 const VPN_COLUMNS: ColumnDef[] = [
@@ -1508,6 +1329,12 @@ const VPN_COLUMNS: ColumnDef[] = [
   { key: "username", label: "Username" },
   { key: "enabled", label: "Enabled" },
 ];
+
+// How often this tab re-pings each connection's remote address on its own,
+// in addition to the manual "Refresh status" button -- a live network check,
+// not a persisted field, so it's always at most this stale. (Was shared with
+// the RADIUS Clients tab before that moved to Configs.)
+const VPN_STATUS_REFRESH_MS = 45_000;
 
 const emptyVpnForm: Partial<OvpnClientConnection> & { password: string } = {
   name: "",
@@ -1556,7 +1383,7 @@ function VpnClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
 
   useEffect(() => {
     refreshStatuses();
-    const interval = setInterval(refreshStatuses, NAS_STATUS_REFRESH_MS);
+    const interval = setInterval(refreshStatuses, VPN_STATUS_REFRESH_MS);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1657,7 +1484,7 @@ function VpnClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
     <div>
       <div className="mb-3 rounded-md border border-[var(--border-hairline)] bg-[var(--tint-hover)] p-3 text-xs text-[var(--text-secondary)]">
         Outbound OpenVPN client tunnels this platform's own VPS dials out on to reach a router's private management
-        network — modeled on Splynx's own Config → Tools → VPN page. This only stores the connection's config;
+        network. This only stores the connection's config;
         installing it as a real tunnel on the VPS (systemd's <code className="font-mono">openvpn-client@&lt;name&gt;</code>{" "}
         service) is still a manual step — use "Download config" per connection for the file to install there. The
         Status column is a live ping to the remote address (auto-refreshed every 45s), not confirmation the tunnel
@@ -1788,7 +1615,7 @@ function VpnClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
             <FormField label="Username">
               <input
                 className={inputClass}
-                placeholder="Splynx"
+                placeholder="e.g. skybre-mgmt"
                 value={form.username}
                 onChange={(e) => setForm({ ...form, username: e.target.value })}
                 // This looks like a login form to browsers (a plain text
@@ -1933,10 +1760,20 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
                 {isVisible("framedipaddress") && <TD>{s.framedipaddress ?? "—"}</TD>}
                 {isVisible("callingstationid") && <TD>{s.callingstationid ?? "—"}</TD>}
                 {isVisible("acctstarttime") && <TD>{s.acctstarttime ? new Date(s.acctstarttime).toLocaleString() : "—"}</TD>}
-                {isVisible("duration") && <TD>{formatDuration(s.acctsessiontime)}</TD>}
+                {isVisible("duration") && <TD>{formatDuration(s.duration_seconds ?? s.acctsessiontime)}</TD>}
                 {isVisible("traffic") && (
                   <TD className="tabular-nums">
-                    {formatBytes(s.acctinputoctets)} / {formatBytes(s.acctoutputoctets)}
+                    {/* Router counters when a live reading exists -- they are
+                        current to the second. The accounting counters lag by
+                        the NAS's interim interval, so a session minutes old
+                        otherwise reads 0.0 MB / 0.0 MB. */}
+                    {formatBytes(s.live_input_octets ?? s.acctinputoctets)} /{" "}
+                    {formatBytes(s.live_output_octets ?? s.acctoutputoctets)}
+                    {s.live_input_octets == null && s.acctstoptime == null && (
+                      <span className="ml-1 text-xs text-[var(--text-muted)]" title="The router reports byte counters on its accounting interval, which is every 5 minutes on this NAS. A session younger than that reads zero until the first update arrives.">
+                        (awaiting first update)
+                      </span>
+                    )}
                   </TD>
                 )}
                 {isVisible("status") && (
@@ -1964,88 +1801,3 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
   );
 }
 
-// ---------------------------------------------------------------------------
-// OVPN Settings -- admin-only (moved here from Configs; feeds RADIUS
-// Clients' "Push to router" default freeradius_ip above)
-// ---------------------------------------------------------------------------
-
-const EMPTY_OVPN_SETTINGS_FORM = { freeradius_ip: "", notes: "" };
-
-function OvpnSettingsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
-  const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState(EMPTY_OVPN_SETTINGS_FORM);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const [saved, setSaved] = useState(false);
-
-  function load() {
-    setLoading(true);
-    api.get<OvpnSettingsConfig>("/ovpn-settings/").then((r) => {
-      setForm({ freeradius_ip: r.data.freeradius_ip, notes: r.data.notes });
-      setLoading(false);
-    });
-  }
-
-  useEffect(() => {
-    load();
-    onRegisterNewAction(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setError("");
-    setSaved(false);
-    setSaving(true);
-    try {
-      await api.patch<OvpnSettingsConfig>("/ovpn-settings/", form);
-      setSaved(true);
-    } catch (err) {
-      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
-      const firstError = data ? Object.values(data).flat()[0] : null;
-      setError(typeof firstError === "string" ? firstError : "Could not save these settings — please try again.");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  if (loading) return <p className="text-[var(--text-muted)]">Loading…</p>;
-
-  return (
-    <div>
-      <p className="mb-4 max-w-2xl text-sm text-[var(--text-secondary)]">
-        Platform-wide OVPN/FreeRADIUS defaults. Individual NAS devices (Mikrotiks) and their shared secrets are still
-        managed under RADIUS Clients above — this is only the default FreeRADIUS server address that "Push to router"
-        pre-fills, so staff don't have to type it in by hand every time.
-      </p>
-
-      <form onSubmit={handleSubmit} className="max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5">
-        <FormField label="FreeRADIUS server IP">
-          <input
-            className={inputClass}
-            placeholder="e.g. 154.65.111.61"
-            value={form.freeradius_ip}
-            onChange={(e) => setForm({ ...form, freeradius_ip: e.target.value })}
-          />
-        </FormField>
-        <FormField label="Notes (staff-only, e.g. links or reminders)">
-          <textarea
-            className={inputClass}
-            rows={4}
-            value={form.notes}
-            onChange={(e) => setForm({ ...form, notes: e.target.value })}
-          />
-        </FormField>
-
-        {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
-        {saved && !error && <p className="mb-3 text-sm text-[#0ca30c]">Settings saved.</p>}
-
-        <div className="flex justify-end">
-          <button type="submit" disabled={saving} className={btnPrimary}>
-            {saving ? "Saving…" : "Save settings"}
-          </button>
-        </div>
-      </form>
-    </div>
-  );
-}

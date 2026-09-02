@@ -40,6 +40,8 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >>"$LOG_FILE"; }
 
 cd "$PROJECT_DIR"
 
+# Read DB credentials from the same .env docker-compose already uses, so
+# this script never needs its own copy of the password.
 DB_USER=$(grep -E '^DB_USER=' backend/.env | cut -d'=' -f2- | tr -d '\r')
 DB_NAME=$(grep -E '^DB_NAME=' backend/.env | cut -d'=' -f2- | tr -d '\r')
 
@@ -54,10 +56,14 @@ else
     exit 1
 fi
 
+# Keep one daily snapshot per day: always refresh it at the 00:xx run,
+# and also create one immediately if today doesn't have one yet (covers
+# the first day this script runs, and any missed midnight run).
 if [ "$hour" = "00" ] || [ ! -f "$DAILY_DIR/skybre_${today}.sql.gz" ]; then
     cp "$dump_file" "$DAILY_DIR/skybre_${today}.sql.gz"
 fi
 
+# Rotate: keep only the newest N files in each directory.
 prune() {
     local dir="$1" keep="$2"
     ls -1t "$dir"/skybre_*.sql.gz 2>/dev/null | tail -n +"$((keep + 1))" | xargs -r rm -f
@@ -65,6 +71,7 @@ prune() {
 prune "$HOURLY_DIR" "$KEEP_HOURLY"
 prune "$DAILY_DIR" "$KEEP_DAILY"
 
+# Off-site copy — only runs once GCS_BUCKET + GCS_KEY_FILE are set up.
 if [ -n "$GCS_BUCKET" ] && [ -f "$GCS_KEY_FILE" ]; then
     if ! command -v gcloud >/dev/null 2>&1; then
         log "WARNING: GCS configured but gcloud CLI not installed — skipping off-site upload"

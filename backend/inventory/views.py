@@ -1,9 +1,11 @@
-from rest_framework import viewsets, permissions
+from rest_framework import viewsets, permissions, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from accounts.permissions import IsStaffMember
+from accounts.permissions import IsStaffMember, section_permission
 from .models import Supplier, Product, SerializedUnit, StockReceipt, StockIssue, StockMovement
+
+HasInventoryAccess = section_permission("inventory")
 from .serializers import (
     SupplierSerializer,
     ProductSerializer,
@@ -18,9 +20,23 @@ from .filters import ProductFilter, SerializedUnitFilter, StockReceiptFilter, St
 
 class SupplierViewSet(viewsets.ModelViewSet):
     serializer_class = SupplierSerializer
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
     ordering_fields = ["name", "created_at"]
     search_fields = ["name", "contact_person", "email", "phone"]
+
+    def get_permissions(self):
+        # Listing suppliers is open to any staff member (not just the
+        # Inventory section) because other sections need a supplier picker
+        # of their own -- Accountant -> Expenses and Accountant -> Bank
+        # Feeds both let staff attribute a purchase/debit to a supplier,
+        # and gating the list on Inventory left those dropdowns silently
+        # empty for accountant-only staff. Exactly the same reasoning (and
+        # shape) as CustomerViewSet.get_permissions, which opens "list" up
+        # so Finance/Services/Scheduling/Tickets can render a customer
+        # picker. Creating/editing/deleting a supplier record still
+        # requires the Inventory section itself.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), IsStaffMember()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasInventoryAccess()]
 
     def get_queryset(self):
         return Supplier.objects.all()
@@ -28,13 +44,26 @@ class SupplierViewSet(viewsets.ModelViewSet):
 
 class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
     filterset_class = ProductFilter
     ordering_fields = ["name", "category", "tracking_type", "created_at"]
     search_fields = ["name", "sku", "description"]
 
+    def get_permissions(self):
+        # list/retrieve stay open to any staff member (regardless of
+        # Inventory section access) since Finance's invoice/quote line
+        # items and Services both need to browse the product catalog to
+        # pick stock items -- only actually changing stock (create/
+        # update/delete/adjust) requires the Inventory section itself.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), IsStaffMember()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasInventoryAccess()]
+
     def get_queryset(self):
-        return Product.objects.all()
+        # The cost/margin properties walk this product's receipt lines and each
+        # line reads its own receipt (to know whether the captured cost was
+        # VAT-inclusive). Prefetched here so listing the catalogue is a fixed
+        # number of queries rather than growing with the number of products.
+        return Product.objects.prefetch_related("receipt_lines__receipt")
 
     @action(detail=True, methods=["post"])
     def adjust(self, request, pk=None):
@@ -75,23 +104,42 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response(ProductSerializer(product).data)
 
 
-class SerializedUnitViewSet(viewsets.ReadOnlyModelViewSet):
-    """Read-only browse of individual serial/MAC-tracked units — for
-    lookups, warranty checks, and seeing what's issued where. Status
-    changes happen via the receipt/issue flows."""
+class SerializedUnitViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Browse and correct individual serial/MAC-tracked units — lookups,
+    warranty checks, and seeing what's issued where.
+
+    List + retrieve + update, deliberately no create and no delete. Units are
+    brought into existence by checking in a receipt (which is what ties them
+    to a supplier and a cost) and destroying one would orphan the movement
+    history that the on-hand count is derived from. What update is for is
+    fixing a typo: a mis-keyed MAC used to be permanent, which made recording
+    MACs at all a bit pointless. The serializer restricts editing to
+    serial_number / mac_address / notes and validates both identifiers,
+    including against every other unit.
+    """
 
     serializer_class = SerializedUnitSerializer
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasInventoryAccess]
     filterset_class = SerializedUnitFilter
-    ordering_fields = ["serial_number", "status", "created_at"]
+    ordering_fields = ["serial_number", "mac_address", "status", "created_at"]
     search_fields = ["serial_number", "mac_address", "product__name"]
 
     def get_queryset(self):
-        return SerializedUnit.objects.select_related("product").all()
+        # The provenance fields on the serializer walk
+        # received_via_line -> receipt -> supplier. Without this the units
+        # list is three extra queries per row.
+        return SerializedUnit.objects.select_related(
+            "product", "received_via_line__receipt__supplier"
+        ).all()
 
 
 class StockReceiptViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasInventoryAccess]
     filterset_class = StockReceiptFilter
     ordering_fields = ["invoice_date", "created_at", "supplier__name"]
     search_fields = ["invoice_number", "supplier__name", "notes"]
@@ -110,7 +158,7 @@ class StockReceiptViewSet(viewsets.ModelViewSet):
 
 
 class StockIssueViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasInventoryAccess]
     filterset_class = StockIssueFilter
     ordering_fields = ["issued_at", "job__title", "issued_to__username"]
     search_fields = ["notes", "job__title", "issued_to__username"]
