@@ -3,18 +3,32 @@ venv/
 __pycache__/
 *.pyc
 backend/db.sqlite3
-backend/.env
 backend/server.log
 
-# Node
-frontend/node_modules/
+# Secrets and their backups. backend/.env holds SECRET_KEY and the DB
+# password; .env.bak exists on the VPS from a duplicate-key cleanup and
+# holds a REAL key, so the glob matters as much as the plain name.
+backend/.env
+backend/.env.bak
+backend/.env.old
+backend/.env.save
+backend/.env.local
+# (backend/.env.example and .env.production.example are deliberately
+#  tracked -- they carry no values.)
+
+# Uploaded files: stock receipts, supplier invoices, staff sick notes.
+# Real customer and staff documents. MEDIA_ROOT is backend/media, so
+# without this an automated `git add -A` on the server would push them.
+backend/media/
+
+# Build output
+backend/staticfiles/
 frontend/dist/
-frontend/.env.local
+frontend/node_modules/
+
+# Runtime logs (the speed-policies cron writes here)
+logs/
+*.log
 
 # OS / editor
 .DS_Store
-*.log
-
-# Build output / local test scaffolding
-backend/staticfiles/
-frontend/dist/
