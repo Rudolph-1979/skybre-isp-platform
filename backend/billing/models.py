@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import IntegrityError, models, transaction
+from django.db.models import BigIntegerField, Max
+from django.db.models.functions import Cast, Substr
 
 
 class Tariff(models.Model):
@@ -334,23 +336,64 @@ class Invoice(models.Model):
         return self._NUMBER_PREFIXES.get(status, self._DEFAULT_PREFIX)
 
     def _next_number_for_status(self, status):
+        """One past the HIGHEST sequence number ever issued under this
+        status's prefix.
+
+        Deliberately the maximum, not the number on the most recently
+        created row. Those are the same thing right up until they aren't:
+        an imported or backdated invoice carrying a lower number than the
+        newest row would otherwise drag the sequence backwards and start
+        handing out numbers that are already taken -- and because the
+        clash is on a unique column, every subsequent create walks
+        forward one number at a time hitting the same wall.
+
+        Rows whose number doesn't parse as `<prefix>-<digits>` (legacy
+        imports, hand-edited references) are skipped rather than guessed
+        at: they're excluded by the regex before the cast, so a single
+        unparseable row can't take the sequence down with it. The digit
+        bound keeps the cast safe -- nine digits is ~1000x more invoices
+        than this platform will ever issue, and anything longer is
+        malformed by definition.
+        """
         prefix = self._prefix_for_status(status)
-        qs = Invoice.objects.filter(number__startswith=f"{prefix}-")
+        qs = Invoice.objects.filter(number__regex=rf"^{prefix}-\d{{1,9}}$")
         if self.pk:
             qs = qs.exclude(pk=self.pk)
-        last = qs.order_by("-id").first()
-        next_seq = 1
-        if last:
-            try:
-                next_seq = int(last.number.rsplit("-", 1)[-1]) + 1
-            except (ValueError, IndexError):
-                next_seq = qs.count() + 1
-        return f"{prefix}-{next_seq:06d}"
+        highest = qs.annotate(
+            _seq=Cast(Substr("number", len(prefix) + 2), BigIntegerField())
+        ).aggregate(highest=Max("_seq"))["highest"]
+        return f"{prefix}-{(highest or 0) + 1:06d}"
 
     def save(self, *args, **kwargs):
-        if not self.number:
+        if self.number:
+            return super().save(*args, **kwargs)
+
+        # Two simultaneous creates can compute the same next number --
+        # `number` is unique, so the constraint is the only thing that
+        # actually serialises them, and the loser gets an IntegrityError.
+        # Retry rather than surfacing a 500; inside a recurring-billing
+        # run, an unhandled clash here used to be enough to take that
+        # customer's whole invoice down with it.
+        #
+        # Mirrors customers.Customer.save()'s handling of exactly this
+        # race on customer_id, down to the attempt count. Each attempt
+        # gets its own atomic block so the failed INSERT can be rolled
+        # back and retried; anything that isn't a number clash is
+        # re-raised untouched. Retries converge because
+        # _next_number_for_status re-reads the maximum each time, so the
+        # winner's number is visible to the next attempt.
+        last_error = None
+        for _ in range(5):
             self.number = self._next_number_for_status(self.status)
-        super().save(*args, **kwargs)
+            try:
+                with transaction.atomic():
+                    return super().save(*args, **kwargs)
+            except IntegrityError as exc:
+                if "number" not in str(exc):
+                    raise
+                last_error = exc
+                self.number = ""
+        raise last_error
 
     @property
     def balance_due(self):
@@ -368,7 +411,11 @@ class Invoice(models.Model):
         if not self.can_convert_to_proforma():
             raise ValueError("Only a quote can be converted to a pro forma invoice.")
         self.status = self.Status.PROFORMA
-        self.number = self._next_number_for_status(self.status)
+        # Cleared rather than assigned here so save() is the single place
+        # that issues a number -- and so this path gets its retry-on-clash
+        # protection too, instead of 500ing on a race the create path
+        # already survives.
+        self.number = ""
         self.save()
 
     def convert_to_invoice(self):
@@ -379,7 +426,8 @@ class Invoice(models.Model):
         if not self.can_convert_to_invoice():
             raise ValueError("Only a quote or a pro forma invoice can be converted to an invoice.")
         self.status = self.Status.UNPAID
-        self.number = self._next_number_for_status(self.status)
+        # See convert_to_proforma: save() issues the number, with retries.
+        self.number = ""
         self.save()
         self.activate_tariff_services()
 

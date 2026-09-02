@@ -13,6 +13,7 @@ choice) that weren't spelled out in the original request and were
 resolved with a documented best guess rather than guessed silently.
 """
 import calendar
+import logging
 from datetime import timedelta
 
 from django.db import transaction
@@ -27,7 +28,40 @@ from .models import (
     RecurringBillingRun,
 )
 
+logger = logging.getLogger(__name__)
+
 _PERIOD_MONTHS = {"monthly": 1, "quarterly": 3, "biannually": 6, "annually": 12}
+
+
+def _send_after_commit(template_key, customer, **kwargs):
+    """Hand an email to the mailer only once the surrounding transaction
+    has actually committed.
+
+    This is the difference between a customer receiving an invoice and a
+    customer receiving an invoice that does not exist. SMTP has no
+    rollback: if the send happens inside the transaction and the
+    transaction then fails, the PDF is already in their inbox quoting a
+    number that no longer exists in the database -- and which the next run
+    will hand to somebody else.
+
+    on_commit also means a rolled-back savepoint discards the queued send,
+    which is exactly the behaviour we want per customer.
+
+    The send is wrapped so that a mailer failure can never fail the
+    billing work that already committed. send_customer_email swallows its
+    own exceptions today, but that is its choice to make, not something
+    this module should depend on -- an invoice that exists with no email
+    is recoverable, the reverse is not.
+    """
+    def _send():
+        try:
+            send_customer_email(template_key, customer, **kwargs)
+        except Exception:  # noqa: BLE001 -- see docstring: never fail committed billing over an email
+            logger.exception(
+                "Failed to send %s email to customer %s after billing committed", template_key, customer.pk
+            )
+
+    transaction.on_commit(_send)
 
 
 def _add_period(base_date, period):
@@ -101,7 +135,7 @@ def _generate_document(customer, config, run_date, run, commit):
         customer.save(update_fields=["balance"])
 
     if config.send_billing_notifications:
-        send_customer_email(doc_type, customer, invoice=invoice)
+        _send_after_commit(doc_type, customer, invoice=invoice)
 
     config.next_billing_date = _add_period(run_date, config.payment_period)
     config.save(update_fields=["next_billing_date"])
@@ -152,7 +186,7 @@ def _process_reminders(customer, config, reminder_settings, run_date, commit):
     ).exists()
     if already_sent_today:
         return 0
-    send_customer_email(EmailTemplate.Key.PAYMENT_REMINDER, customer, invoice=due_invoice)
+    _send_after_commit(EmailTemplate.Key.PAYMENT_REMINDER, customer, invoice=due_invoice)
     return 1
 
 
@@ -220,7 +254,7 @@ def _process_blocking(customer, config, suspension_settings, run_date, commit):
         svc.status = Service.Status.SUSPENDED
         svc.save()
     if config.send_billing_notifications:
-        send_customer_email(EmailTemplate.Key.SUSPENSION, customer)
+        _send_after_commit(EmailTemplate.Key.SUSPENSION, customer)
     return 1
 
 
@@ -332,13 +366,61 @@ def upcoming_blocks(from_date, horizon_days=7, customers=None):
     return results
 
 
+_COUNT_KEYS = ("invoices_created", "proforma_invoices_created", "reminders_sent", "suspensions_applied")
+
+
+def _process_one_customer(customer, config, run, run_date, reminder_settings, suspension_settings, commit):
+    """Everything owed to a single customer on this run, and what it came
+    to. Returns its own counts rather than incrementing a shared tally, so
+    the caller can throw the numbers away if this customer's transaction
+    doesn't survive -- a count for a rolled-back invoice is a lie the
+    History row would otherwise tell forever.
+    """
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
+    if _invoice_due(customer, config, run_date):
+        doc_type = _generate_document(customer, config, run_date, run, commit)
+        if doc_type == "invoice":
+            counts["invoices_created"] += 1
+        elif doc_type == "proforma":
+            counts["proforma_invoices_created"] += 1
+    counts["reminders_sent"] += _process_reminders(customer, config, reminder_settings, run_date, commit)
+    counts["suspensions_applied"] += _process_blocking(customer, config, suspension_settings, run_date, commit)
+    return counts
+
+
+def _describe_failures(failures):
+    """A status_message that names names. "3 customers failed" sends
+    somebody digging through logs; naming the first few means the person
+    reading History can go straight to them. Capped to fit the column."""
+    names = ", ".join(f"{customer.customer_id} ({exc.__class__.__name__})" for customer, exc in failures[:3])
+    more = len(failures) - 3
+    message = f"{len(failures)} customer(s) failed and were skipped: {names}"
+    if more > 0:
+        message += f", and {more} more"
+    return message[:255]
+
+
 def run_recurring_billing(run_date, partner_ids=None, commit=False, triggered_by=None):
     """Core entry point, used by both the Preview and Run API actions (and
     eventually a crontab-scheduled management command). commit=False never
     writes anything -- not an invoice, not an email, not a RecurringBillingRun
-    row -- it only counts what WOULD happen. commit=True does the real work
-    inside one transaction, then always logs a RecurringBillingRun (even on
-    failure, so a failed run is visible in the History list, not silent)."""
+    row -- it only counts what WOULD happen.
+
+    commit=True gives EACH CUSTOMER their own transaction, and that is the
+    important part. This used to run every customer inside one atomic
+    block, which meant a single bad row -- a dropped connection, a
+    numbering clash, one malformed tariff -- rolled back every invoice the
+    run had already created, for everybody, while the invoice emails
+    (which are not transactional) had already gone out. The failure mode
+    was hundreds of customers holding a PDF for an invoice that no longer
+    existed, and a History row cheerfully reporting how many invoices it
+    had created.
+
+    Now a customer who fails is rolled back, logged, named in the run's
+    status_message, and stepped over. Everyone else keeps their invoice.
+    A run with any casualties is marked FAILED -- partial success is still
+    something somebody has to look at -- but the counts on it describe
+    only what actually committed."""
     # Booked tariff changes first: a service switching plans today must bill
     # on the NEW tariff in this same run, not next month's. Idempotent and
     # also available as its own cron command -- see billing.tariff_changes.
@@ -356,51 +438,60 @@ def run_recurring_billing(run_date, partner_ids=None, commit=False, triggered_by
     if partner_ids:
         customers_qs = customers_qs.filter(partner_id__in=partner_ids)
 
-    counts = {"invoices_created": 0, "proforma_invoices_created": 0, "reminders_sent": 0, "suspensions_applied": 0}
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
     status = RecurringBillingRun.Status.PROCESSED
     status_message = ""
     reminder_settings = ReminderSettings.load()
     suspension_settings = SuspensionSettings.load()
 
-    def _do_work():
+    if not commit:
         for customer in customers_qs:
-            config = customer.billing_config
-            run_for_invoice = run if commit else None
-            if _invoice_due(customer, config, run_date):
-                doc_type = _generate_document(customer, config, run_date, run_for_invoice, commit)
-                if doc_type == "invoice":
-                    counts["invoices_created"] += 1
-                elif doc_type == "proforma":
-                    counts["proforma_invoices_created"] += 1
-            counts["reminders_sent"] += _process_reminders(customer, config, reminder_settings, run_date, commit)
-            counts["suspensions_applied"] += _process_blocking(customer, config, suspension_settings, run_date, commit)
+            for key, value in _process_one_customer(
+                customer, customer.billing_config, None, run_date,
+                reminder_settings, suspension_settings, commit=False,
+            ).items():
+                counts[key] += value
+        return {"counts": counts, "status": status, "status_message": status_message, "run": None}
 
-    run = None
-    if commit:
+    # Created and committed up front, before any customer is touched, so
+    # that every invoice this run generates has a run to point at and the
+    # run survives whatever happens next. A run row that only appears if
+    # the work succeeds is a run row you can't find when you most need it.
+    run = RecurringBillingRun.objects.create(run_date=run_date, triggered_by=triggered_by)
+    if partner_ids:
+        run.partners.set(partner_ids)
+
+    failures = []
+    for customer in customers_qs:
         try:
             with transaction.atomic():
-                run = RecurringBillingRun.objects.create(run_date=run_date, triggered_by=triggered_by)
-                if partner_ids:
-                    run.partners.set(partner_ids)
-                _do_work()
-                run.invoices_created_count = counts["invoices_created"]
-                run.proforma_invoices_created_count = counts["proforma_invoices_created"]
-                run.reminders_sent_count = counts["reminders_sent"]
-                run.suspensions_applied_count = counts["suspensions_applied"]
-                run.save(update_fields=[
-                    "invoices_created_count", "proforma_invoices_created_count",
-                    "reminders_sent_count", "suspensions_applied_count",
-                ])
-        except Exception as exc:  # noqa: BLE001 -- a failed run must still be visible in History, not silently lost
-            status = RecurringBillingRun.Status.FAILED
-            status_message = str(exc)
-            run = RecurringBillingRun.objects.create(
-                run_date=run_date, status=status, status_message=status_message, triggered_by=triggered_by,
-                **{f"{k}_count": v for k, v in counts.items()},
-            )
-            if partner_ids:
-                run.partners.set(partner_ids)
-    else:
-        _do_work()
+                customer_counts = _process_one_customer(
+                    customer, customer.billing_config, run, run_date,
+                    reminder_settings, suspension_settings, commit=True,
+                )
+        except Exception as exc:  # noqa: BLE001 -- one bad customer must not end the run for everybody else
+            logger.exception("Recurring billing failed for customer %s; skipping", customer.pk)
+            failures.append((customer, exc))
+            continue
+        # Only reached once this customer's transaction has committed, so
+        # these numbers describe work that actually exists.
+        for key, value in customer_counts.items():
+            counts[key] += value
+
+    if failures:
+        status = RecurringBillingRun.Status.FAILED
+        status_message = _describe_failures(failures)
+
+    run.status = status
+    run.status_message = status_message
+    run.invoices_created_count = counts["invoices_created"]
+    run.proforma_invoices_created_count = counts["proforma_invoices_created"]
+    run.reminders_sent_count = counts["reminders_sent"]
+    run.suspensions_applied_count = counts["suspensions_applied"]
+    run.save(update_fields=[
+        "status", "status_message",
+        "invoices_created_count", "proforma_invoices_created_count",
+        "reminders_sent_count", "suspensions_applied_count",
+    ])
 
     return {"counts": counts, "status": status, "status_message": status_message, "run": run}
