@@ -915,6 +915,29 @@ export interface Ticket {
   comments: TicketComment[];
 }
 
+export interface CustomerTask {
+  id: number;
+  customer: number;
+  customer_name: string;
+  title: string;
+  description: string;
+  status: "open" | "in_progress" | "done" | "cancelled";
+  priority: "low" | "medium" | "high" | "urgent";
+  /** ISO date (no time) or null -- a task needn't have a deadline. */
+  due_date: string | null;
+  assigned_to: number | null;
+  assigned_to_name: string | null;
+  created_by: number | null;
+  created_by_name: string | null;
+  /** Both computed by the API, not the browser: "overdue" depends on
+   *  today's date in OUR timezone, not the viewer's. */
+  is_overdue: boolean;
+  is_outstanding: boolean;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Job {
   id: number;
   customer: number | null;

@@ -295,3 +295,77 @@ class CustomerSessionsTests(TestCase):
         res = self.client.get(f"/api/customers/{self.customer.pk}/sessions/")
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.data["results"], [])
+
+
+class CustomerDeleteCascadeTests(TestCase):
+    """Deleting a customer must survive the audit rows written for
+    everything that cascades away with them.
+
+    Regression: each tracked child (service, invoice, payment, ticket,
+    task) writes a "deleted" audit row mid-cascade, and those rows were
+    linked to the customer being deleted. The collector had already
+    decided which AuditEvent rows to null out before those rows existed,
+    so the link survived, pointed at a deleted row, and the DEFERRABLE FK
+    failed the whole transaction at COMMIT. Symptom: deleting a customer
+    who had ever had a ticket raised IntegrityError and deleted nothing.
+    """
+
+    def test_deleting_a_customer_with_tracked_children_succeeds(self):
+        from customers.models import Customer, CustomerTask
+        from tickets.models import Ticket
+
+        customer = Customer.objects.create(full_name="Cascade Co")
+        ticket = Ticket.objects.create(customer=customer, subject="Line down")
+        ticket.status = Ticket.Status.RESOLVED
+        ticket.save()
+        task = CustomerTask.objects.create(customer=customer, title="Call them back")
+        task.status = CustomerTask.Status.DONE
+        task.save()
+
+        customer_id = customer.pk
+        customer.delete()
+
+        self.assertFalse(Customer.objects.filter(pk=customer_id).exists())
+        self.assertFalse(Ticket.objects.filter(pk=ticket.pk).exists())
+        self.assertFalse(CustomerTask.objects.filter(pk=task.pk).exists())
+
+    def test_the_deletion_events_are_still_recorded(self):
+        """The customer link is dropped, not the audit row -- "who deleted
+        this customer, and when" is the one question this table exists to
+        answer about a customer that no longer exists."""
+        from customers.models import Customer, CustomerTask
+
+        customer = Customer.objects.create(full_name="Still Recorded Co")
+        CustomerTask.objects.create(customer=customer, title="Goes away too")
+        customer.delete()
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action="deleted", target_type="customers.Customer"
+            ).exists()
+        )
+        task_event = AuditEvent.objects.filter(
+            action="deleted", target_type="customers.CustomerTask"
+        ).first()
+        self.assertIsNotNone(task_event)
+        self.assertIsNone(task_event.customer)
+
+    def test_an_unrelated_customer_keeps_its_link(self):
+        """The flag must not leak: a second customer's task events, written
+        after the first customer's delete, still link correctly."""
+        from customers.models import Customer, CustomerTask
+
+        doomed = Customer.objects.create(full_name="Doomed Co")
+        CustomerTask.objects.create(customer=doomed, title="Bye")
+        doomed.delete()
+
+        survivor = Customer.objects.create(full_name="Survivor Co")
+        task = CustomerTask.objects.create(customer=survivor, title="Keep me")
+        task.priority = CustomerTask.Priority.HIGH
+        task.save()
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                customer=survivor, target_type="customers.CustomerTask", action="updated"
+            ).exists()
+        )

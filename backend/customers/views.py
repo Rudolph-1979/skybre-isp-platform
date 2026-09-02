@@ -9,9 +9,11 @@ from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
 from rest_framework.exceptions import MethodNotAllowed
 from rest_framework.response import Response
-from .models import Customer, CustomerDeletionRequest, Partner
-from .serializers import CustomerSerializer, CustomerDeletionRequestSerializer, PartnerSerializer
-from .filters import CustomerFilter
+from .models import Customer, CustomerDeletionRequest, CustomerTask, Partner
+from .serializers import (
+    CustomerSerializer, CustomerDeletionRequestSerializer, CustomerTaskSerializer, PartnerSerializer,
+)
+from .filters import CustomerFilter, CustomerTaskFilter
 from accounts.permissions import IsManagement, IsStaffMember, section_permission
 from config.csv_import import CSVImportMixin
 
@@ -450,3 +452,39 @@ class CustomerDeletionRequestViewSet(viewsets.ModelViewSet):
         deletion_request.decided_at = timezone.now()
         deletion_request.save(update_fields=["status", "decision_note", "decided_by", "decided_at"])
         return Response(CustomerDeletionRequestSerializer(deletion_request).data)
+
+
+class CustomerTaskViewSet(viewsets.ModelViewSet):
+    """Internal follow-up tasks against a customer -- see
+    customers.models.CustomerTask for why this isn't a Job or a Ticket.
+
+    Staff-only, deliberately. TicketViewSet passes its section permission
+    straight through for portal users because tickets ARE the customer's
+    conversation; tasks are the opposite -- notes we make about chasing
+    them -- so IsStaffMember is enforced here and a portal login gets
+    nothing from this endpoint at all.
+    """
+
+    serializer_class = CustomerTaskSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasCustomersAccess]
+    filterset_class = CustomerTaskFilter
+    search_fields = ["title", "description", "customer__full_name"]
+    ordering_fields = ["due_date", "created_at", "updated_at", "priority", "status"]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = CustomerTask.objects.select_related("customer", "assigned_to", "created_by").all()
+        # Same reseller-partner scoping as CustomerViewSet.get_queryset:
+        # a staff member restricted to certain partners must not reach
+        # other partners' customers through this endpoint either. Without
+        # this, tasks would be a side door onto customer names the
+        # Customers page deliberately hides from them.
+        allowed = getattr(user, "allowed_partners", None) or []
+        if allowed and user.role != user.Role.ADMIN:
+            qs = qs.filter(
+                Q(customer__partner_id__in=allowed) | Q(customer__partner__isnull=True)
+            )
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)

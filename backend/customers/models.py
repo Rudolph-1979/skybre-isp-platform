@@ -340,3 +340,120 @@ class CustomerDeletionRequest(models.Model):
 
     def __str__(self):
         return f"Delete {self.customer_display_name or self.customer_display_id} ({self.status})"
+
+
+class CustomerTask(models.Model):
+    """A piece of follow-up work owed to one customer.
+
+    Deliberately NOT scheduling.Job and NOT tickets.Ticket, both of which
+    already exist and neither of which fits:
+
+      * A Job is a calendar block -- `start` and `end` are both required,
+        and it is what the day/technician schedule views read. Filing
+        "phone them back about the debit order" as a Job means inventing a
+        time window for it, and every one of those inventions shows up as
+        a real appointment on somebody's day.
+
+      * A Ticket is the customer's side of a conversation. It has a
+        reference number we quote to them, a department, a comment thread
+        the portal shows them (TicketComment.is_internal exists precisely
+        because the rest is visible), and closing one is a statement to
+        the customer that their issue is handled.
+
+    A task is neither: it is internal, it is not shown to the customer at
+    all, it has no reference number, and it is done when whoever owns it
+    says so. Staff-only by permission, not just by convention -- see
+    CustomerTaskViewSet.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        IN_PROGRESS = "in_progress", "In Progress"
+        DONE = "done", "Done"
+        CANCELLED = "cancelled", "Cancelled"
+
+    # The statuses that still need somebody to do something. Named once so
+    # a fifth status later can't leave three separate checks disagreeing
+    # about what "outstanding" means -- same reason Customer.OFF_STATUSES
+    # exists.
+    OPEN_STATUSES = ("open", "in_progress")
+
+    class Priority(models.TextChoices):
+        LOW = "low", "Low"
+        MEDIUM = "medium", "Medium"
+        HIGH = "high", "High"
+        URGENT = "urgent", "Urgent"
+
+    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name="tasks")
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
+    priority = models.CharField(max_length=20, choices=Priority.choices, default=Priority.MEDIUM)
+    # A date, not a datetime: these are "by Friday" items, and asking for a
+    # time of day on every one of them would get a made-up answer.
+    # Optional, because plenty of follow-ups genuinely have no deadline and
+    # forcing one produces a wall of fake due dates that then can't be
+    # told apart from the real ones.
+    due_date = models.DateField(
+        null=True, blank=True, help_text="Optional. Leave blank for a task with no deadline."
+    )
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_customer_tasks",
+        limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
+        help_text="Leave blank for a task the whole team can pick up.",
+    )
+    # SET_NULL rather than CASCADE: a staff member leaving must not delete
+    # the tasks they raised, the same reasoning as
+    # CustomerDeletionRequest.requested_by.
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    # Stamped by save() from `status`, never set by the API -- two fields
+    # that can disagree about whether a task is finished is a bug waiting
+    # to be written, so only one of them is writable.
+    completed_at = models.DateTimeField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            # The customer page's task list, and the only query this model
+            # gets asked in bulk.
+            models.Index(fields=["customer", "status"]),
+        ]
+
+    @property
+    def is_outstanding(self):
+        return self.status in self.OPEN_STATUSES
+
+    @property
+    def is_overdue(self):
+        """Past its due date and still not done.
+
+        A cancelled or completed task is never overdue -- the date passing
+        after the work stopped mattering isn't a thing to chase.
+        """
+        if not self.due_date or not self.is_outstanding:
+            return False
+        return self.due_date < timezone.localdate()
+
+    def save(self, *args, **kwargs):
+        # Keep completed_at in step with status in both directions: moving
+        # a task to Done stamps it, and moving it back out of Done clears
+        # it. Without the clear, a task reopened after being closed by
+        # mistake keeps a completion time that has already been read as
+        # "this was finished on the 3rd".
+        if self.status == self.Status.DONE:
+            if self.completed_at is None:
+                self.completed_at = timezone.now()
+        elif self.completed_at is not None:
+            self.completed_at = None
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.title} ({self.get_status_display()})"

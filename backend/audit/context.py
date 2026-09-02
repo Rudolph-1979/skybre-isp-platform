@@ -27,6 +27,22 @@ _actor_override: ContextVar = ContextVar("audit_actor_override", default=None)
 # Set while a management command or background job is running, so those
 # events are attributed to the job by name instead of to nobody.
 _system_label: ContextVar = ContextVar("audit_system_label", default="")
+# Primary keys of Customers currently part-way through being deleted.
+#
+# Deleting a customer cascades away their services, invoices, payments,
+# tickets and tasks -- all of them tracked, all of them writing a
+# "deleted" audit row as they go, and each of those rows wants to be
+# filed against the customer for the History tab. But the collector has
+# already snapshotted which AuditEvent rows to null out before those rows
+# exist, so a link written mid-cascade is never nulled and is left
+# pointing at a customer that is deleted moments later. The FK is
+# DEFERRABLE INITIALLY DEFERRED, so that lands as an IntegrityError at
+# COMMIT -- i.e. the whole delete fails, not just the logging.
+#
+# A customer being deleted has no History tab to read the link from, so
+# the link is worth nothing here anyway: the events themselves are still
+# recorded, just without the customer FK set.
+_deleting_customer_pks: ContextVar = ContextVar("audit_deleting_customer_pks", default=frozenset())
 
 
 def bind_request(request):
@@ -84,3 +100,18 @@ def acting_as_system(label):
         yield
     finally:
         _system_label.reset(token)
+
+
+def mark_customer_deleting(pk):
+    """Called from a Customer pre_delete. Django's collector fires every
+    pre_delete before it deletes anything, so this is always set before
+    the first child's post_delete runs."""
+    _deleting_customer_pks.set(_deleting_customer_pks.get() | {pk})
+
+
+def unmark_customer_deleting(pk):
+    _deleting_customer_pks.set(_deleting_customer_pks.get() - {pk})
+
+
+def customer_is_being_deleted(pk):
+    return pk in _deleting_customer_pks.get()

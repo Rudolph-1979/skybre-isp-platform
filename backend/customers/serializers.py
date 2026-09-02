@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Customer, CustomerDeletionRequest, Partner
+from .models import Customer, CustomerDeletionRequest, CustomerTask, Partner
 
 
 class PartnerSerializer(serializers.ModelSerializer):
@@ -139,4 +139,35 @@ class CustomerDeletionRequestSerializer(serializers.ModelSerializer):
     def validate_customer(self, value):
         if value.deletion_requests.filter(status=CustomerDeletionRequest.Status.PENDING).exists():
             raise serializers.ValidationError("There's already a pending deletion request for this customer.")
+        return value
+
+
+class CustomerTaskSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.full_name", read_only=True)
+    assigned_to_name = serializers.CharField(source="assigned_to.username", read_only=True, default=None)
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True, default=None)
+    # Computed server-side rather than in the browser: "overdue" depends on
+    # today's date in OUR timezone, and a customer's laptop set to another
+    # one would otherwise disagree with the same list on the next desk.
+    is_overdue = serializers.BooleanField(read_only=True)
+    is_outstanding = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = CustomerTask
+        fields = [
+            "id", "customer", "customer_name", "title", "description",
+            "status", "priority", "due_date",
+            "assigned_to", "assigned_to_name", "created_by", "created_by_name",
+            "is_overdue", "is_outstanding",
+            "completed_at", "created_at", "updated_at",
+        ]
+        # created_by is stamped from the request (see the viewset), not
+        # accepted from the client -- otherwise anyone could file a task
+        # under someone else's name.
+        read_only_fields = ["id", "created_by", "completed_at", "created_at", "updated_at"]
+
+    def validate_title(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Give the task a title — it's what shows in the list.")
         return value

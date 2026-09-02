@@ -1,7 +1,7 @@
 import django_filters
 from django.utils import timezone
 
-from .models import Customer
+from .models import Customer, CustomerTask
 
 
 class CustomerFilter(django_filters.FilterSet):
@@ -58,3 +58,37 @@ class CustomerFilter(django_filters.FilterSet):
         if not ids:
             return queryset
         return queryset.filter(partner_id__in=ids)
+
+
+class CustomerTaskFilter(django_filters.FilterSet):
+    """Plain equality filters, plus:
+
+    - `outstanding`: true = only tasks that still need doing (Open or In
+      Progress). Shares CustomerTask.OPEN_STATUSES rather than restating
+      the pair, so this filter and the model can't drift apart.
+    - `overdue`: true = outstanding AND past its due date. Tasks with no
+      due date are never overdue, so they're excluded here rather than
+      being swept in by a null comparison.
+    """
+
+    outstanding = django_filters.BooleanFilter(method="filter_outstanding")
+    overdue = django_filters.BooleanFilter(method="filter_overdue")
+
+    class Meta:
+        model = CustomerTask
+        fields = ["customer", "status", "priority", "assigned_to"]
+
+    def filter_outstanding(self, queryset, name, value):
+        if value is None:
+            return queryset
+        if value:
+            return queryset.filter(status__in=CustomerTask.OPEN_STATUSES)
+        return queryset.exclude(status__in=CustomerTask.OPEN_STATUSES)
+
+    def filter_overdue(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(
+            status__in=CustomerTask.OPEN_STATUSES,
+            due_date__lt=timezone.localdate(),
+        )

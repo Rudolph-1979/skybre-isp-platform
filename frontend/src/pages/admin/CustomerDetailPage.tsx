@@ -28,6 +28,7 @@ import type {
   Customer, Service, Invoice, Payment, Ticket, User, EmailTemplateKey, EmailLog,
   Tariff, IPPool, IPAddress, CustomerDeletionRequest, Partner, Device, ConnectionRule,
   PaymentMethod, BillingDefaultsConfig, CustomerBillingConfig as CustomerBillingConfigType,
+  CustomerTask,
 } from "../../types";
 
 type Tab = "overview" | "billing" | "email" | "history";
@@ -94,6 +95,50 @@ const emptyServiceEditForm: ServiceEditForm = {
   ...emptyServiceConnectionValues, ...emptyServiceShapingValues,
 };
 
+// Outstanding work first, then by due date, then newest. Done in the
+// browser rather than as an API ordering because it is three keys deep on
+// a list that is only ever a handful of rows, and because "outstanding"
+// is a property of the status set rather than a column to sort on.
+const TASK_STATUS_RANK: Record<CustomerTask["status"], number> = {
+  open: 0,
+  in_progress: 0,
+  done: 1,
+  cancelled: 2,
+};
+
+function sortTasks(tasks: CustomerTask[]) {
+  return [...tasks].sort((a, b) => {
+    const rank = TASK_STATUS_RANK[a.status] - TASK_STATUS_RANK[b.status];
+    if (rank !== 0) return rank;
+    // A task with no deadline sorts after the dated ones rather than
+    // before them -- an empty due date is "whenever", not "right now".
+    if (a.due_date !== b.due_date) {
+      if (!a.due_date) return 1;
+      if (!b.due_date) return -1;
+      return a.due_date < b.due_date ? -1 : 1;
+    }
+    return a.created_at < b.created_at ? 1 : -1;
+  });
+}
+
+type TaskForm = {
+  title: string;
+  description: string;
+  status: CustomerTask["status"];
+  priority: CustomerTask["priority"];
+  due_date: string;
+  assigned_to: string;
+};
+
+const emptyTaskForm: TaskForm = {
+  title: "",
+  description: "",
+  status: "open",
+  priority: "medium",
+  due_date: "",
+  assigned_to: "",
+};
+
 export function CustomerDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -112,6 +157,14 @@ export function CustomerDetailPage() {
   const [showStatementPdf, setShowStatementPdf] = useState(false);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [tickets, setTickets] = useState<Ticket[]>([]);
+  // Internal follow-up tasks (customers.CustomerTask). Staff-only -- the
+  // customer never sees these, unlike their tickets.
+  const [tasks, setTasks] = useState<CustomerTask[]>([]);
+  const [showTask, setShowTask] = useState(false);
+  const [editingTask, setEditingTask] = useState<CustomerTask | null>(null);
+  const [taskForm, setTaskForm] = useState<TaskForm>(emptyTaskForm);
+  const [taskSaving, setTaskSaving] = useState(false);
+  const [taskError, setTaskError] = useState("");
   const [staff, setStaff] = useState<User[]>([]);
   const [partners, setPartners] = useState<Partner[]>([]);
   // Reseller partners this staff member is allowed to assign a customer to
@@ -253,6 +306,95 @@ export function CustomerDetailPage() {
     api.get<{ results: EmailLog[] }>(`/email-logs/?customer=${id}`).then((res) => setEmailLogs(res.data.results));
   }
 
+  function refetchTasks() {
+    if (!id) return;
+    api
+      .get<{ results: CustomerTask[] }>(`/customer-tasks/?customer=${id}&page_size=200`)
+      .then((res) => setTasks(sortTasks(res.data.results)))
+      // Staff without Customers-section access can still reach this page
+      // through a direct link; the endpoint 403s for them. An empty list
+      // is the honest result -- a thrown promise would blank the page.
+      .catch(() => setTasks([]));
+  }
+
+  function openNewTask() {
+    setEditingTask(null);
+    setTaskForm(emptyTaskForm);
+    setTaskError("");
+    setShowTask(true);
+  }
+
+  function openEditTask(task: CustomerTask) {
+    setEditingTask(task);
+    setTaskForm({
+      title: task.title,
+      description: task.description,
+      status: task.status,
+      priority: task.priority,
+      due_date: task.due_date ?? "",
+      assigned_to: task.assigned_to ? String(task.assigned_to) : "",
+    });
+    setTaskError("");
+    setShowTask(true);
+  }
+
+  async function handleSaveTask(e: FormEvent) {
+    e.preventDefault();
+    if (!id) return;
+    setTaskSaving(true);
+    setTaskError("");
+    const payload = {
+      customer: Number(id),
+      title: taskForm.title,
+      description: taskForm.description,
+      status: taskForm.status,
+      priority: taskForm.priority,
+      // null, not "" -- the API field is a nullable date and an empty
+      // string is not a date.
+      due_date: taskForm.due_date || null,
+      assigned_to: taskForm.assigned_to ? Number(taskForm.assigned_to) : null,
+    };
+    try {
+      if (editingTask) {
+        await api.patch(`/customer-tasks/${editingTask.id}/`, payload);
+      } else {
+        await api.post("/customer-tasks/", payload);
+      }
+      setShowTask(false);
+      setEditingTask(null);
+      setTaskForm(emptyTaskForm);
+      refetchTasks();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
+      const firstError = data ? Object.values(data).flat()[0] : null;
+      setTaskError(typeof firstError === "string" ? firstError : "Could not save this task.");
+    } finally {
+      setTaskSaving(false);
+    }
+  }
+
+  /** The one-click "that's handled" on each row. Sends only `status`, so
+   *  it can't quietly overwrite a title or due date somebody else edited
+   *  since this page was loaded. */
+  async function markTaskDone(task: CustomerTask) {
+    try {
+      await api.patch(`/customer-tasks/${task.id}/`, { status: "done" });
+      refetchTasks();
+    } catch {
+      setTaskError("Could not mark that task done.");
+    }
+  }
+
+  async function handleDeleteTask(task: CustomerTask) {
+    if (!window.confirm(`Delete the task "${task.title}"? This can't be undone.`)) return;
+    try {
+      await api.delete(`/customer-tasks/${task.id}/`);
+      refetchTasks();
+    } catch {
+      setTaskError("Could not delete that task.");
+    }
+  }
+
   function refetchDeletionRequest() {
     if (!id) return;
     api
@@ -267,6 +409,7 @@ export function CustomerDetailPage() {
     api.get<{ results: Invoice[] }>(`/invoices/?customer=${id}&ordering=-date_created`).then((res) => setInvoices(res.data.results));
     api.get<{ results: Payment[] }>(`/payments/?customer=${id}&ordering=-date`).then((res) => setPayments(res.data.results));
     api.get<{ results: Ticket[] }>(`/tickets/?customer=${id}`).then((res) => setTickets(res.data.results));
+    refetchTasks();
     api.get<{ results: User[] }>("/staff-users/?page_size=100").then((res) => setStaff(res.data.results));
     api.get<{ results: Tariff[] }>("/tariffs/?page_size=100").then((res) => setTariffs(res.data.results));
     api.get<{ results: Partner[] }>("/partners/?page_size=200&ordering=name").then((res) => setPartners(res.data.results));
@@ -834,6 +977,95 @@ export function CustomerDetailPage() {
           </Table>
 
           <div className="mb-2 mt-6 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold">Tasks</h2>
+              {/* Said once, here, rather than trusted to be obvious: the
+                  word "task" gives no clue whether the customer can see
+                  it, and somebody will eventually type something blunt
+                  into one. */}
+              <p className="text-xs text-[var(--text-muted)]">
+                Internal follow-ups. Never shown to the customer — for anything they should see, raise a ticket.
+              </p>
+            </div>
+            <button className={btnPrimary} onClick={openNewTask}>
+              + New task
+            </button>
+          </div>
+          {taskError && (
+            <p className="mb-2 text-sm text-[var(--status-critical)]">{taskError}</p>
+          )}
+          <Table>
+            <THead>
+              <tr>
+                <TH>Task</TH>
+                <TH>Due</TH>
+                <TH>Priority</TH>
+                <TH>Status</TH>
+                <TH>Assigned to</TH>
+                <TH></TH>
+              </tr>
+            </THead>
+            <tbody>
+              {tasks.map((task) => (
+                <TR key={task.id}>
+                  <TD>
+                    <span className={task.is_outstanding ? "" : "text-[var(--text-muted)] line-through"}>
+                      {task.title}
+                    </span>
+                    {task.description && (
+                      <span className="mt-0.5 block whitespace-pre-line text-xs text-[var(--text-muted)]">
+                        {task.description}
+                      </span>
+                    )}
+                  </TD>
+                  <TD>
+                    {task.due_date ? (
+                      <span className={task.is_overdue ? "font-medium text-[var(--status-critical)]" : ""}>
+                        {task.due_date}
+                        {/* Only on the rows that are actually late, so it
+                            reads as an exception rather than a column
+                            label repeated down the page. */}
+                        {task.is_overdue && <span className="ml-1">· overdue</span>}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--text-muted)]">—</span>
+                    )}
+                  </TD>
+                  <TD><StatusBadge status={task.priority} /></TD>
+                  <TD><StatusBadge status={task.status} /></TD>
+                  <TD>
+                    {task.assigned_to_name ?? <span className="text-[var(--text-muted)]">Anyone</span>}
+                  </TD>
+                  <TD>
+                    <div className="flex gap-3">
+                      {task.is_outstanding && (
+                        <button
+                          className="text-[var(--series-1)] hover:underline"
+                          onClick={() => markTaskDone(task)}
+                        >
+                          Done
+                        </button>
+                      )}
+                      <button className="text-[var(--series-1)] hover:underline" onClick={() => openEditTask(task)}>
+                        Edit
+                      </button>
+                      <button
+                        className="text-red-600 hover:underline dark:text-red-400"
+                        onClick={() => handleDeleteTask(task)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </TD>
+                </TR>
+              ))}
+              {tasks.length === 0 && (
+                <TR><TD className="text-[var(--text-muted)]">No tasks for this customer.</TD></TR>
+              )}
+            </tbody>
+          </Table>
+
+          <div className="mb-2 mt-6 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold">Invoices</h2>
             <button type="button" className={btnSecondary} onClick={() => setShowStatementPdf(true)}>
               Preview statement
@@ -1375,6 +1607,115 @@ export function CustomerDetailPage() {
               </button>
               <button type="submit" disabled={saving} className={btnPrimary}>
                 {saving ? "Saving…" : "Save changes"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {showTask && (
+        <Modal
+          title={editingTask ? "Edit task" : "New task"}
+          onClose={() => {
+            setShowTask(false);
+            setEditingTask(null);
+          }}
+        >
+          {/* autoComplete="off" on the form and on the free-text field:
+              Chrome offers saved addresses/names for any text input it
+              recognises the shape of, and a dropdown of the operator's
+              own details over a customer task field is the bug that was
+              fixed across the other six forms. */}
+          <form onSubmit={handleSaveTask} autoComplete="off">
+            <FormField label="Task" required>
+              <input
+                className={inputClass}
+                value={taskForm.title}
+                onChange={(e) => setTaskForm({ ...taskForm, title: e.target.value })}
+                placeholder="e.g. Phone about the failed debit order"
+                autoComplete="off"
+                required
+              />
+            </FormField>
+            <FormField label="Notes" hint="Optional. Context whoever picks this up would otherwise have to ask for.">
+              <textarea
+                className={inputClass}
+                rows={3}
+                value={taskForm.description}
+                onChange={(e) => setTaskForm({ ...taskForm, description: e.target.value })}
+              />
+            </FormField>
+            <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+              <FormField label="Due date" hint="Leave blank for no deadline.">
+                <input
+                  type="date"
+                  className={inputClass}
+                  value={taskForm.due_date}
+                  onChange={(e) => setTaskForm({ ...taskForm, due_date: e.target.value })}
+                />
+              </FormField>
+              <FormField label="Priority">
+                <select
+                  className={inputClass}
+                  value={taskForm.priority}
+                  onChange={(e) =>
+                    setTaskForm({ ...taskForm, priority: e.target.value as CustomerTask["priority"] })
+                  }
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="urgent">Urgent</option>
+                </select>
+              </FormField>
+              <FormField label="Assigned to" hint="Leave blank for a task the whole team can pick up.">
+                <select
+                  className={inputClass}
+                  value={taskForm.assigned_to}
+                  onChange={(e) => setTaskForm({ ...taskForm, assigned_to: e.target.value })}
+                >
+                  <option value="">Anyone</option>
+                  {staff.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.username}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+              {/* Only when editing. On a new task the only sensible value
+                  is Open, and offering "Done" on a task being created
+                  invites a row that was never actually a task. */}
+              {editingTask && (
+                <FormField label="Status">
+                  <select
+                    className={inputClass}
+                    value={taskForm.status}
+                    onChange={(e) =>
+                      setTaskForm({ ...taskForm, status: e.target.value as CustomerTask["status"] })
+                    }
+                  >
+                    <option value="open">Open</option>
+                    <option value="in_progress">In progress</option>
+                    <option value="done">Done</option>
+                    <option value="cancelled">Cancelled</option>
+                  </select>
+                </FormField>
+              )}
+            </div>
+            {taskError && <p className="mb-3 text-sm text-[var(--status-critical)]">{taskError}</p>}
+            <div className="mt-2 flex justify-end gap-2">
+              <button
+                type="button"
+                className={btnSecondary}
+                onClick={() => {
+                  setShowTask(false);
+                  setEditingTask(null);
+                }}
+              >
+                Cancel
+              </button>
+              <button type="submit" disabled={taskSaving} className={btnPrimary}>
+                {taskSaving ? "Saving…" : editingTask ? "Save task" : "Add task"}
               </button>
             </div>
           </form>

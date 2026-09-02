@@ -9,6 +9,9 @@ const STATUS_STYLES: Record<string, { bg: string; text: string; dot: string }> =
   online: { bg: "#e8f7e8", text: "#0ca30c", dot: "var(--status-good)" },
   paid: { bg: "#e8f7e8", text: "#0ca30c", dot: "var(--status-good)" },
   resolved: { bg: "#e8f7e8", text: "#0ca30c", dot: "var(--status-good)" },
+  // CustomerTask.Status.DONE. Without it a finished task rendered as
+  // undifferentiated grey, i.e. the same as "unknown".
+  done: { bg: "#e8f7e8", text: "#0ca30c", dot: "var(--status-good)" },
   sent: { bg: "#e8f7e8", text: "#0ca30c", dot: "var(--status-good)" },
   approved: { bg: "#e8f7e8", text: "#0ca30c", dot: "var(--status-good)" },
   rejected: { bg: "#fbeaea", text: "#b32e2e", dot: "var(--status-critical)" },

@@ -9,10 +9,13 @@ is what a person changes on purpose and might later have to justify.
 """
 import logging
 
-from django.db.models.signals import m2m_changed, post_delete, post_save, pre_save
+from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 
-from .context import current_actor, current_request_meta, current_system_label
+from .context import (
+    current_actor, current_request_meta, current_system_label,
+    customer_is_being_deleted, mark_customer_deleting, unmark_customer_deleting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,11 @@ class Tracked:
 REGISTRY = {
     "customers.Customer": Tracked(customer="self"),
     "customers.Partner": Tracked(),
+    # Internal follow-up tasks. Worth a row for the same reason
+    # tickets are: "nobody ever told me to call them" and "that was
+    # marked done on Tuesday" are both arguments the History tab
+    # settles. Rendered per-customer via the customer FK.
+    "customers.CustomerTask": Tracked(customer="customer"),
     "billing.Service": Tracked(customer="customer"),
     "billing.Tariff": Tracked(),
     "billing.Invoice": Tracked(customer="customer"),
@@ -183,7 +191,14 @@ def _customer_for(instance, config):
         # Mid-cascade the related row can already be gone. Losing the
         # per-customer link is acceptable; losing the event is not.
         return None
-    return customer if (customer is not None and customer.pk) else None
+    if customer is None or not customer.pk:
+        return None
+    if customer_is_being_deleted(customer.pk):
+        # The customer is going away in this same cascade -- see
+        # context._deleting_customer_pks for why linking to them here
+        # fails the entire delete at COMMIT.
+        return None
+    return customer
 
 
 def record(action, instance=None, changes=None, detail="", actor=None, customer=None):
@@ -322,6 +337,15 @@ def _label_for_m2m(field_name):
     return field_name.replace("_", " ").capitalize()
 
 
+@receiver(pre_delete)
+def _mark_customer_deleting(sender, instance, **kwargs):
+    """Flag a Customer that is on its way out, so the "deleted" rows
+    written for everything cascading off them don't link back to a row
+    that won't be there at COMMIT."""
+    if model_key(instance) == "customers.Customer" and instance.pk:
+        mark_customer_deleting(instance.pk)
+
+
 @receiver(post_delete)
 def _on_delete(sender, instance, **kwargs):
     key = model_key(instance)
@@ -334,3 +358,7 @@ def _on_delete(sender, instance, **kwargs):
     if key == "customers.Customer":
         customer = None
     record("deleted", instance=instance, customer=customer)
+    if key == "customers.Customer" and instance.pk:
+        # The customer's own post_delete is the last one in the cascade,
+        # so the flag has done its job by here.
+        unmark_customer_deleting(instance.pk)

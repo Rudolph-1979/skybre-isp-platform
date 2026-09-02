@@ -14,3 +14,7 @@ frontend/.env.local
 # OS / editor
 .DS_Store
 *.log
+
+# Build output / local test scaffolding
+backend/staticfiles/
+frontend/dist/
