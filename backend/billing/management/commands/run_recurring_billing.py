@@ -19,10 +19,10 @@ Usage:
 """
 from datetime import date as date_cls
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from billing.recurring import run_recurring_billing
+from billing.recurring import RecurringBillingBusy, run_recurring_billing
 
 
 class Command(BaseCommand):
@@ -39,7 +39,15 @@ class Command(BaseCommand):
         if options["partner"]:
             partner_ids = [int(p) for p in options["partner"].split(",") if p.strip()]
 
-        result = run_recurring_billing(run_date, partner_ids=partner_ids, commit=options["commit"])
+        try:
+            result = run_recurring_billing(run_date, partner_ids=partner_ids, commit=options["commit"])
+        except RecurringBillingBusy as exc:
+            # Non-zero exit with one line, not a traceback: from cron this
+            # is the expected outcome when a previous tick is still going.
+            raise CommandError(str(exc)) from exc
+        except ValueError as exc:
+            # A future --date with --commit. See run_recurring_billing.
+            raise CommandError(str(exc)) from exc
         counts = result["counts"]
         mode = "COMMITTED" if options["commit"] else "preview only, nothing written"
         self.stdout.write(self.style.SUCCESS(

@@ -584,14 +584,23 @@ class RecurringBillingViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def run(self, request):
-        from .recurring import run_recurring_billing
+        from .recurring import RecurringBillingBusy, run_recurring_billing
         try:
             run_date, partner_ids = self._parse_args(request)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=400)
-        result = run_recurring_billing(
-            run_date, partner_ids=partner_ids or None, commit=True, triggered_by=request.user
-        )
+        try:
+            result = run_recurring_billing(
+                run_date, partner_ids=partner_ids or None, commit=True, triggered_by=request.user
+            )
+        except ValueError as exc:
+            # A future run date. See run_recurring_billing.
+            return Response({"detail": str(exc)}, status=400)
+        except RecurringBillingBusy as exc:
+            # 409, not 500: the request is well-formed, the server is just
+            # already doing this. A second Run click is the ordinary way to
+            # get here, so it needs to read as "wait", not "error".
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(RecurringBillingRunSerializer(result["run"]).data)
 
 
