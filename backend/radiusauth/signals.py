@@ -303,11 +303,41 @@ def sync_service_radius(service):
     look like right now. Always deletes-and-recreates rather than patching
     individual rows in place -- simpler to reason about and stays correct
     no matter what changed (username, password, status, tariff, IP
-    assignment...)."""
+    assignment...).
+
+    All of it in ONE transaction, and the slow part computed before the
+    delete. Both matter because FreeRADIUS is reading these tables the
+    whole time, from a different process.
+
+    ATOMIC_REQUESTS is not set, so this used to run in autocommit: the
+    DELETE committed on its own, and the Cleartext-Password row was only
+    re-inserted afterwards -- after IP allocation and after
+    _mikrotik_rate_limit, which reaches through speeds.effective_speeds
+    into a month of hourly UsageBucket rows. A customer whose CPE
+    re-dialled inside that window found no radcheck row and got an
+    Access-Reject. Worse, any exception in between -- an IntegrityError on
+    an address, a database hiccup, a request timing out -- left the
+    subscriber with NO auth rows at all, unable to authenticate until
+    somebody noticed and re-saved the service by hand.
+
+    Resolving the rate limit up front shrinks the window to the writes
+    themselves; the transaction means a failure anywhere in it puts the
+    old rows back rather than leaving the line stranded.
+    """
     username = service.radius_username
     if not username:
         return
 
+    # Resolved before anything is deleted: this is the expensive read, and
+    # it must not sit between the delete and the recreate.
+    rate_limit = _mikrotik_rate_limit(service)
+
+    with transaction.atomic():
+        _sync_service_radius_rows(service, username, rate_limit)
+
+
+def _sync_service_radius_rows(service, username, rate_limit):
+    """The write half of sync_service_radius, inside its transaction."""
     _clear_radius_entries(username)
 
     walled_garden = _walled_garden_eligible(service)
@@ -361,7 +391,7 @@ def sync_service_radius(service):
         RadReply.objects.create(username=username, attribute="Framed-IP-Address", op="=", value=ip)
 
     RadReply.objects.create(
-        username=username, attribute="Mikrotik-Rate-Limit", op="=", value=_mikrotik_rate_limit(service)
+        username=username, attribute="Mikrotik-Rate-Limit", op="=", value=rate_limit
     )
 
 

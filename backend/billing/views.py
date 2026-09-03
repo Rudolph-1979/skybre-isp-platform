@@ -123,13 +123,38 @@ class TariffViewSet(CSVImportMixin, viewsets.ModelViewSet):
 
 
 class ScopedByCustomerMixin:
-    """Staff see everything; customers only see records tied to their own profile."""
+    """Customers see only their own records; staff see only the partners
+    they are allowed to.
 
-    def get_base_queryset(self, model, related_name="customer"):
+    The partner half used to be missing here, and only here. Every other
+    app applies it -- customers, sales, network, radiusauth, audit,
+    bankfeeds, and UpcomingBlocksView further down this very file, whose
+    docstring spells out that a reseller-scoped staff member "must not
+    learn the names of customers outside their partners".
+
+    So a staff member restricted to one reseller correctly saw only that
+    reseller's customers on the Customers page, and then every partner's
+    invoices, payments and services on the Finance page -- with customer
+    names and totals, and, because get_object() uses the same queryset, a
+    working PATCH and DELETE on a competitor's invoices.
+
+    `customer_path` is the lookup from `model` to customers.Customer, so
+    the same rule can be expressed for a model related to a customer
+    directly or through another hop.
+    """
+
+    def get_base_queryset(self, model, related_name="customer", customer_path=None):
+        from customers.views import scope_customers_to_user
+        from customers.models import Customer
+
         user = self.request.user
         qs = model.objects.all()
         if user.is_staff_member:
-            return qs
+            allowed = getattr(user, "allowed_partners", None) or []
+            if not allowed or user.role == user.Role.ADMIN:
+                return qs
+            visible = scope_customers_to_user(Customer.objects.all(), user)
+            return qs.filter(**{f"{customer_path or related_name}__in": visible})
         customer_profile = getattr(user, "customer_profile", None)
         if customer_profile is None:
             return qs.none()
@@ -586,6 +611,19 @@ class CreditRequestViewSet(viewsets.ModelViewSet):
     queryset = CreditRequest.objects.select_related("customer", "requested_by", "decided_by").all()
     filterset_fields = ["customer", "status"]
 
+    def get_queryset(self):
+        # Partner-scoped like everything else that names a customer; a
+        # credit request carries the customer's name and the amount.
+        from customers.models import Customer
+        from customers.views import scope_customers_to_user
+
+        qs = super().get_queryset()
+        user = self.request.user
+        allowed = getattr(user, "allowed_partners", None) or []
+        if not allowed or user.role == user.Role.ADMIN:
+            return qs
+        return qs.filter(customer__in=scope_customers_to_user(Customer.objects.all(), user))
+
     def get_permissions(self):
         if self.action in ("approve", "reject"):
             return [permissions.IsAuthenticated(), IsManagement(), HasFinanceAccess()]
@@ -615,18 +653,42 @@ class CreditRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        credit = self.get_object()
-        if credit.status != CreditRequest.Status.PENDING:
-            return Response({"detail": "This request has already been decided."}, status=400)
+        """Credit the customer, once.
 
-        customer = credit.customer
-        customer.balance = customer.balance - credit.amount
-        customer.save(update_fields=["balance"])
+        This used to read the request, check it was Pending, write the
+        balance and then write the decision -- four steps in autocommit
+        with no row lock. Two Approve clicks 50 ms apart both passed the
+        Pending check and both credited, so a R200 credit on a R1,000
+        balance left R600. And if the decision save failed after the
+        balance write, the customer kept the credit with the request still
+        Pending, ready to be approved again.
 
-        credit.status = CreditRequest.Status.APPROVED
-        credit.decided_by = request.user
-        credit.decided_at = timezone.now()
-        credit.save(update_fields=["status", "decided_by", "decided_at"])
+        The request row is now locked for the duration and re-read inside
+        the lock, so the second click finds it Approved and stops -- and
+        the balance write uses F() rather than a read-modify-write, which
+        is what let a concurrent payment lose a credit (or vice versa).
+        bankfeeds.confirm() has used select_for_update for exactly this
+        "double-clicked button could post the same money twice" hazard all
+        along.
+        """
+        from django.db.models import F
+
+        from customers.models import Customer
+
+        with transaction.atomic():
+            credit = CreditRequest.objects.select_for_update().get(pk=self.get_object().pk)
+            if credit.status != CreditRequest.Status.PENDING:
+                return Response({"detail": "This request has already been decided."}, status=400)
+
+            Customer.objects.filter(pk=credit.customer_id).update(
+                balance=F("balance") - credit.amount
+            )
+            credit.status = CreditRequest.Status.APPROVED
+            credit.decided_by = request.user
+            credit.decided_at = timezone.now()
+            credit.save(update_fields=["status", "decided_by", "decided_at"])
+
+        credit.refresh_from_db()
         return Response(CreditRequestSerializer(credit).data)
 
     @action(detail=True, methods=["post"])
