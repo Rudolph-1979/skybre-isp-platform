@@ -51,6 +51,35 @@ def public_ip_prefetch():
     ]
 
 
+def scope_customers_to_user(qs, user):
+    """Narrow a Customer queryset to what `user` is allowed to see.
+
+    The single implementation of customer visibility. It lives at module
+    level rather than inside CustomerViewSet.get_queryset because it is
+    not only list endpoints that have to honour it: bulk delete reaches
+    customers by id straight from the request body, and a copy-pasted
+    filter there drifted out of sync with this one and silently stopped
+    scoping at all (its comment still claimed it did). Anything that
+    resolves a customer from client-supplied input goes through here.
+
+    Partner visibility restriction (see User.allowed_partners): empty
+    means unrestricted, same convention as allowed_sections. Admin always
+    sees everything regardless. Restricted staff still see customers with
+    no partner at all (direct customers aren't "owned" by any reseller).
+    A customer-role user sees only their own record; anyone with neither
+    a staff role nor a customer profile sees nothing.
+    """
+    if user.is_staff_member:
+        allowed = getattr(user, "allowed_partners", None) or []
+        if allowed and user.role != user.Role.ADMIN:
+            qs = qs.filter(Q(partner_id__in=allowed) | Q(partner__isnull=True))
+        return qs
+    customer_profile = getattr(user, "customer_profile", None)
+    if customer_profile is None:
+        return qs.none()
+    return qs.filter(pk=customer_profile.pk)
+
+
 class PartnerViewSet(viewsets.ModelViewSet):
     """Reseller partners a Customer can be tagged to (see Customer.partner).
     Any staff member can list/view partners -- needed for the Customers
@@ -246,26 +275,12 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         return [permissions.IsAuthenticated(), IsStaffMember(), HasCustomersAccess()]
 
     def get_queryset(self):
-        user = self.request.user
-        qs = (
+        return scope_customers_to_user(
             Customer.objects.select_related("assigned_staff", "partner")
             .prefetch_related(*public_ip_prefetch())
-            .all()
+            .all(),
+            self.request.user,
         )
-        if user.is_staff_member:
-            # Partner visibility restriction (see User.allowed_partners):
-            # empty means unrestricted, same convention as allowed_sections.
-            # Admin always sees everything regardless. Restricted staff
-            # still see customers with no partner at all (direct
-            # customers aren't "owned" by any reseller).
-            allowed = getattr(user, "allowed_partners", None) or []
-            if allowed and user.role != user.Role.ADMIN:
-                qs = qs.filter(Q(partner_id__in=allowed) | Q(partner__isnull=True))
-            return qs
-        customer_profile = getattr(user, "customer_profile", None)
-        if customer_profile is None:
-            return qs.none()
-        return qs.filter(pk=customer_profile.pk)
 
     def retrieve(self, request, *args, **kwargs):
         # Expire a lapsed live-view grant before showing the toggle, so staff
@@ -337,6 +352,22 @@ class CustomerDeletionRequestViewSet(viewsets.ModelViewSet):
     serializer_class = CustomerDeletionRequestSerializer
     queryset = CustomerDeletionRequest.objects.select_related("customer", "requested_by", "decided_by").all()
     filterset_fields = ["customer", "status"]
+
+    def get_queryset(self):
+        """Scoped the same way the customers themselves are. A deletion
+        request carries the customer's name, so an unscoped list handed a
+        reseller-restricted staff member the names of customers outside
+        their partners -- the thing UpcomingBlocksView's docstring in
+        billing.views spells out must not happen.
+
+        Requests whose customer has already been deleted (customer_id is
+        NULL, the snapshot case the serializer handles) stay visible: the
+        record is the audit trail for a deletion that already happened,
+        and there is no partner left on it to filter by.
+        """
+        qs = super().get_queryset()
+        visible = scope_customers_to_user(Customer.objects.all(), self.request.user)
+        return qs.filter(Q(customer__in=visible) | Q(customer__isnull=True))
 
     def get_permissions(self):
         if self.action in ("approve", "reject"):
@@ -412,10 +443,21 @@ class CustomerDeletionRequestViewSet(viewsets.ModelViewSet):
 
         user = request.user
         can_decide_immediately = user.role in (user.Role.MANAGEMENT, user.Role.ADMIN)
-        # Scoped through the same get_queryset a normal request would use
+        # Scoped through the same visibility rule a normal request would use
         # (partner visibility restrictions, etc.) -- bulk delete can't
         # reach a customer this staff member couldn't otherwise see.
-        customers_by_id = {c.id: c for c in Customer.objects.filter(id__in=customer_ids)}
+        #
+        # This used to read Customer.objects.filter(id__in=...) on the
+        # unfiltered manager while the comment above already claimed it was
+        # scoped. Because Management is the tier that deletes immediately,
+        # a single reseller-restricted Management account posting a range of
+        # ids could delete the entire customer base -- every partner's
+        # records, cascading services, RADIUS logins, invoices and payments
+        # -- without ever being able to so much as list them.
+        customers_by_id = {
+            c.id: c
+            for c in scope_customers_to_user(Customer.objects.all(), user).filter(id__in=customer_ids)
+        }
 
         deleted, requested, skipped = [], [], []
         for customer_id in customer_ids:

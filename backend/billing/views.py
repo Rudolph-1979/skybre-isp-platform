@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.db import transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -551,6 +552,16 @@ class PaymentViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [permissions.IsAuthenticated(), HasFinanceAccess()]
         return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+
+    def perform_destroy(self, instance):
+        # Deleting a payment has to put the ledger back where it was --
+        # see Payment.reverse_ledger_effect for what used to happen
+        # instead. Both writes and the delete go in one transaction so a
+        # failure can't leave the balance reversed with the payment still
+        # on file, or vice versa.
+        with transaction.atomic():
+            instance.reverse_ledger_effect()
+            instance.delete()
 
 
 class CreditRequestViewSet(viewsets.ModelViewSet):

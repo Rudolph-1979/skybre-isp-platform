@@ -526,6 +526,47 @@ class Payment(models.Model):
     def __str__(self):
         return f"Payment {self.amount} - {self.customer}"
 
+    def reverse_ledger_effect(self):
+        """Undo what recording this payment did to the ledger.
+
+        There was no reversal path anywhere in billing before this. All the
+        arithmetic lived in PaymentSerializer.create, so deleting a payment
+        -- the obvious way to correct one applied to the wrong invoice --
+        left the customer's balance credited and the invoice still marked
+        Paid, and the money simply vanished from what the customer owed.
+
+        The bank feed made that worse rather than better: deleting a
+        payment deliberately puts its bank transaction back in the review
+        queue (bankfeeds.signals._revert_to_review_queue) so it can be
+        confirmed again against the right invoice -- which, with nothing
+        reversing the first one, credited a single EFT to the customer
+        twice.
+
+        Uses F() and a locked invoice row rather than read-modify-write,
+        because the balance is exactly the field two concurrent finance
+        actions race on. Caller wraps this and the delete in one atomic
+        block. Idempotent it is NOT -- call it once, immediately before
+        deleting the row.
+        """
+        from django.db.models import F
+
+        type(self.customer).objects.filter(pk=self.customer_id).update(
+            balance=F("balance") + self.amount
+        )
+        if self.invoice_id is None:
+            return
+        invoice = Invoice.objects.select_for_update().get(pk=self.invoice_id)
+        invoice.paid_amount = invoice.paid_amount - self.amount
+        # A payment that had flipped the invoice to Paid no longer covers
+        # it. The status it held before that flip isn't recoverable, so it
+        # goes back to Unpaid -- the state an invoice with money still
+        # outstanding is in. Anything that wasn't Paid is left alone: a
+        # cancelled or draft invoice doesn't become unpaid because a
+        # payment against it was reversed.
+        if invoice.status == Invoice.Status.PAID and invoice.paid_amount < invoice.total:
+            invoice.status = Invoice.Status.UNPAID
+        invoice.save(update_fields=["paid_amount", "status"])
+
 
 class CreditRequest(models.Model):
     """A request to credit a customer's account for a stated reason --
