@@ -124,15 +124,16 @@ def _generate_document(customer, config, run_date, run, commit):
         )
     invoice.recalc_totals()
 
-    if status_value == Invoice.Status.UNPAID:
-        # Mirrors the Splynx reference's "Debit" ledger entry -- nothing in
-        # this codebase increased Customer.balance on invoice creation
-        # before this feature (only Payment/CreditRequest ever decreased
-        # it), so recurring-billing invoices are the first thing that
-        # keeps balance in sync with what's actually owed for opted-in
-        # customers. Manually-created invoices are unaffected/unchanged.
-        customer.balance = customer.balance + invoice.total
-        customer.save(update_fields=["balance"])
+    # Mirrors the Splynx reference's "Debit" ledger entry. This used to be
+    # an inline `customer.balance + invoice.total` here and ONLY here, with
+    # a note that manually-created invoices were unaffected -- while
+    # payments credited the balance regardless of which kind of invoice
+    # they settled, so the ledger drifted on every hand-raised invoice.
+    # Invoice.apply_balance_debit is now the single implementation, called
+    # from every path that can change whether an invoice is owed, and it
+    # tracks what it did in Invoice.balance_debited so the debit can be
+    # reversed on a delete or a cancellation.
+    invoice.apply_balance_debit()
 
     if config.send_billing_notifications:
         _send_after_commit(doc_type, customer, invoice=invoice)

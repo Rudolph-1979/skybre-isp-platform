@@ -66,6 +66,40 @@ class Tariff(models.Model):
         return f"{self.name} ({self.price}/{self.billing_period})"
 
 
+class IssuedNumberHighWater(models.Model):
+    """The highest sequence number ever issued under each document prefix.
+
+    Invoice._next_number_for_status takes one past the highest number on
+    an EXISTING row, which is right until a row stops existing.
+    InvoiceViewSet.destroy permits hard-deleting a real invoice, and
+    deleting the newest one dropped the maximum back down -- so the next
+    invoice created was issued a number a customer was already holding a
+    PDF for. Two customers, one tax invoice number, which is the same
+    failure 91e0b03 fixed from the other direction.
+
+    A separate row per prefix rather than a column on Invoice, because the
+    fact being recorded is about the sequence, not about any one document
+    -- and it has to outlive every document in it.
+
+    Consulted alongside the row maximum rather than instead of it, so the
+    counter self-heals: an import that inserts numbers above it, or a
+    counter that is somehow behind, still produces a number above
+    everything that exists. Bumped only AFTER a successful save, so a
+    create that fails does not burn a number and leave a gap in a
+    sequence that has to explain itself to SARS.
+    """
+
+    prefix = models.CharField(max_length=10, unique=True)
+    last_seq = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "issued number high-water mark"
+        verbose_name_plural = "issued number high-water marks"
+
+    def __str__(self):
+        return f"{self.prefix}-{self.last_seq:06d}"
+
+
 class Service(models.Model):
     """A customer's active subscription to a tariff/plan."""
 
@@ -328,6 +362,29 @@ class Invoice(models.Model):
     created_by_run = models.ForeignKey(
         "RecurringBillingRun", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoices_created"
     )
+    # Whether this invoice's total is currently included in
+    # Customer.balance. Not derived from `status`, because it has to
+    # describe what actually happened to the balance rather than what
+    # should have -- see apply_balance_debit().
+    #
+    # The migration that adds this field deliberately leaves it False on
+    # EVERY existing row, including recurring-billing invoices that really
+    # were debited. False is the only value that cannot introduce a NEW
+    # error: it means "reversing this invoice credits nothing", which is
+    # exactly the behaviour those rows have today. Setting it True on a
+    # guess would hand customers credit for invoices that were never
+    # debited, and a run-created invoice born UNPAID is indistinguishable
+    # after the fact from a run-created pro forma that was later converted.
+    # The historical drift is a data question, answered by the
+    # `balance_drift` management command rather than by this migration.
+    balance_debited = models.BooleanField(default=False, editable=False)
+
+    # Statuses whose total counts toward what the customer owes: issued,
+    # and not cancelled. A draft is not issued yet; a quote/pro forma is
+    # not an invoice; a cancelled invoice is not owed. PAID is included
+    # because the debit stays and the payment's own credit offsets it --
+    # removing it would double-count the payment.
+    DEBITED_STATUSES = (Status.UNPAID, Status.PAID, Status.OVERDUE)
 
     class Meta:
         ordering = ["-date_created"]
@@ -362,7 +419,43 @@ class Invoice(models.Model):
         highest = qs.annotate(
             _seq=Cast(Substr("number", len(prefix) + 2), BigIntegerField())
         ).aggregate(highest=Max("_seq"))["highest"]
-        return f"{prefix}-{(highest or 0) + 1:06d}"
+        # ...and never below a number that has already been issued once,
+        # even if the row carrying it has since been deleted. See
+        # IssuedNumberHighWater: taking the maximum of existing rows alone
+        # meant deleting the newest invoice handed its number straight to
+        # the next one.
+        watermark = (
+            IssuedNumberHighWater.objects.filter(prefix=prefix)
+            .values_list("last_seq", flat=True)
+            .first()
+        )
+        return f"{prefix}-{max(highest or 0, watermark or 0) + 1:06d}"
+
+    def _record_issued_number(self):
+        """Remember that this number has been used, so it is never reused.
+
+        After the save rather than before it, so a create that fails
+        leaves no gap. Written with Greatest() so two concurrent creates
+        cannot move the mark backwards.
+        """
+        from django.db.models import Value
+        from django.db.models.functions import Greatest
+
+        prefix, _, seq = (self.number or "").rpartition("-")
+        if not prefix or not seq.isdigit():
+            return
+        updated = IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+            last_seq=Greatest("last_seq", Value(int(seq)))
+        )
+        if not updated:
+            try:
+                IssuedNumberHighWater.objects.create(prefix=prefix, last_seq=int(seq))
+            except IntegrityError:
+                # Another create got there first; its own Greatest() call
+                # covers this number too.
+                IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+                    last_seq=Greatest("last_seq", Value(int(seq)))
+                )
 
     def save(self, *args, **kwargs):
         if self.number:
@@ -387,7 +480,9 @@ class Invoice(models.Model):
             self.number = self._next_number_for_status(self.status)
             try:
                 with transaction.atomic():
-                    return super().save(*args, **kwargs)
+                    result = super().save(*args, **kwargs)
+                    self._record_issued_number()
+                    return result
             except IntegrityError as exc:
                 if "number" not in str(exc):
                     raise
@@ -398,6 +493,71 @@ class Invoice(models.Model):
     @property
     def balance_due(self):
         return self.total - self.paid_amount
+
+    def apply_balance_debit(self):
+        """Bring Customer.balance in line with whether this invoice is owed.
+
+        Idempotent, and driven by the gap between `balance_debited` (what
+        the balance currently reflects) and DEBITED_STATUSES (what it
+        should reflect). Safe to call after any save, and safe to call
+        twice.
+
+        Before this, only the recurring-billing engine ever debited a
+        balance -- recurring._generate_document did it inline, with a
+        comment noting that "manually-created invoices are
+        unaffected/unchanged". But PaymentSerializer.create credited the
+        balance for ANY payment. So the two halves of the ledger disagreed
+        for every invoice not raised by the engine: staff raise a R1,000
+        invoice by hand (balance unchanged), the customer pays it (balance
+        -R1,000), and the customer's portal, their statement PDF and every
+        email now show R1,000 of credit that does not exist -- while
+        blocking_candidate_services' `balance <= minimum_balance` test
+        exempts them from suspension permanently.
+
+        Every path that can change whether an invoice is owed calls this:
+        creation, quote/pro forma conversion, a status edit, and deletion
+        (which calls it after moving the status to cancelled, or via
+        release_balance_debit below).
+
+        F() rather than read-modify-write, for the same reason
+        Payment.reverse_ledger_effect uses it: the balance is the field
+        two concurrent finance actions race on.
+        """
+        from django.db.models import F
+
+        should_be_debited = self.status in self.DEBITED_STATUSES
+        if should_be_debited == self.balance_debited:
+            return
+
+        delta = self.total if should_be_debited else -self.total
+        type(self.customer).objects.filter(pk=self.customer_id).update(
+            balance=F("balance") + delta
+        )
+        self.balance_debited = should_be_debited
+        # update() rather than save(), so this can never recurse through a
+        # save-triggered signal and can never write a stale copy of any
+        # other field back over a concurrent edit.
+        Invoice.objects.filter(pk=self.pk).update(balance_debited=self.balance_debited)
+
+    def release_balance_debit(self):
+        """Drop this invoice's debit off the customer's balance, for a
+        delete rather than a status change.
+
+        Deleting an invoice used to leave its debit behind forever: the
+        recurring engine had already added the total to the balance, and
+        InvoiceViewSet.destroy removed the only record of why. The
+        customer was then chased for -- and eventually suspended over --
+        money that no invoice claimed.
+        """
+        from django.db.models import F
+
+        if not self.balance_debited:
+            return
+        type(self.customer).objects.filter(pk=self.customer_id).update(
+            balance=F("balance") - self.total
+        )
+        self.balance_debited = False
+        Invoice.objects.filter(pk=self.pk).update(balance_debited=False)
 
     def can_convert_to_proforma(self):
         return self.status == self.Status.QUOTE
@@ -429,6 +589,8 @@ class Invoice(models.Model):
         # See convert_to_proforma: save() issues the number, with retries.
         self.number = ""
         self.save()
+        # The moment it stops being a quote/pro forma it is money owed.
+        self.apply_balance_debit()
         self.activate_tariff_services()
 
     def recalc_totals(self):

@@ -289,7 +289,14 @@ class InvoiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
                     "(POST /invoice-deletion-requests/) for Management to approve."
                 ),
             )
-        return super().destroy(request, *args, **kwargs)
+        # Take the invoice's debit back off the customer's balance before
+        # the row goes. Deleting an invoice used to leave the debit behind
+        # with nothing left to explain it, so the customer was chased for
+        # -- and eventually suspended over -- money no invoice claimed.
+        # One transaction, so the balance and the row move together.
+        with transaction.atomic():
+            instance.release_balance_debit()
+            return super().destroy(request, *args, **kwargs)
 
 
 class InvoiceDeletionRequestViewSet(viewsets.ModelViewSet):
@@ -338,6 +345,11 @@ class InvoiceDeletionRequestViewSet(viewsets.ModelViewSet):
         deletion_request.decided_at = timezone.now()
         deletion_request.save(update_fields=["status", "decided_by", "decided_at"])
 
+        # A quote/pro forma carries no balance debit, so this is a no-op
+        # today -- called anyway so the invariant "nothing is deleted
+        # without releasing its debit" holds at every delete site rather
+        # than depending on which statuses reach this one.
+        invoice.release_balance_debit()
         invoice.delete()
 
         return Response(InvoiceDeletionRequestSerializer(deletion_request).data)
