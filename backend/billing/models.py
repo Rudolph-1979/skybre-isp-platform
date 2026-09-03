@@ -363,21 +363,32 @@ class Invoice(models.Model):
         "RecurringBillingRun", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoices_created"
     )
     # Whether this invoice's total is currently included in
-    # Customer.balance. Not derived from `status`, because it has to
-    # describe what actually happened to the balance rather than what
-    # should have -- see apply_balance_debit().
+    # Customer.balance. THREE states, not two:
     #
-    # The migration that adds this field deliberately leaves it False on
-    # EVERY existing row, including recurring-billing invoices that really
-    # were debited. False is the only value that cannot introduce a NEW
-    # error: it means "reversing this invoice credits nothing", which is
-    # exactly the behaviour those rows have today. Setting it True on a
-    # guess would hand customers credit for invoices that were never
-    # debited, and a run-created invoice born UNPAID is indistinguishable
-    # after the fact from a run-created pro forma that was later converted.
-    # The historical drift is a data question, answered by the
-    # `balance_drift` management command rather than by this migration.
-    balance_debited = models.BooleanField(default=False, editable=False)
+    #   True  -- this invoice's total is in the balance; releasing it
+    #            takes the total back off.
+    #   False -- it is not, and this invoice is managed by
+    #            apply_balance_debit(), so issuing it will add it.
+    #   NULL  -- unknown. Every row that predates this feature. The
+    #            balance already reflects whatever the old code did to it
+    #            (recurring._generate_document debited; nothing else did),
+    #            and there is no way to tell after the fact which is which:
+    #            a run-created invoice born UNPAID is indistinguishable
+    #            from a run-created pro forma that was later converted.
+    #
+    # NULL is inert -- apply_balance_debit() and release_balance_debit()
+    # both leave it completely alone. That matters because the first
+    # version of this field defaulted every existing row to False, which
+    # is not neutral: False means "not yet debited", so the first PATCH of
+    # any legacy UNPAID invoice re-added a total that was already in the
+    # balance and silently doubled the customer's debt. Reasoning only
+    # about the reversal direction missed it.
+    #
+    # Historical rows therefore keep exactly the balance contribution they
+    # have today, right or wrong. What that contribution actually is, is a
+    # data question -- answered by `manage.py balance_drift`, and repaired
+    # deliberately, never guessed at by a migration.
+    balance_debited = models.BooleanField(default=False, null=True, editable=False)
 
     # Statuses whose total counts toward what the customer owes: issued,
     # and not cancelled. A draft is not issued yet; a quote/pro forma is
@@ -524,6 +535,13 @@ class Invoice(models.Model):
         two concurrent finance actions race on.
         """
         from django.db.models import F
+
+        # NULL means this invoice predates the flag and the balance already
+        # reflects whatever the old code did. Touching it would either
+        # double a debit that is already there or credit one that never
+        # was, so it is left alone entirely. See the field's comment.
+        if self.balance_debited is None:
+            return
 
         should_be_debited = self.status in self.DEBITED_STATUSES
         if should_be_debited == self.balance_debited:

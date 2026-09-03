@@ -34,20 +34,44 @@ import csv
 from decimal import Decimal
 
 from django.core.management.base import BaseCommand
-from django.db.models import DecimalField, Q, Sum
+from django.db.models import DecimalField, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce
 
-from billing.models import CreditRequest, Invoice
+from billing.models import CreditRequest, Invoice, Payment
 from customers.models import Customer
 
 _ZERO = Decimal("0.00")
+_MONEY = DecimalField(max_digits=14, decimal_places=2)
 
 
-def _money(field, condition=None):
+def _total_per_customer(model, customer_field="customer", value_field="amount", condition=None):
+    """A correlated subquery summing one relation per customer.
+
+    Subqueries rather than three Sum()s in one annotate(). Three
+    aggregates over three multi-valued relations in a single annotate()
+    makes Django emit one query with three LEFT JOINs, and every sum is
+    then multiplied by the row counts of the other two -- the standard
+    join fan-out. The first version of this command did exactly that, so
+    a customer with 2 invoices and 2 payments reported twice the real
+    invoiced and paid figures. Because the invoice side inflates faster
+    than the payment side, it could also flip the SIGN of the drift --
+    in a report whose closing line tells you a negative drift is the
+    ledger bug's signature. It was inventing the evidence.
+
+    Each subquery aggregates independently, so nothing is multiplied.
+    """
+    rows = model.objects.filter(**{customer_field: OuterRef("pk")})
+    if condition is not None:
+        rows = rows.filter(condition)
     return Coalesce(
-        Sum(field, filter=condition),
+        Subquery(
+            rows.values(customer_field)
+            .annotate(_t=Sum(value_field))
+            .values("_t")[:1],
+            output_field=_MONEY,
+        ),
         _ZERO,
-        output_field=DecimalField(max_digits=14, decimal_places=2),
+        output_field=_MONEY,
     )
 
 
@@ -71,11 +95,13 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         rows = []
         customers = Customer.objects.annotate(
-            invoiced=_money("invoices__total", Q(invoices__status__in=Invoice.DEBITED_STATUSES)),
-            paid=_money("payments__amount"),
-            credited=_money(
-                "credit_requests__amount",
-                Q(credit_requests__status=CreditRequest.Status.APPROVED),
+            invoiced=_total_per_customer(
+                Invoice, value_field="total",
+                condition=Q(status__in=Invoice.DEBITED_STATUSES),
+            ),
+            paid=_total_per_customer(Payment),
+            credited=_total_per_customer(
+                CreditRequest, condition=Q(status=CreditRequest.Status.APPROVED),
             ),
         ).only("id", "full_name", "balance", "status")
 

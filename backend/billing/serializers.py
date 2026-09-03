@@ -326,6 +326,11 @@ class InvoiceSerializer(serializers.ModelSerializer):
         """
         if self.instance is None:
             return value
+        # Going back to a quote or pro forma. Not merely wrong-looking: it
+        # made can_convert_to_proforma() true again, and converting clears
+        # `number` and reissues from the QUO sequence, freeing the original
+        # INV number for the next invoice to reuse while the customer still
+        # holds the original PDF.
         if (
             value in Invoice.PRE_INVOICE_STATUSES
             and self.instance.status not in Invoice.PRE_INVOICE_STATUSES
@@ -333,6 +338,15 @@ class InvoiceSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 f"{self.instance.number} is already a real invoice and can't be turned back into a "
                 f"{Invoice(status=value).get_status_display().lower()}. Cancel it instead."
+            )
+        # Going back to draft. `draft` is outside DEBITED_STATUSES, so this
+        # released the invoice's debit and silently wrote the debt off
+        # while leaving the issued INV number on a document that now
+        # claims not to have been issued.
+        if value == Invoice.Status.DRAFT and self.instance.status != Invoice.Status.DRAFT:
+            raise serializers.ValidationError(
+                f"{self.instance.number} has already been issued and can't go back to draft -- "
+                "that would write off what the customer owes. Cancel it instead."
             )
         return value
 
@@ -440,6 +454,18 @@ class PaymentSerializer(serializers.ModelSerializer):
         if invoice is not None and invoice.status == Invoice.Status.CANCELLED:
             raise serializers.ValidationError({
                 "invoice": f"{invoice.number} has been cancelled. Record the payment against the customer instead.",
+            })
+        # A draft is not issued yet, so it is outside DEBITED_STATUSES and
+        # carries no balance debit. Paying one reproduced the original
+        # ledger drift exactly -- the payment credited the balance while
+        # nothing had ever debited it -- one status value away from the
+        # bug this was all meant to fix.
+        if invoice is not None and invoice.status == Invoice.Status.DRAFT:
+            raise serializers.ValidationError({
+                "invoice": (
+                    f"{invoice.number} is still a draft and has not been issued. Issue it "
+                    "before recording a payment against it."
+                ),
             })
         return attrs
 

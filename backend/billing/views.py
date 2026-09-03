@@ -1,12 +1,12 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
-from rest_framework.exceptions import MethodNotAllowed, PermissionDenied
+from rest_framework.exceptions import MethodNotAllowed, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -314,6 +314,35 @@ class InvoiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
                     "(POST /invoice-deletion-requests/) for Management to approve."
                 ),
             )
+        # An invoice with money against it cannot be deleted. Payment.invoice
+        # is SET_NULL, so the payment rows survive the delete with their
+        # credit still applied to the balance -- while releasing the
+        # invoice's debit removes the other side of it. The customer is
+        # left in credit by whatever they paid, with no invoice on file to
+        # explain it: exactly the phantom-credit state this whole change
+        # set out to eliminate, and it flips
+        # blocking_candidate_services' `balance <= minimum_balance` test
+        # so the line can never be suspended again.
+        #
+        # Refusing is deliberate rather than unwinding the payments
+        # automatically. Whether that money is a refund owed, a credit to
+        # carry, or a capture against the wrong invoice is a finance
+        # decision, and reversing a real receipt silently is not this
+        # endpoint's call to make. Payments are now reversible on their
+        # own (see Payment.reverse_ledger_effect), so the route is:
+        # reverse the payments, then delete.
+        paid = instance.payments.count()
+        if paid:
+            total_paid = instance.payments.aggregate(total=Sum("amount"))["total"] or 0
+            raise ValidationError({
+                "detail": (
+                    f"{instance.number} has {paid} payment{'s' if paid != 1 else ''} against it "
+                    f"totalling {total_paid}. Deleting it would leave that money on the customer's "
+                    "account as credit with no invoice to explain it. Reverse the payment"
+                    f"{'s' if paid != 1 else ''} on the Finance page first, then delete the invoice."
+                )
+            })
+
         # Take the invoice's debit back off the customer's balance before
         # the row goes. Deleting an invoice used to leave the debit behind
         # with nothing left to explain it, so the customer was chased for

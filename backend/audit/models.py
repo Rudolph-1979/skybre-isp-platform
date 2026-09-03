@@ -95,6 +95,18 @@ class AuditEvent(models.Model):
             models.Index(fields=["target_type", "target_id", "-created_at"]),
             models.Index(fields=["actor", "-created_at"]),
             models.Index(fields=["customer", "-created_at"]),
+            # accounts.login_guard counts recent failed sign-ins for one
+            # attempted username on EVERY login -- staff and all ~1,600
+            # portal subscribers -- so it runs on the hottest endpoint in
+            # the platform, against a table that grows with every record
+            # edit. `action` and `created_at` are indexed individually,
+            # which leaves Postgres bitmap-ANDing two indexes and then
+            # filtering actor_label (not indexed at all) by hand. This
+            # covers the guard's exact predicate.
+            models.Index(
+                fields=["actor_label", "action", "-created_at"],
+                name="audit_login_guard_idx",
+            ),
         ]
 
     def __str__(self):
