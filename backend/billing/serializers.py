@@ -299,7 +299,50 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "subtotal", "tax_total", "total", "paid_amount", "balance_due", "note", "items",
             "can_convert_to_proforma", "can_convert_to_invoice",
         ]
-        read_only_fields = ["id", "number", "date_created", "subtotal", "tax_total", "total", "paid_amount"]
+        read_only_fields = [
+            "id", "number", "date_created", "subtotal", "tax_total", "total", "paid_amount",
+            # An issued invoice cannot be moved to another customer. It
+            # carries a balance debit against the customer it was issued
+            # to (see Invoice.apply_balance_debit) and its line items'
+            # `service` FKs point at that customer's services -- so a
+            # reassignment left the debit on the first customer and the
+            # services pointing at the wrong one. Reassigning is what the
+            # deletion-request flow and a fresh invoice are for.
+            "customer",
+        ]
+
+    def validate_status(self, value):
+        """Guard the one-directional quote -> pro forma -> invoice
+        lifecycle the model documents.
+
+        `status` is writable on purpose -- staff mark an invoice cancelled
+        or overdue from the list -- but nothing validated the transition,
+        so a real invoice could be PATCHed back to `quote`. That was not
+        merely wrong-looking: it made can_convert_to_proforma() true
+        again, and converting clears `number` and reissues from the QUO
+        sequence, which frees the original INV number for the next invoice
+        to reuse while the customer still holds the original PDF. Number
+        laundering by PATCH.
+        """
+        if self.instance is None:
+            return value
+        if (
+            value in Invoice.PRE_INVOICE_STATUSES
+            and self.instance.status not in Invoice.PRE_INVOICE_STATUSES
+        ):
+            raise serializers.ValidationError(
+                f"{self.instance.number} is already a real invoice and can't be turned back into a "
+                f"{Invoice(status=value).get_status_display().lower()}. Cancel it instead."
+            )
+        return value
+
+    def update(self, instance, validated_data):
+        invoice = super().update(instance, validated_data)
+        # A status edit is one of the ways an invoice starts or stops being
+        # owed -- cancelling one has to take its debit back off the
+        # customer's balance.
+        invoice.apply_balance_debit()
+        return invoice
 
     def get_balance_due(self, obj):
         return obj.total - obj.paid_amount
@@ -333,6 +376,10 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
         # with a tariff line waits until it's converted to an invoice.
         if invoice.status not in Invoice.PRE_INVOICE_STATUSES:
             invoice.activate_tariff_services()
+        # An invoice raised by hand is owed exactly as much as one the
+        # recurring engine raised. This call is the whole of the fix for
+        # the ledger drift described in Invoice.apply_balance_debit.
+        invoice.apply_balance_debit()
         return invoice
 
 
@@ -347,6 +394,81 @@ class PaymentSerializer(serializers.ModelSerializer):
             "date", "note", "received_by", "received_by_name",
         ]
         read_only_fields = ["id", "date"]
+
+    def validate(self, attrs):
+        """A payment had no validation at all before this: `customer` and
+        `invoice` were independent writable FKs, so nothing stopped a
+        payment being recorded against one customer while it settled a
+        DIFFERENT customer's invoice -- debiting the first customer's
+        balance and flipping the second's invoice to Paid from one
+        request, leaving two ledgers wrong and one customer no longer
+        chased for money nobody received. bankfeeds' confirm endpoint
+        passes an invoice id straight from the request body into here
+        while determining the customer server-side, so that combination
+        was reachable without editing anything by hand.
+
+        Paying a quote or pro forma is refused for the reason
+        recalc_totals already refuses to auto-flip one to Paid: those are
+        pre-invoice documents with nothing owed on them yet. It also used
+        to be a one-way trap -- a quote marked Paid fails
+        can_convert_to_invoice(), so it could never become a real invoice
+        again while still carrying a QUO- number and counting as a tax
+        invoice in the Output VAT report.
+
+        Amount is deliberately NOT constrained here beyond being non-zero.
+        A negative "Manual Adjustment" is the existing way staff correct a
+        ledger, and over-payment legitimately leaves a customer in credit.
+        """
+        customer = attrs.get("customer", getattr(self.instance, "customer", None))
+        invoice = attrs.get("invoice", getattr(self.instance, "invoice", None))
+        amount = attrs.get("amount", getattr(self.instance, "amount", None))
+
+        if amount is not None and amount == 0:
+            raise serializers.ValidationError({"amount": "A payment of zero has no effect."})
+
+        if invoice is not None and customer is not None and invoice.customer_id != customer.pk:
+            raise serializers.ValidationError({
+                "invoice": "That invoice belongs to a different customer.",
+            })
+        if invoice is not None and invoice.status in Invoice.PRE_INVOICE_STATUSES:
+            raise serializers.ValidationError({
+                "invoice": (
+                    f"{invoice.number} is a {invoice.get_status_display().lower()}, not an invoice. "
+                    "Convert it to an invoice before recording a payment against it."
+                ),
+            })
+        if invoice is not None and invoice.status == Invoice.Status.CANCELLED:
+            raise serializers.ValidationError({
+                "invoice": f"{invoice.number} has been cancelled. Record the payment against the customer instead.",
+            })
+        return attrs
+
+    def update(self, instance, validated_data):
+        """A payment's money fields are fixed once recorded.
+
+        Editing them silently desynchronised the ledger: all the balance
+        and paid_amount arithmetic lived in create() only, so a PATCH
+        changing 1000 to 100 left the customer's balance and the invoice's
+        paid_amount still reflecting 1000 forever, with the payment list
+        and the ledger permanently disagreeing about the same money.
+
+        Correcting a payment means deleting it -- which now reverses its
+        ledger effect, see Payment.reverse_ledger_effect -- and recording
+        the right one. Descriptive fields stay editable.
+        """
+        locked = {"customer", "invoice", "amount"}
+        changed = [
+            f for f in locked
+            if f in validated_data and validated_data[f] != getattr(instance, f)
+        ]
+        if changed:
+            raise serializers.ValidationError({
+                f: "This can't be changed on a recorded payment. Delete it and record the correct one."
+                for f in changed
+            })
+        for f in locked:
+            validated_data.pop(f, None)
+        return super().update(instance, validated_data)
 
     def create(self, validated_data):
         validated_data["received_by"] = self.context["request"].user

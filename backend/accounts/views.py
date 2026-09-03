@@ -46,8 +46,14 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 
     def post(self, request, *args, **kwargs):
         from audit.auth_events import record_login, record_login_failure
+        from .login_guard import check_login_allowed
 
         attempted = str(request.data.get("username", ""))[:255]
+        # Before the password is checked, so a locked-out caller learns
+        # nothing about whether what they just tried was correct. See
+        # accounts.login_guard for why this counts audit rows rather than
+        # using a DRF throttle.
+        check_login_allowed(attempted, getattr(request, "_audit_ip", None))
         serializer = self.get_serializer(data=request.data)
         try:
             serializer.is_valid(raise_exception=True)

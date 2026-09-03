@@ -30,6 +30,21 @@ class PaymentAdmin(admin.ModelAdmin):
     list_display = ("customer", "invoice", "amount", "method", "date")
     list_filter = ("method",)
 
+    # Read-only on purpose. Every ledger effect of a payment (the
+    # customer's balance, the invoice's paid_amount and Paid flip, and the
+    # reversal of all three) lives in PaymentSerializer/PaymentViewSet, so
+    # a payment added, edited or deleted through the admin's default forms
+    # moves money in the payments table without moving it in the ledger.
+    # Payments are recorded and corrected on the Finance page.
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(CreditRequest)
 class CreditRequestAdmin(admin.ModelAdmin):

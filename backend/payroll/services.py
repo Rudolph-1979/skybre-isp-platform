@@ -1,7 +1,56 @@
+import datetime
 from decimal import Decimal
 
 from accounts.models import User
 from .models import AttendanceRecord, PayrollRunLine, PayrollSettings, StaffProfile, days_in_month
+
+
+def salary_for_period(monthly_salary, period_start, period_end):
+    """What a salaried employee is owed for a run's period.
+
+    Month by month: each calendar month the period touches contributes
+    `salary * days_of_it_in_the_period / days_in_that_month`. A whole
+    calendar month therefore contributes exactly one salary, a part-month
+    is prorated, and a period spanning several months adds up.
+
+    That last case is why this exists. The previous version compared the
+    period's length against the days in its FIRST month and paid a flat
+    one month's salary whenever the period was at least that long:
+
+        month_length = days_in_month(run.period_start)
+        period_days = (period_end - period_start).days + 1
+        if period_days >= month_length: base_pay = salary
+
+    Nothing constrains a run to a single calendar month -- the only
+    validation is period_end >= period_start -- so a two-month catch-up
+    run (1 July to 31 August, 62 days against July's 31) paid one month's
+    salary for two months worked. Every salaried employee underpaid by
+    exactly one month, on a payslip PDF and a bank-export CSV that both
+    printed the figure without complaint, and overtime came from
+    attendance so the run still looked plausible.
+
+    Rounded per month and then summed, rather than once at the end,
+    because that is the arithmetic a payroll clerk checking a payslip
+    would do by hand.
+    """
+    total = Decimal("0.00")
+    cursor = period_start.replace(day=1)
+    last_month = period_end.replace(day=1)
+    while cursor <= last_month:
+        in_month = days_in_month(cursor)
+        month_end = cursor.replace(day=in_month)
+        overlap_start = max(cursor, period_start)
+        overlap_end = min(month_end, period_end)
+        overlap_days = (overlap_end - overlap_start).days + 1
+        if overlap_days >= in_month:
+            total += monthly_salary
+        else:
+            total += (
+                monthly_salary * Decimal(overlap_days) / Decimal(in_month)
+            ).quantize(Decimal("0.01"))
+        # First of the following month, without needing dateutil.
+        cursor = month_end + datetime.timedelta(days=1)
+    return total
 
 
 # Fields a person types in that this function must NOT destroy. Everything
@@ -61,13 +110,9 @@ def generate_payroll_run_lines(run):
         overtime_rate = (rate * profile.overtime_multiplier).quantize(Decimal("0.01"))
 
         if profile.pay_type == StaffProfile.PayType.SALARY:
-            salary = profile.monthly_salary or Decimal("0")
-            month_length = days_in_month(run.period_start)
-            period_days = (run.period_end - run.period_start).days + 1
-            if period_days >= month_length:
-                base_pay = salary
-            else:
-                base_pay = (salary * Decimal(period_days) / Decimal(month_length)).quantize(Decimal("0.01"))
+            base_pay = salary_for_period(
+                profile.monthly_salary or Decimal("0"), run.period_start, run.period_end
+            )
         else:
             base_pay = (rate * regular_hours).quantize(Decimal("0.01"))
 

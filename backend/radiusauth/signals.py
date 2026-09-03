@@ -303,11 +303,41 @@ def sync_service_radius(service):
     look like right now. Always deletes-and-recreates rather than patching
     individual rows in place -- simpler to reason about and stays correct
     no matter what changed (username, password, status, tariff, IP
-    assignment...)."""
+    assignment...).
+
+    All of it in ONE transaction, and the slow part computed before the
+    delete. Both matter because FreeRADIUS is reading these tables the
+    whole time, from a different process.
+
+    ATOMIC_REQUESTS is not set, so this used to run in autocommit: the
+    DELETE committed on its own, and the Cleartext-Password row was only
+    re-inserted afterwards -- after IP allocation and after
+    _mikrotik_rate_limit, which reaches through speeds.effective_speeds
+    into a month of hourly UsageBucket rows. A customer whose CPE
+    re-dialled inside that window found no radcheck row and got an
+    Access-Reject. Worse, any exception in between -- an IntegrityError on
+    an address, a database hiccup, a request timing out -- left the
+    subscriber with NO auth rows at all, unable to authenticate until
+    somebody noticed and re-saved the service by hand.
+
+    Resolving the rate limit up front shrinks the window to the writes
+    themselves; the transaction means a failure anywhere in it puts the
+    old rows back rather than leaving the line stranded.
+    """
     username = service.radius_username
     if not username:
         return
 
+    # Resolved before anything is deleted: this is the expensive read, and
+    # it must not sit between the delete and the recreate.
+    rate_limit = _mikrotik_rate_limit(service)
+
+    with transaction.atomic():
+        _sync_service_radius_rows(service, username, rate_limit)
+
+
+def _sync_service_radius_rows(service, username, rate_limit):
+    """The write half of sync_service_radius, inside its transaction."""
     _clear_radius_entries(username)
 
     walled_garden = _walled_garden_eligible(service)
@@ -361,7 +391,7 @@ def sync_service_radius(service):
         RadReply.objects.create(username=username, attribute="Framed-IP-Address", op="=", value=ip)
 
     RadReply.objects.create(
-        username=username, attribute="Mikrotik-Rate-Limit", op="=", value=_mikrotik_rate_limit(service)
+        username=username, attribute="Mikrotik-Rate-Limit", op="=", value=rate_limit
     )
 
 
@@ -482,6 +512,42 @@ def _service_post_delete_clear_radius(sender, instance, **kwargs):
         IPAddress.objects.filter(id__in=ids).update(status=IPAddress.Status.FREE, assigned_service=None)
 
 
+# The only Tariff fields Mikrotik-Rate-Limit is derived from --
+# speeds.plan_speeds() reads the two speed columns, and speeds.effective_speeds()
+# layers fair use on top of them. Everything else on a Tariff (price, name,
+# description, tax rate, billing period, is_active, data_cap_gb) changes
+# nothing about what the router is told, so a save that touches only those
+# must not reach the network at all.
+_TARIFF_RADIUS_FIELDS = (
+    "speed_download_kbps",
+    "speed_upload_kbps",
+    "fup_threshold_gb",
+    "fup_speed_pct",
+)
+
+
+@receiver(pre_save, sender=Tariff)
+def _tariff_pre_save_capture_old_speeds(sender, instance, **kwargs):
+    """Stashes the previous speed/fair-use values so post_save can tell a
+    real speed change from a price edit. Same shape as
+    _service_pre_save_capture_old_state above, and as
+    network.signals' _network_old_* capture.
+
+    A missing row leaves the marker as None, which post_save reads as
+    "can't establish what changed" and treats as no change -- failing
+    toward not touching the router, the safe direction.
+    """
+    if not instance.pk:
+        instance._old_radius_speeds = None
+        return
+    try:
+        old = Tariff.objects.only(*_TARIFF_RADIUS_FIELDS).get(pk=instance.pk)
+    except Tariff.DoesNotExist:
+        instance._old_radius_speeds = None
+        return
+    instance._old_radius_speeds = {f: getattr(old, f) for f in _TARIFF_RADIUS_FIELDS}
+
+
 @receiver(post_save, sender=Tariff)
 def _tariff_post_save_resync_services(sender, instance, created, **kwargs):
     """A tariff's speed is what Mikrotik-Rate-Limit is derived from -- if
@@ -492,14 +558,44 @@ def _tariff_post_save_resync_services(sender, instance, created, **kwargs):
     router AT LOGIN, so a live session keeps the queue it was given whenever it
     last connected -- meaning a speed upgrade you sold someone silently does
     not reach them until they happen to reconnect. Same shape as the
-    suspension bug, and the same fix: drop the session so it re-authenticates
-    and picks the new limit up. Handled inside sync_service_radius' caller
+    suspension bug. Handled inside sync_service_radius' caller
     here rather than in network.signals, because a Service.save() with no
     status change is exactly the case network.signals deliberately ignores.
+
+    Gated on the speed/fair-use fields actually changing. This used to fire
+    on EVERY non-create Tariff.save(), so correcting a typo in a plan's
+    description, or putting its price up, re-synced and then dropped the
+    live session of every customer on it -- a few hundred paid-up people
+    knocked offline by an edit that changed nothing they could observe,
+    with no RadiusAction row to say it had happened. network.signals'
+    _service_post_save has always compared old and new for exactly this
+    reason; this handler simply never got the same treatment.
+
+    Two further differences from the version this replaces, both taken from
+    the reasoning already written down elsewhere in the codebase:
+
+      * It goes through enforcement.apply_change(reason="tariff") rather
+        than calling disconnect_service_sessions directly. A speed change
+        is precisely the case CoA handles WITHOUT dropping the customer
+        (see network.signals: "delivering an upgrade by cutting someone
+        off has always been the wrong shape"), and apply_change records
+        the outcome in RadiusAction either way.
+      * allow_disconnect_fallback=False, for the reason apply_change's own
+        docstring gives about the scheduled speed-policy run: this fans
+        out across every customer on the plan at once, so a CoA that fails
+        network-wide (wrong shared secret, UDP 3799 blocked) would
+        otherwise disconnect the entire plan in order to deliver a speed
+        change. The new speed is already in radreply, so it lands at their
+        next reconnect regardless.
     """
     if created:
         return
-    from network.router_sync import disconnect_service_sessions
+    old_speeds = getattr(instance, "_old_radius_speeds", None)
+    if not old_speeds:
+        return
+    if all(old_speeds[f] == getattr(instance, f) for f in _TARIFF_RADIUS_FIELDS):
+        return
+
     from network.signals import _after_commit_in_background
 
     for service in instance.services.exclude(radius_username__isnull=True).exclude(radius_username=""):
@@ -510,8 +606,16 @@ def _tariff_post_save_resync_services(sender, instance, created, **kwargs):
         if service.status == Service.Status.ACTIVE:
             _after_commit_in_background(
                 f"rate-limit refresh for service {service.pk}",
-                lambda svc=service: disconnect_service_sessions(svc),
+                lambda svc=service: _apply_tariff_speed_change(svc),
             )
+
+
+def _apply_tariff_speed_change(service):
+    # Imported at call time, not module scope: radiusauth.enforcement reaches
+    # back into network.router_sync, which imports this module during app-ready.
+    from .enforcement import apply_change
+
+    return apply_change(service, "tariff", allow_disconnect_fallback=False)
 
 
 # ---------------------------------------------------------------------------

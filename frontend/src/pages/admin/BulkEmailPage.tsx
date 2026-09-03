@@ -5,6 +5,7 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import EmailBodyPreview from "../../components/EmailBodyPreview";
 import type { Customer, EmailTemplateKey, EmailLog } from "../../types";
 
 const PAGE_SIZE = 50;
@@ -334,10 +335,7 @@ function SendTab() {
             <p className="text-xs uppercase tracking-wide text-[var(--text-muted)]">Subject (rendered for one sample recipient)</p>
             <p className="mb-3 font-medium text-[var(--text-primary)]">{preview.subject}</p>
             <p className="text-xs uppercase tracking-wide text-[var(--text-muted)]">Body</p>
-            <div
-              className="mt-1 rounded bg-[var(--surface-1)] p-3 text-sm text-[var(--text-primary)]"
-              dangerouslySetInnerHTML={{ __html: preview.body_html }}
-            />
+            <EmailBodyPreview html={preview.body_html} />
           </div>
         )}
 

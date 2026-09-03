@@ -7,6 +7,7 @@ import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { PdfPreviewModal } from "../../components/PdfPreviewModal";
+import EmailBodyPreview from "../../components/EmailBodyPreview";
 import {
   ServiceConnectionFields, serviceConnectionPayload, emptyServiceConnectionValues,
   type ServiceConnectionValues,
@@ -1353,10 +1354,7 @@ export function CustomerDetailPage() {
                   <p className="text-xs uppercase tracking-wide text-[var(--text-muted)]">Subject</p>
                   <p className="mb-3 font-medium text-[var(--text-primary)]">{preview.subject}</p>
                   <p className="text-xs uppercase tracking-wide text-[var(--text-muted)]">Body</p>
-                  <div
-                    className="mt-1 rounded bg-[var(--surface-1)] p-3 text-sm text-[var(--text-primary)]"
-                    dangerouslySetInnerHTML={{ __html: preview.body_html }}
-                  />
+                  <EmailBodyPreview html={preview.body_html} />
                   {preview.will_attach_pdf && (
                     <p className="mt-2 text-xs text-[var(--text-muted)]">
                       A PDF will be attached to this email.{" "}

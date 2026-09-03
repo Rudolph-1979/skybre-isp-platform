@@ -26,6 +26,31 @@ if not DEBUG and SECRET_KEY == _INSECURE_DEV_SECRET_KEY:
         "Set a real, random SECRET_KEY in the environment/.env before running in production."
     )
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*", cast=Csv())
+CORS_ALLOW_ALL_ORIGINS = config("CORS_ALLOW_ALL_ORIGINS", default=True, cast=bool)
+
+# The same fail-loudly-at-startup treatment SECRET_KEY already gets, for
+# the two other settings that default wide open. Both defaults are right
+# for local development and wrong on a public host, and neither announces
+# itself when it is wrong -- ALLOWED_HOSTS="*" accepts any Host header
+# (so cache-poisoning and password-reset links pointed at an attacker's
+# domain both become possible), and CORS_ALLOW_ALL_ORIGINS=True lets any
+# website on the internet read authenticated API responses from a
+# logged-in staff member's browser.
+#
+# Checked only when DEBUG is False, so a developer running locally is
+# unaffected. On the VPS this turns two silent misconfigurations into a
+# container that refuses to start and says which line to fix.
+if not DEBUG:
+    if "*" in ALLOWED_HOSTS:
+        raise ImproperlyConfigured(
+            'ALLOWED_HOSTS is still "*" while DEBUG=False. Set it to the real hostnames, '
+            "e.g. ALLOWED_HOSTS=portal.skybre.co.za,154.65.111.61"
+        )
+    if CORS_ALLOW_ALL_ORIGINS:
+        raise ImproperlyConfigured(
+            "CORS_ALLOW_ALL_ORIGINS is True while DEBUG=False. Set it to False and list the "
+            "real origins in CORS_ALLOWED_ORIGINS, e.g. CORS_ALLOWED_ORIGINS=https://portal.skybre.co.za"
+        )
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -175,7 +200,8 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": True,
 }
 
-CORS_ALLOW_ALL_ORIGINS = config("CORS_ALLOW_ALL_ORIGINS", default=True, cast=bool)
+# CORS_ALLOW_ALL_ORIGINS is read at the top of this file, next to
+# ALLOWED_HOSTS, so the boot guard there can check it.
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=Csv())
 
 # Required by Django once the site is served over HTTPS behind a reverse
