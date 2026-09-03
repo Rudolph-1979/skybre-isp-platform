@@ -71,17 +71,120 @@ class FNBTokenRequestTests(TestCase):
 
     # ---- the failures explain themselves --------------------------------
 
-    def test_a_redirect_names_the_location_and_explains_the_405(self):
+    # ---- a redirected grant is re-POSTed, not demoted to a GET ----------
+
+    def test_a_same_host_redirect_is_followed_as_another_post(self):
+        """The fix for the 405: requests would have turned hop two into a
+        GET. Here it stays a POST and the token comes back."""
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.side_effect = [
+                _response(302, headers={"Location": "/v2/oauth/token"}),
+                _response(200, json_data={"access_token": "tok"}),
+            ]
+            self.assertEqual(self.client_obj._fetch_access_token(), "tok")
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[1].args[0], "https://bank.example/v2/oauth/token")
+        # Both hops carry the grant, and neither lets requests follow.
+        for call in post.call_args_list:
+            self.assertEqual(call.kwargs["data"]["grant_type"], "client_credentials")
+            self.assertIs(call.kwargs["allow_redirects"], False)
+
+    def test_a_permanent_redirect_is_followed_too(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.side_effect = [
+                _response(301, headers={"Location": "https://bank.example/oauth/token/"}),
+                _response(200, json_data={"access_token": "tok"}),
+            ]
+            self.assertEqual(self.client_obj._fetch_access_token(), "tok")
+
+    def test_two_hops_still_resolve(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.side_effect = [
+                _response(301, headers={"Location": "/v2/oauth/token"}),
+                _response(302, headers={"Location": "/v2/oauth/token/"}),
+                _response(200, json_data={"access_token": "tok"}),
+            ]
+            self.assertEqual(self.client_obj._fetch_access_token(), "tok")
+
+    def test_a_redirect_loop_fails_fast_rather_than_hanging(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.return_value = _response(302, headers={"Location": "/oauth/token"})
+            with self.assertRaises(FNBClientError) as caught:
+                self.client_obj._fetch_access_token()
+        self.assertIn("kept redirecting", str(caught.exception))
+        self.assertLessEqual(post.call_count, 4)
+
+    def test_a_failure_after_a_redirect_says_where_it_ended_up(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.side_effect = [
+                _response(301, headers={"Location": "/v2/oauth/token"}),
+                _response(401, text="bad client"),
+            ]
+            with self.assertRaises(FNBClientError) as caught:
+                self.client_obj._fetch_access_token()
+        message = str(caught.exception)
+        self.assertIn("Re-POSTed through", message)
+        self.assertIn("/v2/oauth/token", message)
+        self.assertIn("bad client", message)
+
+    def test_a_redirect_with_no_location_is_reported(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            resp = _response(302)
+            resp.is_redirect = True
+            post.return_value = resp
+            with self.assertRaises(FNBClientError) as caught:
+                self.client_obj._fetch_access_token()
+        self.assertIn("no Location header", str(caught.exception))
+
+    # ---- but the credential is never forwarded anywhere new -------------
+
+    def test_a_cross_host_redirect_is_refused(self):
+        """api_base_url is staff-typed free text and this request's body
+        carries the client secret, so a redirect to a different host must
+        not be followed."""
         with mock.patch("bankfeeds.fnb_client.requests.post") as post:
             post.return_value = _response(
-                302, headers={"Location": "https://api.bank.example/v2/oauth/token"}
+                302, headers={"Location": "https://evil.example/collect"}
             )
             with self.assertRaises(FNBClientError) as caught:
                 self.client_obj._fetch_access_token()
         message = str(caught.exception)
-        self.assertIn("302", message)
-        self.assertIn("https://api.bank.example/v2/oauth/token", message)
-        self.assertIn("becomes a GET", message)
+        self.assertIn("different host", message)
+        self.assertIn("evil.example", message)
+        # Refused before a second request is made, not after.
+        self.assertEqual(post.call_count, 1)
+
+    def test_an_https_to_http_downgrade_is_refused(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.return_value = _response(
+                302, headers={"Location": "http://bank.example/oauth/token"}
+            )
+            with self.assertRaises(FNBClientError) as caught:
+                self.client_obj._fetch_access_token()
+        self.assertIn("over the wire in clear", str(caught.exception))
+        self.assertEqual(post.call_count, 1)
+
+    def test_a_non_http_redirect_target_is_refused(self):
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.return_value = _response(302, headers={"Location": "file:///etc/passwd"})
+            with self.assertRaises(FNBClientError) as caught:
+                self.client_obj._fetch_access_token()
+        self.assertIn("not http(s)", str(caught.exception))
+
+    def test_an_http_base_url_may_still_be_upgraded_to_https(self):
+        """The commonest real case: the base URL was stored as http:// and
+        the bank redirects to https:// on the same host."""
+        self.account.api_base_url = "http://bank.example"
+        self.account.save(update_fields=["api_base_url"])
+        client_obj = FNBClient(self.account)
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            post.side_effect = [
+                _response(301, headers={"Location": "https://bank.example/oauth/token"}),
+                _response(200, json_data={"access_token": "tok"}),
+            ]
+            self.assertEqual(client_obj._fetch_access_token(), "tok")
+        self.assertEqual(post.call_args_list[1].args[0], "https://bank.example/oauth/token")
 
     def test_a_405_reports_the_status_the_url_and_the_body(self):
         with mock.patch("bankfeeds.fnb_client.requests.post") as post:

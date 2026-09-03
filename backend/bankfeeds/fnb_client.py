@@ -25,6 +25,7 @@ FNB API docs/credentials are available; everything else in this app
 should keep working unchanged.
 """
 from datetime import date as date_cls
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -88,24 +89,16 @@ class FNBClient:
             parts.append("The response had an empty body.")
         return " ".join(parts)
 
-    def _fetch_access_token(self) -> str:
-        """PLACEHOLDER: assumes a standard OAuth2 client-credentials
-        grant (the most common shape for this kind of bank API) -- update
-        the path/payload/response field name once FNB's actual auth flow
-        is confirmed.
+    # A redirected token request is followed by hand, not by requests, and
+    # never more than this many times. Three is enough for the shapes that
+    # actually occur (http -> https, then a trailing-slash or version-path
+    # move) and short enough that a redirect loop fails fast.
+    _MAX_TOKEN_REDIRECTS = 3
 
-        allow_redirects=False, deliberately. requests follows redirects by
-        default and, on a 301, 302 or 303, DOWNGRADES a POST to a GET
-        (Session.resolve_redirects does this). So a base URL that redirects
-        at all -- http:// stored where the bank serves https://, or a
-        trailing-slash redirect on the token path -- sent a correct POST
-        that arrived as a GET, and came back 405 Method Not Allowed with
-        nothing on screen to suggest a redirect had happened. Refusing to
-        follow it turns that into a message naming the Location header.
-        """
-        url = f"{self.account.api_base_url.rstrip('/')}/oauth/token"
+    def _post_token_once(self, url):
+        """One POST of the client-credentials grant, redirects unfollowed."""
         try:
-            resp = requests.post(
+            return requests.post(
                 url,
                 data={
                     "grant_type": "client_credentials",
@@ -113,27 +106,108 @@ class FNBClient:
                     "client_secret": self.account.api_client_secret,
                 },
                 timeout=15,
+                # Never let requests follow this one. See _fetch_access_token.
                 allow_redirects=False,
             )
         except requests.RequestException as exc:
             raise FNBClientError(f"Could not reach FNB's API at {url}: {exc}") from exc
 
-        # 3xx is not an error to raise_for_status(), so it has to be caught
-        # here or the redirect body falls through to .json() and surfaces
-        # as an unrelated parse error.
-        if resp.is_redirect or resp.is_permanent_redirect:
-            location = resp.headers.get("Location") or "(no Location header)"
+    def _resolve_token_redirect(self, url, resp):
+        """Where to re-POST after a 3xx, or raise saying why we won't.
+
+        requests follows redirects by default and, on a 301, 302 or 303,
+        DOWNGRADES a POST to a GET -- that is Session.resolve_redirects'
+        documented behaviour, inherited from what browsers do with form
+        submissions. So a base URL that redirects at all (http:// stored
+        where the bank serves https://, or a trailing-slash redirect on
+        the token path) sent a correct POST that arrived as a GET, and
+        came back 405 Method Not Allowed with nothing to suggest a
+        redirect had happened.
+
+        Following it here instead keeps the method: the grant is re-POSTed
+        to the new location, which is what every one of these redirects
+        actually means. Two things are refused rather than followed,
+        because this request carries api_client_secret in its body:
+
+          * a redirect to a DIFFERENT host, which would hand the client
+            credential to whoever that host belongs to. api_base_url is
+            staff-typed free text, so this is the difference between
+            following a bank's own http -> https move and forwarding a
+            secret to anywhere a typo points.
+          * a redirect from https:// down to http://, which would put the
+            credential on the wire in clear.
+        """
+        location = resp.headers.get("Location")
+        if not location:
             raise FNBClientError(
-                f"FNB's API redirected the token request: POST {url} returned HTTP "
-                f"{resp.status_code} pointing at {location}. Redirects are not followed on this "
-                "call because a redirected POST becomes a GET, which is what produces a 405 here. "
-                f"Set this account's API base URL so the token path resolves to {location} "
-                "directly -- usually that means switching http:// to https://, or removing or "
-                "adding a trailing slash."
+                f"FNB's API returned HTTP {resp.status_code} for POST {url} with no Location "
+                "header, so there is nothing to follow. Check this account's API base URL."
             )
 
+        target = urljoin(url, location)
+        here, there = urlparse(url), urlparse(target)
+
+        if there.scheme not in ("http", "https"):
+            raise FNBClientError(
+                f"FNB's API redirected the token request to {target}, which is not http(s). "
+                "Refusing to follow it."
+            )
+        if here.scheme == "https" and there.scheme == "http":
+            raise FNBClientError(
+                f"FNB's API redirected the token request from {url} down to {target}. Refusing "
+                "to follow it: the client credential travels in this request's body and would "
+                "go over the wire in clear."
+            )
+        if here.netloc and there.netloc != here.netloc:
+            raise FNBClientError(
+                f"FNB's API redirected the token request from {here.netloc} to {there.netloc}. "
+                "Refusing to follow a redirect to a different host, because the client secret "
+                "is in this request's body. If that host is genuinely FNB's, set this account's "
+                f"API base URL to it directly so the credential is only ever sent somewhere "
+                "chosen deliberately."
+            )
+        return target
+
+    def _fetch_access_token(self) -> str:
+        """PLACEHOLDER: assumes a standard OAuth2 client-credentials
+        grant (the most common shape for this kind of bank API) -- update
+        the path/payload/response field name once FNB's actual auth flow
+        is confirmed.
+
+        Redirects are resolved here rather than by requests, so that a
+        redirected grant is re-POSTed instead of being silently turned
+        into a GET and answered with a 405. See _resolve_token_redirect.
+        """
+        url = f"{self.account.api_base_url.rstrip('/')}/oauth/token"
+        followed = []
+
+        for _ in range(self._MAX_TOKEN_REDIRECTS + 1):
+            resp = self._post_token_once(url)
+            # 3xx is not an error to raise_for_status(), so it has to be
+            # handled explicitly or the redirect body falls through to
+            # .json() and surfaces as an unrelated parse error.
+            if not (resp.is_redirect or resp.is_permanent_redirect):
+                break
+            followed.append(f"{resp.status_code} {url}")
+            url = self._resolve_token_redirect(url, resp)
+        else:
+            raise FNBClientError(
+                "FNB's API kept redirecting the token request "
+                f"({self._MAX_TOKEN_REDIRECTS} hops without an answer): "
+                + " -> ".join(followed)
+                + f" -> {url}. That is usually a redirect loop; check this account's API base URL."
+            )
+
+        trail = ""
+        if followed:
+            # Worth saying out loud on a failure: the request that failed is
+            # not at the URL anybody configured.
+            trail = " Re-POSTed through: " + " -> ".join(followed) + f" -> {url}."
+
         if resp.status_code >= 400:
-            raise FNBClientError(self._describe_response("authenticate with", "POST", url, resp))
+            raise FNBClientError(
+                self._describe_response("authenticate with", "POST", url, resp) + trail
+            )
 
         try:
             payload = resp.json()
@@ -141,6 +215,7 @@ class FNBClient:
             raise FNBClientError(
                 self._describe_response("read a token from", "POST", url, resp)
                 + " It was not JSON."
+                + trail
             )
 
         token = payload.get("access_token")
