@@ -17,7 +17,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from accounts.login_guard import MAX_PER_IP, MAX_PER_USERNAME, WINDOW
+from accounts.login_guard import MAX_PER_USERNAME, WINDOW
 from audit.models import AuditEvent
 
 User = get_user_model()
@@ -84,14 +84,63 @@ class LoginGuardTests(TestCase):
         self.assertEqual(res.status_code, 200, res.data)
         self.assertTrue(other.is_active)
 
-    def test_credential_stuffing_from_one_address_is_capped(self):
-        """The per-IP limit catches a host working through a list of
-        accounts, where no single username reaches its own limit."""
-        for i in range(MAX_PER_IP):
-            self._seed_failures(1, username=f"victim{i}", ip="198.51.100.7")
-        res = self._attempt(username="target", password="the-real-password",
-                            HTTP_X_FORWARDED_FOR="198.51.100.7")
+    def test_there_is_no_per_ip_limit_to_weaponise(self):
+        """Deliberately removed. request._audit_ip prefers the left-most
+        X-Forwarded-For, which the client sets -- so an attacker rotating
+        it bypassed the limit entirely, while anybody could lock a whole
+        office out by sending failures carrying that office's address.
+        audit.middleware's docstring says that value is safe BECAUSE
+        nothing authorises on it; the guard contradicted that.
+
+        So: junk failures attributed to an address must not stop a
+        legitimate sign-in from it."""
+        for i in range(60):
+            self._seed_failures(1, username=f"victim{i}", ip="41.0.0.7")
+        res = self._attempt(password="the-real-password", HTTP_X_FORWARDED_FOR="41.0.0.7")
+        self.assertEqual(res.status_code, 200, res.data)
+
+    def test_rotating_the_forwarded_header_does_not_evade_the_username_limit(self):
+        """The other half: the limit that remains is keyed on the account,
+        which no header can change."""
+        self._seed_failures(MAX_PER_USERNAME)
+        res = self._attempt(HTTP_X_FORWARDED_FOR="203.0.113.99")
         self.assertEqual(res.status_code, 429)
+
+    def test_the_two_factor_code_prompt_does_not_count_as_a_failure(self):
+        """The defect this cost us: the SPA signs a 2FA user in with TWO
+        posts, and the first writes a LOGIN_FAILED row reading "Password
+        correct, 2FA code required". Counting it meant ten CORRECT
+        sign-ins exhausted a limit of ten and locked the admin out of
+        their own platform."""
+        AuditEvent.objects.bulk_create([
+            AuditEvent(
+                actor=None, actor_label="target", action=AuditEvent.Action.LOGIN_FAILED,
+                detail="Password correct, 2FA code required", ip_address="203.0.113.9",
+                user_agent="",
+            )
+            for _ in range(MAX_PER_USERNAME * 3)
+        ])
+        res = self._attempt(password="the-real-password")
+        self.assertEqual(res.status_code, 200, res.data)
+
+    def test_a_rejected_two_factor_code_does_still_count(self):
+        """A wrong code IS a guess -- that is the second factor being
+        brute-forced, which is the thing worth stopping."""
+        AuditEvent.objects.bulk_create([
+            AuditEvent(
+                actor=None, actor_label="target", action=AuditEvent.Action.LOGIN_FAILED,
+                detail="Password correct, 2FA code rejected", ip_address="203.0.113.9",
+                user_agent="",
+            )
+            for _ in range(MAX_PER_USERNAME)
+        ])
+        res = self._attempt(password="the-real-password")
+        self.assertEqual(res.status_code, 429)
+
+    def test_an_empty_username_is_not_counted_or_blocked(self):
+        self._seed_failures(MAX_PER_USERNAME, username="(no username given)")
+        res = self._attempt(username="", password="x")
+        self.assertNotEqual(res.status_code, 429)
 
     def test_a_real_failure_writes_the_audit_row_the_guard_counts(self):
         """The guard and the audit trail read the same rows -- if
