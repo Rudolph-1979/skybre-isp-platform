@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from .fnb_client import validate_api_base_url
 from .models import BankAccount, BankTransaction, BankFeedSyncLog
 
 
@@ -24,6 +25,20 @@ class BankAccountSerializer(serializers.ModelSerializer):
 
     def get_api_client_secret_set(self, obj):
         return obj.api_client_secret_set()
+
+    def validate_api_base_url(self, value):
+        """Reject an address that cannot be a bank's before it is saved.
+
+        The failure this prevents is quiet: a wrong base URL is only ever
+        noticed as a failed sync an hour later, and the message it
+        produced named a status code rather than the mistake. Catching it
+        on save puts the explanation in front of the person who typed it,
+        while they still have the right value to hand.
+        """
+        try:
+            return validate_api_base_url(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
     def _save_with_optional_secret(self, instance, validated_data):
         # A blank/omitted secret means "leave whatever's stored alone" --

@@ -28,6 +28,7 @@ from datetime import date as date_cls
 from urllib.parse import urljoin, urlparse
 
 import requests
+from django.conf import settings
 
 
 class FNBClientError(Exception):
@@ -36,6 +37,79 @@ class FNBClientError(Exception):
     unexpected response shape. sync.py catches this and logs it on a
     BankFeedSyncLog rather than letting one bad account take down the
     whole hourly run across all 4 accounts."""
+
+
+def _own_hostnames() -> set:
+    """Hostnames that belong to this platform rather than to a bank.
+
+    ALLOWED_HOSTS is the list the deployment already maintains to answer
+    exactly this question ("is this host us?"), so it is reused rather
+    than duplicated into another setting staff would have to keep in
+    sync. The loopback names are added because a base URL pointing at the
+    machine the sync runs on is the same mistake wearing a different hat.
+    """
+    hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    for entry in getattr(settings, "ALLOWED_HOSTS", None) or []:
+        # A leading dot is ALLOWED_HOSTS' subdomain wildcard; "*" matches
+        # everything and would make every URL on earth look like ours.
+        entry = (entry or "").strip().lstrip(".").lower()
+        if entry and entry != "*":
+            hosts.add(entry)
+    site_host = urlparse(getattr(settings, "SITE_URL", "") or "").hostname
+    if site_host:
+        hosts.add(site_host.lower())
+    return hosts
+
+
+def validate_api_base_url(value: str) -> str:
+    """Return `value` trimmed, or raise ValueError saying why it cannot be
+    a bank API base URL.
+
+    Blank is allowed here and means "CSV import only" -- FNBClient refuses
+    that separately, with its own message pointing at CSV import.
+
+    This exists because of a real failure: the field was filled in with
+    this platform's own address, so every hourly sync POSTed the client
+    credentials to Skybre's own web server and collected a 405 that named
+    no cause. Nothing in the request path could catch it -- the
+    cross-host guard in _resolve_token_redirect only inspects REDIRECTS,
+    and a base URL that is wrong from the very first request never
+    redirects anywhere. So it is caught here instead, at the point the
+    value is typed and again before any request is sent.
+
+    ValueError rather than FNBClientError or DRF's ValidationError, so
+    the serializer and the client can each wrap it in the exception their
+    own caller expects.
+    """
+    url = (value or "").strip()
+    if not url:
+        return url
+
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        # requests' own words for this are "Invalid URL ...: No scheme
+        # supplied", which is accurate but arrives after a sync has
+        # already been attempted and logged as a failure.
+        raise ValueError(
+            f"'{url}' does not start with http:// or https://. "
+            f"If that is the right address, enter it as https://{url}"
+        )
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"'{url}' is not an http:// or https:// address.")
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError(f"'{url}' has no hostname in it.")
+
+    if host in _own_hostnames():
+        raise ValueError(
+            f"'{url}' is this platform's own address, not a bank's. Pointing the bank feed "
+            "at it makes every sync send this account's client credentials to Skybre's own "
+            "web server, which answers 405 Not Allowed because it has no token endpoint -- "
+            "FNB is never contacted at all. Leave this blank and use CSV import until FNB "
+            "confirms API access and gives you their real base URL."
+        )
+    return url
 
 
 class FNBClient:
@@ -47,6 +121,14 @@ class FNBClient:
                 "No API base URL configured for this account. Either use CSV import for now, or fill in "
                 "the API connection details once FNB confirms API access for this account."
             )
+        # Checked here too, not only in BankAccountSerializer: rows saved
+        # before that validation existed are still in the database, and
+        # the hourly sync reads them straight from it without going
+        # through a serializer at all.
+        try:
+            validate_api_base_url(account.api_base_url)
+        except ValueError as exc:
+            raise FNBClientError(str(exc)) from exc
         self.account = account
 
     @staticmethod
