@@ -23,6 +23,7 @@ export function InvoiceDetailPage() {
   const [converting, setConverting] = useState(false);
   const [showPdf, setShowPdf] = useState(false);
   const [convertError, setConvertError] = useState("");
+  const [paymentError, setPaymentError] = useState("");
 
   // -- Deletion request (deleting a quote/pro forma needs Management
   // approval -- see InvoiceDeletionRequest on the backend) --
@@ -130,11 +131,30 @@ export function InvoiceDetailPage() {
     e.preventDefault();
     if (!invoice) return;
     setSaving(true);
+    setPaymentError("");
     try {
       await api.post("/payments/", { customer: invoice.customer, invoice: invoice.id, amount, method });
       setShowModal(false);
       setAmount("");
       load();
+    } catch (err) {
+      // This used to be try/finally with no catch at all, so a rejected
+      // payment closed nothing, said nothing, and left the ledger
+      // untouched while the staff member had no reason to think it had
+      // failed -- and the customer carried on being chased. The payment
+      // serializer returns FIELD-KEYED errors ("that invoice belongs to a
+      // different customer", "is still a draft and has not been issued"),
+      // not just `detail`, so the message has to be dug out of either
+      // shape.
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      let message = "Could not record this payment — please try again.";
+      if (data && typeof data === "object") {
+        const detail = (data as { detail?: unknown }).detail;
+        const first = Object.values(data as Record<string, unknown>).flat()[0];
+        if (typeof detail === "string") message = detail;
+        else if (typeof first === "string") message = first;
+      }
+      setPaymentError(message);
     } finally {
       setSaving(false);
     }
@@ -318,8 +338,13 @@ export function InvoiceDetailPage() {
       </Table>
 
       {showModal && (
-        <Modal title="Record payment" onClose={() => setShowModal(false)}>
+        <Modal title="Record payment" onClose={() => { setShowModal(false); setPaymentError(""); }}>
           <form onSubmit={handleSubmit}>
+            {paymentError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {paymentError}
+              </p>
+            )}
             <FormField label="Amount (R)">
               <input type="number" step="0.01" required className={inputClass} value={amount} onChange={(e) => setAmount(e.target.value)} />
             </FormField>
@@ -333,7 +358,7 @@ export function InvoiceDetailPage() {
               </select>
             </FormField>
             <div className="mt-4 flex justify-end gap-2">
-              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
+              <button type="button" className={btnSecondary} onClick={() => { setShowModal(false); setPaymentError(""); }}>Cancel</button>
               <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Record payment"}</button>
             </div>
           </form>
