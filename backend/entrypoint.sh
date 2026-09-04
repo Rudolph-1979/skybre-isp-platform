@@ -25,6 +25,30 @@ print("Database never became ready, exiting.")
 sys.exit(1)
 PYEOF
 
+# Check the settings BEFORE migrating, and say something useful if they
+# are wrong. settings.py refuses to import with DEBUG=False while
+# ALLOWED_HOSTS is still "*" or CORS_ALLOW_ALL_ORIGINS is still True --
+# both correct refusals, but with `set -e` here and
+# `restart: unless-stopped` in compose, an unexplained one is a crash loop
+# that looks like the image is broken. This turns it into one banner in
+# `docker compose logs backend` naming the variable to set.
+echo "Checking configuration..."
+if ! python manage.py check --deploy > /tmp/check.out 2>&1; then
+  echo "============================================================"
+  echo " The backend refused to start because of its configuration."
+  echo " Fix backend/.env and bring it up again. Django said:"
+  echo "------------------------------------------------------------"
+  tail -n 20 /tmp/check.out
+  echo "============================================================"
+  echo " Most likely, backend/.env is missing these (required once"
+  echo " DEBUG=False -- see backend/.env.production.example):"
+  echo "   ALLOWED_HOSTS=portal.skybre.co.za,<vps-ip>"
+  echo "   CORS_ALLOW_ALL_ORIGINS=False"
+  echo "   CORS_ALLOWED_ORIGINS=https://portal.skybre.co.za"
+  echo "============================================================"
+  exit 1
+fi
+
 echo "Running migrations..."
 python manage.py migrate --noinput
 
