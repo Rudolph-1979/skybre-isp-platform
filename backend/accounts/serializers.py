@@ -1,3 +1,5 @@
+from django.contrib.auth.password_validation import validate_password as run_password_validators
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import User, STAFF_ROLES
@@ -62,7 +64,11 @@ class StaffAccountsSerializer(serializers.ModelSerializer):
     # Write-only and optional: required to create a new account (enforced
     # in validate() below, since "required" alone would also demand it on
     # every edit) but left blank on update to leave the password unchanged.
-    password = serializers.CharField(write_only=True, required=False, min_length=8, style={"input_type": "password"})
+    # No min_length here on purpose -- length is one of the four rules in
+    # AUTH_PASSWORD_VALIDATORS, and validate() below runs all four, so
+    # stating it twice just means two numbers to disagree with each other
+    # (this said 8 while the setting said 6).
+    password = serializers.CharField(write_only=True, required=False, style={"input_type": "password"})
 
     class Meta:
         model = User
@@ -92,6 +98,37 @@ class StaffAccountsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "email": "Give an email address so they can be sent an invite, or set a password here."
             })
+
+        # Run AUTH_PASSWORD_VALIDATORS on a password set through here.
+        # PasswordResetConfirmView has always done this; this path never did,
+        # so the only rule reaching an admin-created staff login was the
+        # field's own length check. The other three are the ones a hurried
+        # admin actually trips: "12345678" (all numeric) and "password"
+        # (top of Django's common list) were both accepted for a login that
+        # can suspend a customer or edit an invoice, while the same two
+        # strings were refused on the public forgot-password screen.
+        password = attrs.get("password")
+        if password:
+            # An unsaved candidate carries the name/email being set, so the
+            # similarity rule has something to compare against on create,
+            # where there is no row yet -- and on edit compares against the
+            # incoming values rather than the ones being replaced.
+            def field(name):
+                # `in attrs` rather than .get(name, default): a cleared field
+                # arrives as an explicit None, which a default never replaces.
+                if name in attrs:
+                    return attrs[name] or ""
+                return getattr(self.instance, name, "") or ""
+
+            candidate = User(
+                username=field("username"), email=field("email"),
+                first_name=field("first_name"), last_name=field("last_name"),
+            )
+            try:
+                run_password_validators(password, user=candidate)
+            except DjangoValidationError as e:
+                raise serializers.ValidationError({"password": list(e.messages)})
+
         return attrs
 
     def create(self, validated_data):

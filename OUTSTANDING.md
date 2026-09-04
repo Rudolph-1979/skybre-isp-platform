@@ -1,6 +1,6 @@
 # Outstanding items
 
-_Last updated: 2026-08-18_
+_Last updated: 2026-09-04_
 
 Nothing but the to-do list lives here. For what the project is, its full
 history, and how it's deployed, see `PROJECT_STATUS.md` — that's the other
@@ -39,10 +39,15 @@ of the two `.md` files this repo maintains.
 
 ## Small, low-urgency cleanup (no decision needed, just hasn't been done)
 
-- [ ] Remove the static "Demo logins" hint box from the live login page —
-  cosmetic, but shows credentials that don't exist in this deployment.
-- [ ] Raise the password minimum length from 6 to 10+ characters
-  (`AUTH_PASSWORD_VALIDATORS` in settings) — a one-line change.
+- [x] Remove the static "Demo logins" hint box from the live login page.
+  Already gone — 2542b62 ("Catch the repo up to build 43") removed it and
+  this entry was never ticked. `LoginPage.tsx` carries no hint box now.
+- [x] Raise the password minimum length from 6 to 10+ characters
+  (`AUTH_PASSWORD_VALIDATORS` in settings). Done 2026-09-04 — 10, and it
+  turned out not to be a one-line change: the validators only ran on the
+  public forgot-password screen, so the admin path that creates staff
+  logins was checking length and nothing else. Both paths run all four
+  rules now.
 - [ ] Turn on two-factor authentication on Rudolph's own admin account
   (the feature has existed platform-wide since 2026-08-13, just not
   enabled on this one account).
