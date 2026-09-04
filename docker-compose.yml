@@ -9,6 +9,18 @@ services:
       # Do not remove it. Shipping a compose file without this line is
       # what took RADIUS down on 2026-08-2x: the platform stayed up, so
       # nothing looked wrong, while every customer authentication failed.
+      #
+      # And do not widen it to "5432:5432" either, which is the obvious
+      # edit and binds 0.0.0.0. Docker publishes ports by DNAT in the nat
+      # table's DOCKER chain, which never traverses the INPUT chain where
+      # ufw's default-deny lives -- so `ufw status` showing 22/80/443 only
+      # says nothing about a published container port. This database holds
+      # every subscriber's internet password in plaintext
+      # (radiusauth.signals writes Cleartext-Password rows), every router's
+      # admin credentials, and all billing and bank-feed data, so the
+      # 127.0.0.1 prefix is the whole of what keeps it off the internet.
+      #
+      # Same pattern the frontend service uses below, for the same reason.
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
     env_file:
@@ -17,21 +29,6 @@ services:
       TZ: Africa/Johannesburg
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      # LOCALHOST ONLY. FreeRADIUS runs on the host and reads this database
-      # through localhost:5432, so the port has to be published -- but bound
-      # to 127.0.0.1, never 0.0.0.0.
-      #
-      # This is not the usual "tidy it up" advice. Docker publishes ports by
-      # DNAT in the nat table's DOCKER chain, which never traverses the INPUT
-      # chain where ufw's default-deny lives -- so `ufw status` showing
-      # 22/80/443 only says nothing about a published container port. And
-      # this database holds every subscriber's internet password in plaintext
-      # (radiusauth.signals writes Cleartext-Password rows), every router's
-      # admin credentials, and all billing and bank-feed data.
-      #
-      # Same pattern the frontend service uses below, for the same reason.
-      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-ispplatform}"]
       interval: 5s
