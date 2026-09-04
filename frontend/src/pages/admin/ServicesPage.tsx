@@ -73,7 +73,7 @@ export function ServicesPage() {
   const [connectionRules, setConnectionRules] = useState<ConnectionRule[]>([]);
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
     api.get<{ results: Tariff[] }>("/tariffs/?page_size=100").then((res) => setTariffs(res.data.results));
     // Used by the PPPoE IP-assignment section of the create/edit modals
     // below -- fetched once up front the same way customers/tariffs are.

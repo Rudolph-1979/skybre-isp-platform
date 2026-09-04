@@ -43,7 +43,7 @@ export function TicketsPage() {
   const [form, setForm] = useState({ customer: "", subject: "", description: "", department: "support", priority: "medium" });
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
   }, []);
 
   async function handleSubmit(e: FormEvent) {

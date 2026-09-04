@@ -3,6 +3,7 @@ import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { Pager } from "../../components/Pager";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { SearchableSelect, type SearchableOption } from "../../components/SearchableSelect";
@@ -31,6 +32,7 @@ import {
   type User,
   type VatReturnResult,
 } from "../../types";
+import { apiErrorMessage } from "../../utils/apiError";
 
 // Everything here lives under one "Accountant" nav item -- VAT Returns,
 // Expenses, and Bank Feeds are the reason this page exists; Attendance/
@@ -61,19 +63,6 @@ const LEAVE_BALANCE_FIELD: Record<LeaveType, "annual_leave_balance" | "sick_leav
   family_responsibility: "family_responsibility_leave_balance",
 };
 
-// Pulls the first useful message out of a DRF error body, falling back to
-// `fallback`. The guard against a string body matters: an nginx/gunicorn
-// 500 or 502 returns HTML, and Object.values("<!DOCTYPE html>...") spreads
-// it into single characters -- so the old inline version of this rendered
-// an error banner containing exactly "<" instead of the fallback text.
-function apiErrorMessage(err: unknown, fallback: string): string {
-  const data = (err as { response?: { data?: unknown } })?.response?.data;
-  if (!data || typeof data !== "object") return fallback;
-  const detail = (data as { detail?: unknown }).detail;
-  if (typeof detail === "string") return detail;
-  const first = Object.values(data as Record<string, unknown>).flat()[0];
-  return typeof first === "string" ? first : fallback;
-}
 
 function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
@@ -766,6 +755,7 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [syncingId, setSyncingId] = useState<number | null>(null);
+  const [syncError, setSyncError] = useState("");
 
   useEffect(() => {
     onRegisterNewAction({
@@ -817,6 +807,11 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
     try {
       await api.post(`/bank-accounts/${id}/sync-now/`);
       refetch();
+    } catch (err) {
+      // The FNB client's errors are the whole point of this button --
+      // they now name the status, the URL, the redirect chain and the
+      // bank's own response body. Swallowing them made it useless.
+      setSyncError(apiErrorMessage(err, "Could not sync this account."));
     } finally {
       setSyncingId(null);
     }
@@ -824,6 +819,11 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
 
   return (
     <div>
+      {syncError && (
+        <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+          {syncError}
+        </p>
+      )}
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
         Up to a handful of FNB accounts to read incoming payments from. Direct API access from FNB isn't confirmed
         yet — leave "API base URL" blank and use CSV import on the Review tab in the meantime; "Sync now" only works
@@ -951,10 +951,24 @@ const BANK_STATUS_FILTERS: { key: BankTransactionStatus | ""; label: string }[] 
   { key: "", label: "All" },
 ];
 
+const REVIEW_PAGE_SIZE = 50;
+
 function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const [statusFilter, setStatusFilter] = useState<BankTransactionStatus | "">("unmatched");
-  const { items, loading, refetch } = useApiList<BankTransaction>(
-    `/bank-transactions/?page_size=100&ordering=-date${statusFilter ? `&status=${statusFilter}` : ""}`
+  // Paginated. This was a flat page_size=100 with no pager: one imported
+  // FNB statement for 1,592 EFT payers routinely leaves more than 100
+  // credits unmatched, and everything past the newest 100 could never be
+  // allocated to a customer -- so that money sat unapplied while those
+  // customers stayed overdue, with nothing on screen saying the queue was
+  // longer than the page.
+  const [page, setPage] = useState(1);
+  useEffect(() => {
+    setPage(1);
+  }, [statusFilter]);
+  const { items, count, loading, refetch } = useApiList<BankTransaction>(
+    `/bank-transactions/?page_size=${REVIEW_PAGE_SIZE}&page=${page}&ordering=-date${
+      statusFilter ? `&status=${statusFilter}` : ""
+    }`
   );
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -1000,7 +1014,7 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
     api.get<{ results: BankAccount[] }>("/bank-accounts/?page_size=50&ordering=name")
       .then((res) => setAccounts(res.data.results))
       .catch(() => setLoadError("Could not load the bank account list — importing a statement won't work until that's fixed."));
-    api.get<{ results: Customer[]; count: number }>("/customers/?page_size=1000&ordering=full_name")
+    api.get<{ results: Customer[]; count: number }>("/customers/picker/")
       .then((res) => {
         setCustomers(res.data.results);
         // The picker searches the list it was given, so a truncated list would
@@ -1129,6 +1143,7 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
+        <>
         <Table>
           <THead>
             <tr>
@@ -1164,8 +1179,13 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
                         placeholder="Select customer…"
                         emptyLabel="Clear customer"
                         hint={
+                          // The guard stays even though /customers/picker/ is
+                          // unpaginated and count always equals results.length
+                          // now: if anyone ever paginates it, this is the only
+                          // thing that would tell a user why a customer who
+                          // exists "isn't there".
                           customersTruncated
-                            ? "Search by name or payment reference. Only the first 1000 customers are loaded here — if someone is missing, set their payment reference on the Customers page so future imports match them automatically."
+                            ? "Search by name or payment reference. Not every customer is loaded here — if someone is missing, set their payment reference on the Customers page so future imports match them automatically."
                             : "Search by name or payment reference."
                         }
                       />
@@ -1233,6 +1253,8 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
             {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No transactions in this filter.</TD></TR>}
           </tbody>
         </Table>
+        <Pager page={page} pageSize={REVIEW_PAGE_SIZE} count={count} shown={items.length} onPageChange={setPage} label="transactions" />
+        </>
       )}
 
       {showImport && (
@@ -2780,6 +2802,10 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<PayrollRun | null>(null);
   const [busyAction, setBusyAction] = useState(false);
+  // Recalculate/Finalize/Delete happen outside the modal, where the
+  // existing `error` state is never rendered -- so their failures had
+  // nowhere to appear at all.
+  const [actionError, setActionError] = useState("");
   const [payslipPreview, setPayslipPreview] = useState<{ url: string; title: string; filename: string } | null>(null);
   // The line being edited: PAYE and the other typed-in figures.
   const [editingLine, setEditingLine] = useState<PayrollRunLine | null>(null);
@@ -2886,6 +2912,8 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       const res = await api.post<PayrollRun>(`/payroll-runs/${run.id}/recalculate/`);
       setSelected(res.data);
       refetch();
+    } catch (err) {
+      setActionError(apiErrorMessage(err, "Could not recalculate this payroll run."));
     } finally {
       setBusyAction(false);
     }
@@ -2898,6 +2926,10 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       const res = await api.post<PayrollRun>(`/payroll-runs/${run.id}/finalize/`);
       setSelected(res.data);
       refetch();
+    } catch (err) {
+      // A rejected Finalize used to leave the run showing "draft" with no
+      // explanation at all.
+      setActionError(apiErrorMessage(err, "Could not finalize this payroll run."));
     } finally {
       setBusyAction(false);
     }
@@ -2927,6 +2959,11 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
 
   return (
     <div>
+      {actionError && (
+        <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+          {actionError}
+        </p>
+      )}
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (

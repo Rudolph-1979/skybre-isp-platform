@@ -10,6 +10,7 @@ import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSeconda
 import { CSVImportModal } from "../../components/CSVImportModal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { apiErrorMessage } from "../../utils/apiError";
 import type { Customer, CustomerDeletionRequest, Partner } from "../../types";
 
 const PAGE_SIZE = 50;
@@ -314,6 +315,7 @@ export function CustomersPage() {
   const [selectingAll, setSelectingAll] = useState(false);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [bulkReason, setBulkReason] = useState("");
+  const [formError, setFormError] = useState("");
   const [bulkConfirmText, setBulkConfirmText] = useState("");
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [bulkError, setBulkError] = useState("");
@@ -402,11 +404,16 @@ export function CustomersPage() {
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setSaving(true);
+    setFormError("");
     try {
       await api.post("/customers/", form);
       setShowModal(false);
       setForm(EMPTY);
       refetch();
+    } catch (err) {
+      // A duplicate payment reference or a bad email used to show nothing
+      // at all, leaving the modal open and the operator retrying.
+      setFormError(apiErrorMessage(err, "Could not create this customer."));
     } finally {
       setSaving(false);
     }
@@ -658,8 +665,13 @@ export function CustomersPage() {
       )}
 
       {showModal && (
-        <Modal title="New customer" onClose={() => setShowModal(false)}>
+        <Modal title="New customer" onClose={() => { setShowModal(false); setFormError(""); }}>
           <form onSubmit={handleSubmit}>
+            {formError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {formError}
+              </p>
+            )}
             <FormField label="Full name">
               <input
                 className={inputClass}

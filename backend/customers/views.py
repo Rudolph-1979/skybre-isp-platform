@@ -334,7 +334,13 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         # records requires the Customers section itself.
         # "ids" backs the Customers page's select-all checkbox -- same
         # access tier as "list" since it's just ids off the same queryset.
-        if self.action in ("list", "ids"):
+        # "picker" is the same argument again, and belongs here for the
+        # reason the comment above already gives: it IS the customer picker
+        # those pages need. Requiring the Customers section for it would
+        # mean a Finance-only staff member could not name a customer on a
+        # new invoice at all -- which is worse than the truncation it was
+        # added to fix.
+        if self.action in ("list", "ids", "picker"):
             return [permissions.IsAuthenticated(), IsStaffMember()]
         return [permissions.IsAuthenticated(), IsStaffMember(), HasCustomersAccess()]
 
@@ -375,6 +381,43 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
                 "(POST /customer-deletion-requests/) for Management to approve."
             ),
         )
+
+    @action(detail=False, methods=["get"], url_path="picker")
+    def picker(self, request):
+        """Every customer a staff member may see, as the three fields a
+        picker needs -- unpaginated.
+
+        The pickers on Finance, Services and Tickets asked for
+        `?page_size=1000`, and config.pagination caps page_size at 500. DRF
+        clamps silently, so they were handed the first 500 customers by
+        name and nothing said so: searching a picker for a customer whose
+        surname sorted after roughly the 500th returned "Nothing matches",
+        and the invoice, credit, service or ticket simply could not be
+        raised for them. On 1,592 customers that is about 1,092 people who
+        could not be picked.
+
+        A dedicated endpoint rather than raising max_page_size, for the
+        same reason `ids` above exists: the picker needs a name, a
+        reference and an id, not a full serialized customer each with its
+        prefetched services and addresses. This is a few hundred KB where
+        the paginated serializer would be several MB, and raising the
+        global cap would let any endpoint return 2,000 fully-serialized
+        rows.
+
+        Ordered by name because that is the order the picker shows, and
+        scoped through the same get_queryset as everything else -- a
+        reseller-restricted staff member must not be handed the whole book
+        through a convenience endpoint.
+        """
+        queryset = self.filter_queryset(self.get_queryset()).order_by("full_name")
+        # `email` is here for the bulk-email page's "select all matching",
+        # which has to know who actually has an address -- it used to ask
+        # the paginated list for `page_size=<count>` and get 500 back, so
+        # "Select all 1592 matching" quietly became "send to 500".
+        return Response({
+            "results": list(queryset.values("id", "full_name", "customer_id", "email")),
+            "count": queryset.count(),
+        })
 
     @action(detail=False, methods=["get"], url_path="ids")
     def ids(self, request):

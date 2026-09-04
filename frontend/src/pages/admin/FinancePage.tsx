@@ -4,12 +4,14 @@ import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { Pager } from "../../components/Pager";
 import { SearchableSelect } from "../../components/SearchableSelect";
 import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { apiErrorMessage } from "../../utils/apiError";
 import type {
   Invoice, Customer, Product, Tariff, InvoiceItemType, Payment, CreditRequest, InvoiceDeletionRequest,
   Partner, RecurringBillingCounts, RecurringBillingRun, SuspensionSettingsConfig,
@@ -28,6 +30,8 @@ type Tab = "invoices" | "payments" | "credits" | "recurring-billing";
 // `actions` prop happily accepts any ReactNode, including several buttons.
 type ActionButton = { label: string; onClick: () => void; variant?: "primary" | "secondary" };
 type NewAction = ActionButton[] | null;
+
+const PAGE_SIZE = 50;
 
 export function FinancePage() {
   const { user } = useAuth();
@@ -292,11 +296,24 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
     if (customTo) dateParams += `&date_created_to=${customTo}`;
   }
 
+  // Paginated. This was a flat page_size=100 with no pager anywhere,
+  // beside a header printing the true `count` -- so filtering to "0-90
+  // days overdue" showed "340 documents" above a table of 100 rows and
+  // the other 240 overdue invoices were unreachable from the UI.
+  // Collections was working a truncated list with nothing to say so.
+  const [page, setPage] = useState(1);
+  const listQuery = `${dateParams}${statusFilter ? `&status=${statusFilter}` : ""}${
+    docType ? `&document_type=${docType}` : ""
+  }`;
+  // Any filter or sort change goes back to page one; staying on page 7 of
+  // a result set that now has two pages shows an empty table.
+  useEffect(() => {
+    setPage(1);
+  }, [listQuery, ordering]);
   const { items, count, loading, refetch } = useApiList<Invoice>(
-    `/invoices/?page_size=100&ordering=${ordering}${dateParams}${
-      statusFilter ? `&status=${statusFilter}` : ""
-    }${docType ? `&document_type=${docType}` : ""}`
+    `/invoices/?page_size=${PAGE_SIZE}&page=${page}&ordering=${ordering}${listQuery}`
   );
+  const [createError, setCreateError] = useState("");
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   function toggleSort(field: string) {
@@ -317,7 +334,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [tariffs, setTariffs] = useState<Tariff[]>([]);
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
     api.get<{ results: Product[] }>("/products/?page_size=200&ordering=name").then((res) => setProducts(res.data.results));
     api.get<{ results: Tariff[] }>("/tariffs/?page_size=200&ordering=name&is_active=true").then((res) => setTariffs(res.data.results));
   }, []);
@@ -392,6 +409,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setSaving(true);
+    setCreateError("");
     try {
       await api.post("/invoices/", {
         customer,
@@ -412,6 +430,12 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       setShowModal(false);
       setLineItems([{ ...BLANK_LINE_ITEM }]);
       refetch();
+    } catch (err) {
+      // Reachable without trying anything unusual: the Qty field is
+      // neither required nor min-constrained, so clearing it 400s on
+      // items[].quantity -- and clicking "Create invoice" then did
+      // nothing at all, forever, with no message and the modal still open.
+      setCreateError(apiErrorMessage(err, "Could not create this document."));
     } finally {
       setSaving(false);
     }
@@ -535,6 +559,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
+        <>
         <Table>
           <THead>
             <tr>
@@ -577,11 +602,21 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
             )}
           </tbody>
         </Table>
+        <Pager page={page} pageSize={PAGE_SIZE} count={count} shown={items.length} onPageChange={setPage} label="documents" />
+        </>
       )}
 
       {showModal && (
-        <Modal title={modalKind === "quote" ? "New quote" : "New invoice"} onClose={() => setShowModal(false)}>
+        <Modal
+          title={modalKind === "quote" ? "New quote" : "New invoice"}
+          onClose={() => { setShowModal(false); setCreateError(""); }}
+        >
           <form onSubmit={handleSubmit}>
+            {createError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {createError}
+              </p>
+            )}
             <FormField label="Customer">
 <SearchableSelect
                 options={customers.map((c) => ({
@@ -852,7 +887,7 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const [decisionNote, setDecisionNote] = useState("");
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
   }, []);
 
   useEffect(() => {
@@ -929,6 +964,8 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       setRejecting(null);
       setDecisionNote("");
       refetch();
+    } catch (err) {
+      setError(apiErrorMessage(err, "Could not reject this credit request."));
     } finally {
       setBusyId(null);
     }

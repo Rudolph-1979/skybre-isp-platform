@@ -6,6 +6,7 @@ import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import EmailBodyPreview from "../../components/EmailBodyPreview";
+import { apiErrorMessage } from "../../utils/apiError";
 import type { Customer, EmailTemplateKey, EmailLog } from "../../types";
 
 const PAGE_SIZE = 50;
@@ -94,6 +95,7 @@ function SendTab() {
   const [batchLogs, setBatchLogs] = useState<EmailLog[] | null>(null);
   const [checkingResults, setCheckingResults] = useState(false);
   const [error, setError] = useState("");
+  const [selectingAll, setSelectingAll] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -134,8 +136,29 @@ function SendTab() {
   }
 
   async function selectAllMatching() {
-    const res = await api.get<{ results: Customer[] }>(`/customers/?page_size=${count || 1000}${filterQuery}`);
-    setSelected(new Set(res.data.results.filter((c) => c.email).map((c) => c.id)));
+    // /customers/picker/ is unpaginated. This used to ask the normal list
+    // for `page_size=<count>`, and config.pagination caps page_size at
+    // 500 -- so the button said "Select all 1592 matching", the send
+    // button then said "Send to ~500 customers", and the POST carried 500
+    // ids. A payment-reminder or suspension-notice run reached the first
+    // 500 customers alphabetically while the operator believed all 1,592
+    // had been told.
+    //
+    // Also no longer bare: a failure here left the selection silently
+    // unchanged, so clicking it and seeing nothing happen looked like the
+    // filter had matched nobody.
+    setSelectingAll(true);
+    setError("");
+    try {
+      const res = await api.get<{ results: Customer[] }>(
+        `/customers/picker/?${filterQuery.replace(/^&/, "")}`
+      );
+      setSelected(new Set(res.data.results.filter((c) => c.email).map((c) => c.id)));
+    } catch (err) {
+      setError(apiErrorMessage(err, "Could not load the full list of matching customers."));
+    } finally {
+      setSelectingAll(false);
+    }
   }
 
   function clearSelection() {
@@ -237,8 +260,13 @@ function SendTab() {
       </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
-        <button type="button" className={btnSecondary} onClick={selectAllMatching}>
-          Select all {count} matching
+        <button
+          type="button"
+          className={btnSecondary}
+          disabled={selectingAll}
+          onClick={selectAllMatching}
+        >
+          {selectingAll ? "Selecting…" : `Select all ${count} matching`}
         </button>
         <button type="button" className={btnSecondary} onClick={clearSelection}>
           Clear selection
