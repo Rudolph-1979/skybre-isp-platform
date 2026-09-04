@@ -21,6 +21,12 @@ backend/.env.local
 # without this an automated `git add -A` on the server would push them.
 backend/media/
 
+# The sibling skybre-tower-network project (its own repo, one directory
+# over) keeps the tower inventory. A `git add -A` run with both checkouts
+# in play swept a stale copy in here once, plaintext snmp_community and
+# all -- the very credential network/admin.py excludes from the admin form.
+tower-network/
+
 # Build output
 backend/staticfiles/
 frontend/dist/
