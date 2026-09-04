@@ -2,6 +2,7 @@
 Django settings for the ISP Management Platform.
 """
 
+import sys
 from pathlib import Path
 from datetime import timedelta
 
@@ -215,6 +216,22 @@ CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", default="", cast=Csv())
 #   SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 # and ensure the proxy sets X-Forwarded-Proto.
 SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", default=False, cast=bool)
+
+# ...but never while running the test suite.
+#
+# `manage.py test` reads the same .env as the running site, and on the VPS
+# that .env sets SECURE_SSL_REDIRECT=True (correctly — the site is
+# HTTPS-only). The Django test client speaks plain HTTP, so with the
+# redirect active EVERY request a test makes comes back as a 301 to the
+# https:// URL and no view is ever reached. The symptom is brutal to read:
+# dozens of "AssertionError: 301 != 200" plus
+# "'HttpResponsePermanentRedirect' object has no attribute 'data'", spread
+# across every app that has API tests, none of which is a real defect.
+#
+# It made the whole suite unrunnable on the production box, which is
+# exactly where you most want to run it before trusting a deploy.
+if "test" in sys.argv:
+    SECURE_SSL_REDIRECT = False
 SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool)
 CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
 if config("BEHIND_HTTPS_PROXY", default=False, cast=bool):
