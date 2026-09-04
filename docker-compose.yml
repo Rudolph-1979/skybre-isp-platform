@@ -1,6 +1,15 @@
 services:
   db:
     image: postgres:16-alpine
+    ports:
+      # Bound to localhost only. FreeRADIUS runs on the HOST (it owns UDP
+      # 1812/1813 and reads /etc/freeradius), so it cannot reach Postgres
+      # over the compose network -- this mapping is the only path it has.
+      #
+      # Do not remove it. Shipping a compose file without this line is
+      # what took RADIUS down on 2026-08-2x: the platform stayed up, so
+      # nothing looked wrong, while every customer authentication failed.
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
     env_file:
       - ./backend/.env
