@@ -100,27 +100,45 @@ docker compose up -d   # re-create the frontend container with the new port mapp
 sudo apt install -y nginx certbot python3-certbot-nginx
 ```
 
-Create `/etc/nginx/sites-available/isp-platform`:
-
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com www.yourdomain.com;
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
+Install the host config from the repo — **don't hand-write it**:
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/isp-platform /etc/nginx/sites-enabled/
+sudo cp deploy/nginx-host-docker.conf /etc/nginx/sites-available/isp-platform
+sudo ln -sf /etc/nginx/sites-available/isp-platform /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
 ```
+
+The snippet that used to be inlined here is kept in
+`deploy/nginx-host-docker.conf` instead, for two reasons. It was the only
+part of the running system with **no copy in git at all**, while
+`SECURITY_AND_REDUNDANCY.md` names "clone the repo and
+`docker compose up`" as the disaster-recovery procedure — so a rebuild
+produced a platform with no HTTPS and the only copy of the real config was
+on the box being rebuilt. And the inlined version was missing three
+things a live host needs:
+
+- **`client_max_body_size`** — the outermost hop decides, so nginx's 1 MB
+  default applied and a 2–6 MB scanned supplier invoice was refused with a
+  bare 413 before it ever reached the app.
+- **Security headers** — there were none. `index.html` is served by nginx
+  and never passes through Django's `SecurityMiddleware`, so the staff
+  panel and its login page were framable, and certbot doesn't add HSTS.
+- **A restriction on `/django-admin/`** — it was open to the internet, and
+  it's a second login path the app's 2FA does not cover (the TOTP check
+  lives in the DRF token serializer; Django admin uses session auth and
+  knows nothing about it, while every staff role is `is_staff=True`).
+
+Edit the `allow` lines in the `/django-admin/` block before installing, or
+delete the block and reach it through an SSH tunnel instead:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 ubuntu@<vps>   # then http://localhost:8000/django-admin/
+```
+
+Certbot rewrites that file in place, so **git's copy will drift**.
+`deploy/deploy.sh` reports the difference on every run; reconcile it with
+`sudo diff -u deploy/nginx-host-docker.conf /etc/nginx/sites-available/isp-platform`.
 
 Certbot rewrites that file to redirect HTTP → HTTPS and sets up auto-renewal.
 Once it's done, also set these in `backend/.env` and restart:

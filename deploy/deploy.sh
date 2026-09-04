@@ -69,6 +69,19 @@ if docker compose ps --format '{{.Service}} {{.Ports}}' 2>/dev/null | grep -qE '
   fail "Postgres is published on 0.0.0.0:5432. docker-compose.yml in git binds it to 127.0.0.1 -- the running config has diverged. Fix it before deploying."
 fi
 
+# The host nginx config is not deployed by this script -- it lives
+# outside Docker and certbot rewrites it in place. But git's copy drifting
+# from the live one is exactly how the DR runbook came to describe a
+# server that could not serve HTTPS, so the drift is reported.
+LIVE_NGINX=/etc/nginx/sites-available/isp-platform
+if [ -r "$LIVE_NGINX" ] && ! diff -q "$LIVE_NGINX" deploy/nginx-host-docker.conf >/dev/null 2>&1; then
+  echo
+  echo "  NOTE: the live host nginx config differs from deploy/nginx-host-docker.conf."
+  echo "  Not a blocker -- certbot edits that file in place -- but git's copy is what a"
+  echo "  rebuild would use, so reconcile them when you get a chance:"
+  echo "      sudo diff -u deploy/nginx-host-docker.conf $LIVE_NGINX"
+fi
+
 echo "  prerequisites OK"
 
 if [ "$CHECK_ONLY" = "--check" ]; then
