@@ -52,6 +52,23 @@ if not DEBUG:
             "real origins in CORS_ALLOWED_ORIGINS, e.g. CORS_ALLOWED_ORIGINS=https://portal.skybre.co.za"
         )
 
+# The container's own healthcheck curls http://localhost:8000/api/health/,
+# which sends `Host: localhost` -- and Django answers a Host outside
+# ALLOWED_HOSTS with 400, whatever the view says. So with a correctly
+# locked-down ALLOWED_HOSTS the healthcheck would fail permanently, the
+# backend would never be reported healthy, and because the frontend now
+# waits on that condition, nothing would start at all.
+#
+# Appended AFTER the guard above, so it can still refuse a wildcard: this
+# adds two specific loopback names, it does not re-open the setting. They
+# are safe to allow -- host nginx forwards the real Host header, so a
+# reset link or absolute URL built from a request is still derived from
+# the real domain, and nothing outside this container can reach it as
+# `localhost` in the first place.
+for _probe_host in ("localhost", "127.0.0.1"):
+    if _probe_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_probe_host)
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
