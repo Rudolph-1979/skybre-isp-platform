@@ -154,12 +154,18 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
                 "Payment reference", "Account number", "Account no",
             ],
         },
-        "company_name": {"default": ""},
-        "email": {"default": ""},
-        "phone": {"default": ""},
+        # These four were the only fields with no aliases, in a declaration
+        # whose every other entry has them -- so a legacy export's
+        # title-case "Email"/"Phone" headers matched nothing, took the ""
+        # default, and imported silently. 1,592 customers with no email or
+        # phone surfaces weeks later as unexplained non-delivery, and the
+        # password-reset endpoint no-ops for all of them.
+        "company_name": {"default": "", "aliases": ["Company", "Company name", "Business name"]},
+        "email": {"default": "", "aliases": ["Email", "E-mail", "Email address"]},
+        "phone": {"default": "", "aliases": ["Phone", "Telephone", "Mobile", "Cell", "Contact number"]},
         "address": {"default": "", "aliases": ["Street"]},
         "city": {"default": "", "aliases": ["City"]},
-        "zip_code": {"default": ""},
+        "zip_code": {"default": "", "aliases": ["Zip", "Zip code", "Postal code", "Postcode"]},
         # Printed on the customer's side of a tax invoice. Both optional --
         # a residential customer usually has neither.
         "id_number": {
@@ -192,11 +198,69 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
             "aliases": ["Date add", "Date added", "Date Added", "Signup date", "Sign-up date", "Date created", "Created"],
         },
         "assigned_staff_username": {"default": ""},
+        # Which reseller these customers belong to. Resolved by name in
+        # extra_row_validation, which also falls back to the importing
+        # staff member's own reseller -- see there for why a blank one is
+        # refused rather than imported as partner-less.
+        "partner_name": {"default": "", "aliases": ["Partner", "Reseller", "Partner name"]},
+        # No alias on purpose: an incoming "Notes" column would overwrite
+        # the traceability marker written below, which is what the
+        # re-import guard matches on.
         "notes": {"default": ""},
     }
 
     def extra_row_validation(self, cleaned, raw_row):
         errors = []
+
+        # --- which reseller these customers belong to ---------------------
+        # The import had no partner field at all, so every imported row
+        # landed with partner=NULL -- and scope_customers_to_user
+        # deliberately shows partner-less customers to EVERY staff member,
+        # because a direct customer is not owned by any reseller. So a
+        # reseller's whole customer list, imported by that reseller's own
+        # staff, became visible to every other reseller's staff: names,
+        # addresses, ID numbers, VAT numbers, phone, email, balance. That
+        # is the leak commit 0021cc6 closed on the Finance page, walked
+        # back in through the importer.
+        #
+        # Resolvable three ways, most specific first: a Partner column in
+        # the file, an explicit `partner` form field on the request, or --
+        # for a staff member restricted to exactly one reseller -- that
+        # reseller, since it is the only one they could be importing for.
+        partner_name = (cleaned.pop("partner_name", "") or "").strip()
+        requested = (self.request.data.get("partner") or "").strip()
+        user = self.request.user
+        allowed = getattr(user, "allowed_partners", None) or []
+
+        partner = None
+        if partner_name:
+            partner = Partner.objects.filter(name__iexact=partner_name).first()
+            if partner is None:
+                errors.append(f"No partner found named '{partner_name}'")
+        elif requested:
+            partner = Partner.objects.filter(pk=requested).first() if requested.isdigit() else None
+            if partner is None:
+                errors.append(f"No partner found with id '{requested}'")
+        elif len(allowed) == 1:
+            partner = Partner.objects.filter(pk=allowed[0]).first()
+
+        if partner is not None and allowed and user.role != user.Role.ADMIN:
+            if partner.pk not in allowed:
+                errors.append(
+                    f"You can't import customers for '{partner.name}' -- it is not one of the "
+                    "resellers you have access to."
+                )
+                partner = None
+        elif partner is None and allowed and user.role != user.Role.ADMIN:
+            # Restricted staff with more than one allowed reseller have to
+            # say which. Importing as partner-less would publish the rows
+            # to every other reseller.
+            errors.append(
+                "This import needs a reseller: add a 'Partner' column, or send a `partner` "
+                "field with the upload. Leaving it blank would make these customers visible "
+                "to every reseller."
+            )
+        cleaned["partner"] = partner
 
         # Payment reference: normalise, then reject duplicates -- against
         # existing customers AND within this same file. Two customers sharing

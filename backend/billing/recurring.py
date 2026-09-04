@@ -16,7 +16,7 @@ import calendar
 import logging
 from datetime import timedelta
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Count, Min, Q
 from django.utils import timezone
 
@@ -31,6 +31,79 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 _PERIOD_MONTHS = {"monthly": 1, "quarterly": 3, "biannually": 6, "annually": 12}
+
+# Advisory-lock coordinates for a committed run. Same mechanism
+# apply_speed_policies uses, different key, so the two can still overlap
+# -- they touch different things.
+_RUN_LOCK_NAMESPACE = 0x5B17
+_RUN_LOCK_KEY = 1
+
+
+class RecurringBillingBusy(RuntimeError):
+    """Raised when a committed run is asked for while one is already going.
+
+    A separate exception type so the API can turn it into a 409 rather
+    than a 500, and so the management command can exit non-zero with a
+    sensible message instead of a traceback.
+    """
+
+
+def _try_run_lock():
+    """True if this process now holds the run lock.
+
+    Session-scoped rather than transaction-scoped (pg_try_advisory_lock,
+    not ..._xact_lock) because a run is deliberately NOT one transaction
+    -- each customer gets their own -- so there is no single transaction
+    for the lock to live in.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", [_RUN_LOCK_NAMESPACE, _RUN_LOCK_KEY])
+        return bool(cursor.fetchone()[0])
+
+
+def _release_run_lock():
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [_RUN_LOCK_NAMESPACE, _RUN_LOCK_KEY])
+
+
+def _billable_customer_ids(partner_ids=None):
+    """Ids of the customers a committed run will walk.
+
+    Ids only, deliberately. The old code iterated a queryset with
+    select_related, which materialised every billing_config -- including
+    next_billing_date, the sole guard against re-invoicing -- before the
+    first invoice was written. Each customer is re-read and locked inside
+    their own transaction instead, so the due test reads committed state.
+    """
+    qs = Customer.objects.filter(billing_config__billing_enabled=True)
+    if partner_ids:
+        qs = qs.filter(partner_id__in=partner_ids)
+    return list(qs.order_by("pk").values_list("pk", flat=True))
+
+
+def _run_preview(run_date, partner_ids=None):
+    """Count what a run WOULD do. Writes nothing -- not an invoice, not an
+    email, not a RecurringBillingRun row -- so it takes no lock and can be
+    run at any time, including while a real run is going."""
+    customers_qs = Customer.objects.filter(billing_config__billing_enabled=True).select_related("billing_config")
+    if partner_ids:
+        customers_qs = customers_qs.filter(partner_id__in=partner_ids)
+
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
+    reminder_settings = ReminderSettings.load()
+    suspension_settings = SuspensionSettings.load()
+    for customer in customers_qs:
+        for key, value in _process_one_customer(
+            customer, customer.billing_config, None, run_date,
+            reminder_settings, suspension_settings, commit=False,
+        ).items():
+            counts[key] += value
+    return {
+        "counts": counts,
+        "status": RecurringBillingRun.Status.PROCESSED,
+        "status_message": "",
+        "run": None,
+    }
 
 
 def _send_after_commit(template_key, customer, **kwargs):
@@ -421,38 +494,77 @@ def run_recurring_billing(run_date, partner_ids=None, commit=False, triggered_by
     status_message, and stepped over. Everyone else keeps their invoice.
     A run with any casualties is marked FAILED -- partial success is still
     something somebody has to look at -- but the counts on it describe
-    only what actually committed."""
+    only what actually committed.
+
+    A COMMITTED run holds a Postgres advisory lock for its duration, and a
+    second run that cannot take it refuses rather than proceeding. At 1,592
+    customers a run takes minutes -- five queries, one SMTP connection and
+    one PDF render each -- and nothing in the UI stopped a second click.
+    The only guard against re-invoicing is `next_billing_date`, which the
+    old code read from a queryset snapshot materialised before the first
+    invoice was written, so an overlapping run saw every date still in the
+    past and raised a second invoice, a second number, a second balance
+    debit and a second emailed PDF for every due customer -- then wrote the
+    same next_billing_date, leaving no trace that it had happened.
+    apply_speed_policies has taken this lock all along."""
+    if not commit:
+        return _run_preview(run_date, partner_ids)
+
+    # A committed run does not merely invoice for `run_date` -- it calls
+    # apply_due_tariff_changes and apply_due_cancellations, both of which
+    # use `<=` on purpose so a job that missed a day catches up. Handed a
+    # future date, that catch-up becomes a fast-forward: every service with
+    # an end date up to then is TERMINATED and every booked tariff change
+    # lands, months early. `--date` is documented as a way to "preview a
+    # specific date", and with --commit it executed the future instead.
+    today = timezone.localdate()
+    if run_date > today:
+        raise ValueError(
+            f"{run_date} is in the future. A committed run applies every cancellation and tariff "
+            f"change dated up to its run date, so this would terminate services and change plans "
+            f"early. Use a date up to {today}, or drop --commit to preview it."
+        )
+
+    if not _try_run_lock():
+        logger.warning("Refusing to start a recurring-billing run: another one is still going")
+        raise RecurringBillingBusy(
+            "A recurring-billing run is already in progress. Wait for it to finish before "
+            "starting another -- running two at once would invoice every due customer twice."
+        )
+    try:
+        return _run_commit(run_date, partner_ids, triggered_by)
+    finally:
+        _release_run_lock()
+
+
+def _run_commit(run_date, partner_ids, triggered_by):
     # Booked tariff changes first: a service switching plans today must bill
     # on the NEW tariff in this same run, not next month's. Idempotent and
     # also available as its own cron command -- see billing.tariff_changes.
-    if commit:
-        from .tariff_changes import apply_due_tariff_changes
+    from .tariff_changes import apply_due_tariff_changes
 
-        apply_due_tariff_changes(as_of=run_date)
-        # Before invoicing, not after: a customer whose service ended today
-        # should not be handed one more invoice on the way out.
-        from .cancellations import apply_due_cancellations
+    apply_due_tariff_changes(as_of=run_date)
+    # Before invoicing, not after: a customer whose service ended today
+    # should not be handed one more invoice on the way out.
+    from .cancellations import apply_due_cancellations
 
-        apply_due_cancellations(as_of=run_date, commit=True)
+    apply_due_cancellations(as_of=run_date, commit=True)
 
-    customers_qs = Customer.objects.filter(billing_config__billing_enabled=True).select_related("billing_config")
-    if partner_ids:
-        customers_qs = customers_qs.filter(partner_id__in=partner_ids)
+    # Ids only. The old code iterated a queryset with select_related, which
+    # materialised every billing_config -- including next_billing_date, the
+    # sole guard against re-invoicing -- before the first invoice was
+    # written. Each customer is now re-read inside their own transaction,
+    # so the due test reads committed state rather than a snapshot taken
+    # minutes earlier. The advisory lock in run_recurring_billing makes two
+    # runs impossible; this makes one run correct even against a concurrent
+    # edit to a customer's billing config.
+    customer_ids = _billable_customer_ids(partner_ids)
 
     counts = dict.fromkeys(_COUNT_KEYS, 0)
     status = RecurringBillingRun.Status.PROCESSED
     status_message = ""
     reminder_settings = ReminderSettings.load()
     suspension_settings = SuspensionSettings.load()
-
-    if not commit:
-        for customer in customers_qs:
-            for key, value in _process_one_customer(
-                customer, customer.billing_config, None, run_date,
-                reminder_settings, suspension_settings, commit=False,
-            ).items():
-                counts[key] += value
-        return {"counts": counts, "status": status, "status_message": status_message, "run": None}
 
     # Created and committed up front, before any customer is touched, so
     # that every invoice this run generates has a run to point at and the
@@ -463,16 +575,30 @@ def run_recurring_billing(run_date, partner_ids=None, commit=False, triggered_by
         run.partners.set(partner_ids)
 
     failures = []
-    for customer in customers_qs:
+    for customer_id in customer_ids:
+        customer = None
         try:
             with transaction.atomic():
+                # Locked and re-read inside the transaction. select_for_update
+                # on the config row is what makes the next_billing_date test
+                # and the write that satisfies it one atomic decision.
+                customer = (
+                    Customer.objects.select_related("billing_config")
+                    .filter(pk=customer_id, billing_config__billing_enabled=True)
+                    .select_for_update(of=("billing_config",))
+                    .first()
+                )
+                if customer is None:
+                    # Deleted, or billing switched off, since the list was
+                    # taken. Not a failure -- there is simply nothing to do.
+                    continue
                 customer_counts = _process_one_customer(
                     customer, customer.billing_config, run, run_date,
                     reminder_settings, suspension_settings, commit=True,
                 )
         except Exception as exc:  # noqa: BLE001 -- one bad customer must not end the run for everybody else
-            logger.exception("Recurring billing failed for customer %s; skipping", customer.pk)
-            failures.append((customer, exc))
+            logger.exception("Recurring billing failed for customer %s; skipping", customer_id)
+            failures.append((customer or Customer(pk=customer_id), exc))
             continue
         # Only reached once this customer's transaction has committed, so
         # these numbers describe work that actually exists.
