@@ -115,7 +115,7 @@ class Command(BaseCommand):
 
         rate = replies.get("Mikrotik-Rate-Limit")
         if rate:
-            expected = _mikrotik_rate_limit(service.tariff)
+            expected = _mikrotik_rate_limit(service)
             if rate == expected:
                 self.ok(f"Rate limit {rate} matches the tariff.")
             else:
@@ -159,7 +159,7 @@ class Command(BaseCommand):
 
         # --- the actual round trip ----------------------------------------
         if send_coa and secret:
-            current = _mikrotik_rate_limit(service.tariff)
+            current = _mikrotik_rate_limit(service)
             try:
                 dynauth.change_rate_limit(
                     session.nasipaddress, secret, username, current,

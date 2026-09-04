@@ -1,0 +1,79 @@
+# Skybre Tower Network - Inventory
+# =================================
+# Define all towers here. The hub is the VPS/control center.
+# Spokes are the MikroTik tower routers.
+
+hub:
+  name: "VPS-Control"
+  public_ip: "154.65.111.61"
+  wg_port: 51820
+  wg_address: "10.10.0.1/24"
+  snmp_community: "skybre"
+  snmp_version: "2c"
+  api_host: "154.65.111.61"
+  api_port: 8728
+  api_user: "skybre-api"
+  # api_password loaded from env or secrets
+  model: "VPS"
+  location: "Xneelo Cloud"
+
+spokes:
+  - name: "Teraco-JHB"
+    public_ip: "SET_PUBLIC_IP"
+    wg_port: 51820
+    wg_address: "10.10.0.10/24"
+    snmp_community: "skybre"
+    snmp_version: "2c"
+    api_host: "SET_PUBLIC_IP"
+    api_port: 8728
+    api_user: "skybre-api"
+    model: "RB1100AHx4"
+    location: "Teraco Johannesburg"
+    tier: 1
+
+  - name: "Cloudflare-Edge"
+    public_ip: "SET_PUBLIC_IP"
+    wg_port: 51820
+    wg_address: "10.10.0.11/24"
+    snmp_community: "skybre"
+    snmp_version: "2c"
+    api_host: "SET_PUBLIC_IP"
+    api_port: 8728
+    api_user: "skybre-api"
+    model: "RB4011iGS+"
+    location: "Cloudflare Edge"
+    tier: 1
+
+  # Add more towers below:
+  # - name: "Tower-Name"
+  #   public_ip: "x.x.x.x"
+  #   wg_port: 51820
+  #   wg_address: "10.10.0.12/24"
+  #   snmp_community: "skybre"
+  #   snmp_version: "2c"
+  #   api_host: "x.x.x.x"
+  #   api_port: 8728
+  #   api_user: "skybre-api"
+  #   model: "RouterBOARD Model"
+  #   location: "Physical Location"
+  #   tier: 1
+
+vpn:
+  # WireGuard settings
+  mtu: 1420
+  keepalive: 25
+  dns: "1.1.1.1, 1.0.0.1"
+  # Allowed subnet for the entire VPN mesh
+  network: "10.10.0.0/24"
+
+monitoring:
+  # SNMP polling interval in seconds
+  poll_interval: 30
+  # Dashboard refresh rate
+  refresh_rate: 5
+  # Alert thresholds
+  cpu_warn: 70
+  cpu_crit: 90
+  voltage_warn: 10.5
+  voltage_crit: 10.0
+  uptime_warn_hours: 24

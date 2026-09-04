@@ -11,6 +11,11 @@ class TariffAdmin(admin.ModelAdmin):
 class ServiceAdmin(admin.ModelAdmin):
     list_display = ("customer", "tariff", "status", "start_date")
     list_filter = ("status",)
+    # Same reasoning as network.DeviceAdmin: ServiceSerializer makes this
+    # write_only with a radius_password_set boolean, and the admin's
+    # default form rendered the subscriber's actual RADIUS password as
+    # editable plain text. It is set from the Services page.
+    exclude = ("radius_password",)
 
 
 class InvoiceItemInline(admin.TabularInline):

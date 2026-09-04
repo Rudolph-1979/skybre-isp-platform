@@ -212,8 +212,28 @@ class Customer(models.Model):
             return False
         # .update() rather than .save(): updated_at is auto_now, and an
         # automatic expiry is not an edit anybody made to this customer.
-        Customer.objects.filter(pk=self.pk).update(live_bandwidth_public=False)
+        #
+        # last_viewed_at is cleared along with the flag, and that is the
+        # whole fix for the switch appearing broken. It used to be left at
+        # its old value, while CustomerViewSet.perform_update only starts
+        # the idle clock `if live_bandwidth_public and not
+        # live_bandwidth_last_viewed_at`. So the SECOND time staff turned
+        # the switch on, the clock was never restarted, the stale timestamp
+        # was already well past the timeout, and the very next read of the
+        # flag -- the retrieve() immediately after the PATCH -- expired it
+        # again. The toggle bounced straight back to Off with no
+        # explanation, permanently, for every customer it had ever been
+        # used on, and the field is read-only in the serializer so there
+        # was no way to clear it from the API either.
+        #
+        # Clearing it also makes the `last is None` branch above the
+        # correct landing place next time: "no record of a view" really is
+        # the state a freshly re-enabled grant is in.
+        Customer.objects.filter(pk=self.pk).update(
+            live_bandwidth_public=False, live_bandwidth_last_viewed_at=None
+        )
         self.live_bandwidth_public = False
+        self.live_bandwidth_last_viewed_at = None
         return True
 
     def touch_live_bandwidth_view(self, now=None):

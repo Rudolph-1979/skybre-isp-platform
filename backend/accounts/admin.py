@@ -16,4 +16,26 @@ class TwoFactorAuthAdmin(admin.ModelAdmin):
     list_display = ("user", "confirmed", "created_at", "confirmed_at")
     list_filter = ("confirmed",)
     search_fields = ("user__username",)
-    readonly_fields = ("secret", "created_at", "confirmed_at")
+    # `exclude`, NOT readonly_fields. That comment above has been right all
+    # along and the code contradicted it: in Django, readonly_fields means
+    # "render this value as uneditable text", not "hide it". With no
+    # fields/fieldsets declared the default form included `secret`, so
+    # readonly_fields printed the base32 TOTP seed in plain text on the
+    # change form.
+    #
+    # Anyone given view access for the stated purpose -- checking who has
+    # 2FA on -- could therefore open an admin's row, read the seed, enter
+    # it into any authenticator app, and generate a valid second factor
+    # for that account indefinitely, with nothing about the device row
+    # changing to show it had happened. This is the only place in the
+    # platform the secret is readable back; the API surface returns it once
+    # at setup by necessity and never again.
+    exclude = ("secret",)
+    readonly_fields = ("created_at", "confirmed_at")
+
+    def has_add_permission(self, request):
+        # A TOTP device is enrolled by its owner through the API, which is
+        # what generates and confirms the secret. One created here would
+        # have no usable secret and would lock the user out of their own
+        # second factor.
+        return False

@@ -85,7 +85,25 @@ def _customer_post_save_apply_status_to_services(sender, instance, created, **kw
     # Bad Debt cuts them off exactly as a suspension does. Leaving somebody
     # connected after writing off what they owe would be the one status where
     # the label and the reality disagree most expensively.
-    if instance.status in (Customer.Status.SUSPENDED, Customer.Status.BAD_DEBT):
+    #
+    # Reads Customer.OFF_STATUSES rather than listing statuses here, which
+    # is what that constant exists for -- its own comment says "named once,
+    # so nothing has to remember to add a new one to four separate checks",
+    # and this handler was the check that forgot. It hardcoded
+    # (SUSPENDED, BAD_DEBT) and omitted INACTIVE.
+    #
+    # INACTIVE is the status meaning "they left", so it is the natural thing
+    # for staff to set when a customer cancels -- and doing that left every
+    # service ACTIVE with a live Cleartext-Password row in radcheck, so the
+    # line kept full internet indefinitely. Worse, radiusauth.offline
+    # excludes customers in OFF_STATUSES from the recently-offline report,
+    # so the one screen that would have shown a line that should not be up
+    # filtered them out by design. Nothing anywhere would have surfaced it.
+    #
+    # This is the exact bug this module's docstring was written to fix ("a
+    # customer marked Suspended on their own page carried on browsing
+    # exactly as before"), left unfixed for the third off-status.
+    if instance.status in Customer.OFF_STATUSES:
         services = instance.services.filter(status=Service.Status.ACTIVE)
         for service in services:
             service.status = Service.Status.SUSPENDED

@@ -14,6 +14,10 @@ django.conf.settings.EMAIL_* directly, so a change saved in the UI takes
 effect on the very next email sent -- no container restart required.
 """
 
+# Seconds to wait on the SMTP socket. See get_email_connection for why a
+# limit here is not optional.
+SMTP_TIMEOUT_SECONDS = 20
+
 from django.conf import settings
 from django.core.mail import get_connection
 
@@ -51,4 +55,19 @@ def get_email_connection():
         password=cfg["password"],
         use_tls=cfg["use_tls"],
         use_ssl=cfg["use_ssl"],
+        # Without a timeout Django passes None to smtplib.SMTP, which is a
+        # blocking socket with no deadline -- so a half-open connection to
+        # the mail relay hangs the caller forever.
+        #
+        # That matters most where nobody is watching. A recurring-billing
+        # run sends one email per customer, serially, inside the same
+        # process: customers 1-299 get their invoices, customer 300 blocks
+        # on the socket, and 301-1592 are never billed at all, with the
+        # RecurringBillingRun row left on PROCESSED and zeroed counts
+        # because the summary write is never reached.
+        #
+        # 20 seconds is deliberately generous for a handshake and still
+        # bounded. Compare the RouterOS API at 8s and CoA at 4s -- mail was
+        # the only outbound call in the platform with no limit at all.
+        timeout=SMTP_TIMEOUT_SECONDS,
     )
