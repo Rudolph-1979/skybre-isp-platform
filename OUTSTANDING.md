@@ -106,6 +106,78 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
+## Self-review of this branch — UNVERIFIED claims (2026-09-06)
+
+After the audit fixes were written, the branch's own diff was reviewed
+adversarially by readers who had not written it. It found 29 claimed
+defects **introduced by the fixes themselves**. Three were reproduced and
+fixed (see the commit "Fix three defects this branch introduced"); the
+worst of them charged UIF twice on an ordinary 26th-to-25th pay cycle.
+
+**The remaining 26 below were NOT verified.** The verification stage ran
+out of budget before it could confirm or refute a single one, so treat
+every line as a LEAD, not a fact — roughly a third of the claims that did
+get checked turned out to be wrong. Several claim to have been probed
+live by the reviewer, which makes them worth checking first, but nobody
+has independently confirmed any of them.
+
+Do not push this branch to production until these have been worked
+through. The three that were real were real enough to take money off
+staff.
+
+- [ ] **[blocker]** mark_serviced now refuses the whole service when the workshop odometer is below an earlier reading — vehicle stays stuck "In Service"
+  `backend/fleet/views.py:90` — regression
+- [ ] **[blocker]** Offline branch marks last_pushed_rate_limit delivered, permanently suppressing the CoA for a session that only *looked* offline
+  `backend/radiusauth/management/commands/apply_speed_policies.py:180` — regression
+- [ ] **[serious]** Backfill stamps cancelled QUOTES as issued tax invoices, re-creating the exact VAT gap the change fixes
+  `backend/billing/migrations/0021_invoice_date_issued.py:22` — migration_safety
+- [ ] **[serious]** A NULL date_issued is silently invisible to every VAT return, and the one-shot backfill runs while the old code is still writing invoices
+  `backend/billing/models.py:367` — migration_safety
+- [ ] **[serious]** Recalculate can no longer take anyone off a draft run, and there is no other way to remove a line
+  `backend/payroll/services.py:158` — regression
+- [ ] **[serious]** UIF splits remuneration by calendar days rather than by what was actually earned in each month
+  `backend/payroll/services.py:92` — wrong_business_rule
+- [ ] **[serious]** The new UIF tests assert the code's own output, so they lock in the part-month ceiling error
+  `backend/payroll/test_uif_period.py:82` — weak_test
+- [ ] **[serious]** The 450000-for-45000 typo the diff says it fixes is still accepted and still poisons the vehicle permanently
+  `backend/fleet/views.py:82` — weak_test
+- [ ] **[serious]** _service_moment files a backdated service at 23:59:59 of its day, so it is checked against readings taken after the vehicle left the workshop
+  `backend/fleet/views.py:29` — regression
+- [ ] **[serious]** Tracking type can no longer be corrected on a product whose stock is already zero
+  `backend/inventory/serializers.py:126` — regression
+- [ ] **[serious]** A line that was offline when a speed window opened never gets its static shaper queue re-synced, so the boost is silently swallowed
+  `backend/radiusauth/management/commands/apply_speed_policies.py:181` — regression
+- [ ] **[serious]** --limit no longer caps anything for offline lines, and the writes are invisible in both dry run and log
+  `backend/radiusauth/management/commands/apply_speed_policies.py:187` — regression
+- [ ] **[serious]** allow_null=False is a no-op on the deletion-request queryset — the comment states a guarantee the SQL does not give
+  `backend/billing/views.py:387` — misapplied_edit
+- [ ] **[serious]** Deletion requests are scoped on read/approve but not on create, so a restricted user can still reach a competitor's quote
+  `backend/billing/views.py:374` — wrong_business_rule
+- [ ] **[serious]** Picking Salaries latches the VAT rate to 0 and nothing ever puts it back
+  `frontend/src/pages/admin/AccountantPage.tsx:620` — wrong_business_rule
+- [ ] **[serious]** Correcting a workshop odometer typo leaves the ServiceRecord at the typo, so the vehicle never comes due for service again
+  `frontend/src/pages/admin/VehicleDetailPage.tsx:175` — wrong_business_rule
+- [ ] **[serious]** SNMP community made write-only on /api/devices/ but still returned in plaintext by /api/audit-events/
+  `backend/network/serializers.py:49` — misapplied_edit
+- [ ] **[minor]** New "concurrency" tests are single-threaded and cannot fail if the lock and the atomic block are removed
+  `backend/billing/test_payment_ledger.py:229` — weak_test
+- [ ] **[minor]** date_issued was wired into the tax invoice and the VAT return only, so one invoice now carries two conflicting dates and the return cannot be reconciled
+  `backend/notifications/templates/notifications/statement_pdf.html:35` — misapplied_edit
+- [ ] **[minor]** test_a_bandwidth_expense_still_defaults_to_15 never exercises the default, and no test in the file omits the rate
+  `backend/expenses/test_salary_vat.py:91` — weak_test
+- [ ] **[minor]** Two readings at the exact same instant are accepted as long as the new one is higher
+  `backend/fleet/serializers.py:46` — wrong_business_rule
+- [ ] **[minor]** The new "the product row is the lock" invariant is not honoured by the manual stock adjustment endpoint
+  `backend/inventory/views.py:91` — transaction_lock
+- [ ] **[minor]** handleDeleteReading has no catch — a refused delete says nothing and rejects unhandled
+  `frontend/src/pages/admin/VehicleDetailPage.tsx:201` — regression
+- [ ] **[minor]** Odometer history table gained two blank <TH> for one new <TD>
+  `frontend/src/pages/admin/VehicleDetailPage.tsx:436` — misapplied_edit
+- [ ] **[minor]** Password minimum raised to 10 server-side, but both password UIs still advertise 6 and 8
+  `backend/config/settings.py:154` — regression
+- [ ] **[minor]** No test pins the minimum at 10 -- the boundary test uses a 15-character password despite its name
+  `backend/accounts/test_password_policy.py:151` — weak_test
+
 ## Not yet installed (the code exists, the cron entry doesn't)
 
 - [ ] `sync_bank_feeds` management command — documented crontab line:
