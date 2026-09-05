@@ -3,6 +3,7 @@ from .models import Job, Shift
 from .serializers import JobSerializer, ShiftSerializer
 from .filters import JobFilter, ShiftFilter
 from accounts.permissions import IsStaffMember, section_permission
+from customers.scoping import scope_by_customer
 
 HasSchedulingAccess = section_permission("scheduling")
 
@@ -20,10 +21,28 @@ class JobViewSet(viewsets.ModelViewSet):
     ]
 
     def get_queryset(self):
-        return Job.objects.select_related("customer", "assigned_to", "ticket").all()
+        # Partner-scoped like every other customer-linked list. Without
+        # this, a staff member restricted to one reseller saw that
+        # reseller's customers on the Customers page and then every
+        # partner's jobs here -- name, site address and phone on the
+        # calendar card -- and, because get_object() uses this same
+        # queryset, could reschedule or delete a competitor's installation.
+        #
+        # allow_null keeps standalone jobs visible: Job.customer is blank
+        # for office work and internal errands, which belong to no
+        # reseller. scope_by_customer's own docstring names this case.
+        return scope_by_customer(
+            Job.objects.select_related("customer", "assigned_to", "ticket").all(),
+            self.request.user,
+        )
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
+    """Deliberately NOT partner-scoped: a Shift is a staff roster entry
+    with no customer on it at all ("not tied to a specific customer job"
+    -- Shift's own docstring), so there is no partner dimension to filter
+    on. Who is on standby on Saturday is not one reseller's business."""
+
     serializer_class = ShiftSerializer
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
     filterset_class = ShiftFilter

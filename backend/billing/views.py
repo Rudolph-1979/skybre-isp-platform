@@ -360,10 +360,32 @@ class InvoiceDeletionRequestViewSet(viewsets.ModelViewSet):
     or reject it. Mirrors customers.CustomerDeletionRequestViewSet."""
 
     serializer_class = InvoiceDeletionRequestSerializer
-    queryset = InvoiceDeletionRequest.objects.select_related(
-        "invoice", "invoice__customer", "requested_by", "decided_by"
-    ).all()
     filterset_fields = ["invoice", "status"]
+
+    def get_queryset(self):
+        # Scoped through the invoice to its customer, the same rule
+        # ScopedByCustomerMixin applies to the invoices themselves. This
+        # was a flat .all(): the requests carry the invoice number, the
+        # customer's name and the requester's reason, so a
+        # reseller-restricted Management account could read another
+        # partner's pending deletions -- and, since approve()/reject()
+        # resolve through get_object() on this same queryset, approve the
+        # destruction of a competitor's quote. The invoices themselves
+        # were already scoped, so this was the one way round it.
+        #
+        # allow_null=False: a request whose invoice has gone (the FK is
+        # nullable, and approve() handles that case) has no customer to
+        # scope by, so a restricted user should not see it.
+        from customers.scoping import scope_by_customer
+
+        return scope_by_customer(
+            InvoiceDeletionRequest.objects.select_related(
+                "invoice", "invoice__customer", "requested_by", "decided_by"
+            ).all(),
+            self.request.user,
+            path="invoice__customer",
+            allow_null=False,
+        )
 
     def get_permissions(self):
         if self.action in ("approve", "reject"):

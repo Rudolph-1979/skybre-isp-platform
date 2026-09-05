@@ -668,7 +668,9 @@ export interface Device {
   vendor: string;
   model_name: string;
   status: "online" | "offline" | "unknown";
-  snmp_community: string;
+  // Write-only on the API, same as api_password: the community is a
+  // credential and is never echoed back, so only the boolean is readable.
+  snmp_community_set: boolean;
   snmp_version: string;
   latest_reading: MonitoringReading | null;
   api_enabled: boolean;

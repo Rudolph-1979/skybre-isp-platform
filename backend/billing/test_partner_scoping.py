@@ -19,7 +19,9 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from billing.models import CreditRequest, Invoice, InvoiceItem, Payment, Service, Tariff
+from billing.models import (
+    CreditRequest, Invoice, InvoiceDeletionRequest, InvoiceItem, Payment, Service, Tariff,
+)
 from customers.models import Customer, Partner
 
 User = get_user_model()
@@ -131,6 +133,19 @@ class BillingPartnerScopingTests(TestCase):
         self.assertIn("mine", reasons)
         self.assertNotIn("theirs", reasons)
 
+    def test_invoice_deletion_requests_are_partner_scoped(self):
+        """The requests carry the invoice number, the customer's name and
+        the requester's reason. The invoices themselves were scoped; this
+        list was a flat .all(), so it was the way round that."""
+        self._deletion_request(self.their_invoice, "theirs")
+        self._deletion_request(self.my_invoice, "mine")
+        self.client.force_authenticate(self.restricted)
+        res = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        self.assertEqual(res.status_code, 200, res.data)
+        reasons = {row["reason"] for row in res.data["results"]}
+        self.assertIn("mine", reasons)
+        self.assertNotIn("theirs", reasons)
+
     # ---- objects -------------------------------------------------------
 
     def test_another_partners_invoice_cannot_be_read(self):
@@ -181,6 +196,57 @@ class BillingPartnerScopingTests(TestCase):
         self.mine.save(update_fields=["user"])
         ids = self._ids("/api/invoices/?page_size=100", login)
         self.assertEqual(ids, {self.my_invoice.id})
+
+    # ---- deletion requests, object level -------------------------------
+
+    def _deletion_request(self, invoice, reason):
+        return InvoiceDeletionRequest.objects.create(
+            invoice=invoice, reason=reason, requested_by=self.unrestricted,
+        )
+
+    def test_another_partners_deletion_request_cannot_be_read(self):
+        req = self._deletion_request(self.their_invoice, "theirs")
+        self.client.force_authenticate(self.restricted)
+        res = self.client.get(f"/api/invoice-deletion-requests/{req.id}/")
+        self.assertEqual(res.status_code, 404)
+
+    def test_another_partners_deletion_request_cannot_be_approved(self):
+        """approve() resolves through get_object() on the same queryset, so
+        a reseller-restricted Management account could otherwise destroy a
+        competitor's quote."""
+        req = self._deletion_request(self.their_invoice, "theirs")
+        manager = User.objects.create_user(
+            username="acme-boss", password="pw-for-tests",
+            role=User.Role.MANAGEMENT, allowed_partners=[self.acme.id],
+        )
+        self.client.force_authenticate(manager)
+        res = self.client.post(f"/api/invoice-deletion-requests/{req.id}/approve/")
+        self.assertEqual(res.status_code, 404)
+        req.refresh_from_db()
+        self.assertEqual(req.status, InvoiceDeletionRequest.Status.PENDING)
+        self.assertTrue(Invoice.objects.filter(pk=self.their_invoice.pk).exists(),
+                        "the competitor's quote must still be there")
+
+    def test_my_own_partners_deletion_request_can_still_be_approved(self):
+        quote = self._invoice(self.mine, "75.00")
+        quote.status = Invoice.Status.QUOTE
+        quote.save(update_fields=["status"])
+        req = self._deletion_request(quote, "mine")
+        manager = User.objects.create_user(
+            username="acme-boss2", password="pw-for-tests",
+            role=User.Role.MANAGEMENT, allowed_partners=[self.acme.id],
+        )
+        self.client.force_authenticate(manager)
+        res = self.client.post(f"/api/invoice-deletion-requests/{req.id}/approve/")
+        self.assertEqual(res.status_code, 200, res.data)
+
+    def test_unrestricted_staff_see_every_partners_deletion_request(self):
+        self._deletion_request(self.their_invoice, "theirs")
+        self._deletion_request(self.my_invoice, "mine")
+        self.client.force_authenticate(self.unrestricted)
+        res = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        reasons = {row["reason"] for row in res.data["results"]}
+        self.assertEqual({"mine", "theirs"}, reasons)
 
 
 class CreditApprovalTests(TestCase):
