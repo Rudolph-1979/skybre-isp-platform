@@ -66,7 +66,21 @@ class ProductSerializer(serializers.ModelSerializer):
     # what was actually paid on a receipt, never typed here.
     latest_cost_excl_vat = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     average_cost_excl_vat = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    margin_pct = serializers.DecimalField(max_digits=6, decimal_places=1, read_only=True)
+    # Wide on purpose, and it has to be. margin_pct divides by the SELL
+    # price, which is typed by hand, so a resell-price typo on an expensive
+    # item makes the percentage enormous: R10 keyed on a R25,000 splicer is
+    # -249900.0%. max_digits is not just validation here -- DRF quantizes
+    # output under a decimal context whose precision IS max_digits, so at 6
+    # that raised decimal.InvalidOperation. Not an APIException, so it
+    # escaped the serializer as a 500, and because the list serializes in
+    # one pass ONE mistyped row blanked the entire Inventory tab and every
+    # product picker that reads this endpoint (Finance invoice lines,
+    # quotes, Services). 14 digits covers the worst the model fields allow
+    # -- sell_price 0.01 against a cost of 99999999.99 is -999999999800.0,
+    # thirteen digits -- and matches the width used further down this file.
+    # The silly number is meant to show: red in the margin column is how
+    # stores staff find the typo before it reaches a customer invoice.
+    margin_pct = serializers.DecimalField(max_digits=14, decimal_places=1, read_only=True)
     # Write-only, create-only: [{"serial": "...", "mac": "..."}, ...]
     initial_units = serializers.ListField(
         child=serializers.DictField(child=serializers.CharField(allow_blank=True)),
@@ -92,6 +106,35 @@ class ProductSerializer(serializers.ModelSerializer):
         if obj.low_stock_threshold is None:
             return False
         return obj.quantity_on_hand <= obj.low_stock_threshold
+
+    def validate_tracking_type(self, value):
+        # Refused once the product already holds stock of the other kind:
+        # quantity_on_hand is computed from StockMovement rows for a quantity
+        # product and from SerializedUnit rows for a serialized one, so
+        # flipping a product that has either would make its existing stock
+        # silently vanish from the count.
+        #
+        # This is the same rule the receipt-import path already applies (see
+        # StockReceiptCreateSerializer.create), and it was missing here: an
+        # ordinary product edit could change the Tracking dropdown and 305m of
+        # cable on the shelf became 0, with nothing said about it and the
+        # issue screen then refusing to issue cable we actually have.
+        product = self.instance
+        if product is None or value == product.tracking_type:
+            return value
+        if product.tracking_type == Product.TrackingType.QUANTITY:
+            held = product.movements.exists()
+            holding = "quantity-tracked stock"
+        else:
+            held = product.serialized_units.exists()
+            holding = "individually-tracked units"
+        if held:
+            raise serializers.ValidationError(
+                f"'{product.name}' already has {holding} on record, so it can't be "
+                "switched now — its on-hand count is worked out from those. Create a "
+                "separate product for the individually-tracked version."
+            )
+        return value
 
     def validate(self, attrs):
         units = attrs.get("initial_units") or []
@@ -153,7 +196,12 @@ class ProductSerializer(serializers.ModelSerializer):
         # parsing: an empty row pair left untouched by someone who never
         # meant to use the section must not change how the product is
         # tracked.
-        if parsed:
+        #
+        # Create only. On an edit the units are thrown away again (see
+        # update), so flipping an existing product's tracking here would zero
+        # its on-hand count -- exactly what validate_tracking_type refuses --
+        # and give nothing back for it.
+        if parsed and self.instance is None:
             attrs["tracking_type"] = Product.TrackingType.SERIALIZED
         attrs["initial_units"] = parsed
         return attrs
@@ -600,6 +648,36 @@ class StockIssueCreateSerializer(serializers.ModelSerializer):
         user = self.context["request"].user
 
         with transaction.atomic():
+            # Lock the quantity-tracked products before anything is checked
+            # or written. quantity_on_hand is a SUM over StockMovement, and
+            # an aggregate takes no locks and cannot see another request's
+            # uncommitted issue -- so two technicians drawing the last 3
+            # boxes of connectors at the same moment both read "5 in stock",
+            # both passed the check below, and both wrote their -3. Stock on
+            # hand ended at -1 and a job went out with kit that was not in
+            # the store. The serialized branch below has locked its unit all
+            # along; this side had nothing to contend on, because there is no
+            # counter column -- the product row is the lock.
+            #
+            # Same shape as CreditRequest.approve, which locks the request
+            # row so the Pending check and the credit that answers it are one
+            # decision rather than two.
+            #
+            # Taken up front and ordered by pk, not one at a time inside the
+            # loop, so two issues that share two products cannot grab them in
+            # opposite orders and deadlock each other.
+            quantity_product_pks = {
+                line_data["product"].pk
+                for line_data in lines_data
+                if line_data["product"].tracking_type != Product.TrackingType.SERIALIZED
+            }
+            if quantity_product_pks:
+                list(
+                    Product.objects.select_for_update()
+                    .filter(pk__in=quantity_product_pks)
+                    .order_by("pk")
+                )
+
             issue = StockIssue.objects.create(created_by=user, **validated_data)
 
             for line_data in lines_data:
@@ -633,6 +711,9 @@ class StockIssueCreateSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError(
                             f"Enter a quantity greater than 0 for '{product.name}'."
                         )
+                    # Read while the product row is locked (above), so this
+                    # figure already includes any issue that committed while
+                    # this request was waiting for that lock.
                     available = product.quantity_on_hand
                     if quantity > available:
                         raise serializers.ValidationError(
