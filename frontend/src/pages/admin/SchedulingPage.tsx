@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { SearchableSelect } from "../../components/SearchableSelect";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { DayScheduleGrid } from "../../components/DayScheduleGrid";
+import { apiErrorMessage } from "../../utils/apiError";
 import type { Job, Shift, Customer, User } from "../../types";
 
 const JOB_TYPE_COLOR: Record<Job["job_type"], string> = {
@@ -74,12 +76,22 @@ export function SchedulingPage() {
   const [jobModal, setJobModal] = useState<{ job: JobFormState; editingId: number | null } | null>(null);
   const [shiftModal, setShiftModal] = useState<{ shift: ShiftFormState; editingId: number | null } | null>(null);
   const [saving, setSaving] = useState(false);
+  // What the API said about the last save or delete, one message per modal.
+  // Until now every one of them was thrown away -- see handleJobSubmit.
+  const [jobError, setJobError] = useState("");
+  const [shiftError, setShiftError] = useState("");
 
   useEffect(() => {
     api.get<{ results: User[] }>("/staff-users/?page_size=100").then((res) => setStaff(res.data.results));
-    api.get<{ results: Customer[] }>("/customers/?page_size=500&ordering=full_name").then((res) =>
-      setCustomers(res.data.results)
-    );
+    // /customers/picker/ rather than the paginated list, because page_size is
+    // capped at 500 and DRF clamps it silently: this dropdown held the first
+    // 500 customers by name with nothing saying so, so a job for anyone whose
+    // surname sorted past roughly the 500th could not be booked against them
+    // at all -- about 1,092 of our 1,592 customers. The picker is unpaginated,
+    // already ordered by full_name (hence no &ordering here), and partner-
+    // scoped the same way the list is. Finance, Services and Tickets moved to
+    // it already; Scheduling was the one left behind.
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
   }, []);
 
   // Grid always spans 6 full weeks (Sunday-start) covering the whole month.
@@ -241,6 +253,7 @@ export function SchedulingPage() {
     e.preventDefault();
     if (!jobModal) return;
     setSaving(true);
+    setJobError("");
     try {
       const payload = {
         ...jobModal.job,
@@ -257,6 +270,14 @@ export function SchedulingPage() {
       }
       setJobModal(null);
       refetchJobs();
+    } catch (err) {
+      // Easy to hit and previously invisible: neither datetime field stops
+      // you putting End before Start, and JobSerializer.validate rejects
+      // that with "End time must be after the start time." With no catch
+      // the 400 was swallowed, so Save just did nothing -- the modal sat
+      // there, the job was never booked, and nobody was sent out. A
+      // partner-scoped 403 on someone else's job looked identical.
+      setJobError(apiErrorMessage(err, "Could not save this job — please try again."));
     } finally {
       setSaving(false);
     }
@@ -265,10 +286,16 @@ export function SchedulingPage() {
   async function handleDeleteJob() {
     if (!jobModal?.editingId) return;
     setSaving(true);
+    setJobError("");
     try {
       await api.delete(`/jobs/${jobModal.editingId}/`);
       setJobModal(null);
       refetchJobs();
+    } catch (err) {
+      // A refused delete used to leave the modal open with nothing said, so
+      // it read as a click that hadn't registered -- and the job stayed in
+      // the diary.
+      setJobError(apiErrorMessage(err, "Could not delete this job — please try again."));
     } finally {
       setSaving(false);
     }
@@ -278,6 +305,7 @@ export function SchedulingPage() {
     e.preventDefault();
     if (!shiftModal) return;
     setSaving(true);
+    setShiftError("");
     try {
       const payload = {
         ...shiftModal.shift,
@@ -292,6 +320,12 @@ export function SchedulingPage() {
       }
       setShiftModal(null);
       refetchShifts();
+    } catch (err) {
+      // Same silence as the job form, and it matters more here: a shift
+      // that failed to save is a rota gap nobody was told about.
+      // ShiftSerializer.validate rejects end <= start, which an 18:00-to-
+      // 02:00 night shift typed as one day gets wrong every time.
+      setShiftError(apiErrorMessage(err, "Could not save this shift — please try again."));
     } finally {
       setSaving(false);
     }
@@ -300,10 +334,13 @@ export function SchedulingPage() {
   async function handleDeleteShift() {
     if (!shiftModal?.editingId) return;
     setSaving(true);
+    setShiftError("");
     try {
       await api.delete(`/shifts/${shiftModal.editingId}/`);
       setShiftModal(null);
       refetchShifts();
+    } catch (err) {
+      setShiftError(apiErrorMessage(err, "Could not delete this shift — please try again."));
     } finally {
       setSaving(false);
     }
@@ -494,8 +531,16 @@ export function SchedulingPage() {
       )}
 
       {jobModal && (
-        <Modal title={jobModal.editingId ? "Edit job" : "New job"} onClose={() => setJobModal(null)}>
+        <Modal
+          title={jobModal.editingId ? "Edit job" : "New job"}
+          onClose={() => { setJobModal(null); setJobError(""); }}
+        >
           <form onSubmit={handleJobSubmit}>
+            {jobError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {jobError}
+              </p>
+            )}
             <FormField label="Title">
               <input
                 className={inputClass}
@@ -505,16 +550,22 @@ export function SchedulingPage() {
               />
             </FormField>
             <FormField label="Customer (optional — leave blank for a standalone job)">
-              <select
-                className={inputClass}
+              {/* Not `required`: a standalone office task genuinely has no
+                  customer, which is why emptyLabel spells that out rather
+                  than leaving the picker's default "Clear selection". */}
+              <SearchableSelect
+                options={customers.map((c) => ({
+                  value: String(c.id),
+                  label: c.full_name,
+                  meta: c.customer_id,
+                  searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
+                }))}
                 value={jobModal.job.customer}
-                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, customer: e.target.value } })}
-              >
-                <option value="">No customer (standalone)</option>
-                {customers.map((c) => (
-                  <option key={c.id} value={c.id}>{c.full_name} ({c.customer_id})</option>
-                ))}
-              </select>
+                onChange={(v) => setJobModal({ ...jobModal, job: { ...jobModal.job, customer: v } })}
+                placeholder="No customer (standalone)"
+                emptyLabel="No customer (standalone)"
+                hint="Search by name or payment reference."
+              />
             </FormField>
             <FormField label="Job type">
               <select
@@ -597,7 +648,7 @@ export function SchedulingPage() {
                 </button>
               ) : <span />}
               <div className="flex gap-2">
-                <button type="button" className={btnSecondary} onClick={() => setJobModal(null)}>Cancel</button>
+                <button type="button" className={btnSecondary} onClick={() => { setJobModal(null); setJobError(""); }}>Cancel</button>
                 <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Save"}</button>
               </div>
             </div>
@@ -606,8 +657,16 @@ export function SchedulingPage() {
       )}
 
       {shiftModal && (
-        <Modal title={shiftModal.editingId ? "Edit shift" : "New shift"} onClose={() => setShiftModal(null)}>
+        <Modal
+          title={shiftModal.editingId ? "Edit shift" : "New shift"}
+          onClose={() => { setShiftModal(null); setShiftError(""); }}
+        >
           <form onSubmit={handleShiftSubmit}>
+            {shiftError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {shiftError}
+              </p>
+            )}
             <FormField label="Staff member">
               <select
                 className={inputClass}
@@ -675,7 +734,7 @@ export function SchedulingPage() {
                 </button>
               ) : <span />}
               <div className="flex gap-2">
-                <button type="button" className={btnSecondary} onClick={() => setShiftModal(null)}>Cancel</button>
+                <button type="button" className={btnSecondary} onClick={() => { setShiftModal(null); setShiftError(""); }}>Cancel</button>
                 <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Save"}</button>
               </div>
             </div>
