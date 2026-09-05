@@ -324,6 +324,11 @@ class InvoiceSerializer(serializers.ModelSerializer):
         sequence, which frees the original INV number for the next invoice
         to reuse while the customer still holds the original PDF. Number
         laundering by PATCH.
+
+        Guarding only that direction left the forwards one wide open: a
+        quote could be PATCHed straight to `unpaid` and become a live tax
+        invoice without ever going through convert_to_invoice(). See the
+        second check below.
         """
         if self.instance is None:
             return value
@@ -339,6 +344,34 @@ class InvoiceSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 f"{self.instance.number} is already a real invoice and can't be turned back into a "
                 f"{Invoice(status=value).get_status_display().lower()}. Cancel it instead."
+            )
+        # Leaving a quote/pro forma by hand -- the mirror image of the
+        # check above, and it was open. PATCHing a quote to `unpaid`
+        # skipped convert_to_invoice() entirely, and save() only issues a
+        # number when there isn't one, so the customer ended up holding a
+        # live, debited, chaseable tax invoice still printed QUO-000123 --
+        # numbered out of the quote sequence, which is not a valid tax
+        # invoice number, while the INV sequence has no record of it. It
+        # also skipped activate_tariff_services(), so the tariff the
+        # customer had just accepted never became a Service: billed every
+        # month for a line nobody ever switched on. Quote -> pro forma by
+        # PATCH was the same story with the PF prefix.
+        #
+        # Cancelling is the one status edit a pre-invoice document
+        # legitimately gets -- a quote that came to nothing. Every other
+        # move belongs to convert_to_proforma()/convert_to_invoice(),
+        # which reissue the number, debit the balance and start the
+        # services.
+        if (
+            self.instance.status in Invoice.PRE_INVOICE_STATUSES
+            and value != self.instance.status
+            and value != Invoice.Status.CANCELLED
+        ):
+            raise serializers.ValidationError(
+                f"{self.instance.number} is a {self.instance.get_status_display().lower()} -- "
+                "use Convert to invoice rather than editing its status, so it gets a real invoice "
+                "number and the tariff it quoted becomes a service. Cancel it instead if it came "
+                "to nothing."
             )
         # Going back to draft. `draft` is outside DEBITED_STATUSES, so this
         # released the invoice's debit and silently wrote the debt off
