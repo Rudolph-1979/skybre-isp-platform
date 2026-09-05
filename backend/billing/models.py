@@ -1,3 +1,5 @@
+from decimal import ROUND_HALF_UP, Decimal
+
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import IntegrityError, models, transaction
@@ -612,9 +614,36 @@ class Invoice(models.Model):
         self.activate_tariff_services()
 
     def recalc_totals(self):
+        # Round each component to cents and then add, rather than adding at
+        # full precision and leaving the database to round each column on its
+        # own. Rounded independently the three need not agree. A quarter
+        # month of a R50.10 line at 15% is subtotal R12.525 -> R12.53, tax
+        # R1.87875 -> R1.88, total R14.40375 -> R14.40 -- and R12.53 + R1.88
+        # is R14.41. The customer's tax invoice then prints an exclusive
+        # amount and a VAT amount that do not add up to the total it asks
+        # them to pay, and the VAT on the document is not the VAT the return
+        # declares. Deriving the total from the two stored numbers makes the
+        # invoice add up by construction.
+        # ROUND_HALF_UP because that is what Postgres does to a numeric(12,2),
+        # which is what was rounding these before. Python's default is
+        # half-even, and quietly switching to it would move a cent on every
+        # exact tie -- a fix for a rounding complaint must not itself restate
+        # what customers were charged.
+        cents = Decimal("0.01")
+
+        def to_cents(value):
+            return Decimal(value).quantize(cents, rounding=ROUND_HALF_UP)
+
         items = self.items.all()
-        self.subtotal = sum((i.quantity * i.unit_price for i in items), start=0)
-        self.tax_total = sum((i.quantity * i.unit_price * (i.tax_rate_pct / 100) for i in items), start=0)
+        self.subtotal = to_cents(
+            sum((i.quantity * i.unit_price for i in items), start=Decimal("0"))
+        )
+        self.tax_total = to_cents(
+            sum(
+                (i.quantity * i.unit_price * (i.tax_rate_pct / 100) for i in items),
+                start=Decimal("0"),
+            )
+        )
         self.total = self.subtotal + self.tax_total
         # A quote/pro forma has no payments against it -- never auto-flip
         # those to "paid" just because totals happen to net to zero/match.

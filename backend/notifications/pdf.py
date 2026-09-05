@@ -124,14 +124,10 @@ def render_invoice_pdf(invoice, company_name: str) -> bytes:
     # Django templates can't multiply, and doing it in the view keeps the
     # rounding in one place.
     rows = []
-    total_exclusive = Decimal("0")
-    total_tax = Decimal("0")
     for item in invoice.items.all():
         excl_total = (item.quantity or 0) * (item.unit_price or Decimal("0"))
         rate = item.tax_rate_pct or Decimal("0")
         tax = (excl_total * rate / Decimal("100")).quantize(Decimal("0.01"))
-        total_exclusive += excl_total
-        total_tax += tax
         period = ""
         if item.period_start and item.period_end:
             period = f"{item.period_start:%d/%m/%Y} - {item.period_end:%d/%m/%Y}"
@@ -168,8 +164,15 @@ def render_invoice_pdf(invoice, company_name: str) -> bytes:
         "doc_title": doc_title,
         "due_label": due_label,
         "rows": rows,
-        "total_exclusive": total_exclusive,
-        "total_tax": total_tax,
+        # The totals come off the invoice, not from re-adding the rows here.
+        # This used to sum each line's tax AFTER rounding it to cents, while
+        # Invoice.recalc_totals rounds the total once -- so the document
+        # printed a "Total exclusive" and a "Total tax" from one calculation
+        # and a "Total" and "Balance due" from another, and on the wrong
+        # numbers they did not add up. Whatever the customer is actually
+        # charged is what the document has to show.
+        "total_exclusive": invoice.subtotal,
+        "total_tax": invoice.tax_total,
         "related": related,
         "balance_due": invoice.total - invoice.paid_amount,
     }
