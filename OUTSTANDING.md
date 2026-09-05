@@ -54,59 +54,57 @@ of the two `.md` files this repo maintains.
 - [ ] Turn imported customers' Splynx plan info (currently just text in
   each customer's Notes field) into real Tariff/Service links.
 
-## From the 2026-09-04 platform audit (confirmed, not yet fixed)
+## From the 2026-09-04 platform audit — all fixed
 
-Each was reproduced by reading the code and independently checked from
-three angles (is it reachable in production / can the mechanism be
-refuted / is it already handled or tested). The three that were fixed
-are in the branch already; these are the rest, roughly worst first.
+Every finding below was reproduced first, fixed with a test that fails
+against the pre-fix code, and verified against the full suite. Done
+2026-09-05. Listed here rather than deleted so there is a record of what
+was wrong, since several were silent and none had ever shown up as a
+complaint.
 
-- [ ] **Invoice/quote PDFs do not add up** (`notifications/pdf.py:132`) —
-  the PDF rounds VAT per line while the stored invoice rounds once, so a
-  tax invoice's own columns disagree with its total, and with what the VAT
-  return declares. Customer-facing.
-- [ ] **VAT return dates a converted quote by the quote's date**
-  (`expenses/views.py:62`) — output VAT can land in an already-filed
-  period and never be declared.
-- [ ] **Expenses default to claiming 15% input VAT** (`expenses/models.py:64`),
-  including on Salaries/Payroll, where no VAT was ever charged.
-- [ ] **UIF is capped at one month's ceiling** however many months a
-  payroll run covers (`payroll/services.py:128`), so a catch-up run
-  under-deducts and under-remits.
-- [ ] **Recalculating a draft payroll run deletes the line of anyone
-  deactivated since it was generated** (`payroll/services.py:89`) — final
-  pay and typed PAYE vanish with no warning.
-- [ ] **Changing a product's "Tracking" dropdown zeroes its stock on hand**
-  (`inventory/serializers.py:86`) — the receipt-import path guards against
-  exactly this and says why; the ordinary product edit does not.
-- [ ] **A resell-price typo 500s the whole Products API**
-  (`inventory/serializers.py:69`), blanking the Inventory tab and every
-  product picker.
-- [ ] **Two simultaneous stock issues can both pass the availability
-  check** (`inventory/serializers.py:636`), driving stock negative.
-- [ ] **A quote PATCHed straight to "unpaid"** becomes a live tax invoice
-  still numbered QUO-, and its quoted tariff never becomes a service
-  (`billing/serializers.py:314`).
-- [ ] **A mistyped odometer on "Mark as serviced"** leaves the vehicle
-  reading Overdue permanently, with no way to correct it from the UI
-  (`fleet/views.py:50`); backdated readings are refused outright
-  (`fleet/serializers.py:34`), so a late logbook entry can never be
-  recorded.
-- [ ] **Scheduling page, front end** (`SchedulingPage.tsx`): the job
-  customer dropdown silently lists only the first 500 of ~1,592 customers
-  (line 80), and saving or deleting a job/shift swallows every API error
-  so a rejected save reports nothing (line 240).
+- [x] Tax invoices did not add up — the PDF rounded VAT per line while the
+  invoice rounded once, so the exclusive + VAT a customer entered in their
+  own books missed the total they were billed.
+- [x] Output VAT on a converted quote was declared in **no** VAT return —
+  dated by `date_created`, which never moves off the day the quote was
+  raised. `Invoice.date_issued` now records when a document actually
+  becomes a tax invoice.
+- [x] Expenses claimed 15% input VAT on wages, where none was ever
+  charged.
+- [x] UIF was capped once per run instead of once per month, so a
+  multi-month catch-up run under-deducted and under-declared on the EMP201.
+- [x] Recalculating a draft payroll run deleted a leaver's line, and their
+  final pay with it.
+- [x] Recording a payment overwrote any credit approved or invoice issued
+  in the same moment, and a second payment against one invoice erased the
+  first. The forward path was the last half of the ledger still doing
+  read-modify-write.
+- [x] A quote could be PATCHed straight to `unpaid`, becoming a live tax
+  invoice still numbered QUO-, with the quoted tariff never turned into a
+  service.
+- [x] Changing a product's Tracking dropdown zeroed its stock on hand; a
+  resell-price typo 500'd the whole Products API; two simultaneous stock
+  issues could both pass the availability check.
+- [x] A mistyped service odometer was permanent and left the vehicle
+  reading Overdue for good, while a late logbook entry could never be
+  recorded at all.
+- [x] Scheduling could only book jobs for the first 500 customers, and
+  swallowed every save and delete error in silence.
 
-Also flagged but NOT yet verified, so treat as leads rather than facts —
-the audit ran out of budget partway through checking them: statement/
-invoice PDFs may not be partner-scoped (`notifications/views.py:147`),
-tickets may not be partner-scoped (`tickets/views.py:22`), the speed-now
-endpoint may leak another reseller's line speed and usage
-(`radiusauth/views.py:618`), recording a payment updates the balance with
-a read-modify-write that a concurrent debit could lose
-(`billing/serializers.py:507`), and fair-use shaping may be pushed only to
-the live session and never into radreply, so a router reboot restores the
-old speed (`radiusauth/.../apply_speed_policies.py:158`).
+And the five that were still unverified leads when the list was written —
+all five turned out to be real:
+
+- [x] Any staff member could pull **any** customer's statement or invoice
+  PDF, ignoring their reseller restriction.
+- [x] Support tickets, and their whole comment threads, were visible and
+  editable across partners.
+- [x] The speed-now endpoint leaked another reseller's plan, live line
+  speed and month-to-date usage.
+- [x] Fair-use shaping and speed-window boosts were pushed only to the
+  live session and never into `radreply`, so a router reboot restored the
+  old speed permanently — and the scheduled job then reported "already
+  correct" and never re-sent it.
+- [x] (the payment race, above)
 
 ## Not yet installed (the code exists, the cron entry doesn't)
 
