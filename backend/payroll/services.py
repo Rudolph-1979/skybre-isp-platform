@@ -55,47 +55,62 @@ def salary_for_period(monthly_salary, period_start, period_end):
     return total
 
 
-def uif_for_period(settings_obj, remuneration, period_start, period_end):
-    """(employee, employer) UIF for a run's period, capped per MONTH.
+def _add_one_month(day):
+    """The same day-of-month a month later, clamped to a short month."""
+    year, month = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+    return datetime.date(year, month, min(day.day, days_in_month(datetime.date(year, month, 1))))
 
-    PayrollSettings.uif_for caps at one month's ceiling, which is the rule:
-    1% from the employee and 1% matched by the employer, on remuneration up
-    to the ceiling FOR A MONTH. Nothing constrains a run to one calendar
-    month, though -- the only validation is period_end >= period_start -- so
-    calling it once with a whole period's remuneration squeezed two months of
-    pay under a single month's cap. A two-month catch-up run for anyone
-    earning over the ceiling took R177.12 off the employee instead of
-    R354.24, and declared the same shortfall in the employer's own
-    contribution on the EMP201 -- which is the employer's to make good later,
-    with penalties and interest.
 
-    Remuneration is split across the months by each month's share of the
-    period's days, then each month is capped and rounded on its own -- the
-    same month-by-month-then-sum arithmetic as salary_for_period, and what a
-    clerk writing one payslip per month by hand would arrive at. A part month
-    still gets a whole month's ceiling: the ceiling limits what a month's
-    earnings are charged on, it does not accrue by the day.
+def monthly_cycles_in(period_start, period_end):
+    """How many monthly PAY CYCLES a run covers -- not calendar months.
 
-    A period inside one calendar month gives a share equal to the whole
-    remuneration, so the ordinary monthly run is unchanged to the cent.
+    Counted by stepping a month at a time from the start date, which is how
+    a payroll clerk counts them: 26 Aug -> 25 Sep is ONE cycle even though
+    it touches two calendar months, and 1 Jul -> 31 Aug is two.
+
+    This distinction is the whole point. An earlier version of this split by
+    calendar month and charged a 26th-to-25th cycle two ceilings, taking
+    R79.50 too much off everyone earning over the ceiling, every month.
     """
-    period_days = (period_end - period_start).days + 1
+    cycles = 0
+    cursor = period_start
+    while cursor <= period_end:
+        cycles += 1
+        cursor = _add_one_month(cursor)
+    return max(cycles, 1)
+
+
+def uif_for_period(settings_obj, remuneration, period_start, period_end):
+    """(employee, employer) UIF for a run's period, capped once per PAY CYCLE.
+
+    UIF is 1% from the employee and 1% matched by the employer, on
+    remuneration up to a ceiling for each month of pay. PayrollSettings.uif_for
+    applies exactly one ceiling, and nothing constrains a run to one cycle --
+    the only validation is period_end >= period_start -- so a two-month
+    catch-up run squeezed two months of pay under a single month's cap:
+    R177.12 off the employee instead of R354.24, with the employer's own
+    contribution short by the same amount on the EMP201.
+
+    So the remuneration is spread evenly over the cycles the run covers and
+    each cycle is capped on its own. An ordinary one-cycle run -- which is
+    nearly all of them, straddling month-end or not -- gets exactly one
+    ceiling and is therefore unchanged to the cent from the original code.
+
+    NOTE FOR WHOEVER OWNS PAYROLL: the even spread is an assumption. If a
+    catch-up run covers two months in which the person earned very
+    differently (nothing in one, everything in the other), the honest answer
+    is two separate runs, one per month, which this platform already
+    supports. This function only makes the multi-cycle case better than
+    charging one ceiling for all of it; it does not make it exact.
+    """
+    cycles = monthly_cycles_in(period_start, period_end)
+    share = (remuneration / Decimal(cycles)).quantize(Decimal("0.01"))
     employee = Decimal("0.00")
     employer = Decimal("0.00")
-    cursor = period_start.replace(day=1)
-    last_month = period_end.replace(day=1)
-    while cursor <= last_month:
-        month_end = cursor.replace(day=days_in_month(cursor))
-        overlap_start = max(cursor, period_start)
-        overlap_end = min(month_end, period_end)
-        overlap_days = (overlap_end - overlap_start).days + 1
-        share = (
-            remuneration * Decimal(overlap_days) / Decimal(period_days)
-        ).quantize(Decimal("0.01"))
-        month_employee, month_employer = settings_obj.uif_for(share)
-        employee += month_employee
-        employer += month_employer
-        cursor = month_end + datetime.timedelta(days=1)
+    for _ in range(cycles):
+        cycle_employee, cycle_employer = settings_obj.uif_for(share)
+        employee += cycle_employee
+        employer += cycle_employer
     return employee, employer
 
 

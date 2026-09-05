@@ -79,13 +79,41 @@ class UifForPeriodTests(TestCase):
             ),
             (CAPPED_MONTH * 12, CAPPED_MONTH * 12),
         )
-    def test_a_period_spanning_two_part_months_caps_each_month_in_full(self):
-        """15 July to 14 August touches two calendar months, and each gets
-        a whole month's ceiling: the ceiling limits what a month's earnings
-        are charged on, it does not accrue day by day."""
+    def test_a_cycle_that_straddles_month_end_is_still_ONE_cycle(self):
+        """The 26th-to-25th pay cycle, which is how a great many South
+        African employers run payroll. It touches two calendar months and is
+        one month's pay, so it gets ONE ceiling.
+
+        This is a regression test with a story: an earlier version of this
+        function counted calendar months instead of pay cycles and charged
+        such a cycle two ceilings -- R256.62 instead of R177.12, every
+        month, off everyone earning over the ceiling, with the employer
+        over-declaring the same amount on the EMP201. The test that used to
+        sit here asserted the two-ceiling answer, so a green suite defended
+        the bug.
+        """
+        self.assertEqual(
+            uif_for_period(
+                self.settings_obj, Decimal("41075.27"), _d("2026-08-26"), _d("2026-09-25")
+            ),
+            (CAPPED_MONTH, CAPPED_MONTH),
+        )
+
+    def test_a_mid_month_to_mid_month_cycle_is_also_one_cycle(self):
+        """15 July to 14 August is the same shape: one month of pay."""
         self.assertEqual(
             uif_for_period(
                 self.settings_obj, Decimal("60000.00"), _d("2026-07-15"), _d("2026-08-14")
+            ),
+            (CAPPED_MONTH, CAPPED_MONTH),
+        )
+
+    def test_two_full_months_is_two_cycles(self):
+        """The case this function was written for still works: a catch-up
+        run covering two whole monthly cycles gets two ceilings."""
+        self.assertEqual(
+            uif_for_period(
+                self.settings_obj, Decimal("60000.00"), _d("2026-07-01"), _d("2026-08-31")
             ),
             (CAPPED_MONTH * 2, CAPPED_MONTH * 2),
         )

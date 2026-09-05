@@ -70,8 +70,26 @@ class ExpenseSerializer(serializers.ModelSerializer):
         # all, and its message names this exact case: "use 0 for a
         # purchase that carries no VAT (salaries, transfers, loan
         # repayments)". This is the manual side agreeing with it.
+        # Only judge what this request actually writes. Enforcing it on every
+        # save meant an expense captured at 15% before this rule existed
+        # could not be edited AT ALL -- correcting its description came back
+        # 400 about a VAT rate the request never mentioned.
+        touches_vat = "category" in attrs or "vat_rate_pct" in attrs
+        if not touches_vat and self.instance is not None:
+            return attrs
+
         category = attrs.get("category", getattr(self.instance, "category", None))
-        rate = attrs.get("vat_rate_pct", getattr(self.instance, "vat_rate_pct", None))
+        # The rate has a MODEL DEFAULT of 15, so an omitted key on create is
+        # not "no rate" -- it is 15, which is the single most likely way to
+        # book a payroll run: fill the form in, never touch the VAT field.
+        # Reading attrs alone missed exactly that case, which is the case
+        # this guard exists for.
+        if "vat_rate_pct" in attrs:
+            rate = attrs["vat_rate_pct"]
+        elif self.instance is not None:
+            rate = self.instance.vat_rate_pct
+        else:
+            rate = Expense._meta.get_field("vat_rate_pct").get_default()
         if category == Expense.Category.SALARIES and rate:
             raise serializers.ValidationError({
                 "vat_rate_pct": (
