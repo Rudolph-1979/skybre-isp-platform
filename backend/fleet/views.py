@@ -1,3 +1,5 @@
+import datetime
+
 from django.utils import timezone
 from rest_framework import permissions, viewsets
 from rest_framework.decorators import action
@@ -13,6 +15,19 @@ from .serializers import (
 )
 
 HasVehiclesAccess = section_permission("vehicles")
+
+
+def _service_moment(service_date):
+    """The instant a service's odometer reading belongs at. Services get
+    written up days after the vehicle came back, so a backdated one has to
+    be filed at the end of the day it actually happened -- stamped with
+    "now" it would be checked against readings taken weeks later, and an
+    ordinary late write-up would be refused."""
+    if service_date >= timezone.localdate():
+        return timezone.now()
+    return timezone.make_aware(
+        datetime.datetime.combine(service_date, datetime.time.max), timezone.get_current_timezone()
+    )
 
 
 class VehicleViewSet(viewsets.ModelViewSet):
@@ -32,7 +47,8 @@ class VehicleViewSet(viewsets.ModelViewSet):
         higher than the latest logged reading, also logs a fresh
         OdometerReading -- so "current km" stays in sync with what was
         actually seen at the workshop, without needing a separate manual
-        step."""
+        step. The number is checked against the vehicle's reading history
+        first, because a slipped digit here poisons both."""
         vehicle = self.get_object()
         service_date = request.data.get("service_date")
         odometer_km = request.data.get("odometer_km")
@@ -41,11 +57,38 @@ class VehicleViewSet(viewsets.ModelViewSet):
         if not service_date or odometer_km is None:
             return Response({"detail": "service_date and odometer_km are required."}, status=400)
         try:
+            service_date = datetime.date.fromisoformat(service_date)
+        except (TypeError, ValueError):
+            # It used to reach the database as a raw string and blow up
+            # with a 500, which tells whoever is on the phone nothing.
+            return Response({"detail": "service_date must be a date (YYYY-MM-DD)."}, status=400)
+        try:
             odometer_km = int(odometer_km)
         except (TypeError, ValueError):
             return Response({"detail": "odometer_km must be a whole number."}, status=400)
         if odometer_km < 0:
             return Response({"detail": "odometer_km can't be negative."}, status=400)
+
+        # The odometer typed here lands in the vehicle's history, so it
+        # gets the same sanity check as a reading logged by hand -- one
+        # rule, in one place. It used to be written straight to the
+        # database unchecked, and a slipped digit stuck: 4500 for 45000
+        # reset the km countdown from a number the bakkie passed years
+        # ago, so it read Overdue the moment it left the workshop, and
+        # 450000 for 45000 froze its current km at the typo because every
+        # honest reading afterwards was then rejected for being lower.
+        # Checked BEFORE the ServiceRecord is written, so a refused typo
+        # leaves nothing behind to clean up.
+        reading = OdometerReadingSerializer(
+            data={
+                "vehicle": vehicle.pk,
+                "reading_km": odometer_km,
+                "recorded_at": _service_moment(service_date),
+                "notes": "Logged automatically from a service record.",
+            }
+        )
+        if not reading.is_valid():
+            return Response(reading.errors, status=400)
 
         ServiceRecord.objects.create(
             vehicle=vehicle,
@@ -55,13 +98,7 @@ class VehicleViewSet(viewsets.ModelViewSet):
             logged_by=request.user,
         )
         if odometer_km > vehicle.current_odometer_km:
-            OdometerReading.objects.create(
-                vehicle=vehicle,
-                reading_km=odometer_km,
-                recorded_at=timezone.now(),
-                recorded_by=request.user,
-                notes="Logged automatically from a service record.",
-            )
+            reading.save(recorded_by=request.user)
         # Logging the service IS the vehicle coming back from the workshop,
         # so it comes off "In Service" here rather than needing a second,
         # separate act that somebody will forget. Without this, a vehicle

@@ -136,9 +136,12 @@ class Vehicle(models.Model):
 
 class OdometerReading(models.Model):
     """One logged odometer reading for a vehicle. The vehicle's "current
-    km" is always its latest reading by value -- readings shouldn't
-    decrease over the vehicle's life (enforced in the serializer, not
-    here, to give a clean API error rather than a 500)."""
+    km" is always its highest reading. An odometer only counts up, so a
+    reading may not sit below one taken before it or above one taken after
+    it (enforced in the serializer, not here, to give a clean API error
+    rather than a 500) -- the rule is about the order of the readings IN
+    TIME, not the order they were typed in, because logbooks arrive late
+    and a reading keyed in wrong has to stay correctable."""
 
     vehicle = models.ForeignKey(Vehicle, on_delete=models.CASCADE, related_name="odometer_readings")
     reading_km = models.PositiveIntegerField()

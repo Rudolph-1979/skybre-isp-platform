@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import serializers
 
 from .models import FuelLog, OdometerReading, ServiceRecord, Vehicle
@@ -26,14 +27,33 @@ class OdometerReadingSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         vehicle = attrs.get("vehicle") or getattr(self.instance, "vehicle", None)
         reading_km = attrs.get("reading_km", getattr(self.instance, "reading_km", None))
-        if vehicle is not None and reading_km is not None:
+        recorded_at = attrs.get("recorded_at", getattr(self.instance, "recorded_at", None))
+        if vehicle is not None and reading_km is not None and recorded_at is not None:
             qs = vehicle.odometer_readings.all()
             if self.instance is not None:
                 qs = qs.exclude(pk=self.instance.pk)
-            latest = qs.order_by("-reading_km").first()
-            if latest and reading_km < latest.reading_km:
+            # An odometer only counts up, so a reading is impossible only
+            # when it contradicts its neighbours IN TIME -- below what the
+            # vehicle already read before it, or above what it read after
+            # it. This used to compare against the highest reading ever
+            # logged, whenever it was taken, which broke two real jobs. A
+            # driver's logbook typed up a week late was refused outright,
+            # so the trip could never be recorded. And a slipped digit
+            # (450000 for 45000) became permanent: it was the highest
+            # reading, so every honest reading afterwards sat below it and
+            # was rejected, the vehicle's current km froze at the typo,
+            # and the fleet list read Overdue for the rest of its life.
+            earlier = qs.filter(recorded_at__lte=recorded_at).order_by("-recorded_at", "-id").first()
+            if earlier and reading_km < earlier.reading_km:
                 raise serializers.ValidationError(
-                    f"Odometer reading can't be lower than the last recorded reading ({latest.reading_km} km)."
+                    f"Odometer reading can't be lower than the {earlier.reading_km} km already "
+                    f"recorded on {timezone.localtime(earlier.recorded_at):%Y-%m-%d}."
+                )
+            later = qs.filter(recorded_at__gt=recorded_at).order_by("recorded_at", "id").first()
+            if later and reading_km > later.reading_km:
+                raise serializers.ValidationError(
+                    f"Odometer reading can't be higher than the {later.reading_km} km recorded "
+                    f"later, on {timezone.localtime(later.recorded_at):%Y-%m-%d}."
                 )
         return attrs
 

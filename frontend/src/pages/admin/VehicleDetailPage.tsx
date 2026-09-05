@@ -11,10 +11,15 @@ function formatDate(iso: string) {
   return new Date(iso).toLocaleDateString();
 }
 
-function nowForInput() {
-  const d = new Date();
+// <input type="datetime-local"> wants local wall-clock time, so the
+// timezone offset has to come off before slicing the ISO string.
+function forInput(d: Date) {
   d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
   return d.toISOString().slice(0, 16);
+}
+
+function nowForInput() {
+  return forInput(new Date());
 }
 
 function todayForInput() {
@@ -40,6 +45,12 @@ export function VehicleDetailPage() {
   const [editError, setEditError] = useState("");
 
   const [showReading, setShowReading] = useState(false);
+  // Set when the modal is correcting an existing reading rather than
+  // adding one. A reading keyed in wrong -- 450 000 for 45 000 at the
+  // workshop -- used to be permanent from this screen, and it takes the
+  // vehicle's current km and its service status down with it, so it has
+  // to be fixable here rather than by a developer on the database.
+  const [editingReading, setEditingReading] = useState<OdometerReading | null>(null);
   const [readingForm, setReadingForm] = useState({ reading_km: "", recorded_at: nowForInput(), notes: "" });
   const [savingReading, setSavingReading] = useState(false);
   const [readingError, setReadingError] = useState("");
@@ -161,18 +172,54 @@ export function VehicleDetailPage() {
     navigate("/admin/vehicles");
   }
 
+  function openReading(reading?: OdometerReading) {
+    setReadingError("");
+    setEditingReading(reading || null);
+    setReadingForm(
+      reading
+        ? {
+            reading_km: String(reading.reading_km),
+            recorded_at: forInput(new Date(reading.recorded_at)),
+            notes: reading.notes,
+          }
+        : { reading_km: "", recorded_at: nowForInput(), notes: "" }
+    );
+    setShowReading(true);
+  }
+
+  async function handleDeleteReading(reading: OdometerReading) {
+    // For the reading that should never have been logged at all -- the
+    // vehicle's current km is the highest one on this list, so a bogus
+    // high reading has to be removable or it hides every real one after
+    // it and the vehicle reads Overdue for good.
+    if (
+      !confirm(
+        `Delete the ${reading.reading_km.toLocaleString()} km reading of ${formatDate(reading.recorded_at)}?`
+      )
+    )
+      return;
+    await api.delete(`/odometer-readings/${reading.id}/`);
+    refetchAll();
+  }
+
   async function handleReadingSubmit(e: FormEvent) {
     e.preventDefault();
     setReadingError("");
     setSavingReading(true);
     try {
-      await api.post("/odometer-readings/", {
+      const body = {
         vehicle: Number(id),
         reading_km: Number(readingForm.reading_km),
         recorded_at: new Date(readingForm.recorded_at).toISOString(),
         notes: readingForm.notes,
-      });
+      };
+      if (editingReading) {
+        await api.patch(`/odometer-readings/${editingReading.id}/`, body);
+      } else {
+        await api.post("/odometer-readings/", body);
+      }
       setShowReading(false);
+      setEditingReading(null);
       setReadingForm({ reading_km: "", recorded_at: nowForInput(), notes: "" });
       refetchAll();
     } catch (err) {
@@ -375,7 +422,7 @@ export function VehicleDetailPage() {
         <div>
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-[var(--text-primary)]">Odometer history</h2>
-            <button className={btnSecondary} onClick={() => setShowReading(true)}>
+            <button className={btnSecondary} onClick={() => openReading()}>
               + Log reading
             </button>
           </div>
@@ -386,6 +433,8 @@ export function VehicleDetailPage() {
                 <TH>Reading</TH>
                 <TH>Logged by</TH>
                 <TH>Notes</TH>
+                <TH></TH>
+                <TH></TH>
               </tr>
             </THead>
             <tbody>
@@ -395,6 +444,17 @@ export function VehicleDetailPage() {
                   <TD className="tabular-nums">{r.reading_km.toLocaleString()} km</TD>
                   <TD>{r.recorded_by_name || "—"}</TD>
                   <TD>{r.notes || "—"}</TD>
+                  <TD>
+                    <button className="text-xs text-[var(--series-1)] hover:underline" onClick={() => openReading(r)}>
+                      Correct
+                    </button>
+                    <button
+                      className="ml-2 text-xs text-[var(--status-critical)] hover:underline"
+                      onClick={() => handleDeleteReading(r)}
+                    >
+                      Delete
+                    </button>
+                  </TD>
                 </TR>
               ))}
               {readings.length === 0 && (
@@ -576,7 +636,10 @@ export function VehicleDetailPage() {
       )}
 
       {showReading && (
-        <Modal title="Log odometer reading" onClose={() => setShowReading(false)}>
+        <Modal
+          title={editingReading ? "Correct odometer reading" : "Log odometer reading"}
+          onClose={() => setShowReading(false)}
+        >
           <form onSubmit={handleReadingSubmit}>
             <FormField label="Reading (km)">
               <input
