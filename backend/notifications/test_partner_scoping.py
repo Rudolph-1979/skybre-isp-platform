@@ -1,0 +1,132 @@
+"""A reseller-restricted staff member must not pull another partner's documents.
+
+The invoice and statement PDF endpoints live in notifications rather than
+billing because a customer has to be able to fetch their own from the
+portal. That dual audience is why they carry their own permission check
+instead of a scoped queryset -- and the staff half of that check tested
+only the Customers section and stopped. So a staff member restricted to
+one reseller saw only that reseller on the Customers page and on Finance
+(billing.ScopedByCustomerMixin), and could still GET
+/api/customers/<id>/statement/pdf/ for a competitor's customer: full
+name, address, every invoice billed and the balance outstanding. Ids are
+plain integers, so finding one is walking a number in the URL bar.
+"""
+from decimal import Decimal
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from billing.models import Invoice, InvoiceItem
+from customers.models import Customer, Partner
+
+User = get_user_model()
+
+
+class DocumentPdfPartnerScopingTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.acme = Partner.objects.create(name="Acme Fibre")
+        self.rival = Partner.objects.create(name="Rival Networks")
+
+        self.mine = Customer.objects.create(
+            full_name="Acme Customer", email="ac@example.com", partner=self.acme
+        )
+        self.theirs = Customer.objects.create(
+            full_name="Rival Customer", email="rc@example.com", partner=self.rival
+        )
+        self.direct = Customer.objects.create(
+            full_name="Direct Customer", email="dc@example.com", partner=None
+        )
+
+        self.my_invoice = self._invoice(self.mine)
+        self.their_invoice = self._invoice(self.theirs)
+        self.direct_invoice = self._invoice(self.direct)
+
+        self.restricted = User.objects.create_user(
+            username="acme-support", password="pw-for-tests",
+            role=User.Role.SUPPORT, allowed_partners=[self.acme.id],
+        )
+        self.unrestricted = User.objects.create_user(
+            username="hq-support", password="pw-for-tests", role=User.Role.SUPPORT,
+        )
+        self.admin = User.objects.create_user(
+            username="root", password="pw-for-tests",
+            role=User.Role.ADMIN, allowed_partners=[self.acme.id],
+        )
+
+        # The portal login on the rival's own record -- the audience the
+        # partner check must not catch.
+        self.their_portal_login = User.objects.create_user(
+            username="rival-portal", password="pw-for-tests", role=User.Role.CUSTOMER,
+        )
+        self.theirs.user = self.their_portal_login
+        self.theirs.save(update_fields=["user"])
+
+    def _invoice(self, customer):
+        invoice = Invoice.objects.create(
+            customer=customer, status=Invoice.Status.UNPAID, date_due="2026-09-30"
+        )
+        InvoiceItem.objects.create(
+            invoice=invoice, description="Fibre 50/50", quantity=1,
+            unit_price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+        )
+        invoice.recalc_totals()
+        return invoice
+
+    def _get(self, path, user):
+        self.client.force_authenticate(user)
+        return self.client.get(path)
+
+    def test_another_partners_statement_pdf_cannot_be_pulled(self):
+        """A statement is the whole account history on one page -- name,
+        address, every invoice billed and the balance still owed."""
+        res = self._get(f"/api/customers/{self.theirs.id}/statement/pdf/", self.restricted)
+        self.assertEqual(res.status_code, 404)
+    def test_another_partners_invoice_pdf_cannot_be_pulled(self):
+        """Invoice ids run in sequence across every partner, so guessing a
+        competitor's was a matter of counting."""
+        res = self._get(f"/api/invoices/{self.their_invoice.id}/pdf/", self.restricted)
+        self.assertEqual(res.status_code, 404)
+    def test_my_own_partners_documents_are_still_readable(self):
+        """The PDF preview on the Customer Detail page has to keep working
+        for the reseller's own book."""
+        res = self._get(f"/api/customers/{self.mine.id}/statement/pdf/", self.restricted)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res["Content-Type"], "application/pdf")
+
+        res = self._get(f"/api/invoices/{self.my_invoice.id}/pdf/", self.restricted)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res["Content-Type"], "application/pdf")
+    def test_a_direct_customers_documents_are_still_readable(self):
+        """A customer with no partner isn't owned by any reseller, so they
+        stay visible here just as they do on the customer list."""
+        res = self._get(f"/api/customers/{self.direct.id}/statement/pdf/", self.restricted)
+        self.assertEqual(res.status_code, 200)
+
+        res = self._get(f"/api/invoices/{self.direct_invoice.id}/pdf/", self.restricted)
+        self.assertEqual(res.status_code, 200)
+    def test_unrestricted_and_admin_staff_still_see_every_partner(self):
+        """Empty allowed_partners means unrestricted, and Admin overrides a
+        populated list -- head office must not be locked out of a PDF."""
+        res = self._get(f"/api/customers/{self.theirs.id}/statement/pdf/", self.unrestricted)
+        self.assertEqual(res.status_code, 200)
+
+        # self.admin carries allowed_partners=[acme] and must still get the
+        # rival's document.
+        res = self._get(f"/api/customers/{self.theirs.id}/statement/pdf/", self.admin)
+        self.assertEqual(res.status_code, 200)
+    def test_a_customer_can_still_fetch_their_own_statement(self):
+        """The whole reason these endpoints aren't on the Finance-gated
+        invoice API: a customer reads their own statement from the portal.
+        The partner rule is a staff concept and must not reach them."""
+        res = self._get(f"/api/customers/{self.theirs.id}/statement/pdf/", self.their_portal_login)
+        self.assertEqual(res.status_code, 200)
+
+        res = self._get(f"/api/invoices/{self.their_invoice.id}/pdf/", self.their_portal_login)
+        self.assertEqual(res.status_code, 200)
+    def test_a_customer_still_cannot_fetch_someone_elses_statement(self):
+        """Unchanged behaviour, pinned so the new staff branch can't be
+        refactored over the top of it."""
+        res = self._get(f"/api/customers/{self.mine.id}/statement/pdf/", self.their_portal_login)
+        self.assertEqual(res.status_code, 404)

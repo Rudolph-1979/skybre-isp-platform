@@ -611,13 +611,37 @@ class ServiceSpeedNowView(APIView):
 
     def get(self, request, pk):
         from billing.models import Service
+        from customers.scoping import scope_by_customer
 
         from .speeds import describe, effective_speeds, plan_speeds
 
-        service = (
-            Service.objects.select_related("tariff", "connection_rule").filter(pk=pk).first()
+        # Scoped to the caller's partners, not just fetched by id. Before
+        # this, a reseller-restricted staff member with Customers access
+        # could type any service id into the URL and read a competitor's
+        # plan, the speed that line is running at this second, whether it
+        # is shaped, and how many GB it has used this month -- the exact
+        # facts the Customers page is careful not to show them. Service
+        # ids are sequential, so "any id" means the whole book.
+        #
+        # Every other customer-linked endpoint in this file already
+        # filters on allowed_partners (CustomerUsageView,
+        # CustomerLiveRateView, UsageReportView, OfflineCustomersView).
+        # This view was added afterwards and resolved the Service straight
+        # from the pk.
+        #
+        # allow_null=False because Service.customer is a non-null FK --
+        # there is no ownerless service to keep visible, unlike a
+        # scheduling Job with no customer.
+        services = scope_by_customer(
+            Service.objects.select_related("tariff", "connection_rule"),
+            request.user,
+            allow_null=False,
         )
+        service = services.filter(pk=pk).first()
         if service is None:
+            # 404 rather than 403 on another partner's service, so this
+            # can't be used to map out which service ids exist -- the same
+            # convention CustomerUsageView already follows.
             return Response({"detail": "Not found."}, status=404)
         effective = effective_speeds(service)
         plan_up, plan_down = plan_speeds(service)

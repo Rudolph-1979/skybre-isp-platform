@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from accounts.models import User
 from billing.models import Service, Tariff
-from customers.models import Customer
+from customers.models import Customer, Partner
 from radiusauth.models import SpeedWindow, UsageBucket
 from radiusauth.signals import _mikrotik_rate_limit
 from radiusauth.speeds import countable_usage_gb, effective_speeds
@@ -398,6 +398,90 @@ class SpeedNowApiTests(TestCase):
         )
         self.assertEqual(res.status_code, 400)
         self.assertIn("end_time", res.data)
+
+
+class SpeedNowPartnerScopingTests(TestCase):
+    """A reseller-restricted staff member must not be able to read another
+    partner's line through the speed-now endpoint.
+
+    Every other customer-linked endpoint in radiusauth/views.py filters on
+    allowed_partners. ServiceSpeedNowView resolved the Service straight
+    from the pk in the URL, so a competitor's plan, current line speed,
+    shaping state and month-to-date GB were one guessed id away -- and
+    service ids are sequential.
+
+    The tests above only ever authenticated an unrestricted Admin against
+    a customer with no partner, which is the one combination where scoped
+    and unscoped code look identical.
+    """
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+
+        self.client = APIClient()
+        self.acme = Partner.objects.create(name="Acme Fibre")
+        self.rival = Partner.objects.create(name="Rival Networks")
+        self.tariff = Tariff.objects.create(
+            name="20 Mbps", price=Decimal("899.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240, fup_threshold_gb=100,
+        )
+        self.mine = self._service(self.acme, "Acme Customer", "ac@example.com", "acme1")
+        self.theirs = self._service(self.rival, "Rival Customer", "rc@example.com", "rival1")
+        self.direct = self._service(None, "Direct Customer", "dc@example.com", "direct1")
+
+        self.restricted = User.objects.create_user(
+            username="acme-desk", password="pw-for-tests",
+            role=User.Role.SUPPORT, allowed_sections=["customers"],
+            allowed_partners=[self.acme.id],
+        )
+        self.admin = User.objects.create_user(
+            username="root", password="pw-for-tests",
+            role=User.Role.ADMIN, allowed_partners=[self.acme.id],
+        )
+
+    def _service(self, partner, name, email, username):
+        customer = Customer.objects.create(full_name=name, email=email, partner=partner)
+        return Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date="2026-08-01", radius_username=username,
+        )
+
+    def _speed_now(self, user, service):
+        self.client.force_authenticate(user)
+        return self.client.get(f"/api/services/{service.pk}/speed-now/")
+
+    def test_another_partners_line_is_not_readable(self):
+        """A support agent restricted to Acme typing a sequential service
+        id into the URL was reading Rival's plan, current speed and how
+        many GB that customer had used this month."""
+        res = self._speed_now(self.restricted, self.theirs)
+        self.assertEqual(res.status_code, 404)
+        # 404 not 403, so the ids themselves stay unmappable.
+        self.assertNotIn("used_gb", res.data)
+
+    def test_your_own_partners_line_is_still_readable(self):
+        """The whole point of the endpoint is that a support agent can
+        answer \"why is my internet slow\" in one sentence -- for the
+        customers they are actually allowed to support."""
+        res = self._speed_now(self.restricted, self.mine)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["plan_download_kbps"], 20480)
+        self.assertIn("full plan speed", res.data["explanation"])
+
+    def test_a_direct_customers_line_is_still_readable(self):
+        """A customer with no partner belongs to no reseller, so hiding
+        them from restricted staff would take direct customers off the
+        support desk entirely -- the rule everywhere else keeps them."""
+        res = self._speed_now(self.restricted, self.direct)
+        self.assertEqual(res.status_code, 200)
+
+    def test_an_admin_still_sees_every_partners_line(self):
+        """Admin outranks allowed_partners everywhere else in the project,
+        and an Admin with a partner list set is a real account here -- it
+        must not quietly become a restricted one."""
+        res = self._speed_now(self.admin, self.theirs)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["service_id"], self.theirs.pk)
 
 
 class SafetyTests(TestCase):

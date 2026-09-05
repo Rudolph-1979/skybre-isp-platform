@@ -8,6 +8,7 @@ from rest_framework.views import APIView
 from accounts.permissions import IsAdmin, IsStaffMember, section_permission
 from billing.models import Invoice
 from customers.models import Customer
+from customers.scoping import scope_customers_to_user
 
 from . import services
 from .email_settings import get_email_config, get_email_connection
@@ -125,8 +126,9 @@ class SendCustomerEmailView(APIView):
 class _DocumentPdfMixin:
     """Shared plumbing for the two PDF endpoints below.
 
-    Both are readable by staff with Customers access AND by the customer the
-    document belongs to (the portal shows customers their own invoices). That
+    Both are readable by staff with Customers access -- within their partner
+    restriction -- AND by the customer the document belongs to (the portal
+    shows customers their own invoices). That
     dual audience is the whole reason these live here rather than on
     billing.InvoiceViewSet, which is Finance-gated and would 403 a customer.
 
@@ -151,6 +153,27 @@ class _DocumentPdfMixin:
             # see HasCustomersAccess above.
             if not HasCustomersAccess().has_permission(request, self):
                 return Response({"detail": "You do not have access to customer documents."}, status=status.HTTP_403_FORBIDDEN)
+            # ...and the same partner restriction as everywhere else that
+            # resolves a customer straight from the URL. The section gate
+            # was the whole staff check here, so a staff member restricted
+            # to one reseller -- who saw only that reseller on the Customers
+            # page and on Finance -- could still fetch any other reseller's
+            # invoice or statement PDF by walking the ids. The document
+            # carries the customer's name, address, every invoice they have
+            # been billed and what they still owe.
+            #
+            # billing.ScopedByCustomerMixin already applies this rule to the
+            # invoice API; these two endpoints sidestepped it by loading the
+            # customer through the plain manager instead of a scoped
+            # queryset.
+            if not scope_customers_to_user(
+                Customer.objects.filter(pk=customer.pk), user
+            ).exists():
+                # 404, not 403, for the same reason as the customer branch
+                # below and to match what /api/invoices/<id>/ already
+                # answers: a 403 would confirm that a competitor's document
+                # id exists.
+                return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
             return None
         own = self._own_customer(request)
         if own is not None and own.pk == customer.pk:

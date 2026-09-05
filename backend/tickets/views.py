@@ -2,6 +2,7 @@ from rest_framework import viewsets, permissions, serializers
 from .models import Ticket, TicketComment
 from .serializers import TicketSerializer, TicketCommentSerializer
 from accounts.permissions import section_permission
+from customers.scoping import scope_by_customer
 
 HasTicketsAccess = section_permission("tickets")
 
@@ -20,7 +21,21 @@ class TicketViewSet(viewsets.ModelViewSet):
         user = self.request.user
         qs = Ticket.objects.select_related("customer", "assigned_to").all()
         if user.is_staff_member:
-            return qs
+            # Partner-scoped like every other customer-linked list. Staff
+            # was a flat "return qs", so an agent restricted to one reseller
+            # saw that reseller's customers on the Customers page and then
+            # every partner's tickets here -- the customer's name and the
+            # whole comment thread the serializer nests, which is where
+            # people paste account numbers and site addresses. get_object()
+            # runs off this same queryset, so they could also reply to,
+            # reassign, close or delete a competitor's ticket.
+            #
+            # allow_null=False because Ticket.customer is NOT NULL: unlike a
+            # scheduling Job, there is no such thing as a ticket belonging to
+            # nobody, so the default's "a null customer belongs to no
+            # reseller" branch would never match a row -- and if one ever
+            # could, a restricted user is not who should see it.
+            return scope_by_customer(qs, user, allow_null=False)
         customer_profile = getattr(user, "customer_profile", None)
         if customer_profile is None:
             return qs.none()
@@ -75,7 +90,17 @@ class TicketCommentViewSet(viewsets.ModelViewSet):
             # told them.
             if self.action not in ("list", "retrieve"):
                 qs = qs.filter(author=user)
-        return qs
+        # Staff fell through to every comment in the system. Scoping the
+        # tickets alone would have been cosmetic: this sibling endpoint is
+        # how the thread is actually fetched, so a restricted agent could
+        # GET /api/ticket-comments/?ticket=<id> against a guessed id and
+        # read another partner's whole conversation, internal notes
+        # included, then edit or delete it. Same rule, one hop further out.
+        #
+        # A no-op for portal users -- scope_by_customer deliberately leaves
+        # non-staff alone -- so the lines above still decide what a customer
+        # sees. allow_null=False for the same reason as on the ticket list.
+        return scope_by_customer(qs, user, path="ticket__customer", allow_null=False)
 
     def _customer_ticket_or_400(self, user, ticket):
         """A customer may only attach a comment to one of their own tickets.
