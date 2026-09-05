@@ -605,7 +605,21 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               <select
                 className={inputClass}
                 value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value as ExpenseCategory })}
+                onChange={(e) => {
+                  // Picking Salaries zeroes the VAT rate. Wages carry no
+                  // VAT, and the rate defaults to 15 -- so the whole wage
+                  // bill was one unchanged field away from claiming input
+                  // VAT that was never charged. The backend refuses it
+                  // either way; this stops the form walking staff into
+                  // the error. Same reasoning as the bank-feed confirm
+                  // modal below, which declines to default a rate at all.
+                  const category = e.target.value as ExpenseCategory;
+                  setForm({
+                    ...form,
+                    category,
+                    vat_rate_pct: category === "salaries" ? "0" : form.vat_rate_pct,
+                  });
+                }}
               >
                 {Object.entries(EXPENSE_CATEGORY_LABELS).map(([v, l]) => (
                   <option key={v} value={v}>{l}</option>

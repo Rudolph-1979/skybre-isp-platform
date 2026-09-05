@@ -58,6 +58,28 @@ class ExpenseSerializer(serializers.ModelSerializer):
         supplier = attrs.get("supplier", getattr(self.instance, "supplier", None))
         if supplier is not None:
             attrs["supplier_name"] = ""
+
+        # Wages carry no VAT. There is no tax invoice behind a salary and
+        # no input tax to claim, but vat_rate_pct defaults to 15 for every
+        # category, so capturing a payroll run on the Expenses tab and
+        # leaving the rate alone claimed 15% input VAT on the whole wage
+        # bill -- easily the largest single cost here -- and understated
+        # the VAT payable on the return by that much.
+        #
+        # The bank-feed side of this already refuses to guess a rate at
+        # all, and its message names this exact case: "use 0 for a
+        # purchase that carries no VAT (salaries, transfers, loan
+        # repayments)". This is the manual side agreeing with it.
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        rate = attrs.get("vat_rate_pct", getattr(self.instance, "vat_rate_pct", None))
+        if category == Expense.Category.SALARIES and rate:
+            raise serializers.ValidationError({
+                "vat_rate_pct": (
+                    "Salaries carry no VAT, so no input VAT can be claimed on them -- set the "
+                    "rate to 0. If this is a payroll bureau's own invoice, that is a "
+                    "professional fee and does carry VAT: file it under Professional fees."
+                )
+            })
         return attrs
 
     def get_from_bank_feed(self, obj):
