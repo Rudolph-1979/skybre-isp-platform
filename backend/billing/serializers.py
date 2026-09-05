@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -497,16 +498,54 @@ class PaymentSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
+        from django.db.models import F
+
         validated_data["received_by"] = self.context["request"].user
-        payment = super().create(validated_data)
-        if payment.invoice:
-            payment.invoice.paid_amount += payment.amount
-            if payment.invoice.paid_amount >= payment.invoice.total:
-                payment.invoice.status = Invoice.Status.PAID
-            payment.invoice.save()
-        customer = payment.customer
-        customer.balance = customer.balance - payment.amount
-        customer.save()
+        # Recording a payment used to read the customer, subtract, and save
+        # the whole row -- three autocommit writes with no lock. Anything
+        # that moved the balance between that read and that save was
+        # written back out of existence: Management approves a R200 credit
+        # while Accounts has the payment form open, the payment saves the
+        # balance it read before the credit existed, and the customer keeps
+        # R200 they were told they had been given. The API answered 201
+        # either way, so nobody saw it happen.
+        #
+        # This was the last half of the ledger still doing it that way.
+        # CreditRequestViewSet.approve, apply_balance_debit and
+        # Payment.reverse_ledger_effect were all already moved to F() for
+        # exactly this race; the forward payment path was not.
+        #
+        # The customer is touched before the invoice -- the same order
+        # Payment.reverse_ledger_effect takes them in -- so recording one
+        # payment while another is being deleted cannot deadlock by
+        # grabbing the two rows in opposite orders.
+        with transaction.atomic():
+            payment = super().create(validated_data)
+            customer = payment.customer
+            type(customer).objects.filter(pk=payment.customer_id).update(
+                balance=F("balance") - payment.amount
+            )
+            # The receipt below prints customer.balance, so the copy this
+            # request is holding has to be re-read after an F() update --
+            # otherwise every "payment received" email would quote the
+            # customer's pre-payment balance.
+            customer.refresh_from_db()
+            if payment.invoice_id:
+                # Re-read the invoice under a lock rather than trusting the
+                # copy loaded during validation. Two EFTs confirmed against
+                # one invoice at the same time each added their amount to
+                # the paid_amount they had read, so one of them vanished:
+                # a fully settled invoice stayed Unpaid and the customer
+                # kept being chased for money already in the bank.
+                # update_fields for the second half of it -- a full save()
+                # writes this request's stale status and balance_debited
+                # back over a concurrent apply_balance_debit, which is the
+                # drift balance_debited exists to prevent.
+                invoice = Invoice.objects.select_for_update().get(pk=payment.invoice_id)
+                invoice.paid_amount = invoice.paid_amount + payment.amount
+                if invoice.paid_amount >= invoice.total:
+                    invoice.status = Invoice.Status.PAID
+                invoice.save(update_fields=["paid_amount", "status"])
 
         # Auto-send a "payment received" receipt for ANY payment (manual or
         # recurring-engine), not just ones the recurring-billing engine
