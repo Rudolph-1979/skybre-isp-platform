@@ -159,6 +159,9 @@ def render_invoice_pdf(invoice, company_name: str) -> bytes:
         "logo_path": _logo_path(defaults),
         "generated_date": timezone.localdate(),
         "invoice": invoice,
+        # The date the document itself carries. For a converted quote that
+        # is when it became a tax invoice, not when the quote was raised.
+        "document_date": invoice.date_issued or invoice.date_created,
         "customer": customer,
         "customer_display_name": customer.company_name or customer.full_name,
         "doc_title": doc_title,

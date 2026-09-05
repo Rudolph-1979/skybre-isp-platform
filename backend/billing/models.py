@@ -5,6 +5,7 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import IntegrityError, models, transaction
 from django.db.models import BigIntegerField, Max
 from django.db.models.functions import Cast, Substr
+from django.utils import timezone
 
 
 class Tariff(models.Model):
@@ -333,6 +334,12 @@ class Invoice(models.Model):
     # convert_to_invoice() below.
     PRE_INVOICE_STATUSES = (Status.QUOTE, Status.PROFORMA)
 
+    # The statuses at which this IS a tax invoice: money is owed and output
+    # VAT is due on it. CANCELLED is deliberately absent -- a document
+    # cancelled out of draft was never issued, and one cancelled after
+    # being issued already carries its date_issued from then.
+    ISSUED_STATUSES = (Status.UNPAID, Status.PAID, Status.OVERDUE)
+
     # `number` prefix used at each stage of that lifecycle. Quote and Pro
     # Forma each get their own separate, clearly-labelled sequence so
     # neither one consumes a number from the real invoice sequence --
@@ -349,6 +356,15 @@ class Invoice(models.Model):
     customer = models.ForeignKey("customers.Customer", on_delete=models.CASCADE, related_name="invoices")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
     date_created = models.DateField(auto_now_add=True)
+    # The day this became a real tax invoice, which is NOT date_created.
+    # date_created is auto_now_add: it is stamped when the row is first
+    # written and never moves again. A quote raised in March and converted
+    # in June therefore still says March, so the output VAT on it fell down
+    # the gap between two returns -- March's return excluded it because it
+    # was still a quote, and June's return never saw it because it was
+    # dated March. It was declared in neither. Null until the document is
+    # actually issued; see save().
+    date_issued = models.DateField(null=True, blank=True)
     date_due = models.DateField()
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -471,6 +487,21 @@ class Invoice(models.Model):
                 )
 
     def save(self, *args, **kwargs):
+        # Stamp the issue date the first time this is a real tax invoice --
+        # here rather than in convert_to_invoice(), because that is not the
+        # only way a document becomes one: it can be created as an invoice
+        # outright, or moved out of draft. Only ever set once, so a later
+        # edit (or a status bouncing to PAID and back) cannot move the VAT
+        # period of an invoice already declared on a return.
+        if self.date_issued is None and self.status in self.ISSUED_STATUSES:
+            self.date_issued = timezone.localdate()
+            # Several callers save just the fields they touched (e.g.
+            # Payment.reverse_ledger_effect saves paid_amount + status).
+            # Without adding it here the new date would be computed and
+            # then dropped on the floor.
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = list(kwargs["update_fields"]) + ["date_issued"]
+
         if self.number:
             return super().save(*args, **kwargs)
 

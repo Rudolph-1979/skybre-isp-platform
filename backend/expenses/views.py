@@ -44,7 +44,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
 def _sum_output_vat(period_start, period_end):
     """Output VAT for the period, on the invoice/accrual basis: every
-    InvoiceItem on an invoice actually issued (date_created) in the
+    InvoiceItem on an invoice actually issued (date_issued) in the
     period, excluding quotes/pro-formas/drafts (never real tax invoices)
     and cancelled invoices (VAT never became due). Bucketed by whether
     the line's tax_rate_pct is >0 (standard-rated) or exactly 0
@@ -57,9 +57,16 @@ def _sum_output_vat(period_start, period_end):
         Invoice.Status.QUOTE, Invoice.Status.PROFORMA,
         Invoice.Status.DRAFT, Invoice.Status.CANCELLED,
     ]
+    # date_issued, not date_created. date_created is auto_now_add, so a
+    # quote raised in March and converted to a real invoice in June still
+    # says March -- and the output VAT on it was declared in neither
+    # return: March's excluded it for being a quote, June's never saw it
+    # because of the date. Invoice.date_issued is stamped the day the
+    # document actually becomes a tax invoice, which is the day the VAT
+    # becomes due, and is what the accrual basis turns on.
     items = (
         InvoiceItem.objects
-        .filter(invoice__date_created__gte=period_start, invoice__date_created__lte=period_end)
+        .filter(invoice__date_issued__gte=period_start, invoice__date_issued__lte=period_end)
         .exclude(invoice__status__in=exclude_statuses)
         .only("quantity", "unit_price", "tax_rate_pct", "invoice_id")
     )

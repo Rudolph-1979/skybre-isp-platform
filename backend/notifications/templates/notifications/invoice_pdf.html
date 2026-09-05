@@ -146,7 +146,11 @@ tables throughout, which is also what keeps it stable across page breaks.
       <div class="doc-title">{{ doc_title }}</div>
       <table class="meta" style="width:181.3pt; margin-top:3.7pt;">
         <tr><td>Number:</td><td class="v">{{ invoice.number }}</td></tr>
-        <tr><td>Date:</td><td class="v">{{ invoice.date_created|date:"d/m/Y" }}</td></tr>
+        {# The day it became a tax invoice, falling back to date_created for
+           quotes/pro formas (not issued yet) and for rows raised before
+           date_issued existed. A converted quote used to print the date the
+           QUOTE was raised as its invoice date. #}
+        <tr><td>Date:</td><td class="v">{{ document_date|date:"d/m/Y" }}</td></tr>
         <tr><td>{{ due_label }}:</td><td class="v">{{ invoice.date_due|date:"d/m/Y" }}</td></tr>
         <tr>
           <td class="due-l">Total due:</td>
