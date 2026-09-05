@@ -115,6 +115,8 @@ class Command(BaseCommand):
                 _unlock()
 
     def _run(self, options, commit, seed, limit, apply_change, find_live_session):
+        from radiusauth.signals import record_rate_limit
+
         now = timezone.localtime()
         qs = (
             Service.objects.select_related("tariff", "connection_rule", "device")
@@ -159,11 +161,26 @@ class Command(BaseCommand):
                 skipped += 1
                 continue
 
-            # Only lines that are actually up can be changed in place. For
-            # the rest the new value is already in radreply and applies at
-            # their next connection, so there is nothing to do and nothing
-            # wrong -- counted separately so the two are never confused.
+            # Only lines that are actually up can be changed in place.
+            #
+            # The rest still need radreply putting right. This used to say
+            # the new value was already there and simply move on, which is
+            # true for a tariff edit -- that saves the Service and re-syncs
+            # the rows -- and false for both reasons THIS job exists. A
+            # window opening and a fair-use threshold being crossed change
+            # what the line should be running at without anything touching
+            # the Service, so nothing rewrites radreply, and the customer
+            # logged back in on the old rate.
             if find_live_session(service.radius_username) is None:
+                # Recorded as delivered because for an offline line
+                # radreply IS the delivery -- it is what they get the
+                # moment they reconnect. Without recording it, the same
+                # row would be rewritten with the same value on every
+                # tick, twelve times an hour, for ever.
+                if commit and record_rate_limit(service.radius_username, target.rate_limit):
+                    Service.objects.filter(pk=service.pk).update(
+                        last_pushed_rate_limit=target.rate_limit
+                    )
                 offline += 1
                 continue
 

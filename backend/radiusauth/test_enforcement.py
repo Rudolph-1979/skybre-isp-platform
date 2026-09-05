@@ -17,7 +17,7 @@ from customers.models import Customer
 from network.models import Device
 from radiusauth import dynauth, enforcement
 from radiusauth.fake_nas_testing import FakeNAS
-from radiusauth.models import RadAcct, RadiusAction, RadiusNasClient
+from radiusauth.models import RadAcct, RadiusAction, RadiusNasClient, RadReply
 
 SECRET = "testing-secret-not-real"
 NAS_IP = "127.0.0.1"
@@ -77,6 +77,24 @@ class EnforcementTests(TransactionTestCase):
         self.assertTrue(action.ok)
         self.assertEqual((action.action, action.transport), ("coa_rate", "coa"))
         self.assertIn("stayed connected", action.detail)
+
+    def test_a_coa_also_moves_the_rate_the_next_login_would_get(self):
+        """radreply is what FreeRADIUS hands back at login. A CoA only
+        touches the session that is up right now, so leaving radreply
+        behind means one router reboot silently puts the customer back on
+        the old speed -- and last_pushed_rate_limit says it was already
+        delivered, so the scheduled run never sends it again."""
+        self._session()
+        nas = FakeNAS(SECRET)
+        with mock.patch.object(dynauth, "DEFAULT_PORT", nas.port), \
+             mock.patch.object(dynauth, "coa_port", lambda: nas.port):
+            self.service.tariff = self.faster
+            enforcement.apply_change(self.service, "tariff")
+
+        row = RadReply.objects.filter(
+            username="pppoe_test", attribute="Mikrotik-Rate-Limit"
+        ).first()
+        self.assertEqual(row.value, "5120k/20480k")
 
     def test_status_change_disconnects(self):
         self._session()

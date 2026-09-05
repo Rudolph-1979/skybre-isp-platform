@@ -774,3 +774,65 @@ class ShaperResyncTests(TestCase):
 
         source = inspect.getsource(apply_speed_policies)
         self.assertIn("couldn't re-sync shaper queues", source)
+
+class RadreplyFollowsThePolicyTests(TestCase):
+    """A speed the job works out has to survive a reconnect.
+
+    radreply is what FreeRADIUS hands back at login. A CoA changes the
+    session that is up right now and nothing else, so a rate that only
+    ever went out as a CoA is undone by the customer's next router
+    reboot -- and last_pushed_rate_limit still says it was delivered, so
+    the run reports "already correct" and never sends it again.
+    """
+
+    def setUp(self):
+        self.tariff = Tariff.objects.create(
+            name="Skybre Wireless 5Mbps", price=Decimal("286.35"),
+            speed_download_kbps=5120, speed_upload_kbps=5120,
+        )
+        self.customer = Customer.objects.create(full_name="Rebooter", email="r@x.com")
+        self.service = Service.objects.create(
+            customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date="2026-08-01", radius_username="pppoe_test", radius_password="pw",
+        )
+        SpeedWindow.objects.create(
+            name="SkybreWireless Burst", start_time=datetime.time(0, 0),
+            end_time=datetime.time(23, 59), speed_pct=200,
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("apply_speed_policies", *args, stdout=out)
+        return out.getvalue()
+
+    def _radreply(self):
+        from radiusauth.models import RadReply
+
+        row = RadReply.objects.filter(
+            username="pppoe_test", attribute="Mikrotik-Rate-Limit"
+        ).first()
+        return row.value if row else None
+
+    def test_a_line_that_is_not_connected_still_gets_the_new_rate_for_next_login(self):
+        """There is no session to CoA, so radreply is the only way the
+        boost can ever reach them. The run used to count the line as
+        "not connected, nothing to do" and leave the old rate sitting
+        there for whenever they next dialled in."""
+        self._run("--seed")
+        self._run()
+        self.assertEqual(self._radreply(), "5120k/5120k", "a dry run wrote to radreply")
+        self._run("--commit")
+        self.assertEqual(self._radreply(), "10240k/10240k")
+
+    def test_the_same_offline_line_is_not_rewritten_on_every_tick(self):
+        """Once radreply holds it, it HAS been delivered -- that is what
+        they get the moment they reconnect. Without recording that, a
+        five-minute cron rewrites the same row twelve times an hour for
+        as long as the window is open."""
+        self._run("--seed")
+        self._run("--commit")
+        self.assertIn("1 already correct", self._run("--commit"))

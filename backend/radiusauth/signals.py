@@ -78,6 +78,31 @@ def _mikrotik_rate_limit(service):
     return effective_speeds(service).rate_limit
 
 
+def record_rate_limit(username, rate_limit):
+    """Write a rate limit into radreply, where the NEXT login reads it.
+
+    A CoA moves the queue on the session that is up right now and nothing
+    else. radreply is what FreeRADIUS hands back at login, so until this
+    row moves too, one router reboot puts the customer straight back on
+    the rate they had before -- an off-peak boost silently lost, or, far
+    worse, a line shaped for fair use running at full speed again for the
+    rest of the month. And because the CoA had already recorded
+    last_pushed_rate_limit, the scheduled run then reported "already
+    correct" and never sent it a second time.
+
+    Only touches a row that already exists. A service with no reply rows
+    is one _sync_service_radius_rows deliberately wrote nothing for -- no
+    password yet, or an outright Reject -- and a lone reply row would not
+    help it. Returns the number of rows moved, so callers can tell the
+    difference between "delivered" and "there was nothing there".
+    """
+    if not username:
+        return 0
+    return RadReply.objects.filter(
+        username=username, attribute="Mikrotik-Rate-Limit"
+    ).update(value=rate_limit)
+
+
 def _allocate_network_ip(service):
     """Returns the Framed-IP-Address to hand this OVPN service, allocating
     one from a "network" category IPPool if it doesn't already have one.
