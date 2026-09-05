@@ -1,6 +1,8 @@
 import datetime
 from decimal import Decimal
 
+from django.db.models import Q
+
 from accounts.models import User
 from .models import AttendanceRecord, PayrollRunLine, PayrollSettings, StaffProfile, days_in_month
 
@@ -53,6 +55,50 @@ def salary_for_period(monthly_salary, period_start, period_end):
     return total
 
 
+def uif_for_period(settings_obj, remuneration, period_start, period_end):
+    """(employee, employer) UIF for a run's period, capped per MONTH.
+
+    PayrollSettings.uif_for caps at one month's ceiling, which is the rule:
+    1% from the employee and 1% matched by the employer, on remuneration up
+    to the ceiling FOR A MONTH. Nothing constrains a run to one calendar
+    month, though -- the only validation is period_end >= period_start -- so
+    calling it once with a whole period's remuneration squeezed two months of
+    pay under a single month's cap. A two-month catch-up run for anyone
+    earning over the ceiling took R177.12 off the employee instead of
+    R354.24, and declared the same shortfall in the employer's own
+    contribution on the EMP201 -- which is the employer's to make good later,
+    with penalties and interest.
+
+    Remuneration is split across the months by each month's share of the
+    period's days, then each month is capped and rounded on its own -- the
+    same month-by-month-then-sum arithmetic as salary_for_period, and what a
+    clerk writing one payslip per month by hand would arrive at. A part month
+    still gets a whole month's ceiling: the ceiling limits what a month's
+    earnings are charged on, it does not accrue by the day.
+
+    A period inside one calendar month gives a share equal to the whole
+    remuneration, so the ordinary monthly run is unchanged to the cent.
+    """
+    period_days = (period_end - period_start).days + 1
+    employee = Decimal("0.00")
+    employer = Decimal("0.00")
+    cursor = period_start.replace(day=1)
+    last_month = period_end.replace(day=1)
+    while cursor <= last_month:
+        month_end = cursor.replace(day=days_in_month(cursor))
+        overlap_start = max(cursor, period_start)
+        overlap_end = min(month_end, period_end)
+        overlap_days = (overlap_end - overlap_start).days + 1
+        share = (
+            remuneration * Decimal(overlap_days) / Decimal(period_days)
+        ).quantize(Decimal("0.01"))
+        month_employee, month_employer = settings_obj.uif_for(share)
+        employee += month_employee
+        employer += month_employer
+        cursor = month_end + datetime.timedelta(days=1)
+    return employee, employer
+
+
 # Fields a person types in that this function must NOT destroy. Everything
 # else on a line is derived from attendance and can be safely recomputed.
 _MANUAL_LINE_FIELDS = (
@@ -85,9 +131,32 @@ def generate_payroll_run_lines(run):
     }
     run.lines.all().delete()
 
+    # Who gets a line: everyone currently on the payroll, plus anyone who
+    # already had one on this run. That second half is the leaver. Someone
+    # deactivated between a draft being generated and it being recalculated
+    # has almost always just left, and that line is their final pay -- but
+    # rebuilding from the active staff alone dropped it, along with the PAYE
+    # somebody had typed against it, and the run came back one person shorter
+    # with nothing said about it. The page redraws itself from the response,
+    # and the bank CSV and the payslip PDFs are all driven off these lines, so
+    # the first sign of it was someone not being paid. Recalculate must never
+    # be the thing that quietly decides not to pay somebody.
+    #
+    # It still won't ADD anyone who left before the period: they have no line
+    # on this run, so they aren't in `preserved`, so they aren't matched here.
+    # The staff_profile guard is what the old is_active filter gave us for
+    # free -- the loop below reads staff.staff_profile, and a line can outlive
+    # the profile it was generated from.
     staff_qs = (
-        User.objects.filter(role__in=["admin", "support", "sales", "technician", "management", "accounts"], is_active=True)
-        .filter(staff_profile__is_active=True)
+        User.objects.filter(staff_profile__isnull=False)
+        .filter(
+            Q(
+                role__in=["admin", "support", "sales", "technician", "management", "accounts"],
+                is_active=True,
+                staff_profile__is_active=True,
+            )
+            | Q(pk__in=list(preserved))
+        )
         .select_related("staff_profile")
     )
 
@@ -125,7 +194,13 @@ def generate_payroll_run_lines(run):
         # Remuneration includes any additional amount (a bonus is remuneration
         # for UIF purposes), which is why this happens after the carry-over.
         remuneration = gross_pay + carried.get("additional_amount", Decimal("0"))
-        uif_employee, uif_employer = settings_obj.uif_for(remuneration)
+        # Per month, not per run: uif_for caps at one month's ceiling, so a
+        # two-month catch-up run used to charge UIF on one month of it while
+        # paying two months' salary. SDL has no ceiling, so 1% of the whole
+        # period is right as it stands.
+        uif_employee, uif_employer = uif_for_period(
+            settings_obj, remuneration, run.period_start, run.period_end
+        )
         sdl = settings_obj.sdl_for(remuneration)
 
         lines.append(
@@ -161,7 +236,13 @@ def recalculate_statutory(line):
     """
     settings_obj = PayrollSettings.load()
     remuneration = line.gross_pay + line.additional_amount
-    line.uif_employee, line.uif_employer = settings_obj.uif_for(remuneration)
+    # Capped per month, exactly as generation does it -- otherwise typing a
+    # bonus into a line on a multi-month run quietly put the single-month cap
+    # back on a run that had been generated correctly.
+    run = line.payroll_run
+    line.uif_employee, line.uif_employer = uif_for_period(
+        settings_obj, remuneration, run.period_start, run.period_end
+    )
     line.sdl = settings_obj.sdl_for(remuneration)
     line.save(update_fields=["uif_employee", "uif_employer", "sdl"])
     return line
