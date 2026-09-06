@@ -106,6 +106,40 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
+## Where every claim stands (2026-09-06, latest pass)
+
+63 candidate findings have been raised across two audits and one review of
+this branch's own diff. Reconciling them produced this. It is the honest
+count, not a reassuring one.
+
+**Confirmed and fixed, with a reproduction and a test for each: 15.**
+Including three blockers and, worst of all, a late billing run silently
+losing a whole month of invoices for every affected customer.
+
+**Confirmed real, reproduced, NOT yet fixed: 9.** Fix plans exist for
+these; they have not been applied.
+
+- [ ] **[serious]** Backfill stamps cancelled QUOTES as issued tax invoices
+- [ ] **[serious]** A line that was offline when a speed window opened never gets its static shaper queue re-synced
+- [ ] **[serious]** --limit no longer caps anything for offline lines, and the writes are invisible in both dry run and log
+- [ ] **[serious]** allow_null=False is a no-op on the deletion-request queryset — an approved request's orphaned row stays visible to every restricted user
+- [ ] **[minor]** Recalculate can no longer take anyone off a draft run, and there is no other way to remove a line
+- [ ] **[minor]** A NULL date_issued is silently invisible to every VAT return, and the backfill runs while the old code is still writing invoices
+- [ ] **[minor]** Tracking type can no longer be corrected on a product whose stock is already zero
+- [ ] **[minor]** Picking Salaries latches the VAT rate to 0 and nothing puts it back
+- [ ] **[minor]** A finalized payroll run's period is still writable, and a partial PATCH of one date raises KeyError -> HTTP 500
+
+**Not yet checked at all: 9.** Three of the seven verification groups ran
+out of budget. Those claims are neither confirmed nor refuted and are
+listed in the sections above this one.
+
+**Refuted on inspection: 2** -- the UIF day-split concern (the
+implementation had already been replaced) and the UIF test-quality concern
+(the tests had already been rewritten).
+
+Nothing here should be read as "the rest is fine". The rest is *unchecked*,
+and the pattern so far is that most checked claims turn out to be real.
+
 ## Four findings from the first audit that were never acted on
 
 Found 2026-09-06 by reconciling every finding ever raised against the files
