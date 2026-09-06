@@ -556,9 +556,10 @@ class SafetyTests(TestCase):
     def _connect_all(self):
         """Give every line an open accounting row, so they count as live.
 
-        Offline lines are filtered out BEFORE the limit is applied -- there
-        is no point spending the run's budget on lines that cannot be
-        changed in place -- so a stampede test needs real sessions."""
+        An offline line spends the budget too -- writing radreply is what
+        it gets at its next login -- but only on the tick its rate actually
+        moves, so a stampede test of the CoA path still needs real
+        sessions."""
         from radiusauth.models import RadAcct
 
         for i, service in enumerate(self.services):
@@ -885,3 +886,118 @@ class RadreplyFollowsThePolicyTests(TestCase):
         self.assertNotIn("1 already correct", output,
                          "the live session must not be skipped as already done")
 
+
+class OfflineLinesAreRealChangesTests(TestCase):
+    """A line that is down when a window opens is still being changed.
+
+    radreply is what FreeRADIUS hands it at its next login, so writing it
+    IS the delivery -- which means it has to obey the run's --limit and
+    show up on the log like any other change, and the static simple queue
+    has to move with it or the boost is thrown away at reconnect.
+    """
+
+    def setUp(self):
+        from network.models import Device
+
+        self.tariff = Tariff.objects.create(
+            name="Skybre Wireless 5Mbps", price=Decimal("286.35"),
+            speed_download_kbps=5120, speed_upload_kbps=5120,
+        )
+        self.device = Device.objects.create(
+            name="Tower NAS", ip_address="10.0.0.1", enable_shaper=True,
+        )
+        self.plain_device = Device.objects.create(
+            name="Depot NAS", ip_address="10.0.0.2", enable_shaper=False,
+        )
+        self.customer = Customer.objects.create(full_name="Load Shed", email="ls@x.com")
+        self.services = [
+            Service.objects.create(
+                customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+                start_date="2026-08-01", radius_username=f"dark{i}", radius_password="pw",
+                device=self.device if i < 4 else self.plain_device,
+            )
+            for i in range(5)
+        ]
+        SpeedWindow.objects.create(
+            name="SkybreWireless Burst", start_time=datetime.time(0, 0),
+            end_time=datetime.time(23, 59), speed_pct=200,
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("apply_speed_policies", *args, stdout=out)
+        return out.getvalue()
+
+    def _boosted(self):
+        from radiusauth.models import RadReply
+
+        return sorted(
+            RadReply.objects.filter(
+                attribute="Mikrotik-Rate-Limit", value="10240k/10240k"
+            ).values_list("username", flat=True)
+        )
+
+    def test_a_shaper_device_is_resynced_even_when_every_line_on_it_is_offline(self):
+        """A tower on load-shedding when the 22:00 window opens. The boost
+        goes into radreply and is handed over at reconnect -- and is then
+        thrown away by the static simple queue, still holding the line at
+        plan speed, because the customer gets the more restrictive of the
+        two queues. Nothing on either screen looks wrong."""
+        from unittest import mock
+
+        self._run("--seed")
+        with mock.patch("network.router_sync.sync_device_shaper_queues") as sync:
+            self._run("--commit")
+
+        self.assertEqual(sync.call_count, 1, "the static queues were never re-pushed")
+        # And only the device that actually runs the shaper.
+        self.assertEqual(sync.call_args[0][0].pk, self.device.pk)
+
+    def test_offline_lines_obey_the_run_limit_and_are_named_on_the_log(self):
+        """--limit exists so a misconfigured window turns "the whole network
+        at once" into "fifty, then look at the log". radreply is what the
+        customer gets at their next login, so five disconnected lines under
+        --limit 1 must move one rate, not five -- and the run must not
+        report that nothing happened while it moved them."""
+        self._run("--seed")
+        text = self._run("--commit", "--limit", "1")
+
+        self.assertEqual(len(self._boosted()), 1, "--limit did not cap the radreply writes")
+        self.assertIn(self._boosted()[0], text, "the line that was changed is not on the log")
+        self.assertIn("held back by --limit 1", text)
+
+        # And the rest are picked up on the following ticks, not lost.
+        for _ in range(4):
+            self._run("--commit", "--limit", "1")
+        self.assertEqual(len(self._boosted()), 5)
+
+    def test_an_offline_line_already_holding_the_rate_does_not_spend_the_budget(self):
+        """A window stays open for hours and the same disconnected lines
+        come round every five minutes. If each of them cost a slot, a
+        customer who came back online mid-window would sit behind them and
+        never get their CoA at all.
+
+        (This one passes before the --limit fix as well as after: it is
+        here because the obvious way to write that fix -- charging every
+        offline line a slot -- breaks it.)
+        """
+        from unittest import mock
+
+        from radiusauth.models import RadAcct
+
+        self._run("--seed")
+        self._run("--commit")           # every offline line now holds the boost
+        RadAcct.objects.create(
+            acctsessionid="s9", acctuniqueid="u9", username="dark4",
+            nasipaddress="10.0.0.2", acctstarttime=timezone.now(),
+            acctupdatetime=timezone.now(),
+        )
+        with mock.patch("radiusauth.enforcement.apply_change", return_value=True) as coa:
+            self._run("--commit", "--limit", "1")
+
+        self.assertEqual(coa.call_count, 1, "the live line never got its CoA")
+        self.assertEqual(coa.call_args[0][0].radius_username, "dark4")

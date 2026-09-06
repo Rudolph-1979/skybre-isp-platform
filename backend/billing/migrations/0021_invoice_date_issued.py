@@ -17,10 +17,25 @@ def backfill_date_issued(apps, schema_editor):
     Cancelled documents are backfilled too -- a cancelled invoice was issued
     at some point, and leaving it NULL would let a later un-cancel stamp it
     with today's date.
+
+    Except a cancelled QUOTE. Cancelling is the documented end state of a
+    quote that came to nothing -- InvoiceSerializer.validate_status tells
+    staff exactly that -- and `status` alone cannot say which kind of
+    document a cancelled row was. The NUMBER can: a quote/pro forma keeps
+    its QUO-/PF- number right up until convert_to_invoice() reissues it out
+    of the INV sequence, so a cancelled QUO-/PF- row was never a tax
+    invoice. Stamping one anyway matters the day somebody revives it:
+    save() will not re-stamp a date that is already there, so the revived
+    document's VAT is declared in the month the quote was raised -- a
+    period whose VAT201 was filed long ago -- which is the exact gap this
+    field exists to close.
     """
     Invoice = apps.get_model("billing", "Invoice")
     Invoice.objects.filter(date_issued__isnull=True).exclude(
         status__in=["quote", "proforma", "draft"]
+    ).exclude(
+        models.Q(status="cancelled")
+        & (models.Q(number__startswith="QUO-") | models.Q(number__startswith="PF-"))
     ).update(date_issued=models.F("date_created"))
 
 

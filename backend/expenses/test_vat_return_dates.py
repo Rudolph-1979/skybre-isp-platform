@@ -13,9 +13,11 @@ Invoice.date_issued is stamped the day the document actually becomes a tax
 invoice, and the return is built on that.
 """
 from decimal import Decimal
+from importlib import import_module
 from datetime import date
 from unittest import mock
 
+from django.apps import apps as django_apps
 from django.test import TestCase
 
 from billing.models import Invoice, InvoiceItem
@@ -145,3 +147,110 @@ class OutputVatPeriodTests(TestCase):
         with mock.patch("notifications.pdf.render_to_string", fake_render):
             render_invoice_pdf(invoice, "Skybre")
         self.assertEqual(captured["document_date"], date(2026, 3, 10))
+
+
+
+
+class WhatTheBackfillStampsTests(TestCase):
+    """Migration 0021 hands every pre-existing document an issue date.
+
+    It runs once, over live data, and afterwards nothing can tell a date it
+    invented apart from one the system stamped itself -- so what it decides
+    about a document it cannot classify is the whole risk.
+    """
+
+    def setUp(self):
+        self.customer = Customer.objects.create(
+            full_name="Backfill Customer", email="backfill@example.com"
+        )
+
+    def _output_vat(self, period):
+        return build_vat_return(*period)["output"]["output_vat"]
+
+    def _cancelled_in_march(self, status):
+        """A document raised on 10 March, then cancelled, with date_issued
+        cleared -- the state every row on the live database is in the
+        moment before the migration runs."""
+        invoice = Invoice.objects.create(
+            customer=self.customer, status=status, date_due=date(2026, 4, 30)
+        )
+        InvoiceItem.objects.create(
+            invoice=invoice, description="Fibre install", quantity=Decimal("1.00"),
+            unit_price=Decimal("1000.00"), tax_rate_pct=Decimal("15.00"),
+        )
+        invoice.recalc_totals()
+        invoice.status = Invoice.Status.CANCELLED
+        invoice.save()
+        Invoice.objects.filter(pk=invoice.pk).update(
+            date_created=date(2026, 3, 10), date_issued=None
+        )
+        invoice.refresh_from_db()
+        return invoice
+
+    def _run_the_backfill(self):
+        backfill = import_module("billing.migrations.0021_invoice_date_issued")
+        backfill.backfill_date_issued(django_apps, None)
+
+    def test_reviving_a_cancelled_quote_declares_its_vat_now_not_in_march(self):
+        """A quote that came to nothing is cancelled -- that is exactly what
+        staff are told to do with it -- and cancelled quotes are therefore
+        ordinary rows on this database. If the backfill stamps one as
+        though it were issued in March, reviving it in June declares its
+        R150 against a VAT201 that was filed in April: an amended return and
+        a penalty, for a document that was never a tax invoice in March."""
+        quote = self._cancelled_in_march(Invoice.Status.QUOTE)
+
+        self._run_the_backfill()
+
+        # Re-read it the way the API does before an edit: whatever the
+        # migration wrote is what save() sees.
+        quote = Invoice.objects.get(pk=quote.pk)
+        with mock.patch("billing.models.timezone.localdate", return_value=date(2026, 6, 15)):
+            quote.status = Invoice.Status.UNPAID
+            quote.save()
+        self.assertEqual(self._output_vat(MARCH), Decimal("0.00"))
+        self.assertEqual(self._output_vat(JUNE), Decimal("150.00"))
+
+    def test_a_cancelled_real_invoice_keeps_the_date_it_was_issued(self):
+        """The other half, and the reason the backfill covers cancelled rows
+        at all: an INV was genuinely issued before it was cancelled, so
+        leaving it NULL would let a later un-cancel stamp it with today's
+        date and move VAT that was already declared."""
+        invoice = self._cancelled_in_march(Invoice.Status.UNPAID)
+
+        self._run_the_backfill()
+
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.date_issued, date(2026, 3, 10))
+
+
+    def _issued_by_code_that_did_not_know_about_date_issued(self):
+        """An invoice raised in June with date_issued NULL -- exactly what
+        the old image writes during a deploy, once the migration has added
+        the column but before the new code is serving."""
+        invoice = Invoice.objects.create(
+            customer=self.customer, status=Invoice.Status.UNPAID, date_due=date(2026, 6, 30)
+        )
+        InvoiceItem.objects.create(
+            invoice=invoice, description="Monthly", quantity=Decimal("1.00"),
+            unit_price=Decimal("1000.00"), tax_rate_pct=Decimal("15.00"),
+        )
+        invoice.recalc_totals()
+        Invoice.objects.filter(pk=invoice.pk).update(
+            date_created=date(2026, 6, 3), date_issued=None
+        )
+        return Invoice.objects.get(pk=invoice.pk)
+
+    def test_an_invoice_with_no_issue_date_is_still_declared(self):
+        """R1000 of real work, invoiced and chased, whose R150 of output VAT
+        no return declares: NULL matches neither end of the date filter, so
+        the row is missing from its own period and from every other one --
+        a full-year return does not turn it up either."""
+        self._issued_by_code_that_did_not_know_about_date_issued()
+        self.assertEqual(self._output_vat(JUNE), Decimal("150.00"))
+
+    def test_an_invoice_with_no_issue_date_is_declared_only_once(self):
+        """And in June only. A row with no date must not fall into every
+        period instead of none of them -- that would overstate March."""
+        self._issued_by_code_that_did_not_know_about_date_issued()
+        self.assertEqual(self._output_vat(MARCH), Decimal("0.00"))

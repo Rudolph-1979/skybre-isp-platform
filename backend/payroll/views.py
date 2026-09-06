@@ -112,6 +112,19 @@ class PayrollRunViewSet(viewsets.ModelViewSet):
         run = serializer.save(generated_by=self.request.user)
         generate_payroll_run_lines(run)
 
+    def perform_update(self, serializer):
+        # Same rule as perform_destroy below and as the lines themselves
+        # (PayrollRunLineViewSet.perform_update): a finalized run is the
+        # record of what was actually paid. Its period was still writable,
+        # so a PATCH could move a signed-off run onto dates whose attendance
+        # it was never calculated from -- the payslips already handed out and
+        # the bank CSV already sent would name a period the run no longer has.
+        if serializer.instance.status == PayrollRun.Status.FINALIZED:
+            raise PermissionDenied(
+                "This payroll run is finalised. Correct it with a new run rather than editing this one."
+            )
+        serializer.save()
+
     def perform_destroy(self, instance):
         # A finalized run is the record of what was actually paid --
         # deletable draft runs are just abandoned/incorrect calculations,
@@ -212,14 +225,24 @@ class PayrollRunLineViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
     mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
     """Individual payroll lines -- list, read, and update the figures a person
     enters (PAYE, an extra amount, another deduction, a note).
 
-    No create and no delete: lines exist because a payroll run generated them
-    from attendance, and one appearing or vanishing on its own would make the
-    run disagree with the attendance it was derived from.
+    No create: lines exist because a payroll run generated them from the
+    attendance in the period, and one appearing on its own would make the run
+    disagree with what it was derived from.
+
+    Removing one from a DRAFT run is allowed, because Recalculate deliberately
+    keeps a leaver's line now (see generate_payroll_run_lines) and something
+    has to be able to take a person off a draft. A technician who resigned on
+    31 July but was still marked active when the August draft was generated
+    gets a full month's salary on that draft, and deactivating them and
+    recalculating no longer removes it -- without this, the only way out was to
+    delete the whole draft run and retype everyone's PAYE, and the alternative
+    was paying R30,000 to somebody who had left, off the bank CSV.
 
     Editing is blocked once the run is finalised. That is the whole point of
     finalising -- a signed-off run is the record of what was actually paid, and
@@ -241,6 +264,18 @@ class PayrollRunLineViewSet(
                 "This payroll run is finalised. Correct it with a new run rather than editing this one."
             )
         serializer.save()
+
+    def perform_destroy(self, instance):
+        # Same guard as editing: a finalised run is the record of what was
+        # actually paid, so a line can only be taken off while the run is still
+        # a draft. Note the person also has to be deactivated first -- they are
+        # still on the payroll otherwise, and the next Recalculate puts them
+        # back, which is the right answer for someone who has not left.
+        if instance.payroll_run.status == PayrollRun.Status.FINALIZED:
+            raise PermissionDenied(
+                "This payroll run is finalised. Correct it with a new run rather than editing this one."
+            )
+        instance.delete()
 
     @action(detail=True, methods=["get"], url_path="payslip-pdf")
     def payslip_pdf(self, request, pk=None):

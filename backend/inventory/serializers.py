@@ -123,9 +123,20 @@ class ProductSerializer(serializers.ModelSerializer):
         if product is None or value == product.tracking_type:
             return value
         if product.tracking_type == Product.TrackingType.QUANTITY:
-            held = product.movements.exists()
+            # Stock, not history. A product received and then issued out
+            # again holds nothing, so nothing can vanish from the count --
+            # and once it is serialized no further movement can be booked
+            # against it (the adjust action refuses a serialized product,
+            # and a receipt line demands serials), so those rows stay
+            # history and stay harmless. Testing movements.exists() meant a
+            # product mis-set at creation could never be put right again
+            # once a single +1/-1 correction had been booked against it.
+            held = product.quantity_on_hand
             holding = "quantity-tracked stock"
         else:
+            # Units, not the on-hand count. An issued or faulty unit is
+            # still this product's unit and can come back to the shelf; as
+            # a quantity product it would never be counted again.
             held = product.serialized_units.exists()
             holding = "individually-tracked units"
         if held:
@@ -474,7 +485,10 @@ class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSeria
                     )
                     if wanted != product.tracking_type:
                         if product.tracking_type == Product.TrackingType.QUANTITY:
-                            held = product.movements.exists()
+                            # Stock, not history -- see validate_tracking_type
+                            # for why a product whose movements net to zero
+                            # has nothing to lose by being switched.
+                            held = product.quantity_on_hand
                             holding = "quantity-tracked stock"
                         else:
                             held = product.serialized_units.exists()

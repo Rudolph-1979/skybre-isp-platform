@@ -277,6 +277,35 @@ class BillingPartnerScopingTests(TestCase):
         )
         self.assertEqual(response.status_code, 201, response.data)
 
+    def test_an_approved_requests_orphaned_row_stays_partner_scoped(self):
+        """approve() deletes the invoice, so the request's FK goes NULL --
+        but the row keeps the quote number, the customer's name and the
+        requester's reason as its audit trail. A reseller-restricted user
+        must not start seeing a competitor's once the invoice is gone, and
+        (being decided) Management could otherwise delete that trail."""
+        theirs = self._invoice(self.theirs, "80.00")
+        mine_direct = self._invoice(self.direct, "40.00")
+        gone = self._deletion_request(theirs, "theirs")
+        direct = self._deletion_request(mine_direct, "direct")
+        theirs.delete()  # what approve() does once it has been signed off
+        gone.refresh_from_db()
+        self.assertIsNone(gone.invoice_id)
+
+        self.client.force_authenticate(self.restricted)
+        listed = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        reasons = {row["reason"] for row in listed.data["results"]}
+        self.assertNotIn("theirs", reasons)
+        # A no-partner customer's request is still not owned by any reseller,
+        # so hiding the orphan must not take this one with it.
+        self.assertIn("direct", reasons)
+        detail = self.client.get(f"/api/invoice-deletion-requests/{gone.id}/")
+        self.assertEqual(detail.status_code, 404)
+
+        # The audit trail itself must survive for everyone else.
+        self.client.force_authenticate(self.unrestricted)
+        kept = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        self.assertIn("theirs", {row["reason"] for row in kept.data["results"]})
+
 class CreditApprovalTests(TestCase):
     """Approving a credit must credit it once.
 

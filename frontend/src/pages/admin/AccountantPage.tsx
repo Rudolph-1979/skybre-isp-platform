@@ -613,11 +613,23 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                   // either way; this stops the form walking staff into
                   // the error. Same reasoning as the bank-feed confirm
                   // modal below, which declines to default a rate at all.
+                  //
+                  // Moving OFF Salaries puts the default back, because that 0
+                  // was ours and not the clerk's. It used to latch: the
+                  // serializer's own error tells them to refile a payroll
+                  // bureau's invoice under Professional fees, and that fee
+                  // DOES carry VAT -- dragging the 0 across with them booked
+                  // it at 0% and quietly gave up input VAT we can claim.
                   const category = e.target.value as ExpenseCategory;
                   setForm({
                     ...form,
                     category,
-                    vat_rate_pct: category === "salaries" ? "0" : form.vat_rate_pct,
+                    vat_rate_pct:
+                      category === "salaries"
+                        ? "0"
+                        : form.category === "salaries"
+                          ? EMPTY_EXPENSE_FORM.vat_rate_pct
+                          : form.vat_rate_pct,
                   });
                 }}
               >
@@ -2882,6 +2894,24 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
     }
   }
 
+  async function handleRemoveLine(line: PayrollRunLine) {
+    // Recalculate keeps a leaver's line on purpose now, so this is the only
+    // way to take somebody off a draft: the technician who resigned before
+    // the period started but was still marked active when it was generated.
+    // Refetch the run rather than the line -- the run totals move with it.
+    if (!confirm(`Remove ${line.staff_name} from this payroll run? They won't be paid on it.`)) return;
+    setActionError("");
+    try {
+      await api.delete(`/payroll-run-lines/${line.id}/`);
+      const res = await api.get<PayrollRun>(`/payroll-runs/${selected?.id}/`);
+      setSelected(res.data);
+      refetch();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setActionError(detail || "Could not remove that line.");
+    }
+  }
+
   useEffect(() => {
     onRegisterNewAction({
       label: "+ New payroll run",
@@ -3154,6 +3184,14 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                           onClick={() => openLineEdit(line)}
                         >
                           Edit
+                        </button>
+                      )}
+                      {selected.status === "draft" && (
+                        <button
+                          className="text-xs text-[var(--status-critical)] hover:underline"
+                          onClick={() => handleRemoveLine(line)}
+                        >
+                          Remove
                         </button>
                       )}
                       <button

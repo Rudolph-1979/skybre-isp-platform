@@ -128,6 +128,11 @@ class Command(BaseCommand):
             qs = qs.filter(radius_username=options["username"])
 
         changed, skipped, offline, failed, seeded, deferred = [], 0, 0, 0, 0, 0
+        # Offline lines whose radreply actually moved this run. Counted
+        # alongside the CoAs against --limit, because for a line that is
+        # down radreply IS the speed change -- it is what the router hands
+        # it the moment it reconnects.
+        rewritten = 0
         # Devices whose STATIC simple queues need re-pushing. See the
         # re-sync below for why a CoA on its own is not enough there.
         shaper_devices = set()
@@ -161,6 +166,17 @@ class Command(BaseCommand):
                 skipped += 1
                 continue
 
+            # Both branches below move what the customer actually gets --
+            # a CoA on a live session, radreply on a line that is down --
+            # so both spend the run's budget. Rule 2 in this module's
+            # docstring counted only the CoAs, so a misconfigured
+            # network-wide window rewrote every disconnected customer's
+            # rate in a single tick, uncapped, while the run reported
+            # "0 changed".
+            if len(changed) + rewritten >= limit:
+                deferred += 1
+                continue
+
             # Only lines that are actually up can be changed in place.
             #
             # The rest still need radreply putting right. This used to say
@@ -189,13 +205,26 @@ class Command(BaseCommand):
                 #
                 # Rewriting radreply every tick is not the cost it looks
                 # like: record_rate_limit skips rows that already say this.
+                moved = 1
                 if commit:
-                    record_rate_limit(service.radius_username, target.rate_limit)
+                    moved = record_rate_limit(service.radius_username, target.rate_limit)
+                if moved:
+                    rewritten += 1
+                    self.stdout.write(
+                        f"  {service.radius_username}: {service.last_pushed_rate_limit or '(unknown)'} "
+                        f"-> {target.rate_limit}  [{describe(target)}] — waits for next login"
+                    )
+                # The STATIC simple queue has to follow the new rate too.
+                # It is only ever re-pushed after a successful CoA, so a
+                # device whose lines were ALL offline at this tick -- a
+                # tower on load-shedding when the 22:00 window opened --
+                # keeps its queues at plan speed. The boost then waits in
+                # radreply, is handed over at reconnect, and is thrown
+                # away by the static queue, because the customer gets the
+                # more restrictive of the two.
+                if commit and getattr(service.device, "enable_shaper", False):
+                    shaper_devices.add(service.device_id)
                 offline += 1
-                continue
-
-            if len(changed) >= limit:
-                deferred += 1
                 continue
 
             self.stdout.write(
@@ -247,7 +276,8 @@ class Command(BaseCommand):
             return
 
         self.stdout.write(
-            f"{len(changed)} changed · {skipped} already correct · {offline} not connected · {failed} failed"
+            f"{len(changed)} changed · {skipped} already correct · "
+            f"{offline} not connected ({rewritten} set for next login) · {failed} failed"
         )
         if deferred:
             self.stdout.write(

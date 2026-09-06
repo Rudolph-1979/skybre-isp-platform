@@ -86,3 +86,36 @@ class TrackingTypeSwitchTests(TestCase):
         self.assertEqual(product.tracking_type, Product.TrackingType.QUANTITY)
         self.assertEqual(product.quantity_on_hand, 500)
         self.assertFalse(product.serialized_units.exists(), "an edit must not create units")
+
+    def test_a_quantity_product_whose_stock_has_all_been_issued_can_still_be_corrected(self):
+        """A product mis-set to quantity when it was created, received once
+        and then issued out again, holds nothing at all -- so nothing can
+        vanish from the count. Stores has to be able to put the Tracking
+        dropdown right, instead of being told for ever to create a duplicate
+        catalogue entry for equipment that is already in the catalogue."""
+        product = Product.objects.create(
+            name="Mikrotik hAP ax2", tracking_type=Product.TrackingType.QUANTITY
+        )
+        StockMovement.objects.create(
+            product=product,
+            movement_type=StockMovement.MovementType.RECEIPT,
+            quantity=10,
+        )
+        StockMovement.objects.create(
+            product=product,
+            movement_type=StockMovement.MovementType.ISSUE,
+            quantity=-10,
+        )
+        self.assertEqual(product.quantity_on_hand, 0)
+
+        res = self.client.patch(
+            f"/api/products/{product.pk}/", {"tracking_type": "serialized"}, format="json"
+        )
+
+        self.assertEqual(res.status_code, 200, res.data)
+        product.refresh_from_db()
+        self.assertEqual(product.tracking_type, Product.TrackingType.SERIALIZED)
+        # Nothing was lost by allowing it: the movement history is still
+        # there, and the on-hand figure is the same 0 it was before.
+        self.assertEqual(product.movements.count(), 2)
+        self.assertEqual(product.quantity_on_hand, 0)

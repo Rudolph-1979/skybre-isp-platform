@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils.dateparse import parse_date
 from rest_framework import permissions, viewsets
@@ -64,9 +65,20 @@ def _sum_output_vat(period_start, period_end):
     # because of the date. Invoice.date_issued is stamped the day the
     # document actually becomes a tax invoice, which is the day the VAT
     # becomes due, and is what the accrual basis turns on.
+    # Fall back to date_created when date_issued is NULL, the same way
+    # notifications.pdf dates a document. A NULL matches neither >= nor
+    # <=, so a countable invoice with no issue date is invisible to its own
+    # period AND to every other one -- a full-year return does not turn it
+    # up either, so nothing would ever find it. That is not a theoretical
+    # row: deploy.sh applies migrations while the old containers are
+    # deliberately left serving, so anything invoiced in that gap was
+    # written by code that had never heard of this column. date_created is
+    # the day it was raised, which for such a row is the day it was issued.
+    issued_on = Coalesce("invoice__date_issued", "invoice__date_created")
     items = (
         InvoiceItem.objects
-        .filter(invoice__date_issued__gte=period_start, invoice__date_issued__lte=period_end)
+        .annotate(issued_on=issued_on)
+        .filter(issued_on__gte=period_start, issued_on__lte=period_end)
         .exclude(invoice__status__in=exclude_statuses)
         .only("quantity", "unit_price", "tax_rate_pct", "invoice_id")
     )

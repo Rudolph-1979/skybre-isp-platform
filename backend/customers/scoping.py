@@ -67,4 +67,14 @@ def scope_by_customer(qs, user, path="customer", allow_null=True):
     )
     if allow_null:
         condition |= Q(**{f"{path}__isnull": True})
+    else:
+        # The "no partner" branch above is a LEFT JOIN test, so a row whose
+        # own FK is NULL joins to nothing, reads back as partner IS NULL and
+        # matches anyway -- swallowing the very rows allow_null=False exists
+        # to hide. The live case is an approved InvoiceDeletionRequest: the
+        # invoice is deleted and the FK goes NULL, but the row keeps the
+        # quote number, the customer's name and the reason, so every
+        # reseller-restricted user inherited another partner's audit trail.
+        # Say NOT NULL out loud instead of leaning on the OR.
+        condition &= Q(**{f"{path}__isnull": False})
     return qs.filter(condition)

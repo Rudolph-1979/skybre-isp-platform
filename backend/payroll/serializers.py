@@ -168,7 +168,13 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "status", "generated_by", "created_at", "finalized_at", "lines"]
 
     def validate(self, attrs):
-        if attrs["period_end"] < attrs["period_start"]:
+        # A PATCH sends one field, so attrs may carry only one end of the
+        # period. Subscripting both raised KeyError, which reached the caller
+        # as a 500 rather than a validation error -- and the half of the
+        # period they did send went unchecked. Fall back to what is stored.
+        start = attrs.get("period_start", getattr(self.instance, "period_start", None))
+        end = attrs.get("period_end", getattr(self.instance, "period_end", None))
+        if start is not None and end is not None and end < start:
             raise serializers.ValidationError("Period end must be on or after period start.")
         return attrs
 

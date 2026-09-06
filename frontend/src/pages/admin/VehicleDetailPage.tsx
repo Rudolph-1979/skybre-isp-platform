@@ -5,6 +5,7 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { apiErrorMessage } from "../../utils/apiError";
 import type { FuelLog, OdometerReading, ServiceRecord, StaffProfile, User, Vehicle } from "../../types";
 
 function formatDate(iso: string) {
