@@ -106,6 +106,31 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
+## Four findings from the first audit that were never acted on
+
+Found 2026-09-06 by reconciling every finding ever raised against the files
+the branch actually changed. These were in the first audit's results, were
+never verified, never fixed, and — worse — were never written down here.
+That is the third time this tracking gap has bitten; the reconciliation
+script is the fix, and the list below is the result.
+
+- [ ] **[high]** A billing run done a day late permanently shifts the
+  customer's billing date forward, and the next month's on-time run then
+  skips them — a whole month never invoiced. `billing/recurring.py:214`
+- [ ] **[medium]** Anniversary billing reads the day-of-month off
+  `created_at` in **UTC**, so a customer created just after midnight SAST
+  is billed on the wrong day; and an exact `==` on day-of-month means a due
+  day of 29/30/31 never matches in a shorter month, so no invoice is raised
+  at all. `billing/recurring.py:155`
+- [ ] **[medium]** Approving a leave request twice deducts the days twice;
+  a failure between the two writes deducts the days while leaving the
+  request pending. `payroll/views.py:336`
+- [ ] **[medium]** A finalized payroll run's period is still writable, and
+  a partial PATCH of one date raises `KeyError` → HTTP 500.
+  `payroll/serializers.py:171`
+
+All four are being verified now. None should be acted on before that.
+
 ## Network / RADIUS — where it actually stands (2026-09-06)
 
 Fixed and verified by probe: the SNMP community is no longer readable
