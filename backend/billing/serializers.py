@@ -661,6 +661,24 @@ class InvoiceDeletionRequestSerializer(serializers.ModelSerializer):
         return value
 
     def validate_invoice(self, value):
+        # Scoped here as well as on the queryset. get_queryset covers
+        # reading and approving, but CREATE resolves the invoice straight
+        # from the id in the body, so a reseller-restricted user could
+        # still POST against a competitor's quote -- and the 201 handed
+        # back its number, its status and the customer's name, which is
+        # exactly what the scoping was added to hide. 404-equivalent
+        # wording, so this cannot be used to probe which ids exist.
+        from customers.scoping import scope_by_customer
+
+        request = self.context.get("request")
+        if request is not None and value.customer_id is not None:
+            visible = scope_by_customer(
+                Invoice.objects.filter(pk=value.pk), request.user,
+                path="customer", allow_null=False,
+            )
+            if not visible.exists():
+                raise serializers.ValidationError("No such quote or pro forma invoice.")
+
         if value.status not in Invoice.PRE_INVOICE_STATUSES:
             raise serializers.ValidationError(
                 "Only quotes and pro forma invoices can be requested for deletion this way."

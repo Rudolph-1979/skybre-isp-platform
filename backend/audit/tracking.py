@@ -37,6 +37,12 @@ SENSITIVE_FIELDS = frozenset(
         "radius_password",
         "smtp_password",
         "api_key",
+        # The SNMP community is the read password for every device on the
+        # network. The API keeps it write_only and the admin excludes it,
+        # and both of those were pointless while an edit wrote the old and
+        # new values into the audit trail in plain text -- which is read by
+        # more people than the device page itself.
+        "snmp_community",
     }
 )
 

@@ -100,3 +100,23 @@ class DeviceSecretsTests(TestCase):
         res = self._get(self.staff, f"/api/devices/{self.device.id}/")
         self.assertNotIn("api_password", res.data)
         self.assertTrue(res.data["api_password_set"])
+
+    def test_the_audit_trail_does_not_carry_the_community_either(self):
+        """Making the field write_only on the API achieved nothing while an
+        edit wrote the old and new values into the audit trail in plain
+        text -- and the audit trail is read by more people than the device
+        page. That a secret changed is worth recording; what it was is not.
+        """
+        from audit.models import AuditEvent
+
+        self.client.force_authenticate(self.admin)
+        response = self.client.patch(
+            f"/api/devices/{self.device.id}/", {"snmp_community": "rotated-value"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        trail = " ".join(str(e.changes) for e in AuditEvent.objects.all())
+        self.assertNotIn(COMMUNITY, trail, "the old community leaked into the audit trail")
+        self.assertNotIn("rotated-value", trail, "the new community leaked into the audit trail")
+        self.assertIn("snmp_community", trail, "the fact that it changed must still be recorded")
+

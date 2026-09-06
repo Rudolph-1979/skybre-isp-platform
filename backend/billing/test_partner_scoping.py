@@ -249,6 +249,34 @@ class BillingPartnerScopingTests(TestCase):
         self.assertEqual({"mine", "theirs"}, reasons)
 
 
+    def test_another_partners_quote_cannot_have_a_deletion_request_raised(self):
+        """The queryset covers reading and approving. CREATE resolves the
+        invoice straight from the id in the body, so a restricted user
+        could still POST against a competitor's quote -- and the 201 came
+        back carrying its number, its status and the customer's name,
+        which is precisely what the scoping was added to hide."""
+        quote = self._invoice(self.theirs, "80.00")
+        quote.status = Invoice.Status.QUOTE
+        quote.save(update_fields=["status"])
+        self.client.force_authenticate(self.restricted)
+        response = self.client.post(
+            "/api/invoice-deletion-requests/",
+            {"invoice": quote.id, "reason": "not mine to delete"}, format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertNotIn("Rival Customer", str(response.data))
+
+    def test_my_own_partners_quote_can_still_have_one_raised(self):
+        quote = self._invoice(self.mine, "80.00")
+        quote.status = Invoice.Status.QUOTE
+        quote.save(update_fields=["status"])
+        self.client.force_authenticate(self.restricted)
+        response = self.client.post(
+            "/api/invoice-deletion-requests/",
+            {"invoice": quote.id, "reason": "customer went quiet"}, format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+
 class CreditApprovalTests(TestCase):
     """Approving a credit must credit it once.
 
