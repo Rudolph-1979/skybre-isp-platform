@@ -211,7 +211,26 @@ def _generate_document(customer, config, run_date, run, commit):
     if config.send_billing_notifications:
         _send_after_commit(doc_type, customer, invoice=invoice)
 
-    config.next_billing_date = _add_period(run_date, config.payment_period)
+    # Advance from the date the customer was DUE, not from the date the Run
+    # button happened to be clicked.
+    #
+    # Nothing schedules this engine yet -- staff click Preview -> Run on the
+    # Finance screen each cycle -- so a run landing on the 5th because the
+    # 1st was a Sunday is the ordinary case, not an accident. Anchoring on
+    # run_date moved that customer to the 5th of every month, and the
+    # following month's ON TIME run then found them not yet due and skipped
+    # them: a whole month of service never invoiced, R575 gone per customer,
+    # with the month after that looking completely normal so nobody ever
+    # went looking.
+    #
+    # Advancing one period from the due date means a run that is more than a
+    # period late catches the missed cycle up on the next run rather than
+    # losing it. Billing for service that was actually delivered is the
+    # right direction to err in, and it cannot double-bill within a cycle
+    # because _invoice_due still gates on run_date >= next_billing_date.
+    config.next_billing_date = _add_period(
+        config.next_billing_date or run_date, config.payment_period
+    )
     config.save(update_fields=["next_billing_date"])
     return doc_type
 

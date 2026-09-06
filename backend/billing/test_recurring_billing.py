@@ -317,3 +317,70 @@ class InvoiceNumberingTests(TestCase):
         quote.refresh_from_db()
         self.assertEqual(quote.number, "INV-000002")
         self.assertEqual(quote.status, Invoice.Status.UNPAID)
+
+
+class LateRunTests(RecurringBillingRunTestCase):
+    """A Run clicked a few days after the customer was actually due.
+
+    Nothing schedules this engine yet -- staff click Preview -> Run on the
+    Finance screen each cycle -- so a run landing on the 5th because the
+    1st was a Sunday is the ordinary case, not a rare accident.
+    """
+
+    def _month_start(self, months_back):
+        index = self.today.month - 1 - months_back
+        return datetime.date(self.today.year + index // 12, index % 12 + 1, 1)
+
+    def _due_on(self, customer, day):
+        config = customer.billing_config
+        config.next_billing_date = day
+        config.save(update_fields=["next_billing_date"])
+
+    def test_a_late_run_does_not_make_next_months_on_time_run_skip_the_customer(self):
+        """January's Run is clicked on the 5th. February's is clicked on
+        time -- and that customer must still be billed for February.
+
+        Advancing the cycle from the day Run was clicked moved them to the
+        5th of every month, so the on-time February run found them not yet
+        due and February was never invoiced at all. R575 per customer,
+        silently, with March looking normal again afterwards.
+        """
+        customer = self._billable("Late Larry")
+        january, february = self._month_start(2), self._month_start(1)
+        self._due_on(customer, january)
+
+        run_recurring_billing(january + datetime.timedelta(days=4), commit=True)
+        run_recurring_billing(february, commit=True)
+
+        self.assertEqual(
+            customer.invoices.count(), 2,
+            "a month of service went uninvoiced because the previous run was four days late",
+        )
+
+    def test_a_late_run_still_only_bills_once_for_that_cycle(self):
+        """The mirror image, and the reason the fix is an advance rather
+        than 'always bill': clicking Run again later in the same month must
+        not raise a second invoice for a month already billed."""
+        customer = self._billable("Larry Again")
+        january = self._month_start(2)
+        self._due_on(customer, january)
+
+        run_recurring_billing(january + datetime.timedelta(days=4), commit=True)
+        run_recurring_billing(january + datetime.timedelta(days=11), commit=True)
+
+        self.assertEqual(
+            customer.invoices.count(), 1,
+            "a second Run inside the same cycle billed the customer twice",
+        )
+
+    def test_the_cycle_returns_to_the_customers_own_billing_day(self):
+        """After a late run the customer must be back on their real day,
+        not permanently shifted to whenever the button was pressed."""
+        customer = self._billable("Larry Third")
+        january, february = self._month_start(2), self._month_start(1)
+        self._due_on(customer, january)
+
+        run_recurring_billing(january + datetime.timedelta(days=4), commit=True)
+        customer.billing_config.refresh_from_db()
+        self.assertEqual(customer.billing_config.next_billing_date, february)
+
