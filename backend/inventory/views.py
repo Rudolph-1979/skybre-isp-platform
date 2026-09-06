@@ -1,3 +1,4 @@
+from django.db import transaction
 from rest_framework import viewsets, permissions, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -88,12 +89,27 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
         if delta == 0:
             return Response({"detail": "quantity must be non-zero."}, status=400)
-        if delta < 0 and product.quantity_on_hand + delta < 0:
-            return Response(
-                {"detail": f"Cannot remove {-delta} — only {product.quantity_on_hand} in stock."},
-                status=400,
+
+        # Under the same product-row lock the stock-issue path takes.
+        # quantity_on_hand is a SUM over StockMovement, so checking it and
+        # then writing a movement is the identical read-then-write race:
+        # a technician drawing the last 5 boxes while a storeman writes 5
+        # off for breakage both saw 5 and both wrote, leaving -5. The
+        # issue path was given the lock and this endpoint was not, so the
+        # invariant only held on one side of it.
+        with transaction.atomic():
+            product = (
+                Product.objects.select_for_update().get(pk=product.pk)
             )
-        note = request.data.get("note", "") or "Manual adjustment"
+            if delta < 0 and product.quantity_on_hand + delta < 0:
+                return Response(
+                    {"detail": f"Cannot remove {-delta} — only {product.quantity_on_hand} in stock."},
+                    status=400,
+                )
+            note = request.data.get("note", "") or "Manual adjustment"
+            return self._write_adjustment(product, delta, note, request)
+
+    def _write_adjustment(self, product, delta, note, request):
         StockMovement.objects.create(
             product=product,
             movement_type=StockMovement.MovementType.ADJUSTMENT,

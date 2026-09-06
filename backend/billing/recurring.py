@@ -152,7 +152,13 @@ def _add_period(base_date, period):
 
 def _billing_due_day(customer, config):
     if config.use_date_of_customer_creation:
-        return customer.created_at.day
+        # localtime() first. created_at is stored in UTC, and Skybre is
+        # UTC+2, so a customer signed up at 00:30 on the 1st is stored as
+        # 22:30 on the LAST DAY OF THE PREVIOUS MONTH -- .day on the raw
+        # value said 31, and their anniversary billing landed on the wrong
+        # day for ever. Every other date decision in this file already
+        # works in local time; this one read the column directly.
+        return timezone.localtime(customer.created_at).day
     return config.billing_day
 
 
@@ -161,7 +167,15 @@ def _invoice_due(customer, config, run_date):
         return False
     if config.next_billing_date:
         return run_date >= config.next_billing_date
-    return run_date.day == _billing_due_day(customer, config)
+    # Clamped to the end of a short month. An exact match on day-of-month
+    # meant an anniversary of the 29th, 30th or 31st simply never came
+    # round in a month that has no such day: a customer who signed up on
+    # the 31st got no invoice at all in April, June, September or November,
+    # and never in February. Not a late invoice -- no invoice, every short
+    # month, for as long as they are a customer.
+    due_day = _billing_due_day(customer, config)
+    last_day_this_month = calendar.monthrange(run_date.year, run_date.month)[1]
+    return run_date.day == min(due_day, last_day_this_month)
 
 
 def _generate_document(customer, config, run_date, run, commit):

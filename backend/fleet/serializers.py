@@ -43,7 +43,20 @@ class OdometerReadingSerializer(serializers.ModelSerializer):
             # reading, so every honest reading afterwards sat below it and
             # was rejected, the vehicle's current km froze at the typo,
             # and the fleet list read Overdue for the rest of its life.
-            earlier = qs.filter(recorded_at__lte=recorded_at).order_by("-recorded_at", "-id").first()
+            # __lt, not __lte: a reading stamped at the same instant as an
+            # existing one is not "after" it. A vehicle cannot read two
+            # different numbers at once, and treating an equal timestamp as
+            # later let the higher of the pair straight through -- which is
+            # the poisoning route all over again, reachable with the
+            # timestamp the log-reading form pre-fills.
+            same_instant = qs.filter(recorded_at=recorded_at).exclude(reading_km=reading_km)
+            if same_instant.exists():
+                raise serializers.ValidationError(
+                    f"There is already a reading of {same_instant.first().reading_km} km at exactly "
+                    "this time. A vehicle can only read one number at one moment -- correct that "
+                    "reading instead, or give this one the time it was actually taken."
+                )
+            earlier = qs.filter(recorded_at__lt=recorded_at).order_by("-recorded_at", "-id").first()
             if earlier and reading_km < earlier.reading_km:
                 raise serializers.ValidationError(
                     f"Odometer reading can't be lower than the {earlier.reading_km} km already "

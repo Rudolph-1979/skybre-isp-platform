@@ -89,7 +89,15 @@ class SalaryExpenseVatTests(TestCase):
     # ---- everything else still carries VAT normally ---------------------
 
     def test_a_bandwidth_expense_still_defaults_to_15(self):
-        response = self._post(category=Expense.Category.BANDWIDTH, description="IP transit")
+        """OMITS the rate, so it really does exercise the model default.
+        It used to send an explicit "15" through the shared body and assert
+        the value it had just sent -- which is why the create-path hole
+        above shipped with this test green."""
+        body = {
+            "category": Expense.Category.BANDWIDTH, "description": "IP transit",
+            "date": "2026-09-25", "amount_excl_vat": "12000.00", "supplier_name": "Transit Co",
+        }
+        response = self.client.post("/api/expenses/", body, format="json")
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(Expense.objects.get().vat_rate_pct, Decimal("15.00"))
 

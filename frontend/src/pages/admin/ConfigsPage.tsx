@@ -1026,7 +1026,7 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
               <input
                 type="password"
                 className={inputClass}
-                minLength={8}
+                minLength={10}
                 value={form.password}
                 onChange={(e) => setForm({ ...form, password: e.target.value })}
                 autoComplete="new-password"

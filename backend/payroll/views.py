@@ -1,6 +1,7 @@
 import csv
 from decimal import Decimal
 
+from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import mixins, permissions, viewsets
@@ -361,10 +362,24 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         if request.user.role != request.user.Role.ADMIN:
             raise PermissionDenied("Only an admin can approve leave requests.")
-        leave = self.get_object()
-        if leave.status != LeaveRequest.Status.PENDING:
-            return Response({"detail": "This request has already been decided."}, status=400)
+        # One transaction, and the request row locked before it is read.
+        #
+        # This deducted the balance and then saved the decision as two
+        # separate autocommit writes, with the PENDING check made on an
+        # unlocked read. Two admins clicking Approve at once -- or one
+        # double-clicking -- both passed the check and both deducted, so a
+        # 3-day request took 6 days off. And a failure between the two
+        # writes left the days deducted with the request still PENDING,
+        # so approving it again deducted them a second time. Reproduced:
+        # a 3-day request took a 15-day balance to 12, then to 9.
+        with transaction.atomic():
+            leave = LeaveRequest.objects.select_for_update().get(pk=self.get_object().pk)
+            if leave.status != LeaveRequest.Status.PENDING:
+                return Response({"detail": "This request has already been decided."}, status=400)
 
+            return self._approve_locked(request, leave)
+
+    def _approve_locked(self, request, leave):
         profile = getattr(leave.staff, "staff_profile", None)
         if profile is not None:
             field_name = leave.balance_field_name()

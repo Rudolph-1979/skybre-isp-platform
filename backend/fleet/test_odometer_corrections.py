@@ -156,3 +156,30 @@ class OdometerCorrectionTests(TestCase):
         self.vehicle.refresh_from_db()
         self.assertEqual(self.vehicle.current_odometer_km, 46200)
 
+    def test_two_readings_at_the_very_same_instant_are_refused(self):
+        """A vehicle cannot read two different numbers at one moment. The
+        rule compared "at or before" against "strictly after", so an equal
+        timestamp counted purely as later and the higher of the pair went
+        straight in -- and since current km is the maximum, that poisoned
+        the vehicle exactly as a typo would. The log-reading form pre-fills
+        the timestamp, so hitting it twice is all it takes."""
+        first = self._reading(45000)
+        response = self.client.post(
+            "/api/odometer-readings/",
+            {"vehicle": self.vehicle.pk, "reading_km": 90000,
+             "recorded_at": first.recorded_at.isoformat()},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.vehicle.refresh_from_db()
+        self.assertEqual(self.vehicle.current_odometer_km, 45000)
+
+    def test_re_saving_the_same_reading_at_the_same_instant_is_fine(self):
+        """Only a CONTRADICTION is refused. Correcting a reading without
+        moving its timestamp must still work."""
+        reading = self._reading(45000)
+        response = self.client.patch(
+            f"/api/odometer-readings/{reading.pk}/", {"notes": "checked twice"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+

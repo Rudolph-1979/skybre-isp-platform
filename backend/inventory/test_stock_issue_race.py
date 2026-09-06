@@ -121,3 +121,31 @@ class StockIssueRaceTests(TransactionTestCase):
         self.assertLess(
             locks[0], counts[0], "stock was counted before the row was locked"
         )
+
+    def test_the_manual_adjustment_endpoint_takes_the_same_lock(self):
+        """The stock-issue path relies on the product row being the lock.
+        The manual write-off endpoint did the identical read-then-write
+        with no lock and no transaction, so a technician drawing the last
+        5 boxes while a storeman wrote 5 off for breakage both read 5,
+        both wrote, and stock ended at -5."""
+        client = APIClient()
+        client.force_authenticate(self.staff)
+        with CaptureQueriesContext(connection) as captured:
+            response = client.post(
+                f"/api/products/{self.product.pk}/adjust/",
+                {"quantity": -1, "note": "breakage"}, format="json",
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        locked = [q["sql"] for q in captured.captured_queries
+                  if "inventory_product" in q["sql"].lower() and "for update" in q["sql"].lower()]
+        self.assertTrue(locked, "the manual adjustment did not lock the product row")
+
+    def test_the_adjustment_still_refuses_to_go_negative(self):
+        client = APIClient()
+        client.force_authenticate(self.staff)
+        response = client.post(
+            f"/api/products/{self.product.pk}/adjust/",
+            {"quantity": -99, "note": "typo"}, format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+

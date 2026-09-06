@@ -153,3 +153,40 @@ class ForgotPasswordScreenPolicyTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password(STRONG))
+
+
+class TheMinimumIsExactlyTenTests(TestCase):
+    """Pinning the boundary itself.
+
+    Every password in the file above is 11-15 characters and the only
+    length assertion is a 9-character refusal, so the suite pinned the
+    minimum to "somewhere in 10..15" -- tightening the setting to 12 would
+    have left it entirely green while every admin creating an account and
+    every new hire following an invite hit a wall.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="tech", password="x", role="support")
+        self.factory = APIRequestFactory()
+
+    def _confirm(self, new_password):
+        request = self.factory.post("/x", {
+            "uid": urlsafe_base64_encode(force_bytes(self.user.pk)),
+            "token": default_token_generator.make_token(self.user),
+            "new_password": new_password,
+        }, format="json")
+        return PasswordResetConfirmView.as_view()(request)
+
+    def test_exactly_ten_characters_is_accepted(self):
+        """'Vlei-Otter' is exactly 10 and clears the other three rules, so
+        only the length boundary can decide it."""
+        self.assertEqual(len("Vlei-Otter"), 10)
+        response = self._confirm("Vlei-Otter")
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_exactly_nine_characters_is_refused(self):
+        self.assertEqual(len("Vlei-Otte"), 9)
+        response = self._confirm("Vlei-Otte")
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("10 characters", " ".join(str(m) for m in response.data["new_password"]))
+
