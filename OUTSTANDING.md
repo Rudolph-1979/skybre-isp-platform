@@ -106,39 +106,37 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
-## Where every claim stands (2026-09-06, latest pass)
+## Where every claim stands (2026-09-06, after the fix pass)
 
-63 candidate findings have been raised across two audits and one review of
-this branch's own diff. Reconciling them produced this. It is the honest
-count, not a reassuring one.
+63 candidate findings across two audits and one review of this branch's own
+diff.
 
-**Confirmed and fixed, with a reproduction and a test for each: 15.**
-Including three blockers and, worst of all, a late billing run silently
-losing a whole month of invoices for every affected customer.
+**Confirmed, reproduced and fixed: 24.** Each has a test that fails against
+the commit before its fix. Includes four blockers -- a late billing run
+losing a whole month of invoices, UIF charged twice on an ordinary pay
+cycle, a rounded workshop odometer discarding a service, and a line that
+only looked offline never getting its speed change.
 
-**Confirmed real, reproduced, NOT yet fixed: 9.** Fix plans exist for
-these; they have not been applied.
+**Refuted on inspection: 2.**
 
-- [ ] **[serious]** Backfill stamps cancelled QUOTES as issued tax invoices
-- [ ] **[serious]** A line that was offline when a speed window opened never gets its static shaper queue re-synced
-- [ ] **[serious]** --limit no longer caps anything for offline lines, and the writes are invisible in both dry run and log
-- [ ] **[serious]** allow_null=False is a no-op on the deletion-request queryset — an approved request's orphaned row stays visible to every restricted user
-- [ ] **[minor]** Recalculate can no longer take anyone off a draft run, and there is no other way to remove a line
-- [ ] **[minor]** A NULL date_issued is silently invisible to every VAT return, and the backfill runs while the old code is still writing invoices
-- [ ] **[minor]** Tracking type can no longer be corrected on a product whose stock is already zero
-- [ ] **[minor]** Picking Salaries latches the VAT rate to 0 and nothing puts it back
-- [ ] **[minor]** A finalized payroll run's period is still writable, and a partial PATCH of one date raises KeyError -> HTTP 500
+**Never checked at all: 9.** Three of seven verification groups ran out of
+budget before they ran. These are neither confirmed nor refuted:
 
-**Not yet checked at all: 9.** Three of the seven verification groups ran
-out of budget. Those claims are neither confirmed nor refuted and are
-listed in the sections above this one.
+- 4 self-review claims about test quality (the payment-ledger concurrency
+  tests being single-threaded; the expenses default-rate test asserting
+  the value it sent; the password-policy boundary test using a 15-character
+  password; date_issued being wired into the invoice PDF and the VAT return
+  but not the statement, the invoice serializer, the filters or the sort)
+- 2 about impossible data (two odometer readings at the same instant; the
+  manual stock-adjust endpoint not taking the product lock the stock-issue
+  path now relies on)
+- 3 remaining minor items
 
-**Refuted on inspection: 2** -- the UIF day-split concern (the
-implementation had already been replaced) and the UIF test-quality concern
-(the tests had already been rewritten).
+None is a blocker on its own evidence, but nor has any been checked, and
+most checked claims so far have turned out real.
 
-Nothing here should be read as "the rest is fine". The rest is *unchecked*,
-and the pattern so far is that most checked claims turn out to be real.
+**Still not closable from here:** nothing has run against real MikroTik
+hardware. Every CoA, shaper and blocking test is against a FakeNAS.
 
 ## Four findings from the first audit that were never acted on
 
