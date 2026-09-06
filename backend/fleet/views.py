@@ -69,16 +69,26 @@ class VehicleViewSet(viewsets.ModelViewSet):
         if odometer_km < 0:
             return Response({"detail": "odometer_km can't be negative."}, status=400)
 
-        # The odometer typed here lands in the vehicle's history, so it
-        # gets the same sanity check as a reading logged by hand -- one
-        # rule, in one place. It used to be written straight to the
-        # database unchecked, and a slipped digit stuck: 4500 for 45000
-        # reset the km countdown from a number the bakkie passed years
-        # ago, so it read Overdue the moment it left the workshop, and
-        # 450000 for 45000 froze its current km at the typo because every
-        # honest reading afterwards was then rejected for being lower.
-        # Checked BEFORE the ServiceRecord is written, so a refused typo
-        # leaves nothing behind to clean up.
+        # The odometer typed here also lands in the vehicle's reading
+        # history, so it gets the same check as a reading logged by hand --
+        # which catches a digit slipped DOWNWARDS (4500 for 45000), where
+        # the number contradicts a reading already on file.
+        #
+        # It does NOT catch one slipped upwards. 450000 for 45000 is the
+        # newest and highest reading, so nothing on file contradicts it,
+        # and no rule here can tell it from a vehicle that genuinely has
+        # not been read in a long time without inventing a threshold. An
+        # earlier version of this comment claimed the upward slip was
+        # prevented. It is not. What is true is that it is now RECOVERABLE:
+        # both the reading and the service record can be corrected from the
+        # vehicle page.
+        #
+        # A failed check does not refuse the service. The service happened;
+        # refusing to record it strands the vehicle on "In Service" with no
+        # way forward, and the odometer is the least important thing on the
+        # record. Workshop invoices routinely round -- 45 000 against a
+        # driver's 45 123 two days earlier is a rounding, not a lie -- and
+        # that used to return 400 and lose the whole service.
         reading = OdometerReadingSerializer(
             data={
                 "vehicle": vehicle.pk,
@@ -87,8 +97,33 @@ class VehicleViewSet(viewsets.ModelViewSet):
                 "notes": "Logged automatically from a service record.",
             }
         )
+        # One number IS refusable without inventing a threshold: one that
+        # would make the service overdue the moment it is recorded. Next
+        # due is odometer + interval, so if that lands behind the km the
+        # vehicle has already done, the figure cannot be what the workshop
+        # saw -- 4 500 typed for 45 000 on a 10 000 km interval is due at
+        # 14 500 against 45 000 already travelled. Recording it would set
+        # the bakkie to Overdue the moment it drove out and keep it there.
+        # This is derived from the vehicle's own interval rather than a
+        # guessed tolerance, which is why it can be a hard refusal.
+        if odometer_km + vehicle.service_interval_km <= vehicle.current_odometer_km:
+            return Response(
+                {"odometer_km": [
+                    f"{odometer_km:,} km would put this vehicle's next service at "
+                    f"{odometer_km + vehicle.service_interval_km:,} km, which it passed a while ago "
+                    f"-- it has already done {vehicle.current_odometer_km:,} km. Check the figure "
+                    f"on the invoice."
+                ]},
+                status=400,
+            )
+
+        odometer_warning = None
         if not reading.is_valid():
-            return Response(reading.errors, status=400)
+            odometer_warning = (
+                "The service was recorded, but this odometer reading was not added to the "
+                "vehicle's history because it contradicts a reading already on file: "
+                + " ".join(str(m) for messages in reading.errors.values() for m in messages)
+            )
 
         ServiceRecord.objects.create(
             vehicle=vehicle,
@@ -97,7 +132,7 @@ class VehicleViewSet(viewsets.ModelViewSet):
             notes=notes,
             logged_by=request.user,
         )
-        if odometer_km > vehicle.current_odometer_km:
+        if odometer_warning is None and odometer_km > vehicle.current_odometer_km:
             reading.save(recorded_by=request.user)
         # Logging the service IS the vehicle coming back from the workshop,
         # so it comes off "In Service" here rather than needing a second,
@@ -108,7 +143,13 @@ class VehicleViewSet(viewsets.ModelViewSet):
             vehicle.in_service_since = None
             vehicle.save(update_fields=["in_service_since"])
         vehicle.refresh_from_db()
-        return Response(VehicleSerializer(vehicle).data, status=201)
+        payload = VehicleSerializer(vehicle).data
+        if odometer_warning:
+            # Surfaced rather than swallowed: the service saved, but the
+            # figure on the workshop invoice disagrees with the vehicle's
+            # history and somebody has to look at it.
+            payload["odometer_warning"] = odometer_warning
+        return Response(payload, status=201)
 
     @action(detail=True, methods=["post"], url_path="book-in")
     def book_in(self, request, pk=None):

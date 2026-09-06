@@ -198,7 +198,36 @@ export function VehicleDetailPage() {
       )
     )
       return;
-    await api.delete(`/odometer-readings/${reading.id}/`);
+    try {
+      await api.delete(`/odometer-readings/${reading.id}/`);
+    } catch (err) {
+      // A refused delete used to reject unhandled: the dialog closed, the
+      // row stayed, and nothing said why.
+      setReadingError(apiErrorMessage(err, "Could not delete that reading — please try again."));
+      return;
+    }
+    refetchAll();
+  }
+
+  async function handleDeleteService(service: ServiceRecord) {
+    // "Next service due" is measured from the newest service record, so a
+    // service logged at a mistyped odometer moves the due mark somewhere
+    // the vehicle will not reach for years -- and the fleet list then reads
+    // a calm "ok" for a bakkie nobody is servicing. That is the quiet
+    // failure, so the record has to be removable. Deleting it falls back to
+    // the previous service, or to no service at all.
+    if (
+      !confirm(
+        `Delete the service of ${formatDate(service.service_date)} at ${service.odometer_km.toLocaleString()} km? "Next service due" will be worked out from the one before it.`
+      )
+    )
+      return;
+    try {
+      await api.delete(`/service-records/${service.id}/`);
+    } catch (err) {
+      setServiceError(apiErrorMessage(err, "Could not delete that service record — please try again."));
+      return;
+    }
     refetchAll();
   }
 
@@ -434,7 +463,6 @@ export function VehicleDetailPage() {
                 <TH>Logged by</TH>
                 <TH>Notes</TH>
                 <TH></TH>
-                <TH></TH>
               </tr>
             </THead>
             <tbody>
@@ -480,6 +508,7 @@ export function VehicleDetailPage() {
                 <TH>Odometer</TH>
                 <TH>Logged by</TH>
                 <TH>Notes</TH>
+                <TH></TH>
               </tr>
             </THead>
             <tbody>
@@ -489,6 +518,14 @@ export function VehicleDetailPage() {
                   <TD className="tabular-nums">{s.odometer_km.toLocaleString()} km</TD>
                   <TD>{s.logged_by_name || "—"}</TD>
                   <TD>{s.notes || "—"}</TD>
+                  <TD>
+                    <button
+                      className="text-xs text-[var(--status-critical)] hover:underline"
+                      onClick={() => handleDeleteService(s)}
+                    >
+                      Delete
+                    </button>
+                  </TD>
                 </TR>
               ))}
               {services.length === 0 && (

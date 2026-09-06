@@ -15,7 +15,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import User
-from fleet.models import OdometerReading, Vehicle
+from fleet.models import OdometerReading, ServiceRecord, Vehicle
 
 
 class OdometerCorrectionTests(TestCase):
@@ -32,6 +32,13 @@ class OdometerCorrectionTests(TestCase):
         return OdometerReading.objects.create(
             vehicle=self.vehicle, reading_km=km, recorded_by=self.staff,
             recorded_at=timezone.now() - datetime.timedelta(days=days_ago),
+        )
+
+    def _mark_serviced(self, service_date, odometer_km):
+        return self.client.post(
+            f"/api/vehicles/{self.vehicle.pk}/mark_serviced/",
+            {"service_date": str(service_date), "odometer_km": odometer_km},
+            format="json",
         )
 
     def _log(self, km, days_ago=0):
@@ -103,3 +110,49 @@ class OdometerCorrectionTests(TestCase):
             format="json",
         )
         self.assertEqual(res.status_code, 400)
+
+    # ---- a rounded workshop figure must not lose the whole service -------
+
+    def test_a_workshop_figure_below_a_recent_reading_still_records_the_service(self):
+        """Workshop invoices round. 45 000 against a driver's 45 123 logged
+        two days earlier is a rounding, not a lie.
+
+        The first version of this checked the odometer BEFORE writing the
+        service and returned 400 on a failed check, so the service was lost
+        entirely and the vehicle sat on "In Service" with no way forward.
+        The service happened; the odometer is the least important thing on
+        the record.
+        """
+        self._reading(45123, days_ago=2)
+        self.vehicle.in_service_since = timezone.localdate()
+        self.vehicle.save(update_fields=["in_service_since"])
+
+        response = self._mark_serviced(timezone.localdate(), 45000)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(ServiceRecord.objects.filter(vehicle=self.vehicle).exists(),
+                        "the service must be recorded even when its odometer is questioned")
+        self.vehicle.refresh_from_db()
+        self.assertIsNone(self.vehicle.in_service_since,
+                          "the vehicle must come off In Service when it comes back")
+
+    def test_and_it_says_the_reading_was_not_added(self):
+        """Silently dropping the reading would be its own trap -- staff have
+        to know the history was not updated."""
+        self._reading(45123, days_ago=2)
+        response = self._mark_serviced(timezone.localdate(), 45000)
+        self.assertIn("odometer_warning", response.data)
+        self.assertEqual(
+            OdometerReading.objects.filter(vehicle=self.vehicle, reading_km=45000).count(), 0,
+            "the contradictory reading must not enter the history",
+        )
+
+    def test_a_sensible_service_odometer_is_still_logged_as_a_reading(self):
+        """The ordinary case must keep working: a higher figure at the
+        workshop becomes the vehicle's current km."""
+        self._reading(45000, days_ago=2)
+        response = self._mark_serviced(timezone.localdate(), 46200)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertNotIn("odometer_warning", response.data)
+        self.vehicle.refresh_from_db()
+        self.assertEqual(self.vehicle.current_odometer_km, 46200)
+
