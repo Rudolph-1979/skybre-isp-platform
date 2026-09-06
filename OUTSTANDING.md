@@ -106,62 +106,31 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
-## Where every claim stands (2026-09-06, after the fix pass)
+## Where every claim stands (2026-09-06, final pass)
 
-63 candidate findings across two audits and one review of this branch's own
-diff.
+63 candidate findings across two audits and one adversarial review of this
+branch's own diff. **All 63 have now been looked at.**
 
-**Confirmed, reproduced and fixed: 24.** Each has a test that fails against
-the commit before its fix. Includes four blockers -- a late billing run
-losing a whole month of invoices, UIF charged twice on an ordinary pay
-cycle, a rounded workshop odometer discarding a service, and a line that
-only looked offline never getting its speed change.
+**Confirmed, reproduced and fixed: 30.** Each has a test that fails against
+the commit before its fix. Five were blockers:
 
-**Refuted on inspection: 2.**
+  * a late billing run losing a whole month of invoices, silently
+  * an anniversary of the 29th/30th/31st getting NO invoice in a short month
+  * UIF charged twice on an ordinary 26th-to-25th pay cycle
+  * a rounded workshop odometer discarding the whole service
+  * a line that only looked offline never getting its speed change
 
-**Never checked at all: 9.** Three of seven verification groups ran out of
-budget before they ran. These are neither confirmed nor refuted:
+**Refuted on inspection: 5.** Including two that later commits had already
+fixed, and the UIF day-split concern.
 
-- 4 self-review claims about test quality (the payment-ledger concurrency
-  tests being single-threaded; the expenses default-rate test asserting
-  the value it sent; the password-policy boundary test using a 15-character
-  password; date_issued being wired into the invoice PDF and the VAT return
-  but not the statement, the invoice serializer, the filters or the sort)
-- 2 about impossible data (two odometer readings at the same instant; the
-  manual stock-adjust endpoint not taking the product lock the stock-issue
-  path now relies on)
-- 3 remaining minor items
+**Not verifiable from here: 1.** Nothing has run against real MikroTik
+hardware -- every CoA, shaper and blocking test is against a FakeNAS. See
+the Teraco item above; it needs a maintenance window on the real device.
 
-None is a blocker on its own evidence, but nor has any been checked, and
-most checked claims so far have turned out real.
-
-**Still not closable from here:** nothing has run against real MikroTik
-hardware. Every CoA, shaper and blocking test is against a FakeNAS.
-
-## Four findings from the first audit that were never acted on
-
-Found 2026-09-06 by reconciling every finding ever raised against the files
-the branch actually changed. These were in the first audit's results, were
-never verified, never fixed, and — worse — were never written down here.
-That is the third time this tracking gap has bitten; the reconciliation
-script is the fix, and the list below is the result.
-
-- [ ] **[high]** A billing run done a day late permanently shifts the
-  customer's billing date forward, and the next month's on-time run then
-  skips them — a whole month never invoiced. `billing/recurring.py:214`
-- [ ] **[medium]** Anniversary billing reads the day-of-month off
-  `created_at` in **UTC**, so a customer created just after midnight SAST
-  is billed on the wrong day; and an exact `==` on day-of-month means a due
-  day of 29/30/31 never matches in a shorter month, so no invoice is raised
-  at all. `billing/recurring.py:155`
-- [ ] **[medium]** Approving a leave request twice deducts the days twice;
-  a failure between the two writes deducts the days while leaving the
-  request pending. `payroll/views.py:336`
-- [ ] **[medium]** A finalized payroll run's period is still writable, and
-  a partial PATCH of one date raises `KeyError` → HTTP 500.
-  `payroll/serializers.py:171`
-
-All four are being verified now. None should be acted on before that.
+Three of the fixes were bugs introduced by earlier fixes on this branch,
+and two more were findings that fell out of tracking entirely and were
+recovered by reconciling every finding against the files actually changed.
+Both are worth remembering the next time this looks finished.
 
 ## Network / RADIUS — where it actually stands (2026-09-06)
 
