@@ -55,29 +55,37 @@ def salary_for_period(monthly_salary, period_start, period_end):
     return total
 
 
-def _add_one_month(day):
-    """The same day-of-month a month later, clamped to a short month."""
-    year, month = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
-    return datetime.date(year, month, min(day.day, days_in_month(datetime.date(year, month, 1))))
-
-
 def monthly_cycles_in(period_start, period_end):
     """How many monthly PAY CYCLES a run covers -- not calendar months.
 
-    Counted by stepping a month at a time from the start date, which is how
-    a payroll clerk counts them: 26 Aug -> 25 Sep is ONE cycle even though
-    it touches two calendar months, and 1 Jul -> 31 Aug is two.
+    26 Aug -> 25 Sep is ONE cycle even though it touches two calendar
+    months; 1 Jul -> 31 Aug is two. Counted as the number of whole months
+    between the two dates, plus one more when the end day has reached the
+    day the cycle starts on.
 
-    This distinction is the whole point. An earlier version of this split by
-    calendar month and charged a 26th-to-25th cycle two ceilings, taking
-    R79.50 too much off everyone earning over the ceiling, every month.
+    Deliberately NOT done by stepping a month at a time from the start
+    date. That was the first attempt and it drifts: stepping from 31
+    January clamps to 28 February, and every later step then anchors on
+    the 28th, so a 31 Jan -> 28 Feb run -- one month's pay -- counted two
+    cycles and charged two UIF ceilings. Over-deducting from the employee
+    is exactly the harm this function was written to stop, so the
+    arithmetic here is done in one shot from the original dates and cannot
+    accumulate that error.
+
+    A run whose start and end are both on a month end (31 Jan -> 31 Mar)
+    lands on a cycle boundary and counts the day the next cycle opens.
+    That is the arithmetic being honest about an odd period rather than a
+    bug, but it is the one shape worth a second opinion from whoever owns
+    payroll -- as is the even spread in uif_for_period below.
     """
-    cycles = 0
-    cursor = period_start
-    while cursor <= period_end:
-        cycles += 1
-        cursor = _add_one_month(cursor)
-    return max(cycles, 1)
+    if period_end < period_start:
+        return 1
+    months = (period_end.year - period_start.year) * 12 + (
+        period_end.month - period_start.month
+    )
+    if period_end.day >= period_start.day:
+        months += 1
+    return max(months, 1)
 
 
 def uif_for_period(settings_obj, remuneration, period_start, period_end):

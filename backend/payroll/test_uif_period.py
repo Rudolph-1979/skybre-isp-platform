@@ -15,6 +15,7 @@ from django.test import TestCase
 from payroll.models import PayrollRun, PayrollRunLine, PayrollSettings, StaffProfile
 from payroll.services import (
     generate_payroll_run_lines,
+    monthly_cycles_in,
     recalculate_statutory,
     uif_for_period,
 )
@@ -177,3 +178,39 @@ class MultiMonthRunUifTests(TestCase):
         line.refresh_from_db()
         self.assertEqual(line.uif_employee, CAPPED_MONTH * 2)
         self.assertEqual(line.uif_employer, CAPPED_MONTH * 2)
+
+
+class MonthlyCycleCountingTests(TestCase):
+    """The cycle count decides how many UIF ceilings get charged, so an
+    off-by-one here comes straight off somebody's pay.
+
+    Every case below was wrong in the first implementation, which stepped
+    a month at a time from the start date. Stepping clamps 31 January to
+    28 February and then anchors on the 28th for ever after, so periods
+    beginning on a month end drifted and over-counted.
+    """
+
+    def test_a_run_starting_on_the_31st_does_not_drift(self):
+        """31 Jan -> 28 Feb is one month's pay. The stepping version made
+        it two cycles and charged two ceilings -- R177.12 too much off
+        anyone over the ceiling, which is the exact harm uif_for_period
+        exists to prevent."""
+        self.assertEqual(monthly_cycles_in(_d("2026-01-31"), _d("2026-02-28")), 1)
+
+    def test_a_leap_day_start_does_not_drift_either(self):
+        self.assertEqual(monthly_cycles_in(_d("2024-02-29"), _d("2024-03-28")), 1)
+
+    def test_whole_calendar_months_count_as_you_would_expect(self):
+        self.assertEqual(monthly_cycles_in(_d("2026-09-01"), _d("2026-09-30")), 1)
+        self.assertEqual(monthly_cycles_in(_d("2026-07-01"), _d("2026-08-31")), 2)
+        self.assertEqual(monthly_cycles_in(_d("2026-01-01"), _d("2026-12-31")), 12)
+
+    def test_a_straddling_cycle_is_one(self):
+        self.assertEqual(monthly_cycles_in(_d("2026-08-26"), _d("2026-09-25")), 1)
+
+    def test_degenerate_periods_never_go_below_one(self):
+        """A single-day correction run, or dates the wrong way round, must
+        still charge exactly one cycle rather than zero or a negative."""
+        self.assertEqual(monthly_cycles_in(_d("2026-05-05"), _d("2026-05-05")), 1)
+        self.assertEqual(monthly_cycles_in(_d("2026-05-05"), _d("2026-05-01")), 1)
+

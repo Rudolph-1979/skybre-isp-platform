@@ -106,7 +106,18 @@ class VehicleViewSet(viewsets.ModelViewSet):
         # the bakkie to Overdue the moment it drove out and keep it there.
         # This is derived from the vehicle's own interval rather than a
         # guessed tolerance, which is why it can be a hard refusal.
-        if odometer_km + vehicle.service_interval_km <= vehicle.current_odometer_km:
+        # Guarded on the interval being set at all. It is a
+        # PositiveIntegerField with no lower bound and is writable through
+        # the API, so a vehicle serviced on time rather than distance can
+        # sit at 0 -- and with 0, "next service" is wherever it was last
+        # serviced, so this test refuses every ordinary figure and no
+        # service could be recorded for that vehicle at all. Without an
+        # interval there is no born-overdue to derive, so there is nothing
+        # to refuse on.
+        if (
+            vehicle.service_interval_km
+            and odometer_km + vehicle.service_interval_km <= vehicle.current_odometer_km
+        ):
             return Response(
                 {"odometer_km": [
                     f"{odometer_km:,} km would put this vehicle's next service at "
