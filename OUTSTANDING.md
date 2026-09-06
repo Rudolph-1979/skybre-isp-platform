@@ -106,6 +106,32 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
+## Network / RADIUS — where it actually stands (2026-09-06)
+
+Fixed and verified by probe: the SNMP community is no longer readable
+through the device API *or* the audit trail; speed-now is partner-scoped;
+a speed change reaches `radreply` so it survives a reconnect, and a line
+whose heartbeat merely lapsed is no longer skipped; a suspended PPPoE
+customer is blocked on the walled-garden address they are actually using
+rather than their recycled old one; the device list no longer loads the
+whole monitoring history.
+
+**Still open on the network side:**
+
+- [ ] **[unverified]** A line that was offline when a speed window opened
+  may never get its static shaper queue re-synced, so the boost is
+  swallowed. `apply_speed_policies.py:181`
+- [ ] **[unverified]** `--limit` may no longer cap anything for offline
+  lines, and those writes are invisible in both the dry run and the log.
+  `apply_speed_policies.py:187`
+- [ ] **Nothing here has run against real MikroTik hardware.** Every CoA,
+  shaper and blocking test is against a FakeNAS. See the Teraco item
+  above, which says the same thing about the RouterOS script.
+
+Two of the fixes above were findings from the FIRST audit that I recorded
+nowhere and nearly lost -- the block-list address and the monitoring
+prefetch. Both are now done, but the lesson is in the list, not the code.
+
 ## Self-review of this branch — 18 claims still unchecked (2026-09-06)
 
 The branch's own diff was reviewed adversarially for regressions it
