@@ -172,15 +172,25 @@ class Command(BaseCommand):
             # the Service, so nothing rewrites radreply, and the customer
             # logged back in on the old rate.
             if find_live_session(service.radius_username) is None:
-                # Recorded as delivered because for an offline line
-                # radreply IS the delivery -- it is what they get the
-                # moment they reconnect. Without recording it, the same
-                # row would be rewritten with the same value on every
-                # tick, twelve times an hour, for ever.
-                if commit and record_rate_limit(service.radius_username, target.rate_limit):
-                    Service.objects.filter(pk=service.pk).update(
-                        last_pushed_rate_limit=target.rate_limit
-                    )
+                # radreply is updated so the rate is waiting at their next
+                # login -- but last_pushed_rate_limit is deliberately NOT
+                # touched, because it means "what the LIVE SESSION was last
+                # told" and no session was told anything here.
+                #
+                # Marking it delivered was a real bug for a whole tick:
+                # find_live_session treats a session whose interim updates
+                # went missing as dead, which happens to genuinely connected
+                # customers. That line was counted offline, last_pushed was
+                # set to the target, and on the next tick -- heartbeat back,
+                # customer plainly online -- the skip above matched and the
+                # CoA was never sent. They ran the entire window at the old
+                # speed while the database said the new one had been
+                # delivered.
+                #
+                # Rewriting radreply every tick is not the cost it looks
+                # like: record_rate_limit skips rows that already say this.
+                if commit:
+                    record_rate_limit(service.radius_username, target.rate_limit)
                 offline += 1
                 continue
 

@@ -98,9 +98,13 @@ def record_rate_limit(username, rate_limit):
     """
     if not username:
         return 0
+    # exclude(value=...) so a row that already says this is not rewritten.
+    # The scheduled job passes every offline line through here on every
+    # tick, and without this each one would be pointlessly UPDATEd twelve
+    # times an hour for as long as a speed window is open.
     return RadReply.objects.filter(
         username=username, attribute="Mikrotik-Rate-Limit"
-    ).update(value=rate_limit)
+    ).exclude(value=rate_limit).update(value=rate_limit)
 
 
 def _allocate_network_ip(service):

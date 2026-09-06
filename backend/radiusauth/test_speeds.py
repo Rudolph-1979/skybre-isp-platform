@@ -829,10 +829,59 @@ class RadreplyFollowsThePolicyTests(TestCase):
         self.assertEqual(self._radreply(), "10240k/10240k")
 
     def test_the_same_offline_line_is_not_rewritten_on_every_tick(self):
-        """Once radreply holds it, it HAS been delivered -- that is what
-        they get the moment they reconnect. Without recording that, a
-        five-minute cron rewrites the same row twelve times an hour for
-        as long as the window is open."""
+        """A five-minute cron must not UPDATE the same radreply row twelve
+        times an hour for as long as a window is open.
+
+        This used to be achieved by recording last_pushed_rate_limit in the
+        offline branch, which was wrong for a different reason -- it also
+        suppressed the CoA for a line that only LOOKED offline. Idempotence
+        now lives where it belongs, in record_rate_limit itself, which
+        skips a row that already carries the value.
+        """
+        from radiusauth.signals import record_rate_limit
+
         self._run("--seed")
         self._run("--commit")
-        self.assertIn("1 already correct", self._run("--commit"))
+        self.assertEqual(self._radreply(), "10240k/10240k")
+
+        rows_written = record_rate_limit("pppoe_test", "10240k/10240k")
+        self.assertEqual(rows_written, 0, "a row already saying this must not be rewritten")
+
+        rows_written = record_rate_limit("pppoe_test", "20480k/20480k")
+        self.assertEqual(rows_written, 1, "but a genuinely new rate must still be written")
+
+    def test_a_line_that_only_looked_offline_still_gets_its_coa(self):
+        """find_live_session treats a session whose interim accounting
+        updates went missing as dead. That happens to customers who are
+        plainly connected.
+
+        Such a line is counted "not connected" for that tick, which is
+        fine -- but it must NOT be recorded as delivered. An earlier
+        version set last_pushed_rate_limit in the offline branch, so on
+        the next tick, heartbeat restored and the customer demonstrably
+        online, the "already correct" skip matched and the CoA was never
+        sent. They ran the whole window at the old speed while the
+        database said the new one had been delivered.
+        """
+        from radiusauth.models import RadAcct
+
+        self._run("--seed")
+        RadAcct.objects.create(
+            username="pppoe_test", acctsessionid="S-gap", nasipaddress="127.0.0.1",
+            acctstarttime=timezone.now() - datetime.timedelta(hours=3),
+            acctupdatetime=timezone.now() - datetime.timedelta(minutes=20),
+        )
+        self._run("--commit")
+
+        service = Service.objects.get(radius_username="pppoe_test")
+        self.assertEqual(self._radreply(), "10240k/10240k",
+                         "radreply must still be put right for the next login")
+        self.assertEqual(service.last_pushed_rate_limit, "5120k/5120k",
+                         "no session was told anything, so nothing may be recorded as pushed")
+
+        # Heartbeat restored: the line is unmistakably up.
+        RadAcct.objects.filter(username="pppoe_test").update(acctupdatetime=timezone.now())
+        output = self._run("--commit")
+        self.assertNotIn("1 already correct", output,
+                         "the live session must not be skipped as already done")
+
