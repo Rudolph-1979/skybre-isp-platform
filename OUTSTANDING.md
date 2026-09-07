@@ -106,6 +106,56 @@ all five turned out to be real:
   correct" and never re-sent it.
 - [x] (the payment race, above)
 
+## Recurring billing: the rest of the engine, audited 2026-09-07
+
+The two bugs earlier audits found in this engine are fixed and tested (the
+late-run cycle shift and the anniversary/UTC day). But those audits covered
+`_generate_document` and the due-date logic only, and said so. Reminders,
+suspension, `upcoming_blocks`, the run lock and bookkeeping,
+partial-failure handling, `cancellations.py` and `tariff_changes.py` had
+never been read by anyone, and had **no tests at all**.
+
+They have now been audited, before this engine bills a real client for the
+first time. Eleven findings, each reproduced by the auditor against a real
+database. **Nine bite in production today; three are blockers.** None is
+fixed yet.
+
+- [ ] **[blocker, live now]** A partner-scoped run terminates services and applies tariff changes for every OTHER partner too
+  `billing/recurring.py:579`
+- [ ] **[blocker, live now]** Every recurring invoice email quotes the balance from before that invoice was debited
+  `backend/billing/recurring.py:131`
+- [ ] **[blocker, live now]** An accepted quote's mandatory "Till" date is written into Service.end_date, so cancellations cuts the customer off and marks them Cancelled on the last day they paid for
+  `billing/models.py:702`
+- [ ] **[serious, live now]** A payment reminder is sent on invoice status alone, so a customer who has already paid gets a demand quoting "an outstanding balance of R 0.00"
+  `billing/recurring.py:260`
+- [ ] **[serious, live now]** The reminder dedupe treats a FAILED send as "already sent", so a mail outage silently drops the day's reminders and the re-run sends nothing -- and a Run repeated for the same date on a later day re-sends the lot
+  `billing/recurring.py:291`
+- [ ] **[serious, live now]** An interrupted run leaves History saying "Processed -- 0 invoices" on top of invoices that committed and PDFs already emailed
+  `billing/recurring.py:606`
+- [ ] **[serious, live now]** A payment reminder chases the invoice the same run just raised, and silently drops the one actually falling due
+  `backend/billing/recurring.py:268`
+- [ ] **[minor, live now]** _describe_failures names nobody when the failure is on the customer re-read itself
+  `backend/billing/recurring.py:502`
+- [ ] **[minor, live now]** The cancellation dry run never names the customers it would cancel, so the one preview staff have hides the account-level consequence
+  `billing/cancellations.py:63`
+- [ ] **[serious, latent]** A zero-day blocking period treats an invoice as overdue on the day it falls due, so the run that raises a customer's invoice suspends them in the same transaction — and the dashboard predicts a different date
+  `backend/billing/recurring.py:330`
+- [ ] **[serious, latent]** --as-of on the two overnight commands executes the future instead of checking it: tariff changes land months early and their booking is destroyed, services are terminated months early
+  `billing/management/commands/apply_tariff_changes.py:39`
+
+The three blockers matter most for a first live run:
+
+  * every one of the 1,592 invoice emails would quote the balance from
+    *before* that invoice was debited;
+  * a run scoped to one reseller terminates services and applies tariff
+    changes for every OTHER reseller too;
+  * a customer who came in on an accepted quote carries that quote's "Till"
+    date as `Service.end_date`, so the cancellation job disconnects them and
+    marks them Cancelled on the last day they had paid for.
+
+Do not run recurring billing for real clients until at least those three
+are fixed. Fix plans and failing tests exist for all eleven.
+
 ## Where every claim stands (2026-09-06, final pass)
 
 63 candidate findings across two audits and one adversarial review of this
