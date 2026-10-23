@@ -77,9 +77,17 @@ class Command(BaseCommand):
         # --- 3. customers suspended but with live services -----------------
         self.stdout.write("")
         self.stdout.write(self.style.MIGRATE_HEADING("Suspended customers with services still active"))
+        # OFF_STATUSES, not just SUSPENDED. This is the reconciliation that
+        # is supposed to CATCH a customer who is off but still connected --
+        # and it was blind to two thirds of the ways that happens. A
+        # customer set to Bad Debt or Inactive with live services never
+        # appeared here, so --fix never repaired them either. Same constant
+        # the cascade in customers.signals now reads, and the same reason:
+        # a status list written out by hand is a list somebody forgets to
+        # extend.
         stale = (
             Service.objects.select_related("customer", "device")
-            .filter(customer__status=Customer.Status.SUSPENDED, status=Service.Status.ACTIVE)
+            .filter(customer__status__in=Customer.OFF_STATUSES, status=Service.Status.ACTIVE)
             .order_by("customer__full_name")
         )
         if not stale:

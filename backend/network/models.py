@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -263,4 +264,139 @@ class MonitoringReading(models.Model):
         indexes = [models.Index(fields=["device", "-timestamp"])]
 
     def __str__(self):
-        return f"{self.device} @ {self.timestamp}"
+        return f"{self.device} @ {self.timestamp}"  # one poll; CPE signal is CpeSignal below
+
+
+class CpeSignal(models.Model):
+    """A client line's radio as its AP sees it (Rudolph, 8 Oct 2026: "In the
+    client services I would like to read client mikrotik and ubnt cpe
+    signals"). One row per service, refreshed by poll_cpe_signals.
+
+    The CPE dials the PPPoE itself (router mode), so its MAC is the
+    Calling-Station-Id on the line's RADIUS session -- the same MAC the
+    AP's wireless registration table shows. Matched on that; nothing is
+    typed in. Only MikroTik APs are read (RouterOS API); a CPE on an AP
+    the platform can't read shows as "not seen".
+    """
+
+    class State(models.TextChoices):
+        OK = "ok", "Seen"
+        NOT_SEEN = "not_seen", "Not seen on any AP"
+        NO_MAC = "no_mac", "No MAC from RADIUS yet"
+
+    service = models.OneToOneField("billing.Service", on_delete=models.CASCADE, related_name="cpe_signal")
+    state = models.CharField(max_length=10, choices=State.choices, default=State.NO_MAC)
+    mac = models.CharField(max_length=17, blank=True)
+    ap = models.ForeignKey(Device, on_delete=models.SET_NULL, null=True, blank=True, related_name="cpe_signals")
+    interface = models.CharField(max_length=64, blank=True)
+    radio_name = models.CharField(max_length=64, blank=True)
+    # Received at the AP from the CPE, and (MikroTik CPEs only) at the CPE
+    # from the AP -- Winbox's "Tx/Rx Signal Strength" is tx_signal/signal.
+    signal_dbm = models.SmallIntegerField(null=True, blank=True)
+    tx_signal_dbm = models.SmallIntegerField(null=True, blank=True)
+    snr_db = models.SmallIntegerField(null=True, blank=True)
+    tx_ccq = models.SmallIntegerField(null=True, blank=True)
+    rx_ccq = models.SmallIntegerField(null=True, blank=True)
+    tx_rate = models.CharField(max_length=64, blank=True)
+    rx_rate = models.CharField(max_length=64, blank=True)
+    uptime = models.CharField(max_length=32, blank=True)
+    distance_km = models.CharField(max_length=10, blank=True)
+    seen_at = models.DateTimeField(null=True, blank=True, help_text="Last time an AP listed this CPE.")
+    checked_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.service_id} {self.mac} {self.signal_dbm}"
+
+
+class CpeSignalSample(models.Model):
+    """One reading per poll, for the 24 h / 7 day graph. Pruned after 7 days.
+    (Coverage tables for the Map follow below, #178.)"""
+
+    service = models.ForeignKey("billing.Service", on_delete=models.CASCADE, related_name="cpe_signal_samples")
+    at = models.DateTimeField(db_index=True)
+    signal_dbm = models.SmallIntegerField(null=True, blank=True)
+    tx_signal_dbm = models.SmallIntegerField(null=True, blank=True)
+    tx_ccq = models.SmallIntegerField(null=True, blank=True)
+    rx_ccq = models.SmallIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["at"]
+        indexes = [models.Index(fields=["service", "at"])]
+
+
+# --- Coverage areas from KML/KMZ files (#178, Rudolph 15 Oct 2026) -----------------
+#
+# "Servicable locations will be brought in by KMZ files which we import" --
+# the first file is Vuma's fibre coverage (national areas plus the Kroonstad
+# suburbs' plant). One upload = one CoverageLayer; re-importing a newer file
+# replaces it. Areas are stored as plain coordinate lists with a bounding box
+# (no PostGIS): the house check filters by box in the database, then does an
+# exact point-in-polygon in Python.
+
+
+class CoverageLayer(models.Model):
+    class Kind(models.TextChoices):
+        FIBRE = "fibre", "Fibre"
+        WIRELESS = "wireless", "Wireless"
+
+    name = models.CharField(max_length=120)
+    provider = models.CharField(max_length=60, blank=True, help_text='e.g. "Vuma"')
+    kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.FIBRE)
+    source_file = models.CharField(max_length=255, blank=True)
+    folders = models.JSONField(default=list, blank=True, help_text="The KML folders that were imported.")
+    active = models.BooleanField(default=True)
+    area_count = models.PositiveIntegerField(default=0)
+    point_count = models.PositiveIntegerField(default=0)
+    imported_at = models.DateTimeField(auto_now_add=True)
+    imported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Meta:
+        ordering = ["-imported_at"]
+
+    def __str__(self):
+        return self.name
+
+
+class CoverageArea(models.Model):
+    layer = models.ForeignKey(CoverageLayer, on_delete=models.CASCADE, related_name="areas")
+    name = models.CharField(max_length=255, blank=True)
+    code = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=40, blank=True, help_text="LIVE / BUILD ... as the file says.")
+    live = models.BooleanField(default=True)
+    network = models.CharField(max_length=40, blank=True, help_text="GPON / Active Ethernet ...")
+    folder = models.CharField(max_length=500, blank=True)
+    # [[outer ring [[lng, lat], ...]], [hole], ...] -- one entry per polygon
+    # of a (multi)polygon: [[outer, hole, hole], [outer], ...]
+    rings = models.JSONField()
+    min_lat = models.FloatField(db_index=True)
+    max_lat = models.FloatField(db_index=True)
+    min_lng = models.FloatField(db_index=True)
+    max_lng = models.FloatField(db_index=True)
+
+    def __str__(self):
+        return self.code or self.name
+
+
+class CoveragePoint(models.Model):
+    """A house that can be serviced -- the dots on the map (Rudolph, 15 Oct:
+    "I only want to see a dot for every house that can be possibly
+    serviced"). From Vuma's plant files: the far end of each Home Drop cable
+    is a house (the near end is its wall box, ~24 m away). Where a suburb's
+    file has no home drops (Suidrand), the wall box stands in for the
+    house(s) next to it."""
+
+    class Kind(models.TextChoices):
+        HOUSE = "house", "House (end of a home drop)"
+        WALL_BOX = "wall_box", "Wall box (house next to it)"
+
+    layer = models.ForeignKey(CoverageLayer, on_delete=models.CASCADE, related_name="points")
+    name = models.CharField(max_length=255, blank=True)
+    kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.HOUSE)
+    area = models.CharField(max_length=255, blank=True, help_text="Suburb / file folder it came from.")
+    lat = models.FloatField(db_index=True)
+    lng = models.FloatField(db_index=True)
+
+    def __str__(self):
+        return f"{self.kind} {self.name}"

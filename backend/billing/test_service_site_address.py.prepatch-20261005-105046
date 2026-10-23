@@ -1,0 +1,74 @@
+"""A service at its own address, or the client's main one (Rudolph, 1 Oct:
+"some clients have one account but 3 different services at different
+addresses")."""
+from decimal import Decimal
+
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from customers.models import Customer
+
+from .models import Service, Tariff
+
+
+class ServiceSiteAddressTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(User.objects.create_user(username="boss", password="x", role=User.Role.ADMIN))
+        self.tariff = Tariff.objects.create(name="P", price=Decimal("1"), speed_download_kbps=1, speed_upload_kbps=1)
+        self.customer = Customer.objects.create(
+            full_name="Rudolph", email="r@x.com", address="31 Mynhardt Van Graan Street", city="Hennenman", zip_code="9499",
+        )
+
+    def _post(self, **extra):
+        return self.client.post("/api/services/", {
+            "customer": self.customer.pk, "tariff": self.tariff.pk, "status": "pending", **extra,
+        }, format="json")
+
+    def test_default_is_the_clients_main_address(self):
+        res = self._post()
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertTrue(res.json()["use_customer_address"])
+        self.assertEqual(res.json()["site_address_display"], "31 Mynhardt Van Graan Street, Hennenman, 9499")
+
+    def test_a_separate_address(self):
+        res = self._post(use_customer_address=False, site_address="12 Church St", site_city="Virginia")
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertEqual(res.json()["site_address_display"], "12 Church St, Virginia")
+
+    def test_separate_address_needs_a_street(self):
+        res = self._post(use_customer_address=False, site_city="Virginia")
+        self.assertEqual(res.status_code, 400, res.content)
+        self.assertIn("site_address", res.json())
+
+    def test_switching_back_to_main_address_on_edit(self):
+        service = Service.objects.create(
+            customer=self.customer, tariff=self.tariff, use_customer_address=False, site_address="12 Church St",
+        )
+        res = self.client.patch(f"/api/services/{service.pk}/", {"use_customer_address": True}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(res.json()["site_address_display"], "31 Mynhardt Van Graan Street, Hennenman, 9499")
+
+    # --- coordinates (5 Oct 2026) ---
+
+    def test_coordinates_alone_are_enough_for_a_separate_address(self):
+        res = self._post(use_customer_address=False, site_latitude="-28.123456", site_longitude="26.654321")
+        self.assertEqual(res.status_code, 201, res.content)
+        body = res.json()
+        self.assertEqual(body["site_latitude"], "-28.123456")
+        self.assertEqual(body["site_address_display"], "GPS -28.123456, 26.654321")
+
+    def test_street_and_coordinates_together(self):
+        res = self._post(use_customer_address=False, site_address="Farm Rietfontein",
+                         site_latitude="-28.1", site_longitude="26.6")
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertEqual(res.json()["site_address_display"], "Farm Rietfontein")
+
+    def test_half_a_coordinate_is_refused(self):
+        res = self._post(use_customer_address=False, site_address="1 A St", site_latitude="-28.1")
+        self.assertEqual(res.status_code, 400, res.content)
+
+    def test_out_of_range_coordinates_are_refused(self):
+        res = self._post(use_customer_address=False, site_latitude="-95", site_longitude="26.6")
+        self.assertEqual(res.status_code, 400, res.content)

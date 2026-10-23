@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Job, Shift } from "../types";
+import { jobAssignee } from "../utils/scheduling";
 
 // One day laid out against the hours -- the body of the Scheduling page's
 // Day view. The month grid can only show three items per cell before it
@@ -29,6 +30,7 @@ type Item = {
   start: Date;
   end: Date;
   cancelled: boolean;
+  urgent?: boolean;
   onClick: () => void;
 };
 
@@ -91,6 +93,7 @@ export function DayScheduleGrid({
   onNewShift,
   onEditJob,
   onEditShift,
+  onDropJob,
 }: {
   day: Date;
   jobs: Job[];
@@ -101,6 +104,12 @@ export function DayScheduleGrid({
   onNewShift: (at: Date) => void;
   onEditJob: (job: Job) => void;
   onEditShift: (shift: Shift) => void;
+  // A pool job dragged out of the JobPoolPanel and dropped on this hour --
+  // the pool panel puts its id on the drag event, and the caller (which
+  // owns the pool's job list) looks it up and opens it in the edit modal
+  // pre-filled at this time, rather than committing it silently: the
+  // office still gets to check the time and pick a technician before Save.
+  onDropJob?: (jobId: number, at: Date) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -121,17 +130,29 @@ export function DayScheduleGrid({
     now.getDate() === day.getDate();
 
   const items = useMemo<PlacedItem[]>(() => {
-    const jobItems: Item[] = jobs.map((j) => ({
-      key: `job-${j.id}`,
-      kind: "job",
-      label: j.title,
-      sublabel: j.customer_name ?? j.assigned_to_name ?? "standalone",
-      colour: jobColour(j),
-      start: new Date(j.start),
-      end: new Date(j.end),
-      cancelled: j.status === "cancelled",
-      onClick: () => onEditJob(j),
-    }));
+    // A pool job (no start/end) has no place on an hourly grid -- it should
+    // never reach this component in practice, since the calendar's own
+    // start_from/start_to fetch already excludes it, but filtering here too
+    // means a pool job slipping through some other path is quietly skipped
+    // rather than rendering as an "Invalid Date" block.
+    const jobItems: Item[] = jobs
+      .filter((j) => j.start && j.end)
+      .map((j) => ({
+        key: `job-${j.id}`,
+        kind: "job",
+        label: j.title,
+        // Customer AND tech, not one or the other. This used to fall back to
+        // the assignee only when a job had no customer -- so on every
+        // ordinary customer job, exactly the ones a technician gets sent to,
+        // the name of whoever was going never appeared at all.
+        sublabel: `${j.customer_name ?? "standalone"} · ${jobAssignee(j)}`,
+        colour: jobColour(j),
+        start: new Date(j.start as string),
+        end: new Date(j.end as string),
+        cancelled: j.status === "cancelled",
+        urgent: Boolean(j.urgent),
+        onClick: () => onEditJob(j),
+      }));
     const shiftItems: Item[] = shifts.map((s) => ({
       key: `shift-${s.id}`,
       kind: "shift",
@@ -205,6 +226,21 @@ export function DayScheduleGrid({
           {hours.map((hour) => (
             <div
               key={hour}
+              onDragOver={(e) => {
+                if (!onDropJob) return;
+                // Without this, the browser's default is to refuse the
+                // drop entirely -- onDrop below would simply never fire.
+                e.preventDefault();
+              }}
+              onDrop={(e) => {
+                if (!onDropJob) return;
+                e.preventDefault();
+                const id = Number(e.dataTransfer.getData("text/plain"));
+                if (!id) return;
+                const at = new Date(day);
+                at.setHours(hour, 0, 0, 0);
+                onDropJob(id, at);
+              }}
               className="absolute left-0 right-0 border-t border-[var(--border-hairline)]"
               style={{ top: (hour - START_HOUR) * HOUR_HEIGHT, height: HOUR_HEIGHT }}
             >
@@ -252,7 +288,12 @@ export function DayScheduleGrid({
                 key={item.key}
                 type="button"
                 onClick={item.onClick}
-                title={`${timeLabel(item.start)}–${timeLabel(item.end)} ${item.label}`}
+                // Includes the sublabel: a block under ~32px high hides it
+                // to stay readable, and a 20-minute job is exactly when you
+                // want to know who is on it without opening the record.
+                title={`${item.urgent ? "URGENT — " : ""}${timeLabel(item.start)}–${timeLabel(item.end)} ${item.label}${
+                  item.sublabel ? ` — ${item.sublabel}` : ""
+                }`}
                 className="absolute overflow-hidden rounded px-1.5 py-0.5 text-left text-[11px] font-medium text-white shadow-sm"
                 style={{
                   top,
@@ -262,6 +303,8 @@ export function DayScheduleGrid({
                   background: item.colour,
                   opacity: item.cancelled ? 0.45 : 1,
                   textDecoration: item.cancelled ? "line-through" : undefined,
+                  outline: item.urgent ? "2px solid #ff3b3b" : undefined,
+                  outlineOffset: item.urgent ? -1 : undefined,
                 }}
               >
                 <span className="block truncate">

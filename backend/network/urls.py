@@ -1,3 +1,4 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 from .views import (
     DeviceViewSet, NetworkSiteViewSet, IPPoolViewSet, IPAddressViewSet,
@@ -12,4 +13,32 @@ router.register("ip-addresses", IPAddressViewSet, basename="ipaddress")
 router.register("connection-rules", ConnectionRuleViewSet, basename="connectionrule")
 router.register("monitoring-readings", MonitoringReadingViewSet, basename="monitoringreading")
 
-urlpatterns = router.urls
+from .cpe_signals_api import CpeSignalHistoryView, CpeSignalListView, CpeSignalRefreshView
+from .map_api import (
+    CoverageHousesView, CoverageImportView, CoverageLayersView, CoverageLayerView, CoveragePreviewView,
+    MapConfigView, MapGeocodeView, MapServiceabilityView,
+)
+from .uisp_api import (
+    UispDeviceStatisticsView, UispDevicesView, UispOutagesView, UispSitesView, UispSummaryView,
+)
+
+urlpatterns = router.urls + [
+    # Client CPE signal from the MikroTik APs (8 Oct 2026).
+    path("cpe-signals/", CpeSignalListView.as_view(), name="cpe_signals"),
+    path("cpe-signals/<int:service>/history/", CpeSignalHistoryView.as_view(), name="cpe_signal_history"),
+    path("cpe-signals/<int:service>/refresh/", CpeSignalRefreshView.as_view(), name="cpe_signal_refresh"),
+    # Network (UISP), read-only (14 Oct 2026).
+    path("map/geocode/", MapGeocodeView.as_view(), name="map_geocode"),
+    path("map/config/", MapConfigView.as_view(), name="map_config"),
+    path("map/serviceability/", MapServiceabilityView.as_view(), name="map_serviceability"),
+    path("map/coverage/layers/", CoverageLayersView.as_view(), name="map_coverage_layers"),
+    path("map/coverage/layers/<int:pk>/", CoverageLayerView.as_view(), name="map_coverage_layer"),
+    path("map/coverage/preview/", CoveragePreviewView.as_view(), name="map_coverage_preview"),
+    path("map/coverage/import/", CoverageImportView.as_view(), name="map_coverage_import"),
+    path("map/coverage/houses/", CoverageHousesView.as_view(), name="map_coverage_houses"),
+    path("uisp/summary/", UispSummaryView.as_view(), name="uisp_summary"),
+    path("uisp/devices/", UispDevicesView.as_view(), name="uisp_devices"),
+    path("uisp/devices/<str:device_id>/statistics/", UispDeviceStatisticsView.as_view(), name="uisp_device_statistics"),
+    path("uisp/sites/", UispSitesView.as_view(), name="uisp_sites"),
+    path("uisp/outages/", UispOutagesView.as_view(), name="uisp_outages"),
+]

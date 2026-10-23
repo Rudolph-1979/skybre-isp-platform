@@ -1,6 +1,7 @@
 import csv
 from decimal import Decimal
 
+from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import mixins, permissions, viewsets
@@ -112,6 +113,19 @@ class PayrollRunViewSet(viewsets.ModelViewSet):
         run = serializer.save(generated_by=self.request.user)
         generate_payroll_run_lines(run)
 
+    def perform_update(self, serializer):
+        # Same rule as perform_destroy below and as the lines themselves
+        # (PayrollRunLineViewSet.perform_update): a finalized run is the
+        # record of what was actually paid. Its period was still writable,
+        # so a PATCH could move a signed-off run onto dates whose attendance
+        # it was never calculated from -- the payslips already handed out and
+        # the bank CSV already sent would name a period the run no longer has.
+        if serializer.instance.status == PayrollRun.Status.FINALIZED:
+            raise PermissionDenied(
+                "This payroll run is finalised. Correct it with a new run rather than editing this one."
+            )
+        serializer.save()
+
     def perform_destroy(self, instance):
         # A finalized run is the record of what was actually paid --
         # deletable draft runs are just abandoned/incorrect calculations,
@@ -212,14 +226,24 @@ class PayrollRunLineViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
     mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
     """Individual payroll lines -- list, read, and update the figures a person
     enters (PAYE, an extra amount, another deduction, a note).
 
-    No create and no delete: lines exist because a payroll run generated them
-    from attendance, and one appearing or vanishing on its own would make the
-    run disagree with the attendance it was derived from.
+    No create: lines exist because a payroll run generated them from the
+    attendance in the period, and one appearing on its own would make the run
+    disagree with what it was derived from.
+
+    Removing one from a DRAFT run is allowed, because Recalculate deliberately
+    keeps a leaver's line now (see generate_payroll_run_lines) and something
+    has to be able to take a person off a draft. A technician who resigned on
+    31 July but was still marked active when the August draft was generated
+    gets a full month's salary on that draft, and deactivating them and
+    recalculating no longer removes it -- without this, the only way out was to
+    delete the whole draft run and retype everyone's PAYE, and the alternative
+    was paying R30,000 to somebody who had left, off the bank CSV.
 
     Editing is blocked once the run is finalised. That is the whole point of
     finalising -- a signed-off run is the record of what was actually paid, and
@@ -241,6 +265,18 @@ class PayrollRunLineViewSet(
                 "This payroll run is finalised. Correct it with a new run rather than editing this one."
             )
         serializer.save()
+
+    def perform_destroy(self, instance):
+        # Same guard as editing: a finalised run is the record of what was
+        # actually paid, so a line can only be taken off while the run is still
+        # a draft. Note the person also has to be deactivated first -- they are
+        # still on the payroll otherwise, and the next Recalculate puts them
+        # back, which is the right answer for someone who has not left.
+        if instance.payroll_run.status == PayrollRun.Status.FINALIZED:
+            raise PermissionDenied(
+                "This payroll run is finalised. Correct it with a new run rather than editing this one."
+            )
+        instance.delete()
 
     @action(detail=True, methods=["get"], url_path="payslip-pdf")
     def payslip_pdf(self, request, pk=None):
@@ -326,10 +362,24 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         if request.user.role != request.user.Role.ADMIN:
             raise PermissionDenied("Only an admin can approve leave requests.")
-        leave = self.get_object()
-        if leave.status != LeaveRequest.Status.PENDING:
-            return Response({"detail": "This request has already been decided."}, status=400)
+        # One transaction, and the request row locked before it is read.
+        #
+        # This deducted the balance and then saved the decision as two
+        # separate autocommit writes, with the PENDING check made on an
+        # unlocked read. Two admins clicking Approve at once -- or one
+        # double-clicking -- both passed the check and both deducted, so a
+        # 3-day request took 6 days off. And a failure between the two
+        # writes left the days deducted with the request still PENDING,
+        # so approving it again deducted them a second time. Reproduced:
+        # a 3-day request took a 15-day balance to 12, then to 9.
+        with transaction.atomic():
+            leave = LeaveRequest.objects.select_for_update().get(pk=self.get_object().pk)
+            if leave.status != LeaveRequest.Status.PENDING:
+                return Response({"detail": "This request has already been decided."}, status=400)
 
+            return self._approve_locked(request, leave)
+
+    def _approve_locked(self, request, leave):
         profile = getattr(leave.staff, "staff_profile", None)
         if profile is not None:
             field_name = leave.balance_field_name()
@@ -341,7 +391,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                         "detail": (
                             f"{leave.staff.get_full_name() or leave.staff.username} only has "
                             f"{current_balance} days of {leave.get_leave_type_display().lower()} left, "
-                            f"but this request is for {days} days. Adjust their balance under Staff → "
+                            f"but this request is for {days} days. Adjust their balance under Accountant → "
                             "Employees first if this should still be approved."
                         )
                     },

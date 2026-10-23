@@ -5,6 +5,8 @@ import { useApiList } from "../../hooks/useApiList";
 import { filterSelectClass, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { PaymentAllocationsModal } from "../../components/PaymentAllocationsModal";
+import { formatIsoDateTime } from "../../utils/billingTerms";
 import type { Payment } from "../../types";
 
 const COLUMNS: ColumnDef[] = [
@@ -14,13 +16,15 @@ const COLUMNS: ColumnDef[] = [
   { key: "amount", label: "Amount" },
   { key: "method", label: "Method" },
   { key: "received_by", label: "Received by" },
+  { key: "allocated", label: "Allocated" },
 ];
 
 export function PaymentsPage() {
   const [ordering, setOrdering] = useState("-date");
   const [methodFilter, setMethodFilter] = useState("");
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("payments", ["date"]);
-  const { items, count, loading } = useApiList<Payment>(
+  const [allocating, setAllocating] = useState<Payment | null>(null);
+  const { items, count, loading, refetch } = useApiList<Payment>(
     `/payments/?page_size=100&ordering=${ordering}${methodFilter ? `&method=${methodFilter}` : ""}`
   );
 
@@ -62,21 +66,59 @@ export function PaymentsPage() {
               {isVisible("amount") && <SortableTH field="amount" ordering={ordering} onSort={toggleSort}>Amount</SortableTH>}
               {isVisible("method") && <SortableTH field="method" ordering={ordering} onSort={toggleSort}>Method</SortableTH>}
               {isVisible("received_by") && <SortableTH field="received_by__username" ordering={ordering} onSort={toggleSort}>Received by</SortableTH>}
+              {isVisible("allocated") && <TH>Allocated</TH>}
+              <TH>&nbsp;</TH>
             </tr>
           </THead>
           <tbody>
             {items.map((p) => (
               <TR key={p.id}>
-                <TD>{new Date(p.date).toLocaleString()}</TD>
+                <TD>{formatIsoDateTime(p.date)}</TD>
                 {isVisible("customer") && <TD>{p.customer_name}</TD>}
                 {isVisible("invoice") && <TD>{p.invoice ?? "—"}</TD>}
                 {isVisible("amount") && <TD className="tabular-nums">R {parseFloat(p.amount).toFixed(2)}</TD>}
                 {isVisible("method") && <TD className="capitalize">{p.method.replace("_", " ")}</TD>}
                 {isVisible("received_by") && <TD>{p.received_by_name ?? "—"}</TD>}
+                {isVisible("allocated") && (
+                  <TD className="tabular-nums">
+                    {p.invoice ? (
+                      /* Credited to that invoice directly, with no allocation
+                         row -- see PaymentSerializer. Showing R 0.00 here
+                         would read as unallocated money, which it is not. */
+                      <span className="text-[var(--text-muted)]">on invoice</span>
+                    ) : (
+                      <>
+                        R {parseFloat(p.allocated_amount ?? "0").toFixed(2)}
+                        {parseFloat(p.unallocated_amount ?? "0") > 0 && (
+                          <span className="ml-1 text-xs text-[var(--text-muted)]">
+                            (R {parseFloat(p.unallocated_amount ?? "0").toFixed(2)} credit)
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </TD>
+                )}
+                <TD>
+                  {!p.invoice && (
+                    <button type="button" className={btnSecondary} onClick={() => setAllocating(p)}>
+                      Allocate
+                    </button>
+                  )}
+                </TD>
               </TR>
             ))}
           </tbody>
         </Table>
+      )}
+
+      {allocating && (
+        <PaymentAllocationsModal
+          paymentId={allocating.id}
+          customerId={allocating.customer}
+          paymentAmount={allocating.amount}
+          onClose={() => setAllocating(null)}
+          onSaved={refetch}
+        />
       )}
     </div>
   );

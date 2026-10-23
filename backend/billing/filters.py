@@ -1,7 +1,4 @@
-from datetime import timedelta
-
 import django_filters
-from django.utils import timezone
 
 from .models import Invoice
 
@@ -56,14 +53,14 @@ class InvoiceFilter(django_filters.FilterSet):
         return queryset
 
     def filter_overdue_within_days(self, queryset, name, value):
+        # The rule lives in billing/overdue.py, not here. Finance ->
+        # Dashboard shows an ageing table built from the same definition,
+        # and two hand-written copies of "what counts as overdue" would
+        # eventually disagree on screen about the same invoice.
+        from .overdue import cumulative_q
+
         try:
             days = int(value)
         except (TypeError, ValueError):
             return queryset
-        today = timezone.localdate()
-        cutoff = today - timedelta(days=days)
-        return queryset.filter(
-            status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE],
-            date_due__lt=today,
-            date_due__gte=cutoff,
-        )
+        return queryset.filter(cumulative_q(days))

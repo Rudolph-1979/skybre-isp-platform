@@ -85,7 +85,25 @@ def _customer_post_save_apply_status_to_services(sender, instance, created, **kw
     # Bad Debt cuts them off exactly as a suspension does. Leaving somebody
     # connected after writing off what they owe would be the one status where
     # the label and the reality disagree most expensively.
-    if instance.status in (Customer.Status.SUSPENDED, Customer.Status.BAD_DEBT):
+    #
+    # Reads Customer.OFF_STATUSES rather than listing statuses here, which
+    # is what that constant exists for -- its own comment says "named once,
+    # so nothing has to remember to add a new one to four separate checks",
+    # and this handler was the check that forgot. It hardcoded
+    # (SUSPENDED, BAD_DEBT) and omitted INACTIVE.
+    #
+    # INACTIVE is the status meaning "they left", so it is the natural thing
+    # for staff to set when a customer cancels -- and doing that left every
+    # service ACTIVE with a live Cleartext-Password row in radcheck, so the
+    # line kept full internet indefinitely. Worse, radiusauth.offline
+    # excludes customers in OFF_STATUSES from the recently-offline report,
+    # so the one screen that would have shown a line that should not be up
+    # filtered them out by design. Nothing anywhere would have surfaced it.
+    #
+    # This is the exact bug this module's docstring was written to fix ("a
+    # customer marked Suspended on their own page carried on browsing
+    # exactly as before"), left unfixed for the third off-status.
+    if instance.status in Customer.OFF_STATUSES:
         services = instance.services.filter(status=Service.Status.ACTIVE)
         for service in services:
             service.status = Service.Status.SUSPENDED
@@ -101,7 +119,7 @@ def _customer_post_save_apply_status_to_services(sender, instance, created, **kw
             )
         return
 
-    if instance.status == Customer.Status.ACTIVE:
+    if instance.status in Customer.LIVE_STATUSES:
         services = instance.services.filter(
             status=Service.Status.SUSPENDED, auto_suspended_with_customer=True
         )
@@ -151,6 +169,17 @@ def _service_post_save_reconcile_customer(sender, instance, created, **kwargs):
     if not cascade and instance.auto_suspended_with_customer:
         sender.objects.filter(pk=instance.pk).update(auto_suspended_with_customer=False)
         instance.auto_suspended_with_customer = False
+
+    # Exactly the same reasoning for the billing mark, and it matters more:
+    # that flag is what lets a payment put a line back on by itself. A
+    # status change nobody in billing made means this service is no longer
+    # "down for non-payment" -- staff turned it on, or took it down again
+    # for a reason of their own -- and either way money arriving must not
+    # override that. `_billing_action` is set by the blocking pass and by
+    # billing.reactivation, and by nothing else.
+    if not getattr(instance, "_billing_action", False) and instance.suspended_for_nonpayment:
+        sender.objects.filter(pk=instance.pk).update(suspended_for_nonpayment=False)
+        instance.suspended_for_nonpayment = False
 
     if cascade or instance.status != sender.Status.ACTIVE:
         return

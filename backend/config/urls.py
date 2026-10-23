@@ -2,11 +2,34 @@ import os
 
 from django.conf import settings
 from django.contrib import admin
-from django.http import HttpResponseForbidden
+from django.db import connection
+from django.http import HttpResponseForbidden, JsonResponse
 from django.urls import path, include
 from django.views.static import serve as static_serve
 
 from config.media_security import verify_media_path
+from config.system_status import SystemStatusView
+
+
+def health(request):
+    """Liveness for the container healthcheck, and nothing more.
+
+    Unauthenticated on purpose -- it is what Docker polls before letting
+    the frontend start accepting traffic, so it cannot need a token. It
+    therefore leaks nothing: no version, no counts, no settings, just
+    whether this process can reach its database.
+
+    The database round trip is the point. A gunicorn worker that is up but
+    cannot see Postgres serves 500s to every request, and a healthcheck
+    that only proved the process was listening would call that healthy.
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except Exception:  # noqa: BLE001 -- any DB failure is unhealthy
+        return JsonResponse({"status": "unhealthy"}, status=503)
+    return JsonResponse({"status": "ok"})
 
 
 def protected_media_serve(request, path, document_root=None, show_indexes=False):
@@ -50,6 +73,10 @@ urlpatterns = [
     # every refreshed admin page straight to Django's admin site instead
     # of serving the SPA. Giving Django's admin its own path avoids that.
     path("django-admin/", admin.site.urls),
+    # Before the app includes, so it can never be shadowed by a router.
+    path("api/health/", health),
+    # Dashboard "System status" card, admins only (config/system_status.py).
+    path("api/system-status/", SystemStatusView.as_view()),
     path("api/", include("accounts.urls")),
     path("api/", include("customers.urls")),
     path("api/", include("billing.urls")),
@@ -65,6 +92,12 @@ urlpatterns = [
     path("api/", include("expenses.urls")),
     path("api/", include("audit.urls")),
     path("api/", include("sales.urls")),
+    path("api/", include("contracts.urls")),
+    path("api/", include("ledger.urls")),
+    # Conecto's three webhooks. Unauthenticated by JWT on purpose --
+    # they carry a shared bearer token instead, checked in
+    # conecto.views.ConectoWebhook.
+    path("api/", include("conecto.urls")),
     # Signed, short-lived download links only -- see config/media_security.py.
     # The real permission check already happened when the API response
     # that contained this link was generated (StockReceiptSerializer,

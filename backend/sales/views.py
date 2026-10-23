@@ -1,4 +1,5 @@
 from django.db.models import Count, Q, Sum
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
@@ -18,12 +19,12 @@ def scope_to_partners(qs, user):
 
     A rep restricted to one reseller's customers must not see another
     reseller's pipeline. Leads with no partner are direct enquiries and
-    belong to everybody, exactly as no-partner customers do.
+    follow the same "Direct" tick as no-partner customers (customers.scoping).
     """
-    allowed = getattr(user, "allowed_partners", None) or []
-    if allowed and user.role != user.Role.ADMIN:
-        return qs.filter(Q(partner_id__in=allowed) | Q(partner__isnull=True))
-    return qs
+    from customers.scoping import partner_condition
+
+    condition = partner_condition(user, services=False)
+    return qs if condition is None else qs.filter(condition)
 
 
 class LeadViewSet(viewsets.ModelViewSet):
@@ -39,8 +40,9 @@ class LeadViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = Lead.objects.select_related(
-            "partner", "assigned_to", "interested_tariff", "customer"
-        ).all()
+            "partner", "assigned_to", "interested_tariff", "customer",
+            "coverage_partner", "coverage_checked_by", "scan_job", "install_job",
+        ).prefetch_related("scan_job__assigned_technicians", "install_job__assigned_technicians")
         qs = scope_to_partners(qs, self.request.user)
         params = self.request.query_params
 
@@ -69,6 +71,9 @@ class LeadViewSet(viewsets.ModelViewSet):
         lead = serializer.save(
             assigned_to=serializer.validated_data.get("assigned_to") or self.request.user
         )
+        from .notify import lead_assigned
+
+        lead_assigned(lead, by_user=self.request.user)
         LeadNote.objects.create(
             lead=lead,
             author=self.request.user,
@@ -78,7 +83,12 @@ class LeadViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         before = serializer.instance.status
+        owner_before = serializer.instance.assigned_to_id
         lead = serializer.save()
+        if lead.assigned_to_id != owner_before:
+            from .notify import lead_assigned
+
+            lead_assigned(lead, by_user=self.request.user)
         if lead.status != before:
             LeadNote.objects.create(
                 lead=lead,
@@ -111,6 +121,188 @@ class LeadViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    # --- the flow Rudolph drew (6 Oct 2026); see sales/workflow.py ---------
+
+    def _flow(self, request, fn):
+        from .workflow import FlowError
+
+        try:
+            extra = fn() or {}
+        except FlowError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        lead = self.get_queryset().get(pk=self.kwargs["pk"])
+        return Response({**extra, "lead": LeadSerializer(lead).data})
+
+    @staticmethod
+    def _get(model, value, what):
+        from .workflow import FlowError
+
+        if value in (None, "", 0, "0"):
+            return None
+        try:
+            return model.objects.get(pk=value)
+        except (model.DoesNotExist, ValueError, TypeError):
+            raise FlowError(f"That {what} doesn't exist.")
+
+    @action(detail=True, methods=["post"])
+    def coverage(self, request, pk=None):
+        """Coverage check: method electronic/scan/fibre, and the result once
+        known. A Scan LOS with no result books a Site Visit job."""
+        from django.contrib.auth import get_user_model
+        from django.utils.dateparse import parse_datetime
+
+        from customers.models import Partner
+
+        from .workflow import FlowError, record_coverage
+
+        lead = self.get_object()
+        d = request.data
+
+        def run():
+            start = None
+            if d.get("scan_start"):
+                start = parse_datetime(str(d["scan_start"]))
+                if start is None:
+                    raise FlowError("The scan time isn't a valid date and time.")
+                if timezone.is_naive(start):
+                    start = timezone.make_aware(start)
+            record_coverage(
+                lead, request.user,
+                method=str(d.get("method", "")),
+                result=str(d.get("result", "") or ""),
+                tower=str(d.get("tower", "") or "")[:100],
+                sector=str(d.get("sector", "") or "")[:100],
+                signal=str(d.get("signal", "") or "")[:50],
+                notes=str(d.get("notes", "") or ""),
+                partner=self._get(Partner, d.get("coverage_partner"), "fibre partner"),
+                scan_start=start,
+                scan_technician=self._get(get_user_model(), d.get("scan_technician"), "technician"),
+            )
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["post"])
+    def quote(self, request, pk=None):
+        """Prepare the quote (plan + recurring + once-off items, start date,
+        discount) and optionally email it."""
+        from .quote import email_quote
+        from .workflow import prepare_quote
+
+        lead = self.get_object()
+        d = request.data
+
+        def run():
+            prepare_quote(lead, request.user, **self._quote_args(d))
+            if d.get("send_email") in (True, "true", "1", 1):
+                return {"emailed_to": email_quote(lead, request.user)}
+            return {}
+
+        return self._flow(request, run)
+
+    def _quote_args(self, d):
+        """The quote form's body, checked, as prepare_quote/apply_quote args."""
+        from billing.models import Tariff
+        from django.utils.dateparse import parse_date
+
+        from .workflow import DEFAULT_QUOTE_DAYS, FlowError
+
+        items = d.get("items") or []
+        if not isinstance(items, list):
+            raise FlowError("Once-off items must be a list.")
+        recurring = d.get("recurring") or []
+        if not isinstance(recurring, list):
+            raise FlowError("Recurring charges must be a list.")
+        try:
+            days = int(d.get("valid_days") or DEFAULT_QUOTE_DAYS)
+        except (TypeError, ValueError):
+            raise FlowError("Valid for how many days?")
+        start = None
+        if d.get("start_date"):
+            start = parse_date(str(d.get("start_date")))
+            if start is None:
+                raise FlowError("The service start date must be YYYY-MM-DD.")
+        return {
+            "tariff": self._get(Tariff, d.get("tariff"), "plan"), "items": items, "valid_days": days,
+            "recurring": recurring, "start_date": start, "discount": d.get("discount") or None,
+        }
+
+    @action(detail=True, methods=["post"], url_path="quote-preview")
+    def quote_preview(self, request, pk=None):
+        """The quote PDF exactly as Save would make it, from the form as it
+        stands -- nothing is saved (7 Oct 2026: "Quotes must be previewed
+        before saving")."""
+        from .quote import render_quote_pdf
+        from .workflow import FlowError, apply_quote, quote_number
+
+        lead = self.get_object()
+        try:
+            apply_quote(lead, **self._quote_args(request.data))
+        except FlowError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        lead.quote_sent_at = lead.quote_sent_at or timezone.now()
+        response = HttpResponse(render_quote_pdf(lead), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{quote_number(lead)} preview.pdf"'
+        return response
+
+    @action(detail=True, methods=["post"], url_path="quote-email")
+    def quote_email(self, request, pk=None):
+        from .quote import email_quote
+        from .workflow import FlowError
+
+        lead = self.get_object()
+
+        def run():
+            if not lead.quote_sent_at:
+                raise FlowError("There's no quote yet.")
+            return {"emailed_to": email_quote(lead, request.user)}
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["get"], url_path="quote-pdf")
+    def quote_pdf(self, request, pk=None):
+        from .quote import render_quote_pdf
+        from .workflow import quote_number
+
+        lead = self.get_object()
+        if not lead.quote_sent_at:
+            return Response({"detail": "There's no quote yet."}, status=status.HTTP_404_NOT_FOUND)
+        response = HttpResponse(render_quote_pdf(lead), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{quote_number(lead)}.pdf"'
+        return response
+
+    @action(detail=True, methods=["post"])
+    def accept(self, request, pk=None):
+        """Quote accepted: client created, installation job in the job pool."""
+        from .workflow import accept
+
+        lead = self.get_object()
+
+        def run():
+            customer, job = accept(lead, request.user)
+            return {
+                "customer_id": customer.pk,
+                "customer_reference": customer.customer_id,
+                "install_job_id": job.pk if job else None,
+            }
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        """Lost, at whatever step -- always with a reason."""
+        from .workflow import FlowError, reject
+
+        lead = self.get_object()
+        d = request.data
+
+        def run():
+            reason = str(d.get("reason") or Lead.LostReason.QUOTE_REJECTED)
+            if reason not in Lead.LostReason.values:
+                raise FlowError("Choose why it was lost.")
+            reject(lead, request.user, reason=reason, note=str(d.get("note", "") or "").strip())
+
+        return self._flow(request, run)
 
     @action(detail=True, methods=["get", "post"], url_path="notes")
     def notes_action(self, request, pk=None):

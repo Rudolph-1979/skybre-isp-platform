@@ -1,0 +1,103 @@
+import { useEffect, useState } from "react";
+import { api } from "../api/client";
+import { Table, THead, TH, TR, TD } from "./Table";
+import { StatusBadge } from "./StatusBadge";
+import { formatIsoDateTime } from "../utils/billingTerms";
+import type { EmailLog } from "../types";
+
+/**
+ * Every notification this platform has actually sent this customer.
+ *
+ * Email is the only channel that exists today -- no SMS, WhatsApp or push
+ * -- so in practice this is an email log, sourced from the same EmailLog
+ * rows the Email tab's compose box writes to. It's named and framed as
+ * "communication", not "email", on purpose: the day another channel is
+ * added, its sends belong here too, rather than in a channel-specific tab
+ * nobody remembers to check. Separate from the History tab on purpose as
+ * well -- that one is a field-level change log (who edited what), this one
+ * is what actually left the building addressed to the customer.
+ */
+export function CustomerCommunicationTab({ customerId }: { customerId: number }) {
+  const [logs, setLogs] = useState<EmailLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setLoading(true);
+    api
+      .get<{ results: EmailLog[] }>(`/email-logs/?customer=${customerId}&ordering=-created_at`)
+      .then((res) => setLogs(res.data.results))
+      .catch(() => setError("Couldn't load the communication log."))
+      .finally(() => setLoading(false));
+  }, [customerId]);
+
+  return (
+    <div>
+      <h2 className="mb-1 text-sm font-semibold text-[var(--text-primary)]">Communication history</h2>
+      <p className="mb-3 text-xs text-[var(--text-muted)]">
+        Every email sent to this customer — invoices, reminders, suspension notices, statements,
+        payment receipts, and anything sent manually from the Email tab — with whether it actually
+        went out. There's no SMS or WhatsApp integration on this platform yet, so email is the
+        whole communication history for now.
+      </p>
+
+      {error && (
+        <p className="mb-3 rounded-md bg-[var(--status-critical)]/10 px-3 py-2 text-sm text-[var(--status-critical)]">
+          {error}
+        </p>
+      )}
+
+      {loading && logs.length === 0 ? (
+        <p className="px-1 py-6 text-sm text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]">
+          <Table>
+            <THead>
+              <TR>
+                <TH>Date</TH>
+                <TH>Template</TH>
+                <TH>Subject</TH>
+                <TH>Sent to</TH>
+                <TH>Sent by</TH>
+                <TH>Status</TH>
+              </TR>
+            </THead>
+            <tbody>
+              {logs.map((log) => (
+                <TR key={log.id}>
+                  <TD>{formatIsoDateTime(log.created_at)}</TD>
+                  <TD>{log.template_name}</TD>
+                  <TD className="max-w-xs truncate">
+                    <span title={log.status === "failed" ? log.error_message : log.subject}>
+                      {log.subject || <span className="text-[var(--text-muted)]">—</span>}
+                    </span>
+                  </TD>
+                  <TD>
+                    {log.recipient_email}
+                    {log.cc_email && (
+                      <span className="mt-0.5 block text-xs text-[var(--text-muted)]">cc {log.cc_email}</span>
+                    )}
+                  </TD>
+                  <TD>
+                    {log.sent_by_name || <span className="text-[var(--text-muted)]">Automatic</span>}
+                  </TD>
+                  <TD>
+                    <StatusBadge status={log.status} />
+                    {log.status === "failed" && log.error_message && (
+                      <span className="ml-2 text-xs text-[var(--text-muted)]">{log.error_message}</span>
+                    )}
+                  </TD>
+                </TR>
+              ))}
+              {logs.length === 0 && (
+                <TR>
+                  <TD className="text-[var(--text-muted)]">No emails sent to this customer yet.</TD>
+                </TR>
+              )}
+            </tbody>
+          </Table>
+        </div>
+      )}
+    </div>
+  );
+}

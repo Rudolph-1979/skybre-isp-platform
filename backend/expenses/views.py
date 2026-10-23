@@ -1,12 +1,20 @@
 from decimal import Decimal
 
+# Coalesce moved to vat_sources.py along with the query that used it.
 from django.http import HttpResponse
 from django.utils.dateparse import parse_date
 from rest_framework import permissions, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.permissions import IsStaffMember, section_permission
+# The filters below used to be written out inline here. They now live in
+# vat_sources so the spreadsheet export reads exactly the same definition
+# of "which documents count" that these figures are summed from -- see
+# that module's docstring for why two copies is the failure worth
+# preventing.
+from .vat_sources import input_vat_expenses, input_vat_stock_receipts, output_vat_items
 from .models import Expense
 from .serializers import ExpenseSerializer
 
@@ -27,41 +35,58 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     # bank_transaction is the reverse OneToOne from BankTransaction.
     # created_expense -- select_related it too so from_bank_feed's
     # hasattr() check doesn't cost an extra query per row.
-    queryset = Expense.objects.select_related("supplier", "created_by", "bank_transaction").all()
+    queryset = Expense.objects.select_related("supplier", "created_by", "bank_transaction", "vehicle").all()
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasAccountantAccess]
     # No parser_classes override -- DRF's own defaults (JSONParser,
     # FormParser, MultiPartParser) already cover both a plain JSON
     # edit and a multipart request carrying a new attachment file, same
     # as every other file-attachment viewset in this codebase (e.g.
     # inventory.StockReceiptViewSet, which also doesn't override this).
-    filterset_fields = ["category", "supplier"]
+    filterset_fields = ["category", "supplier", "vehicle"]
     search_fields = ["description", "supplier_name", "invoice_number"]
     ordering_fields = ["date", "amount_excl_vat", "created_at"]
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    @action(detail=False, methods=["get"], url_path="vehicle-choices")
+    def vehicle_choices(self, request):
+        """GET /api/expenses/vehicle-choices/ -- the Vehicle dropdown on the
+        expense form (13 Oct 2026). Served here, under Accountant access,
+        because whoever captures invoices may not have the Vehicles section;
+        it is a registration and a name, nothing more."""
+        from fleet.models import Vehicle
+
+        rows = Vehicle.objects.order_by("-is_active", "registration_number").values(
+            "id", "registration_number", "make", "model", "is_active"
+        )
+        return Response([
+            {
+                "id": r["id"],
+                "label": f"{r['registration_number']} — {r['make']} {r['model']}".strip()
+                + ("" if r["is_active"] else " (inactive)"),
+            }
+            for r in rows
+        ])
+
 
 def _sum_output_vat(period_start, period_end):
     """Output VAT for the period, on the invoice/accrual basis: every
-    InvoiceItem on an invoice actually issued (date_created) in the
+    InvoiceItem on an invoice actually issued (date_issued) in the
     period, excluding quotes/pro-formas/drafts (never real tax invoices)
     and cancelled invoices (VAT never became due). Bucketed by whether
     the line's tax_rate_pct is >0 (standard-rated) or exactly 0
     (zero-rated) -- there's no separate zero-rated/exempt flag anywhere
     in this codebase, so a 0% line is trusted at face value as
     intentionally zero-rated, not treated as a data-entry gap."""
-    from billing.models import Invoice, InvoiceItem
-
-    exclude_statuses = [
-        Invoice.Status.QUOTE, Invoice.Status.PROFORMA,
-        Invoice.Status.DRAFT, Invoice.Status.CANCELLED,
-    ]
-    items = (
-        InvoiceItem.objects
-        .filter(invoice__date_created__gte=period_start, invoice__date_created__lte=period_end)
-        .exclude(invoice__status__in=exclude_statuses)
-        .only("quantity", "unit_price", "tax_rate_pct", "invoice_id")
+    # Which lines count, and the long argument for dating them on
+    # date_issued, both moved to vat_sources.output_vat_items -- the
+    # reasoning went with the code rather than being left here beside a
+    # call that no longer does it. `.only()` stays: what must not drift
+    # between the summary and the export is which ROWS are counted, not
+    # which columns each caller bothers to load.
+    items = output_vat_items(period_start, period_end).only(
+        "quantity", "unit_price", "tax_rate_pct", "invoice_id"
     )
 
     standard_rated_supplies = Decimal("0")
@@ -125,7 +150,7 @@ def _sum_input_vat(period_start, period_end):
     expense_excl = Decimal("0")
     expense_vat = Decimal("0")
     expense_count = 0
-    expenses = Expense.objects.filter(date__gte=period_start, date__lte=period_end).only(
+    expenses = input_vat_expenses(period_start, period_end).only(
         "amount_excl_vat", "vat_rate_pct"
     )
     for expense in expenses:
@@ -140,9 +165,10 @@ def _sum_input_vat(period_start, period_end):
     # prefetch_related populates each line's cached `receipt`, which the
     # line-level VAT properties read -- without it this is one extra query
     # per line.
-    receipts = StockReceipt.objects.filter(
-        invoice_date__gte=period_start, invoice_date__lte=period_end
-    ).prefetch_related("lines")
+    # prefetch_related("lines") now travels with the filter itself, since
+    # every VAT figure on a receipt is derived from its lines and a caller
+    # that forgets it just gets the same answer slowly.
+    receipts = input_vat_stock_receipts(period_start, period_end)
     for receipt in receipts:
         stock_count += 1
         excl, vat, _incl = receipt.totals
@@ -250,11 +276,16 @@ def _find_duplicate_claims(period_start, period_end):
 
 
 def _sum_credit_notes(period_start, period_end):
-    """Informational only -- CreditRequest has no VAT rate/breakdown of
-    its own (see its model docstring: approving one just reduces
-    Customer.balance directly, with no linked invoice or tax split), so
-    this is deliberately NOT netted against Output VAT automatically.
-    Shown so whoever files the return can factor it in by hand if it's
+    """Informational only, and only for a credit with no invoice of its
+    own. Approving a CreditRequest now creates a real, zero-rated credit
+    note invoice (see CreditRequest.create_credit_note_invoice) whose line
+    already lands in `_sum_output_vat`'s zero-rated total for the period
+    it was issued in -- so listing it again here would put the same rand
+    amount in the return twice, once netted against supplies and once as
+    this separate note. credit_note__isnull=True keeps this to exactly
+    the credits that still have nothing else on the return to show for
+    them: ones decided before that feature existed and not yet backfilled.
+    Shown so whoever files the return can factor those in by hand if
     material, rather than the report silently overstating Output VAT."""
     from billing.models import CreditRequest
 
@@ -262,6 +293,7 @@ def _sum_credit_notes(period_start, period_end):
         status=CreditRequest.Status.APPROVED,
         decided_at__date__gte=period_start,
         decided_at__date__lte=period_end,
+        credit_note__isnull=True,
     )
     total = Decimal("0")
     count = 0
@@ -336,6 +368,63 @@ class VatReturnView(APIView):
         if error:
             return Response({"detail": error}, status=400)
         return Response(build_vat_return(period_start, period_end))
+
+
+class VatReturnExportView(APIView):
+    """GET /api/vat-return/export/?period_start=&period_end=&format=xlsx
+
+    The same figures as VatReturnView, as a spreadsheet.
+    `filetype=xlsx` (the default) gives a workbook with the summary and
+    the documents behind it on separate sheets; `filetype=csv` gives one
+    flat file, and `section=summary|output|input|warnings` picks which.
+
+    NOT called `format`. That name is reserved by DRF for content
+    negotiation: `?format=csv` makes it hunt for a renderer named "csv"
+    and 404 before this view is entered. It reads more naturally and it
+    does not work.
+
+    Why both: the xlsx is what gets read and emailed to an accountant,
+    the csv is what gets imported into something else. Stacking several
+    tables into one CSV with blank lines between them would look right in
+    Excel and import into nothing, which defeats the only reason to pick
+    CSV over the workbook.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasAccountantAccess]
+
+    def get(self, request):
+        from .vat_export import SECTIONS, build_csv, build_xlsx
+
+        period_start, period_end, error = _parse_period(request)
+        if error:
+            return Response({"detail": error}, status=400)
+
+        fmt = (request.query_params.get("filetype") or "xlsx").lower()
+        if fmt not in ("xlsx", "csv"):
+            return Response({"detail": "filetype must be xlsx or csv."}, status=400)
+        section = (request.query_params.get("section") or "summary").lower()
+        if section not in SECTIONS:
+            return Response(
+                {"detail": f"section must be one of {', '.join(SECTIONS)}."}, status=400
+            )
+
+        vat_return = build_vat_return(period_start, period_end)
+        stem = f"VAT-Return-{period_start}-to-{period_end}"
+
+        if fmt == "csv":
+            payload = build_csv(vat_return, section)
+            content_type = "text/csv; charset=utf-8"
+            filename = f"{stem}-{section}.csv"
+        else:
+            payload = build_xlsx(vat_return)
+            content_type = (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            filename = f"{stem}.xlsx"
+
+        response = HttpResponse(payload, content_type=content_type)
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
 
 
 class VatReturnPdfView(APIView):

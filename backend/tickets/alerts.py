@@ -6,15 +6,23 @@ tile clicks through to. A tile reading 3 that lands on a list of 5 is worse
 than no tile at all, and that is exactly what happens when the same rule is
 written out twice.
 
-The rule: more than `min_tickets - 1` tickets logged in a single CALENDAR
-month, at any point in the last `months` months. Every department counts
-(support, billing, sales, abuse) -- three contacts of any kind in one month is
-a customer wanting attention, which is the question being asked.
+The rule: tickets logged on at least `min_tickets` SEPARATE DAYS of a single
+CALENDAR month, at any point in the last `months` months. Every department
+counts (support, billing, sales, abuse) -- contact on three different days in
+one month is a customer wanting attention, which is the question being asked.
+
+Days, not tickets (George, 13 Oct 2026: "Clients creating tickets in the same
+day only one should be accepted ... Sometimes clients press the ticket log
+button more than once"). A double-tapped Log ticket button, or three tickets
+about one outage that afternoon, is one bad day, not three. Days are counted
+in local time (TIME_ZONE), so a ticket at 00:30 SAST belongs to that day, not
+the UTC day before. `total_tickets` is still every ticket, so the real volume
+stays visible next to the flag.
 """
 import datetime
 
 from django.db.models import Count
-from django.db.models.functions import TruncMonth
+from django.db.models.functions import TruncDate, TruncMonth
 from django.utils import timezone
 
 # The dashboard's defaults, and what the Customers page filter uses when it
@@ -54,7 +62,10 @@ def high_alert_stats(customers, months=DEFAULT_MONTHS, min_tickets=DEFAULT_MIN_T
         Ticket.objects.filter(created_at__date__gte=start, customer__in=customers)
         .annotate(month=TruncMonth("created_at"))
         .values("customer_id", "month")
-        .annotate(count=Count("id"))
+        # `count` is the number of separate (local) days with a ticket that
+        # month -- what the threshold is measured in. `tickets` is the raw
+        # number, kept for total_tickets.
+        .annotate(count=Count(TruncDate("created_at"), distinct=True), tickets=Count("id"))
     )
 
     per_customer = {}
@@ -63,7 +74,7 @@ def high_alert_stats(customers, months=DEFAULT_MONTHS, min_tickets=DEFAULT_MIN_T
             row["customer_id"],
             {"peak_count": 0, "peak_month": None, "months_breached": 0, "total_tickets": 0},
         )
-        entry["total_tickets"] += row["count"]
+        entry["total_tickets"] += row["tickets"]
         if row["count"] >= min_tickets:
             entry["months_breached"] += 1
         if row["count"] > entry["peak_count"]:

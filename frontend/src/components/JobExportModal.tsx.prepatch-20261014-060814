@@ -1,0 +1,127 @@
+import { useState } from "react";
+import { api } from "../api/client";
+import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "./Modal";
+import type { User } from "../types";
+
+/**
+ * Scheduling -> Export Excel (George, 14 Oct 2026): the jobs scheduled
+ * between two dates, by date, time and technician. The workbook has a Jobs
+ * sheet, a By technician sheet and a Summary (jobs + hours per technician).
+ */
+
+function iso(d: Date) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+const STATUSES = [
+  { value: "scheduled", label: "Scheduled" },
+  { value: "in_progress", label: "In progress" },
+  { value: "completed", label: "Completed" },
+  { value: "cancelled", label: "Cancelled" },
+];
+
+export function JobExportModal({
+  staff,
+  defaultFrom,
+  defaultTo,
+  onClose,
+}: {
+  staff: User[];
+  defaultFrom?: Date;
+  defaultTo?: Date;
+  onClose: () => void;
+}) {
+  const now = new Date();
+  const [from, setFrom] = useState(iso(defaultFrom ?? new Date(now.getFullYear(), now.getMonth(), 1)));
+  const [to, setTo] = useState(iso(defaultTo ?? new Date(now.getFullYear(), now.getMonth() + 1, 0)));
+  const [technician, setTechnician] = useState("");
+  const [statuses, setStatuses] = useState<string[]>(["scheduled", "in_progress", "completed"]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function download() {
+    setError("");
+    if (!from || !to) return setError("Choose both dates.");
+    if (to < from) return setError("The end date is before the start date.");
+    setBusy(true);
+    try {
+      const q = new URLSearchParams({ date_from: from, date_to: to });
+      if (technician) q.set("technician", technician);
+      if (statuses.length && statuses.length < STATUSES.length) q.set("status", statuses.join(","));
+      const res = await api.get(`/jobs/export/?${q.toString()}`, { responseType: "blob" });
+      const url = URL.createObjectURL(
+        new Blob([res.data], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })
+      );
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `jobs-${from}-to-${to}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      onClose();
+    } catch (err: any) {
+      let msg = "Couldn't export the jobs.";
+      const data = err?.response?.data;
+      if (data instanceof Blob) {
+        try {
+          msg = JSON.parse(await data.text()).detail || msg;
+        } catch {
+          /* keep the default */
+        }
+      }
+      setError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="Export jobs to Excel" onClose={onClose}>
+      <div className="flex flex-wrap gap-3">
+        <FormField label="From">
+          <input type="date" className={`${inputClass} w-auto`} value={from} onChange={(e) => setFrom(e.target.value)} />
+        </FormField>
+        <FormField label="To">
+          <input type="date" className={`${inputClass} w-auto`} value={to} onChange={(e) => setTo(e.target.value)} />
+        </FormField>
+      </div>
+      <FormField label="Technician">
+        <select className={inputClass} value={technician} onChange={(e) => setTechnician(e.target.value)}>
+          <option value="">All technicians</option>
+          {staff.map((s) => (
+            <option key={s.id} value={s.id}>{s.first_name || s.username}</option>
+          ))}
+        </select>
+      </FormField>
+      <FormField label="Status">
+        <div className="flex flex-wrap gap-3 text-sm">
+          {STATUSES.map((s) => (
+            <label key={s.value} className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={statuses.includes(s.value)}
+                onChange={(e) =>
+                  setStatuses((prev) => (e.target.checked ? [...prev, s.value] : prev.filter((v) => v !== s.value)))
+                }
+              />
+              {s.label}
+            </label>
+          ))}
+        </div>
+      </FormField>
+      <p className="text-xs text-[var(--text-muted)]">
+        Jobs whose start falls between the two dates (both included), by date and time. The workbook also has a
+        "By technician" sheet (a two-person job is on both lists) and a Summary of jobs and hours per technician.
+        Unscheduled pool jobs aren't included.
+      </p>
+      {error && <p className="mt-2 text-sm text-[var(--status-critical)]">{error}</p>}
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" className={btnSecondary} onClick={onClose}>Cancel</button>
+        <button type="button" className={btnPrimary} disabled={busy || statuses.length === 0} onClick={download}>
+          {busy ? "Exporting…" : "Export Excel"}
+        </button>
+      </div>
+    </Modal>
+  );
+}

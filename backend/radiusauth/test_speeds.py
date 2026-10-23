@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from accounts.models import User
 from billing.models import Service, Tariff
-from customers.models import Customer
+from customers.models import Customer, Partner
 from radiusauth.models import SpeedWindow, UsageBucket
 from radiusauth.signals import _mikrotik_rate_limit
 from radiusauth.speeds import countable_usage_gb, effective_speeds
@@ -400,6 +400,93 @@ class SpeedNowApiTests(TestCase):
         self.assertIn("end_time", res.data)
 
 
+class SpeedNowPartnerScopingTests(TestCase):
+    """A reseller-restricted staff member must not be able to read another
+    partner's line through the speed-now endpoint.
+
+    Every other customer-linked endpoint in radiusauth/views.py filters on
+    allowed_partners. ServiceSpeedNowView resolved the Service straight
+    from the pk in the URL, so a competitor's plan, current line speed,
+    shaping state and month-to-date GB were one guessed id away -- and
+    service ids are sequential.
+
+    The tests above only ever authenticated an unrestricted Admin against
+    a customer with no partner, which is the one combination where scoped
+    and unscoped code look identical.
+    """
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+
+        self.client = APIClient()
+        self.acme = Partner.objects.create(name="Acme Fibre")
+        self.rival = Partner.objects.create(name="Rival Networks")
+        self.tariff = Tariff.objects.create(
+            name="20 Mbps", price=Decimal("899.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240, fup_threshold_gb=100,
+        )
+        self.mine = self._service(self.acme, "Acme Customer", "ac@example.com", "acme1")
+        self.theirs = self._service(self.rival, "Rival Customer", "rc@example.com", "rival1")
+        self.direct = self._service(None, "Direct Customer", "dc@example.com", "direct1")
+
+        self.restricted = User.objects.create_user(
+            username="acme-desk", password="pw-for-tests",
+            role=User.Role.SUPPORT, allowed_sections=["customers"],
+            allowed_partners=[self.acme.id],
+        )
+        self.admin = User.objects.create_user(
+            username="root", password="pw-for-tests",
+            role=User.Role.ADMIN, allowed_partners=[self.acme.id],
+        )
+
+    def _service(self, partner, name, email, username):
+        customer = Customer.objects.create(full_name=name, email=email, partner=partner)
+        return Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date="2026-08-01", radius_username=username,
+        )
+
+    def _speed_now(self, user, service):
+        self.client.force_authenticate(user)
+        return self.client.get(f"/api/services/{service.pk}/speed-now/")
+
+    def test_another_partners_line_is_not_readable(self):
+        """A support agent restricted to Acme typing a sequential service
+        id into the URL was reading Rival's plan, current speed and how
+        many GB that customer had used this month."""
+        res = self._speed_now(self.restricted, self.theirs)
+        self.assertEqual(res.status_code, 404)
+        # 404 not 403, so the ids themselves stay unmappable.
+        self.assertNotIn("used_gb", res.data)
+
+    def test_your_own_partners_line_is_still_readable(self):
+        """The whole point of the endpoint is that a support agent can
+        answer \"why is my internet slow\" in one sentence -- for the
+        customers they are actually allowed to support."""
+        res = self._speed_now(self.restricted, self.mine)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["plan_download_kbps"], 20480)
+        self.assertIn("full plan speed", res.data["explanation"])
+
+    def test_a_direct_customers_line_needs_direct_ticked(self):
+        """Direct customers (no partner) only when "Direct" is ticked for the
+        user (Rudolph, 5 Oct 2026) -- the rule everywhere else."""
+        res = self._speed_now(self.restricted, self.direct)
+        self.assertEqual(res.status_code, 404)
+        self.restricted.allowed_partners = [*self.restricted.allowed_partners, 0]  # tick "Direct"
+        self.restricted.save(update_fields=["allowed_partners"])
+        res = self._speed_now(self.restricted, self.direct)
+        self.assertEqual(res.status_code, 200)
+
+    def test_an_admin_still_sees_every_partners_line(self):
+        """Admin outranks allowed_partners everywhere else in the project,
+        and an Admin with a partner list set is a real account here -- it
+        must not quietly become a restricted one."""
+        res = self._speed_now(self.admin, self.theirs)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["service_id"], self.theirs.pk)
+
+
 class SafetyTests(TestCase):
     """The scheduled run fires for every connected customer at once, so
     its failure modes are network-wide by construction."""
@@ -472,9 +559,10 @@ class SafetyTests(TestCase):
     def _connect_all(self):
         """Give every line an open accounting row, so they count as live.
 
-        Offline lines are filtered out BEFORE the limit is applied -- there
-        is no point spending the run's budget on lines that cannot be
-        changed in place -- so a stampede test needs real sessions."""
+        An offline line spends the budget too -- writing radreply is what
+        it gets at its next login -- but only on the tick its rate actually
+        moves, so a stampede test of the CoA path still needs real
+        sessions."""
         from radiusauth.models import RadAcct
 
         for i, service in enumerate(self.services):
@@ -690,3 +778,229 @@ class ShaperResyncTests(TestCase):
 
         source = inspect.getsource(apply_speed_policies)
         self.assertIn("couldn't re-sync shaper queues", source)
+
+class RadreplyFollowsThePolicyTests(TestCase):
+    """A speed the job works out has to survive a reconnect.
+
+    radreply is what FreeRADIUS hands back at login. A CoA changes the
+    session that is up right now and nothing else, so a rate that only
+    ever went out as a CoA is undone by the customer's next router
+    reboot -- and last_pushed_rate_limit still says it was delivered, so
+    the run reports "already correct" and never sends it again.
+    """
+
+    def setUp(self):
+        self.tariff = Tariff.objects.create(
+            name="Skybre Wireless 5Mbps", price=Decimal("286.35"),
+            speed_download_kbps=5120, speed_upload_kbps=5120,
+        )
+        self.customer = Customer.objects.create(full_name="Rebooter", email="r@x.com")
+        self.service = Service.objects.create(
+            customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date="2026-08-01", radius_username="pppoe_test", radius_password="pw",
+        )
+        SpeedWindow.objects.create(
+            name="SkybreWireless Burst", start_time=datetime.time(0, 0),
+            end_time=datetime.time(23, 59), speed_pct=200,
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("apply_speed_policies", *args, stdout=out)
+        return out.getvalue()
+
+    def _radreply(self):
+        from radiusauth.models import RadReply
+
+        row = RadReply.objects.filter(
+            username="pppoe_test", attribute="Mikrotik-Rate-Limit"
+        ).first()
+        return row.value if row else None
+
+    def test_a_line_that_is_not_connected_still_gets_the_new_rate_for_next_login(self):
+        """There is no session to CoA, so radreply is the only way the
+        boost can ever reach them. The run used to count the line as
+        "not connected, nothing to do" and leave the old rate sitting
+        there for whenever they next dialled in."""
+        self._run("--seed")
+        self._run()
+        self.assertEqual(self._radreply(), "5120k/5120k", "a dry run wrote to radreply")
+        self._run("--commit")
+        self.assertEqual(self._radreply(), "10240k/10240k")
+
+    def test_the_same_offline_line_is_not_rewritten_on_every_tick(self):
+        """A five-minute cron must not UPDATE the same radreply row twelve
+        times an hour for as long as a window is open.
+
+        This used to be achieved by recording last_pushed_rate_limit in the
+        offline branch, which was wrong for a different reason -- it also
+        suppressed the CoA for a line that only LOOKED offline. Idempotence
+        now lives where it belongs, in record_rate_limit itself, which
+        skips a row that already carries the value.
+        """
+        from radiusauth.signals import record_rate_limit
+
+        self._run("--seed")
+        self._run("--commit")
+        self.assertEqual(self._radreply(), "10240k/10240k")
+
+        rows_written = record_rate_limit("pppoe_test", "10240k/10240k")
+        self.assertEqual(rows_written, 0, "a row already saying this must not be rewritten")
+
+        rows_written = record_rate_limit("pppoe_test", "20480k/20480k")
+        self.assertEqual(rows_written, 1, "but a genuinely new rate must still be written")
+
+    def test_a_line_that_only_looked_offline_still_gets_its_coa(self):
+        """find_live_session treats a session whose interim accounting
+        updates went missing as dead. That happens to customers who are
+        plainly connected.
+
+        Such a line is counted "not connected" for that tick, which is
+        fine -- but it must NOT be recorded as delivered. An earlier
+        version set last_pushed_rate_limit in the offline branch, so on
+        the next tick, heartbeat restored and the customer demonstrably
+        online, the "already correct" skip matched and the CoA was never
+        sent. They ran the whole window at the old speed while the
+        database said the new one had been delivered.
+        """
+        from radiusauth.models import RadAcct
+
+        self._run("--seed")
+        RadAcct.objects.create(
+            username="pppoe_test", acctsessionid="S-gap", nasipaddress="127.0.0.1",
+            acctstarttime=timezone.now() - datetime.timedelta(hours=3),
+            acctupdatetime=timezone.now() - datetime.timedelta(minutes=20),
+        )
+        self._run("--commit")
+
+        service = Service.objects.get(radius_username="pppoe_test")
+        self.assertEqual(self._radreply(), "10240k/10240k",
+                         "radreply must still be put right for the next login")
+        self.assertEqual(service.last_pushed_rate_limit, "5120k/5120k",
+                         "no session was told anything, so nothing may be recorded as pushed")
+
+        # Heartbeat restored: the line is unmistakably up.
+        RadAcct.objects.filter(username="pppoe_test").update(acctupdatetime=timezone.now())
+        output = self._run("--commit")
+        self.assertNotIn("1 already correct", output,
+                         "the live session must not be skipped as already done")
+
+
+class OfflineLinesAreRealChangesTests(TestCase):
+    """A line that is down when a window opens is still being changed.
+
+    radreply is what FreeRADIUS hands it at its next login, so writing it
+    IS the delivery -- which means it has to obey the run's --limit and
+    show up on the log like any other change, and the static simple queue
+    has to move with it or the boost is thrown away at reconnect.
+    """
+
+    def setUp(self):
+        from network.models import Device
+
+        self.tariff = Tariff.objects.create(
+            name="Skybre Wireless 5Mbps", price=Decimal("286.35"),
+            speed_download_kbps=5120, speed_upload_kbps=5120,
+        )
+        self.device = Device.objects.create(
+            name="Tower NAS", ip_address="10.0.0.1", enable_shaper=True,
+        )
+        self.plain_device = Device.objects.create(
+            name="Depot NAS", ip_address="10.0.0.2", enable_shaper=False,
+        )
+        self.customer = Customer.objects.create(full_name="Load Shed", email="ls@x.com")
+        self.services = [
+            Service.objects.create(
+                customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+                start_date="2026-08-01", radius_username=f"dark{i}", radius_password="pw",
+                device=self.device if i < 4 else self.plain_device,
+            )
+            for i in range(5)
+        ]
+        SpeedWindow.objects.create(
+            name="SkybreWireless Burst", start_time=datetime.time(0, 0),
+            end_time=datetime.time(23, 59), speed_pct=200,
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("apply_speed_policies", *args, stdout=out)
+        return out.getvalue()
+
+    def _boosted(self):
+        from radiusauth.models import RadReply
+
+        return sorted(
+            RadReply.objects.filter(
+                attribute="Mikrotik-Rate-Limit", value="10240k/10240k"
+            ).values_list("username", flat=True)
+        )
+
+    def test_a_shaper_device_is_resynced_even_when_every_line_on_it_is_offline(self):
+        """A tower on load-shedding when the 22:00 window opens. The boost
+        goes into radreply and is handed over at reconnect -- and is then
+        thrown away by the static simple queue, still holding the line at
+        plan speed, because the customer gets the more restrictive of the
+        two queues. Nothing on either screen looks wrong."""
+        from unittest import mock
+
+        self._run("--seed")
+        with mock.patch("network.router_sync.sync_device_shaper_queues") as sync:
+            self._run("--commit")
+
+        self.assertEqual(sync.call_count, 1, "the static queues were never re-pushed")
+        # And only the device that actually runs the shaper.
+        self.assertEqual(sync.call_args[0][0].pk, self.device.pk)
+
+    def test_offline_lines_obey_the_run_limit_and_are_named_on_the_log(self):
+        """--limit exists so a misconfigured window turns "the whole network
+        at once" into "fifty, then look at the log". radreply is what the
+        customer gets at their next login, so five disconnected lines under
+        --limit 1 must move one rate, not five -- and the run must not
+        report that nothing happened while it moved them."""
+        self._run("--seed")
+        text = self._run("--commit", "--limit", "1")
+
+        self.assertEqual(len(self._boosted()), 1, "--limit did not cap the radreply writes")
+        self.assertIn(self._boosted()[0], text, "the line that was changed is not on the log")
+        self.assertIn("held back by --limit 1", text)
+
+        # And the rest are picked up on the following ticks, not lost.
+        for _ in range(4):
+            self._run("--commit", "--limit", "1")
+        self.assertEqual(len(self._boosted()), 5)
+
+    def test_an_offline_line_already_holding_the_rate_does_not_spend_the_budget(self):
+        """A window stays open for hours and the same disconnected lines
+        come round every five minutes. If each of them cost a slot, a
+        customer who came back online mid-window would sit behind them and
+        never get their CoA at all.
+
+        (This one passes before the --limit fix as well as after: it is
+        here because the obvious way to write that fix -- charging every
+        offline line a slot -- breaks it.)
+        """
+        from unittest import mock
+
+        from radiusauth.models import RadAcct
+
+        self._run("--seed")
+        self._run("--commit")           # every offline line now holds the boost
+        RadAcct.objects.create(
+            acctsessionid="s9", acctuniqueid="u9", username="dark4",
+            nasipaddress="10.0.0.2", acctstarttime=timezone.now(),
+            acctupdatetime=timezone.now(),
+        )
+        with mock.patch("radiusauth.enforcement.apply_change", return_value=True) as coa:
+            self._run("--commit", "--limit", "1")
+
+        self.assertEqual(coa.call_count, 1, "the live line never got its CoA")
+        self.assertEqual(coa.call_args[0][0].radius_username, "dark4")

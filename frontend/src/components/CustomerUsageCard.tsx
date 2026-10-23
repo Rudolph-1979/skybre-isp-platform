@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { PeriodSwitcher, UsageChart, type Period } from "./UsageChart";
+import { SpeedChart } from "./SpeedChart";
 import { btnSecondary } from "./Modal";
 import type { CustomerUsage } from "../types";
+import { formatIsoDateTime } from "../utils/billingTerms";
 
 const REFRESH_MS = 10_000;
 // The live figure is polled far faster than the rest of the payload, because
@@ -262,6 +264,35 @@ export function CustomerUsageCard({
         <div>
           <p className="text-xs uppercase tracking-wide text-[var(--text-muted)]">Sessions this month</p>
           <p className="text-2xl font-semibold tabular-nums text-[var(--text-primary)]">{usage.sessions}</p>
+          {/* Last session up / down per line (Rudolph, 15 Oct 2026). */}
+          {(usage.last_sessions ?? []).map((ls, i) => (
+            <div key={ls.username ?? i} className="mt-2 text-xs">
+              {(usage.last_sessions?.length ?? 0) > 1 && ls.username && (
+                <p className="font-medium text-[var(--text-secondary)]">{ls.username}</p>
+              )}
+              {ls.state === null ? (
+                <p className="text-[var(--text-muted)]">Never connected</p>
+              ) : (
+                <>
+                  <p>
+                    <span className="text-[var(--text-muted)]">Last up: </span>
+                    <span className="tabular-nums text-[var(--text-primary)]">{ls.up_at ? formatIsoDateTime(ls.up_at) : "—"}</span>
+                    {ls.state === "up" && <span className="ml-1" style={{ color: "var(--status-good, #22c55e)" }}>· still up</span>}
+                  </p>
+                  <p>
+                    <span className="text-[var(--text-muted)]">Last down: </span>
+                    <span className="tabular-nums text-[var(--text-primary)]">{ls.down_at ? formatIsoDateTime(ls.down_at) : "—"}</span>
+                    {ls.down_cause && <span className="ml-1 text-[var(--text-muted)]">({ls.down_cause})</span>}
+                  </p>
+                  {ls.state === "silent" && ls.heard_at && (
+                    <p style={{ color: "var(--status-warning)" }}>
+                      Not heard from since {formatIsoDateTime(ls.heard_at)} — probably dropped without telling us
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -274,6 +305,12 @@ export function CustomerUsageCard({
           <PeriodSwitcher value={period} onChange={setPeriod} />
         </div>
         <UsageChart series={usage.series ?? null} measuringSince={usage.measuring_since} />
+      </div>
+
+      {/* Speed, not volume: shows a line pinned at its plan speed, which a
+          GB-per-day bar can't (Rudolph, 5 Oct 2026, from Splynx's graph). */}
+      <div className="mt-5 border-t border-[var(--border-hairline)] pt-4">
+        <SpeedChart customerId={customerId} />
       </div>
 
       <div className="mt-5 border-t border-[var(--border-hairline)] pt-4">

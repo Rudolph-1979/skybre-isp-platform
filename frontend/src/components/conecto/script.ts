@@ -6,6 +6,8 @@
 // is shared between the two sets — no "clever" reuse — because the failure
 // mode is leaking a staff-facing number onto a customer's screen.
 
+import { KB } from "./kb";
+
 export type Pose = "idle" | "look" | "alert" | "think";
 
 export interface ConectoMessage {
@@ -27,104 +29,155 @@ export const STAFF_HELP: { prefix: string; title: string; body: string }[] = [
   {
     prefix: "/admin/customers",
     title: "Customers",
-    body:
-      "Every account on the platform. The payment reference here is what customers type on " +
-      "their EFT — it's how Bank Feeds matches their money to them, so it's worth getting right.",
+    body: "Every account on the platform. Search finds names, references, public IPs and PPPoE usernames; the Connection and Payment status columns answer 'who is down' and 'who owes' at a glance. The payment reference is what customers type on their EFT — it's how Bank Feeds matches their money.",
   },
   {
     prefix: "/admin/finance",
     title: "Finance",
-    body:
-      "Invoices, payments and credits. Quotes and pro formas are not tax invoices and carry no " +
-      "VAT liability until they become real invoices — only issued invoices count toward Output VAT.",
+    body: "Quotes, pro formas and invoices each have a tab with + New quote / + New invoice. Recurring Billing is where each billing date is previewed and approved — the daily 15:00 run creates no invoices without an approved, still-matching preview.",
   },
   {
     prefix: "/admin/inventory",
     title: "Stock / Inventory",
-    body:
-      "Stock receipts are where equipment invoices belong — they now feed Input VAT on your VAT " +
-      "return, so the same invoice should not also be entered under Expenses.",
+    body: "Equipment invoices belong in Stock Receipts — they feed Input VAT, so don't capture them under Expenses too. Stock goes out through Stock Issues & Transfers; fix counts with Adjust, never by deleting.",
   },
   {
     prefix: "/admin/accountant",
     title: "Accountant",
-    body:
-      "Input VAT comes from two places: Expenses for non-stock costs, and stock receipts for " +
-      "equipment. If an invoice appears in both, the duplicate warning will tell you.",
+    body: "VAT returns, expenses, the chart of accounts, Bank Feeds, attendance, leave and payroll. Input VAT comes from Expenses and from stock receipts, so an equipment invoice belongs in one place only. In Bank Feeds nothing becomes a payment or expense until someone clicks Confirm.",
   },
   {
     prefix: "/admin/networking",
     title: "Networking",
-    body:
-      "Routers, RADIUS clients, IP pools and OpenVPN. A suspended PPPoE customer keeps their " +
-      "address but gets routed to the walled garden; OVPN sessions are rejected outright. An IP " +
-      "pool with no addresses generated hands out nothing — which looks like a RADIUS fault but isn't.",
+    body: "Routers, sites, IP pools, OpenVPN and live sessions. A pool reading 0 / 0 hands out nothing until you click Generate addresses. RADIUS clients now live under Configs → RADIUS.",
   },
   {
     prefix: "/admin/scheduling",
     title: "Scheduling",
-    body: "Jobs and shifts. The day view scrolls, and the red line is the current time.",
+    body: "Jobs, the job pool, staff shifts and weekly support rotations. A job only reaches a technician's phone once it has a time, an address and a Technician-role person assigned; the calendar refreshes every 5 seconds.",
   },
   {
     prefix: "/admin/services",
     title: "Services",
-    body:
-      "A service is what a customer actually pays for. Suspending one writes through to the " +
-      "router immediately via RADIUS — there's no separate 'apply' step.",
+    body: "Every line on the platform, filterable by status. A client's own services, with Cancel service, signal and online state, are on their customer page. Changes write through to the router straight away — a plan change reaches the live session without disconnecting the client.",
   },
   {
     prefix: "/admin/tickets",
-    title: "Tickets",
-    body: "Support, billing, sales and abuse contacts. Three in a month flags a customer as high alert.",
+    title: "Support Tickets",
+    body: "Customer tickets and technicians' job feedback. Accept a ticket to own it; only the customer resolves and only Management closes. Three separate days with tickets in one month flags a customer as high alert.",
   },
   {
     prefix: "/admin/vehicles",
-    title: "Fleet",
-    body: "Vehicles, fuel and driver details. Fuel entries feed the expense side of the accounts.",
+    title: "Vehicles",
+    body: "The fleet: km, services, tyres, fuel, trips and licence renewals. Webfleet adds trips and a km reading every 15 minutes; fuel consumption still comes from our own fuel log. Import the FNB Fleetcard statement with the button top right.",
   },
   {
     prefix: "/admin/bulk-email",
-    title: "Bulk email",
-    body:
-      "Sends one template to a selected list. Document templates (invoice, quote, pro forma) are " +
-      "excluded here — those need a specific document attached, so they go out per customer.",
+    title: "Email",
+    body: "Send one template to a selected list, and Sent Email for everything the platform has sent. Invoices, quotes and pro formas go per customer, because each needs its own document attached.",
   },
   {
     prefix: "/admin/configs",
     title: "Configs",
-    body:
-      "Platform settings, permissions, users and RADIUS. Auto-suspension lives here — it's the " +
-      "master switch that decides whether overdue customers actually get cut off.",
+    body: "Platform settings: tariffs, email templates and settings, contracts, users and permissions, partners, billing and the activity log. Which tabs you see depends on your role; Auto-suspension under Billing is the master switch for cutting off overdue customers.",
   },
   {
     prefix: "/admin/account",
     title: "Your account",
-    body: "Your own login, password and two-factor settings.",
+    body: "Your two-factor authentication. Turn it on with an authenticator app and keep the backup codes somewhere safe; they're shown once.",
   },
   {
     prefix: "/admin",
     title: "Dashboard",
-    body: "Where things stand right now. Any tile showing a number above zero is worth a look.",
+    body: "Where things stand right now. Click any tile for the list behind its number; Arrange tiles puts them in your own order, saved to your profile.",
+  },
+  {
+    prefix: "/admin/usage-report",
+    title: "Usage report",
+    body: "Every customer's data usage for one period, heaviest first, with how much of any cap they've used. The table shows the top 200; Export CSV gives you everyone.",
+  },
+  {
+    prefix: "/admin/offline-customers",
+    title: "Recently offline",
+    body: "A call list: customers whose line went down and hasn't come back, longest first. Suspended and cancelled customers are left out, and the list re-checks itself every minute.",
+  },
+  {
+    prefix: "/admin/finance/invoices",
+    title: "Invoice / quote",
+    body: "One document. Convert a quote to a pro forma or invoice here (one-way), send or preview the PDF, record a payment on a real invoice, and request deletion of a quote or pro forma — Management approves that.",
+  },
+  {
+    prefix: "/bank-feeds/fnb-callback",
+    title: "Connect FNB bank feed",
+    body: "Where FNB returns you after approving a bank-feed connection. An Administrator must be signed in to finish it; then use Sync now on the account.",
+  },
+  {
+    prefix: "/admin/administration/clients-per-partner",
+    title: "Clients per partner",
+    body: "Clients, live lines and monthly value per partner. A client with lines at two partners appears in both rows; the total counts each client once. Click a row to see its clients.",
+  },
+  {
+    prefix: "/admin/administration/clients-per-tariff",
+    title: "Clients per tariff",
+    body: "Clients, live lines, monthly value, cost and markup per tariff. Lines on a tariff with no cost set are left out of cost and profit and flagged 'without a cost'.",
+  },
+  {
+    prefix: "/admin/administration/revenue",
+    title: "Revenue",
+    body: "MRR and ARPU over time, top payers, payments and invoicing per period, and outstanding by payment method. Dashed MRR points are estimates; solid ones were recorded on the day.",
+  },
+  {
+    prefix: "/admin/administration",
+    title: "Administration",
+    body: "Management reports: clients per partner, clients per tariff and revenue.",
+  },
+  {
+    prefix: "/admin/networking/map",
+    title: "Map",
+    body: "Towers and links from UISP, technicians and Webfleet vehicles, and the 'Can we service it?' check. Click the map, paste GPS or search an address; line of sight is a guide, so confirm with a scan.",
+  },
+  {
+    prefix: "/admin/networking/uisp",
+    title: "Network (UISP)",
+    body: "Backhaul, access points and core read from UISP every minute, read-only. Click a device for its graphs; MikroTiks only show whether they answer, so their detail is under Networking → Routers.",
+  },
+  {
+    prefix: "/admin/networking/devices",
+    title: "Router detail",
+    body: "Charts, live sessions straight from the router, and who connects through this box, with phone numbers for outage calls. Test Connection and Poll Now need the RouterOS API enabled.",
+  },
+  {
+    prefix: "/map-screen",
+    title: "Map screen",
+    body: "The map for a second screen or TV: towers, links and vehicles, with a panel listing sites and links that are down. Same sign-in and rights as Networking → Map.",
+  },
+  {
+    prefix: "/admin/tickets/kpi-report",
+    title: "Ticket KPI report",
+    body: "Tickets accepted and resolved cleanly per staff member, by year, plus NOC. Score is tickets resolved ÷ average resolution hours; reopened tickets never count.",
+  },
+  {
+    prefix: "/admin/leads",
+    title: "Leads",
+    body: "Enquiries from first contact to Accepted or Lost: qualify, check coverage, quote, then accept to create the client and an installation job in the pool. Keep a follow-up date on every open lead.",
   },
 ];
 
 export const CUSTOMER_HELP: { prefix: string; title: string; body: string }[] = [
   {
     prefix: "/portal/invoices",
-    title: "Your invoices",
-    body: "Everything billed to you, and what's still outstanding. Use your payment reference on any EFT.",
+    title: "Invoices & Payments",
+    body: "Everything billed to you and every payment we received, newest first. Click View PDF for a copy, or View statement for your whole account.",
   },
   {
     prefix: "/portal/tickets",
     title: "Support",
-    body: "Log anything that isn't working and we'll pick it up. The more detail, the faster we can help.",
+    body: "Log anything that isn't working and we'll pick it up. When it's fixed, click Mark as resolved; if it comes back, reopen it.",
   },
   {
     prefix: "/portal",
     title: "Your account",
-    body:
-      "Your account at a glance — how much data you've used this month, what you owe, and how to " +
-      "reach us. Speeds shown are live from your connection.",
+    body: "Your account at a glance: what you owe, your services, and how much data you've used this month. Your account reference is under Welcome back; use it on every payment.",
   },
 ];
 
@@ -150,7 +203,7 @@ export const STAFF_TOUR: TourStep[] = [
   {
     title: "The dashboard is the morning check",
     body:
-      "Blocking tomorrow, unpaid invoices, offline routers, open tickets. If every tile reads zero, " +
+      "Blocking soon, unpaid invoices, offline routers, open tickets. If every tile reads zero, " +
       "there's nothing to chase.",
     pose: "look",
     to: "/admin",
@@ -174,10 +227,19 @@ export const STAFF_TOUR: TourStep[] = [
   {
     title: "The network side",
     body:
-      "Routers, RADIUS and IP pools. Suspending a service here reaches the router straight away — " +
-      "worth knowing before you click it.",
+      "Routers, IP pools, VPN clients, live sessions, UISP and the network map. RADIUS clients are " +
+      "under Configs → RADIUS. Suspending a service reaches the router straight away — worth knowing " +
+      "before you click it.",
     pose: "alert",
     to: "/admin/networking",
+  },
+  {
+    title: "Ask me anything about Vexar",
+    body:
+      "Click me and type what you need — \"how do I cancel a service\", \"why wasn't he cut off\", " +
+      "\"import fleetcard\". I answer from written notes about how Vexar works, so I never make " +
+      "things up; if I don't know, I'll say so.",
+    pose: "think",
   },
 ];
 
@@ -203,245 +265,77 @@ export interface KbEntry {
   audience: "staff" | "customer" | "both";
 }
 
-export const KB: KbEntry[] = [
-  {
-    id: "ref-matching",
-    title: "A customer's payment isn't matching in Bank Feeds",
-    body:
-      "Matching looks for the customer's payment reference inside the bank description. If they use " +
-      "an old reference from a previous system, set their reference to that — it's editable on the " +
-      "customer record. References under 4 characters (or under 6 if all digits) are never " +
-      "auto-matched, because short numbers collide with amounts and dates in bank narrations.",
-    keywords: ["payment", "not matching", "unmatched", "bank", "feed", "reference", "eft",
-               "deposit", "money", "allocate", "statement", "splynx"],
-    to: "/admin/customers",
-    audience: "staff",
-  },
-  {
-    id: "change-ref",
-    title: "Change a customer's payment reference",
-    body:
-      "Open the customer, Edit, and change Payment reference. Leave it blank on a new customer and " +
-      "the next CUS-###### is generated. Changing it on an existing customer means payments still " +
-      "arriving with the old reference stop matching automatically.",
-    keywords: ["reference", "change", "edit", "customer id", "account number", "cus"],
-    to: "/admin/customers",
-    audience: "staff",
-  },
-  {
-    id: "vat-stock",
-    title: "VAT on equipment I bought",
-    body:
-      "Enter the supplier invoice as a stock receipt in Stock/Inventory — not under Expenses. Tick " +
-      "'unit costs include VAT' if the invoice quotes inclusive prices and type them exactly as " +
-      "printed. Stock receipts feed Input VAT on the VAT return, so entering the same invoice in " +
-      "both places would claim the VAT twice (the return warns you if that happens).",
-    keywords: ["vat", "input vat", "equipment", "stock", "receipt", "supplier invoice", "claim",
-               "inclusive", "exclusive", "sars", "router purchase"],
-    to: "/admin/inventory",
-    audience: "staff",
-  },
-  {
-    id: "vat-return",
-    title: "Where the VAT return numbers come from",
-    body:
-      "Output VAT comes from invoices actually issued in the period (not payments received). Input " +
-      "VAT comes from two places: Expenses for non-stock costs like rent and bandwidth, and stock " +
-      "receipts for equipment. Credit notes are shown for information only — they aren't netted " +
-      "off automatically, because credit requests don't record a VAT rate of their own.",
-    keywords: ["vat", "return", "vat201", "output", "input", "sars", "period", "accountant"],
-    to: "/admin/accountant",
-    audience: "staff",
-  },
-  {
-    id: "supplier-vat",
-    title: "A supplier isn't registered for VAT",
-    body:
-      "Open the supplier in Stock/Inventory → Suppliers and untick 'Registered for VAT'. Their " +
-      "receipt lines then default to 0% and no Input VAT is claimed. Getting this wrong claims VAT " +
-      "you were never charged, which is the direction SARS penalises.",
-    keywords: ["supplier", "vat", "registered", "cash", "not registered", "zero rated"],
-    to: "/admin/inventory",
-    audience: "staff",
-  },
-  {
-    id: "blocking",
-    title: "Why a customer is about to be cut off",
-    body:
-      "Blocking needs BOTH an invoice overdue longer than their blocking period AND a balance worse " +
-      "than their minimum balance — the minimum balance acts as a credit cushion that can excuse a " +
-      "technically-overdue invoice. Nothing is ever suspended while Auto-suspension is off " +
-      "(Configs → Billing), whatever an individual customer's settings say.",
-    keywords: ["block", "blocking", "cut off", "suspend", "suspension", "overdue", "disconnect",
-               "tomorrow", "minimum balance", "why"],
-    to: "/admin?panel=blocks",
-    audience: "staff",
-  },
-  {
-    id: "suspend-effect",
-    title: "What happens when I suspend a service",
-    body:
-      "It reaches the router immediately through RADIUS — there's no separate apply step. A PPPoE " +
-      "customer keeps an address but is routed to the walled garden; an OpenVPN session is rejected " +
-      "outright. Un-suspending reverses it the same way.",
-    keywords: ["suspend", "walled garden", "pppoe", "ovpn", "openvpn", "radius", "disconnect",
-               "unsuspend", "service"],
-    to: "/admin/services",
-    audience: "staff",
-  },
-  {
-    id: "ip-pool",
-    title: "A customer connects but gets no IP address",
-    body:
-      "Check the IP pool has had its addresses generated — a pool with none configured hands out " +
-      "nothing, so RADIUS returns Access-Accept with no Framed-IP-Address. It looks like a RADIUS " +
-      "fault but isn't. Also check the pool's category matches what you're allocating: allocation " +
-      "reads the category, not the pool's name.",
-    keywords: ["ip", "pool", "address", "no ip", "framed", "dhcp", "allocation", "empty"],
-    to: "/admin/networking",
-    audience: "staff",
-  },
-  {
-    id: "radius-silent",
-    title: "RADIUS isn't authenticating anyone",
-    body:
-      "Both an unknown client IP and a wrong shared secret cause a SILENT discard — no error, no " +
-      "log. Work through it in this order: firewall, then the client's IP in the RADIUS client " +
-      "list, then the shared secret. An empty log is itself the diagnosis: the packet never " +
-      "arrived. Note that reloading FreeRADIUS does not re-read clients — it needs a restart.",
-    keywords: ["radius", "auth", "not working", "reject", "silent", "secret", "nas", "freeradius",
-               "no log", "cannot connect"],
-    to: "/admin/configs",
-    audience: "staff",
-  },
-  {
-    id: "live-usage",
-    title: "Live speed vs data used",
-    body:
-      "They come from different places. Data totals come from RADIUS accounting and are " +
-      "authoritative for billing. Live speed comes from polling the router, which is accurate to " +
-      "the second — a router's counters reset every session, so they can measure speed but never " +
-      "consumption. If a speed reads as an average it's because the router poll wasn't available.",
-    keywords: ["usage", "speed", "live", "bandwidth", "mbps", "data", "accounting", "traffic",
-               "how much"],
-    audience: "staff",
-  },
-  {
-    id: "usage-link",
-    title: "Send a customer a link to check their own usage",
-    body:
-      "On the customer's record, copy their usage link. It needs no login, so treat it like a " +
-      "password — anyone holding it sees that line's usage and nothing else. 'Issue new link' " +
-      "revokes the old one immediately.",
-    keywords: ["usage link", "share", "customer link", "no login", "revoke", "send"],
-    to: "/admin/customers",
-    audience: "staff",
-  },
-  {
-    id: "view-as",
-    title: "See what a customer sees",
-    body:
-      "On the customer's record, use the option to view their portal. You keep your own login the " +
-      "whole time — no customer password is involved and nothing is changed on their account.",
-    keywords: ["view as", "impersonate", "customer portal", "what they see", "login as"],
-    to: "/admin/customers",
-    audience: "staff",
-  },
-  {
-    id: "quote-vs-invoice",
-    title: "Quotes, pro formas and invoices",
-    body:
-      "A quote or pro forma is not a tax invoice and carries no VAT liability. Only a real issued " +
-      "invoice counts toward Output VAT, and only a real invoice activates the tariff services on " +
-      "it. Converting a pro forma to an invoice is what makes both of those happen.",
-    keywords: ["quote", "proforma", "pro forma", "invoice", "difference", "tax invoice", "vat"],
-    to: "/admin/finance",
-    audience: "staff",
-  },
-  {
-    id: "permissions",
-    title: "A staff member can't see a section",
-    body:
-      "Access is per section, set under Configs → Permissions. Separately, a staff member can be " +
-      "restricted to particular partners — they then only see customers belonging to those " +
-      "partners, including inside dashboard totals.",
-    keywords: ["permission", "access", "section", "cannot see", "hidden", "role", "staff",
-               "partner", "restrict"],
-    to: "/admin/configs",
-    audience: "staff",
-  },
-  {
-    id: "backups",
-    title: "Backups",
-    body:
-      "The database is dumped hourly and daily on the server. Two known gaps worth remembering: " +
-      "every copy currently sits on the same machine, and uploaded files (expense receipts and " +
-      "attachments) are not included — only the database.",
-    keywords: ["backup", "restore", "dump", "disaster", "lost data", "recovery"],
-    audience: "staff",
-  },
-  {
-    id: "data-cap",
-    title: "How much data have I used?",
-    body:
-      "Your usage page shows what you've used this month, and your current download and upload " +
-      "speed. Monthly totals come from your connection's own reporting, so they can lag a few " +
-      "minutes behind.",
-    keywords: ["data", "usage", "cap", "used", "how much", "gb", "speed", "slow", "limit"],
-    to: "/portal",
-    audience: "customer",
-  },
-  {
-    id: "pay-invoice",
-    title: "How do I pay?",
-    body:
-      "Your invoices page lists what's outstanding. Use your payment reference on the EFT — it's " +
-      "what matches your payment to your account. Without it, allocating your payment takes longer.",
-    keywords: ["pay", "payment", "invoice", "reference", "eft", "bank", "owe", "bill", "account"],
-    to: "/portal/invoices",
-    audience: "customer",
-  },
-  {
-    id: "internet-down",
-    title: "My internet isn't working",
-    body:
-      "Check your usage page first — if it shows you as connected, the problem is likely inside " +
-      "your home network rather than the line. If it shows you as not connected, log a support " +
-      "ticket and we'll pick it up.",
-    keywords: ["not working", "down", "offline", "no internet", "slow", "broken", "help",
-               "disconnected"],
-    to: "/portal/tickets",
-    audience: "customer",
-  },
-];
+export { KB };
 
 // Ranked keyword search. Deliberately simple and predictable: exact keyword
 // hits score highest, then title words, then body words. Returns nothing
 // rather than a bad guess when the score is zero.
-export function searchKb(query: string, audience: "staff" | "customer"): KbEntry[] {
+// Words that say nothing about WHAT is being asked. Without this, "how do I"
+// in a question scored points against every title that also starts "How".
+const STOP = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "do", "does", "did", "for",
+  "from", "get", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "of",
+  "on", "or", "our", "should", "so", "that", "the", "their", "them", "there", "they", "this", "to",
+  "was", "we", "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+  "he", "she", "him", "her", "his", "wasn", "isn", "didn", "doesn", "don", "won", "not", "t", "s", "just",
+  "please", "need", "want", "help", "about",
+]);
+
+const tokenCache = new Map<string, { kw: string[]; title: string[]; body: string[] }>();
+function tokens(text: string) {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+function tokensOf(e: KbEntry) {
+  let t = tokenCache.get(e.id);
+  if (!t) {
+    t = { kw: tokens(e.keywords.join(" ")), title: tokens(e.title), body: tokens(e.body) };
+    tokenCache.set(e.id, t);
+  }
+  return t;
+}
+// "suspended" -> "suspend", "emails" -> "email": the query word is matched
+// as the START of a word, so trimming the ending finds every form of it.
+function stem(w: string) {
+  if (w.length > 6 && w.endsWith("ing")) return w.slice(0, -3);
+  if (w.length > 5 && w.endsWith("ed")) return w.slice(0, -2);
+  if (w.length > 4 && w.endsWith("s") && !w.endsWith("ss")) return w.slice(0, -1);
+  return w;
+}
+// A whole word, or the start of one for longer words ("suspend" finds
+// "suspended") -- never the middle of one ("line" must not find "offline").
+function hit(list: string[], w: string) {
+  return list.some((t) => t === w || (w.length > 3 && t.startsWith(w)));
+}
+
+export function searchKb(query: string, audience: "staff" | "customer", limit = 5): KbEntry[] {
   const q = query.toLowerCase().trim();
   if (q.length < 2) return [];
-  const words = q.split(/\s+/).filter((w) => w.length > 1);
+  const words = [...new Set(tokens(q).filter((w) => w.length > 1 && !STOP.has(w)).map(stem))];
   if (!words.length) return [];
 
   const scored = KB
     .filter((e) => e.audience === audience || e.audience === "both")
     .map((e) => {
+      const t = tokensOf(e);
       let score = 0;
-      const title = e.title.toLowerCase();
-      const body = e.body.toLowerCase();
+      let matched = 0;
       for (const kw of e.keywords) {
-        if (q.includes(kw)) score += 12;                      // whole phrase present
-        else if (words.some((w) => kw.includes(w) && w.length > 2)) score += 5;
+        if (kw.includes(" ") && q.includes(kw)) score += 12;   // a whole phrase, e.g. "cut off"
       }
       for (const w of words) {
-        if (title.includes(w)) score += 4;
-        if (body.includes(w)) score += 1;
+        let any = false;
+        if (hit(t.kw, w)) { score += 5; any = true; }
+        if (hit(t.title, w)) { score += 4; any = true; }
+        if (hit(t.body, w)) { score += 1; any = true; }
+        if (any) matched += 1;
       }
+      // Answers that cover MORE of the question rank higher: "cancel
+      // service" should beat everything that merely mentions "service".
+      score += 4 * matched * matched;
       return { e, score };
     })
-    .filter((r) => r.score >= 5)
+    .filter((r) => r.score >= 9)
     .sort((a, b) => b.score - a.score);
 
-  return scored.slice(0, 3).map((r) => r.e);
+  return scored.slice(0, limit).map((r) => r.e);
 }

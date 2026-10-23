@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.db import models
 
@@ -220,11 +221,77 @@ class RadiusNasClient(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # WHO AND WHEN.
+    #
+    # Twelve writes hit these rows on the evening of 2026-09-20 and not one
+    # of them left a trace. The container that served the requests was
+    # replaced two hours later and took its logs with it, DRF writes no
+    # audit row, and the model recorded only when a row was CREATED. So
+    # afterwards, "who deactivated the NAS clients" had no answer anywhere
+    # in the system -- for the most load-bearing configuration on the
+    # network, where an empty list means every customer goes dark.
+    #
+    # updated_at answers "when was this last touched" at a glance.
+    # RadiusNasClientAudit below keeps one row per write, because a single
+    # timestamp says nothing about the eleven writes before the last one.
+    updated_at = models.DateTimeField(auto_now=True, null=True, blank=True)
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Who last saved this client. Null for changes made by code rather than by a person.",
+    )
+
     class Meta:
         ordering = ["name"]
 
     def __str__(self):
         return f"{self.name} ({self.ip_address})"
+
+
+class RadiusNasClientAudit(models.Model):
+    """One row per write to a RadiusNasClient -- who, when, and which
+    fields moved.
+
+    Exists because of the 2026-09-20 outage, where the answer to "what
+    changed just before RADIUS stopped trusting every router" was
+    unobtainable. A last-modified timestamp would not have helped: there
+    were twelve writes that evening and only the last one would have been
+    visible.
+
+    The secret's VALUE is never stored here, only the fact that it
+    changed. An audit table gets read by more people, and exported more
+    casually, than the screen it audits; a shared RADIUS secret sitting in
+    it would be a worse problem than the question it answers.
+
+    Rows are kept when the client is deleted -- that is the event most
+    worth being able to look up afterwards -- which is why client_pk and
+    shortname are copied rather than reached through the FK.
+    """
+
+    class Action(models.TextChoices):
+        CREATED = "created", "Created"
+        UPDATED = "updated", "Updated"
+        DELETED = "deleted", "Deleted"
+
+    client = models.ForeignKey(
+        RadiusNasClient, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="audit_entries",
+    )
+    client_pk = models.IntegerField(null=True, blank=True)
+    shortname = models.CharField(max_length=64, blank=True)
+    action = models.CharField(max_length=10, choices=Action.choices)
+    changed_fields = ArrayField(models.CharField(max_length=64), default=list, blank=True)
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    changed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-changed_at"]
+
+    def __str__(self):
+        return f"{self.action} {self.shortname or self.client_pk} at {self.changed_at:%Y-%m-%d %H:%M}"
 
 
 class OvpnSettings(models.Model):
@@ -409,6 +476,43 @@ class UsageBucket(models.Model):
 
     def __str__(self):
         return f"{self.username} {self.bucket_start:%Y-%m-%d %H:00}: {self.download_bytes}d/{self.upload_bytes}u"
+
+
+class SpeedBucket(models.Model):
+    """Bytes one RADIUS login moved in one 5-minute slot -- the detail behind
+    the Splynx-style speed graph (Rudolph, 5 Oct 2026: "This shows very
+    nicely when customer over utilised his line").
+
+    UsageBucket (hourly) answers "how much"; an hour is far too coarse to
+    show a line pinned at its plan speed for twenty minutes. Fed by the same
+    sampler from the same counter deltas, spread over the slots the delta
+    actually covers (radiusauth.speed.bank_speed), so the two tables can
+    never disagree about how many bytes moved.
+
+    Kept for SPEED_RETENTION_DAYS only (pruned by the sampler): the 24-hour
+    and 7-day graphs read this; the 31-day and 12-month graphs read
+    UsageBucket, which keeps everything.
+    """
+
+    username = models.CharField(max_length=255)
+    # Exact start of a 5-minute slot, UTC.
+    bucket_start = models.DateTimeField()
+    # Customer's point of view, like UsageBucket.
+    download_bytes = models.BigIntegerField(default=0)
+    upload_bytes = models.BigIntegerField(default=0)
+
+    class Meta:
+        ordering = ["bucket_start"]
+        constraints = [
+            models.UniqueConstraint(fields=["username", "bucket_start"], name="speed_bucket_unique_slot"),
+        ]
+        indexes = [
+            models.Index(fields=["username", "bucket_start"], name="speed_bucket_user_time"),
+            models.Index(fields=["bucket_start"], name="speed_bucket_time"),
+        ]
+
+    def __str__(self):
+        return f"{self.username} {self.bucket_start:%Y-%m-%d %H:%M}: {self.download_bytes}d/{self.upload_bytes}u"
 
 
 class LiveTrafficInterest(models.Model):

@@ -1,0 +1,117 @@
+"""Stock by location (George, 13 Oct 2026): receipts land at a warehouse,
+issues leave from one, and a transfer moves stock between two."""
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from inventory.models import Product, SerializedUnit, StockIssue, StockSite, Supplier
+
+
+class StockLocationTests(TestCase):
+    def setUp(self):
+        self.api = APIClient()
+        self.api.force_authenticate(User.objects.create_user(username="stores", password="x", role=User.Role.ADMIN))
+        self.main = StockSite.objects.create(name="Kroonstad Warehouse", is_default=True)
+        self.bloem = StockSite.objects.create(name="Bloem Store")
+        self.supplier = Supplier.objects.create(name="Scoop")
+        self.cable = Product.objects.create(name="CAT6", tracking_type=Product.TrackingType.QUANTITY)
+        self.router = Product.objects.create(name="Cudy", tracking_type=Product.TrackingType.SERIALIZED)
+
+    def _receive(self, site=None):
+        payload = {
+            "supplier": self.supplier.pk, "invoice_number": "INV1", "invoice_date": "2026-10-13",
+            "lines": [
+                {"product": self.cable.pk, "quantity": 100, "unit_cost": "2.00"},
+                {"product": self.router.pk, "serial_numbers": "SN1\nSN2", "unit_cost": "500.00"},
+            ],
+        }
+        if site:
+            payload["site"] = site.pk
+        res = self.api.post("/api/stock-receipts/", payload, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        return res
+
+    def test_receipt_lands_at_the_chosen_site_or_the_default(self):
+        self._receive(self.bloem)
+        self.assertEqual(self.cable.quantity_at(self.bloem), 100)
+        self.assertEqual(self.cable.quantity_at(self.main), 0)
+        self.assertEqual(self.router.quantity_at(self.bloem), 2)
+        self.api.post("/api/stock-receipts/", {
+            "supplier": self.supplier.pk, "invoice_number": "INV2", "invoice_date": "2026-10-13",
+            "lines": [{"product": self.cable.pk, "quantity": 5}],
+        }, format="json")
+        self.assertEqual(self.cable.quantity_at(self.main), 5)
+
+    def test_transfer_moves_stock_and_keeps_the_total(self):
+        self._receive(self.main)
+        res = self.api.post("/api/stock-issues/", {
+            "from_site": self.main.pk, "to_site": self.bloem.pk,
+            "lines": [{"product": self.cable.pk, "quantity": 30}, {"product": self.router.pk, "serial_number": "SN1"}],
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual((self.cable.quantity_at(self.main), self.cable.quantity_at(self.bloem)), (70, 30))
+        self.assertEqual(self.cable.quantity_on_hand, 100)
+        unit = SerializedUnit.objects.get(serial_number="SN1")
+        self.assertEqual((unit.status, unit.site_id), (SerializedUnit.Status.IN_STOCK, self.bloem.pk))
+        self.assertTrue(StockIssue.objects.get().is_transfer)
+
+    def test_issue_is_checked_against_the_site_it_leaves(self):
+        self._receive(self.main)
+        res = self.api.post("/api/stock-issues/", {
+            "from_site": self.bloem.pk, "lines": [{"product": self.cable.pk, "quantity": 1}],
+        }, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.api.post("/api/stock-issues/", {
+            "from_site": self.bloem.pk, "lines": [{"product": self.router.pk, "serial_number": "SN2"}],
+        }, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.api.post("/api/stock-issues/", {
+            "from_site": self.main.pk, "lines": [{"product": self.router.pk, "serial_number": "SN2"},
+                                                 {"product": self.cable.pk, "quantity": 10}],
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(SerializedUnit.objects.get(serial_number="SN2").status, SerializedUnit.Status.ISSUED)
+        self.assertEqual(self.cable.quantity_on_hand, 90)
+
+    def test_same_site_transfer_refused_and_products_show_per_site(self):
+        self._receive(self.main)
+        res = self.api.post("/api/stock-issues/", {
+            "from_site": self.main.pk, "to_site": self.main.pk, "lines": [{"product": self.cable.pk, "quantity": 1}],
+        }, format="json")
+        self.assertEqual(res.status_code, 400)
+        rows = {p["name"]: p for p in self.api.get("/api/products/?page_size=50").data["results"]}
+        self.assertEqual(rows["CAT6"]["stock_by_site"], [{"site": self.main.pk, "site_name": "Kroonstad Warehouse", "quantity": 100}])
+        rows = {p["name"]: p for p in self.api.get(f"/api/products/?page_size=50&site={self.bloem.pk}").data["results"]}
+        self.assertEqual(rows["CAT6"]["quantity_on_hand"], 0)
+
+    def test_adjust_at_a_site(self):
+        self._receive(self.main)
+        res = self.api.post(f"/api/products/{self.cable.pk}/adjust/", {"quantity": -5, "site": self.bloem.pk}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.api.post(f"/api/products/{self.cable.pk}/adjust/", {"quantity": 7, "site": self.bloem.pk}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(self.cable.quantity_at(self.bloem), 7)
+
+
+class ProductDeleteTests(TestCase):
+    """Deleting a duplicate product (14 Oct 2026)."""
+
+    def setUp(self):
+        self.api = APIClient()
+        self.api.force_authenticate(User.objects.create_user(username="st2", password="x", role=User.Role.ADMIN))
+        StockSite.objects.create(name="Main", is_default=True)
+
+    def test_unused_duplicate_deletes(self):
+        p = Product.objects.create(name="RB-LHG5XL", tracking_type=Product.TrackingType.SERIALIZED)
+        self.assertEqual(self.api.delete(f"/api/products/{p.pk}/").status_code, 204)
+        self.assertFalse(Product.objects.filter(pk=p.pk).exists())
+
+    def test_product_with_history_is_refused(self):
+        from inventory.models import StockMovement
+
+        p = Product.objects.create(name="RJ45", tracking_type=Product.TrackingType.QUANTITY)
+        StockMovement.objects.create(product=p, movement_type="adjustment", quantity=1)
+        res = self.api.delete(f"/api/products/{p.pk}/")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("untick Active", res.data["detail"])
+        self.assertTrue(Product.objects.filter(pk=p.pk).exists())

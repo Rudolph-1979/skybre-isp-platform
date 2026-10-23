@@ -1,0 +1,667 @@
+import { useEffect, useState, type FormEvent } from "react";
+import { useSearchParams } from "react-router-dom";
+import { api } from "../../api/client";
+import { useApiList } from "../../hooks/useApiList";
+import { PageHeader } from "../../components/PageHeader";
+import { SearchableSelect } from "../../components/SearchableSelect";
+import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
+import { StatusBadge } from "../../components/StatusBadge";
+import { ServiceSuspensionReason } from "../../components/LineSuspension";
+import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import {
+  ServiceConnectionFields, serviceConnectionPayload, emptyServiceConnectionValues,
+  type ServiceConnectionValues,
+} from "../../components/ServiceConnectionFields";
+import {
+  ServiceShapingFields, serviceShapingPayload, emptyServiceShapingValues,
+  type ServiceShapingValues,
+} from "../../components/ServiceShapingFields";
+import { LiveBandwidthWidget } from "../../components/LiveBandwidthWidget";
+import type { Service, Customer, Tariff, IPPool, IPAddress, Device, ConnectionRule, RecurringCharge } from "../../types";
+
+const COLUMNS: ColumnDef[] = [
+  { key: "customer", label: "Customer" },
+  { key: "tariff", label: "Tariff" },
+  { key: "partner", label: "Partner" },
+  { key: "price", label: "Price" },
+  { key: "status", label: "Status" },
+  { key: "start_date", label: "Start date" },
+  { key: "radius", label: "RADIUS login" },
+];
+
+type NewServiceForm = { customer: string; tariff: string; status: Service["status"] } & ServiceConnectionValues &
+  ServiceShapingValues;
+
+const emptyNewServiceForm: NewServiceForm = {
+  customer: "", tariff: "", status: "pending", ...emptyServiceConnectionValues, ...emptyServiceShapingValues,
+};
+
+type EditForm = {
+  status: Service["status"];
+  // A reduction on this line's plan price. Strings because they come straight
+  // off <input> elements; the backend parses them and is the only thing that
+  // decides whether a discount is legal.
+  discount_type: "none" | "percentage" | "amount";
+  discount_value: string;
+  discount_starts_on: string;
+  discount_ends_on: string;
+  discount_reason: string;
+  // Standard recurring add-ons opted onto this service (Rudolph, 30 Sep).
+  // Plain id list -- the catalog itself is managed on the Tariffs page's
+  // "Recurring Charges" tab.
+  recurring_charges: number[];
+} & ServiceConnectionValues & ServiceShapingValues;
+
+const emptyEditForm: EditForm = {
+  status: "pending",
+  discount_type: "none", discount_value: "", discount_starts_on: "", discount_ends_on: "", discount_reason: "",
+  recurring_charges: [],
+  ...emptyServiceConnectionValues, ...emptyServiceShapingValues,
+};
+
+export function ServicesPage() {
+  const [ordering, setOrdering] = useState("-created_at");
+  // Seeded from the URL so a dashboard tile can land you on a filtered view
+  // rather than the unfiltered page, leaving you to re-apply the filter you
+  // just clicked. Lazy initialiser: read once on mount, then it's ordinary
+  // state the user is free to change.
+  const [searchParams] = useSearchParams();
+  const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") ?? "");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("services", ["customer"]);
+  const { items, loading, refetch } = useApiList<Service>(
+    `/services/?page_size=200&ordering=${ordering}${statusFilter ? `&status=${statusFilter}` : ""}`
+  );
+  const [customers, setCustomers] = useState<Customer[]>([]);
+
+  function toggleSort(field: string) {
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-created_at" : field));
+  }
+  const [tariffs, setTariffs] = useState<Tariff[]>([]);
+  const [showModal, setShowModal] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [newError, setNewError] = useState<string | null>(null);
+  const [form, setForm] = useState<NewServiceForm>(emptyNewServiceForm);
+  const [editingService, setEditingService] = useState<Service | null>(null);
+  const [editForm, setEditForm] = useState<EditForm>(emptyEditForm);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [customerPools, setCustomerPools] = useState<IPPool[]>([]);
+  const [newPoolAddresses, setNewPoolAddresses] = useState<IPAddress[]>([]);
+  const [poolAddresses, setPoolAddresses] = useState<IPAddress[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [connectionRules, setConnectionRules] = useState<ConnectionRule[]>([]);
+  // Which plans this customer may actually be put on.
+  //
+  // Asked of the SERVER (?for_customer=) rather than filtered here, so the
+  // dropdown and the rule the API enforces are the same query. Filtering in
+  // the browser would mean writing the rule a second time, and the copy
+  // that drifts is always the one nobody tests.
+  const [tariffsForCustomer, setTariffsForCustomer] = useState<Tariff[] | null>(null);
+  // The recurring-charge catalog, and which of it this customer's service
+  // may actually be opted onto -- same "ask the server, don't filter in
+  // the browser" reasoning as tariffsForCustomer above, keyed on the
+  // service being edited rather than the new-service form: recurring
+  // charges are opted onto an existing service, not chosen at creation.
+  const [recurringCharges, setRecurringCharges] = useState<RecurringCharge[]>([]);
+  const [chargesForCustomer, setChargesForCustomer] = useState<RecurringCharge[] | null>(null);
+
+  // Re-ask whenever the chosen customer changes. Clearing the tariff at the
+  // same time matters: without it, picking customer A, choosing their plan,
+  // then switching to customer B leaves B's form holding A's partner's
+  // tariff — which the server would refuse, after the form looked fine.
+  useEffect(() => {
+    if (!form.customer) {
+      setTariffsForCustomer(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ results: Tariff[] }>(`/tariffs/?page_size=200&is_active=true&for_customer=${form.customer}`)
+      .then((res) => {
+        if (!cancelled) setTariffsForCustomer(res.data.results);
+      })
+      .catch(() => {
+        // Fall back to the full list rather than an empty dropdown: the
+        // server still refuses a mismatched tariff, so the worst case is a
+        // rejected save with a message naming both partners.
+        if (!cancelled) setTariffsForCustomer(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.customer]);
+
+  // Same idea, for the service being edited: which recurring charges its
+  // customer's partner may opt it onto. is_active=true, matching the
+  // catalog's own "does not touch what already exists" convention -- a
+  // charge already opted in stays checked and visible via
+  // recurring_charges_detail below even if it later goes inactive or its
+  // partner narrows, since removing it is a deliberate separate action.
+  useEffect(() => {
+    if (!editingService) {
+      setChargesForCustomer(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ results: RecurringCharge[] }>(
+        `/recurring-charges/?page_size=200&is_active=true&for_customer=${editingService.customer}`
+      )
+      .then((res) => {
+        if (!cancelled) setChargesForCustomer(res.data.results);
+      })
+      .catch(() => {
+        if (!cancelled) setChargesForCustomer(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingService?.customer]);
+
+  useEffect(() => {
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
+    // Tariffs are re-fetched per customer below, once one is chosen. This
+    // initial call fills the list for the edit modal and for the moment
+    // before a customer is picked.
+    api.get<{ results: Tariff[] }>("/tariffs/?page_size=100").then((res) => setTariffs(res.data.results));
+    // Fallback list for the recurring-charges picker before chargesForCustomer
+    // resolves, same role tariffs (above) plays for the tariff dropdown.
+    api.get<{ results: RecurringCharge[] }>("/recurring-charges/?page_size=200").then((res) => setRecurringCharges(res.data.results));
+    // Used by the PPPoE IP-assignment section of the create/edit modals
+    // below -- fetched once up front the same way customers/tariffs are.
+    api.get<{ results: IPPool[] }>("/ip-pools/?category=customer&page_size=200").then((res) => setCustomerPools(res.data.results));
+    // Used by the Router & shaping section of the create/edit modals.
+    api.get<{ results: Device[] }>("/devices/?page_size=200").then((res) => setDevices(res.data.results));
+    api.get<{ results: ConnectionRule[] }>("/connection-rules/?page_size=500").then((res) => setConnectionRules(res.data.results));
+  }, []);
+
+  // Free addresses in the pool chosen on the "New service" form.
+  useEffect(() => {
+    if (form.ip_assignment_mode === "pool" && form.ip_pool) {
+      api.get<{ results: IPAddress[] }>(`/ip-addresses/?pool=${form.ip_pool}&page_size=500`).then((res) =>
+        setNewPoolAddresses(res.data.results)
+      );
+    } else {
+      setNewPoolAddresses([]);
+    }
+  }, [form.ip_assignment_mode, form.ip_pool]);
+
+  // Free (or already-held-by-this-service) addresses in the pool chosen on
+  // the "Edit service" form -- refetched whenever that selection changes.
+  useEffect(() => {
+    if (editForm.ip_assignment_mode === "pool" && editForm.ip_pool) {
+      api.get<{ results: IPAddress[] }>(`/ip-addresses/?pool=${editForm.ip_pool}&page_size=500`).then((res) =>
+        setPoolAddresses(res.data.results)
+      );
+    } else {
+      setPoolAddresses([]);
+    }
+  }, [editForm.ip_assignment_mode, editForm.ip_pool]);
+
+  function openCreate() {
+    setForm(emptyNewServiceForm);
+    setNewError(null);
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setNewError(null);
+    try {
+      await api.post("/services/", {
+        customer: form.customer,
+        tariff: form.tariff,
+        status: form.status,
+        start_date: new Date().toISOString().slice(0, 10),
+        ...serviceConnectionPayload(form),
+        ...serviceShapingPayload(form),
+      });
+      setShowModal(false);
+      refetch();
+    } catch (err: any) {
+      const data = err?.response?.data;
+      const message = data && typeof data === "object" ? Object.values(data).flat().join(" ") : null;
+      setNewError(message || "Couldn't create this service.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function openEdit(service: Service) {
+    setEditingService(service);
+    setEditError(null);
+    setEditForm({
+      status: service.status,
+      radius_username: service.radius_username ?? "",
+      radius_password: "",
+      radius_connection_type: service.radius_connection_type,
+      ip_assignment_mode: service.ip_assignment_mode,
+      static_ip: service.static_ip ?? "",
+      ip_pool: service.ip_pool ? String(service.ip_pool) : "",
+      ip_address: "",
+      device: service.device ? String(service.device) : "",
+      connection_rule: service.connection_rule ? String(service.connection_rule) : "",
+      access_device: service.access_device ? String(service.access_device) : "",
+      access_detail: service.access_detail ?? "",
+      fup_threshold_gb: service.fup_threshold_gb == null ? "" : String(service.fup_threshold_gb),
+      fup_speed_pct: service.fup_speed_pct == null ? "" : String(service.fup_speed_pct),
+      fup_exempt: service.fup_exempt ?? false,
+      discount_type: service.discount_type ?? "none",
+      // "0" would read as a discount that exists and is worth nothing, which
+      // is not what none means -- so an absent discount shows an empty box.
+      discount_value:
+        service.discount_type && service.discount_type !== "none" ? String(service.discount_value ?? "") : "",
+      discount_starts_on: service.discount_starts_on ?? "",
+      discount_ends_on: service.discount_ends_on ?? "",
+      discount_reason: service.discount_reason ?? "",
+      recurring_charges: service.recurring_charges ?? [],
+    });
+  }
+
+  async function handleEditSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!editingService) return;
+    setEditSaving(true);
+    setEditError(null);
+    try {
+      await api.patch(`/services/${editingService.id}/`, {
+        status: editForm.status,
+        // Sent whole, every save. The backend zeroes the value when the type
+        // is none, so switching a discount off cannot leave a stale figure
+        // waiting to apply itself the next time somebody turns the type back
+        // on without looking at the amount.
+        discount_type: editForm.discount_type,
+        discount_value: editForm.discount_type === "none" ? 0 : Number(editForm.discount_value || 0),
+        discount_starts_on: editForm.discount_starts_on || null,
+        discount_ends_on: editForm.discount_ends_on || null,
+        discount_reason: editForm.discount_reason,
+        recurring_charges: editForm.recurring_charges,
+        ...serviceConnectionPayload(editForm),
+        ...serviceShapingPayload(editForm),
+      });
+      setEditingService(null);
+      refetch();
+    } catch (err: any) {
+      const data = err?.response?.data;
+      const message = data && typeof data === "object"
+        ? Object.values(data).flat().join(" ")
+        : "Couldn't save this service.";
+      setEditError(message || "Couldn't save this service.");
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function handleDelete(service: Service) {
+    if (
+      !confirm(
+        `Delete the ${service.tariff_name} service for ${service.customer_name}? This also releases its RADIUS ` +
+          "login and any assigned IP address. This can't be undone."
+      )
+    )
+      return;
+    try {
+      await api.delete(`/services/${service.id}/`);
+      if (editingService?.id === service.id) setEditingService(null);
+      refetch();
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || "Couldn't delete this service.");
+    }
+  }
+
+  return (
+    <div>
+      <PageHeader
+        title="Customer Services"
+        subtitle="Active subscriptions linking customers to tariffs."
+        actions={
+          <button className={btnPrimary} onClick={openCreate}>
+            + New service
+          </button>
+        }
+      />
+
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <select className={filterSelectClass} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="pending">Pending Activation</option>
+          <option value="active">Active</option>
+          <option value="suspended">Suspended</option>
+          <option value="terminated">Terminated</option>
+        </select>
+        {statusFilter && (
+          <button type="button" className={btnSecondary} onClick={() => setStatusFilter("")}>
+            Clear filters
+          </button>
+        )}
+        <div className="ml-auto">
+          <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["customer"]} />
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
+              {isVisible("tariff") && <SortableTH field="tariff__name" ordering={ordering} onSort={toggleSort}>Tariff</SortableTH>}
+              {isVisible("partner") && <SortableTH field="tariff__partner__name" ordering={ordering} onSort={toggleSort}>Partner</SortableTH>}
+              {isVisible("price") && <SortableTH field="tariff__price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
+              {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
+              {isVisible("start_date") && <SortableTH field="start_date" ordering={ordering} onSort={toggleSort}>Start date</SortableTH>}
+              {isVisible("radius") && <SortableTH field="radius_username" ordering={ordering} onSort={toggleSort}>RADIUS login</SortableTH>}
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((s) => (
+              <TR key={s.id}>
+                <TD>{s.customer_name}</TD>
+                {isVisible("tariff") && <TD>{s.tariff_name}</TD>}
+                {/* An em dash means the tariff belongs to no partner — a
+                    shared plan available to everyone — not missing data. */}
+                {isVisible("partner") && <TD>{s.partner_name ?? "—"}</TD>}
+                {isVisible("price") && <TD className="tabular-nums">R {parseFloat(s.price).toFixed(2)}</TD>}
+                {isVisible("status") && (
+                  <TD>
+                    <StatusBadge status={s.status} />
+                    <ServiceSuspensionReason status={s.status} suspendedForNonpayment={s.suspended_for_nonpayment} />
+                  </TD>
+                )}
+                {isVisible("start_date") && <TD>{s.start_date ?? "—"}</TD>}
+                {isVisible("radius") && <TD>{s.radius_username ?? "—"}</TD>}
+                <TD>
+                  <div className="flex gap-3">
+                    <button className="text-[var(--series-1)] hover:underline" onClick={() => openEdit(s)}>
+                      Edit
+                    </button>
+                    <button
+                      className="text-red-600 hover:underline dark:text-red-400"
+                      onClick={() => handleDelete(s)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </TD>
+              </TR>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal title="New service" onClose={() => setShowModal(false)}>
+          <form onSubmit={handleSubmit}>
+            <FormField label="Customer">
+<SearchableSelect
+                options={customers.map((c) => ({
+                  value: String(c.id),
+                  label: c.full_name,
+                  meta: c.customer_id,
+                  searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
+                }))}
+                value={form.customer}
+                onChange={(v) => setForm({ ...form, customer: v, tariff: "" })}
+                placeholder="Select customer…"
+                hint="Search by name or payment reference."
+                required
+              />
+            </FormField>
+            <FormField label="Tariff">
+              <select
+                className={inputClass}
+                required
+                disabled={!form.customer}
+                value={form.tariff}
+                onChange={(e) => setForm({ ...form, tariff: e.target.value })}
+              >
+                <option value="">
+                  {form.customer ? "Select tariff…" : "Choose a customer first…"}
+                </option>
+                {(tariffsForCustomer ?? tariffs).map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} — R{t.price}
+                  </option>
+                ))}
+              </select>
+              {/* Says why the list is short, rather than leaving someone
+                  hunting for a plan that was deliberately left out. */}
+              {form.customer && tariffsForCustomer !== null && (
+                <p className="mt-1 text-xs text-[var(--text-muted)]">
+                  {tariffsForCustomer.length === 0
+                    ? "No plans are available to this customer's partner yet. Assign partners to tariffs under Configs → Tariffs."
+                    : "Showing this customer's partner's plans, plus any available to everyone."}
+                </p>
+              )}
+            </FormField>
+            <FormField label="Status">
+              <select className={inputClass} value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value as Service["status"] })}>
+                <option value="pending">Pending Activation</option>
+                <option value="active">Active</option>
+                <option value="suspended">Suspended</option>
+                <option value="terminated">Terminated</option>
+              </select>
+            </FormField>
+
+            <ServiceConnectionFields
+              values={form}
+              onChange={(patch) => setForm({ ...form, ...patch })}
+              customerPools={customerPools}
+              poolAddresses={newPoolAddresses}
+            />
+
+            <ServiceShapingFields
+              values={form}
+              onChange={(patch) => setForm({ ...form, ...patch })}
+              devices={devices}
+              connectionRules={connectionRules}
+            />
+
+            {newError && <p className="mt-3 text-sm text-red-700 dark:text-red-300">{newError}</p>}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
+              <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Create service"}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {editingService && (
+        <Modal title={`Edit service — ${editingService.customer_name}`} onClose={() => setEditingService(null)}>
+          <form onSubmit={handleEditSubmit}>
+            <FormField label="Status">
+              <select
+                className={inputClass}
+                value={editForm.status}
+                onChange={(e) => setEditForm({ ...editForm, status: e.target.value as Service["status"] })}
+              >
+                <option value="pending">Pending Activation</option>
+                <option value="active">Active</option>
+                <option value="suspended">Suspended</option>
+                <option value="terminated">Terminated</option>
+              </select>
+            </FormField>
+
+            {/* --- Discount on this line -------------------------------
+                Only Management/Admin can SAVE one -- the backend rejects the
+                change from anyone else -- but the fields stay readable for
+                everyone, so staff can see why an invoice does not match the
+                plan price instead of guessing. */}
+            <div className="mb-4 rounded-md border border-[var(--border-hairline)] p-3">
+              <div className="mb-2 text-sm font-medium text-[var(--text-primary)]">Discount</div>
+
+              <div className="flex flex-wrap items-end gap-3">
+                <FormField label="Type">
+                  <select
+                    className={inputClass}
+                    value={editForm.discount_type}
+                    onChange={(e) =>
+                      setEditForm({
+                        ...editForm,
+                        discount_type: e.target.value as EditForm["discount_type"],
+                        // 10 as a percentage and 10 as rands are not the same
+                        // discount, so changing the type clears the number
+                        // rather than silently reinterpreting it.
+                        discount_value: "",
+                      })
+                    }
+                  >
+                    <option value="none">No discount</option>
+                    <option value="percentage">Percentage off</option>
+                    <option value="amount">Rand amount off</option>
+                  </select>
+                </FormField>
+
+                {editForm.discount_type !== "none" && (
+                  <FormField label={editForm.discount_type === "percentage" ? "Percent off" : "Rands off"}>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      max={editForm.discount_type === "percentage" ? "100" : undefined}
+                      className={`${inputClass} w-32`}
+                      value={editForm.discount_value}
+                      onChange={(e) => setEditForm({ ...editForm, discount_value: e.target.value })}
+                    />
+                  </FormField>
+                )}
+              </div>
+
+              {editForm.discount_type !== "none" && (
+                <>
+                  <div className="mt-3 flex flex-wrap items-end gap-3">
+                    <FormField label="Starts">
+                      <input
+                        type="date"
+                        className={`${inputClass} w-auto`}
+                        value={editForm.discount_starts_on}
+                        onChange={(e) => setEditForm({ ...editForm, discount_starts_on: e.target.value })}
+                      />
+                    </FormField>
+                    <FormField label="Ends">
+                      <input
+                        type="date"
+                        className={`${inputClass} w-auto`}
+                        value={editForm.discount_ends_on}
+                        onChange={(e) => setEditForm({ ...editForm, discount_ends_on: e.target.value })}
+                      />
+                    </FormField>
+                  </div>
+
+                  <FormField label="Reason">
+                    <input
+                      className={inputClass}
+                      placeholder="Loyalty — 5 years · Retention offer, Sept"
+                      value={editForm.discount_reason}
+                      onChange={(e) => setEditForm({ ...editForm, discount_reason: e.target.value })}
+                    />
+                  </FormField>
+
+                  <p className="mt-2 text-xs text-[var(--text-muted)]">
+                    Appears on the invoice as its own line under the plan, with VAT charged on the
+                    reduced amount. Leave <em>Starts</em> blank to apply it immediately and{" "}
+                    <em>Ends</em> blank to run until you remove it. The end date is checked on the day
+                    the invoice is raised — <strong>end it the day before the next billing date</strong>,
+                    not on it, or that invoice still carries the discount.
+                  </p>
+                </>
+              )}
+
+              {editingService.discount_active && (
+                <p className="mt-2 text-xs text-[var(--series-1)]">
+                  Currently taking <strong>R{editingService.discount_amount_now}</strong> off each invoice.
+                </p>
+              )}
+            </div>
+
+            <div className="mt-4 border-t border-[var(--border-hairline)] pt-4">
+              <p className="mb-2 text-sm font-medium text-[var(--text-primary)]">Recurring charges</p>
+              <p className="mb-2 text-xs text-[var(--text-muted)]">
+                Standard add-ons opted onto this service -- each bills as its own line on the invoice,
+                alongside the plan above. Manage the catalog on the Tariffs page's Recurring Charges tab.
+              </p>
+              {(() => {
+                // Whatever this partner may be newly opted onto, plus
+                // anything already opted in even if it later went
+                // inactive or its partner narrowed -- removing a charge is
+                // a deliberate separate action, not a side effect of the
+                // picker no longer offering it (recurring_charges_detail
+                // carries the label for one that fell out of the list).
+                const offered = chargesForCustomer ?? recurringCharges;
+                const extra = (editingService.recurring_charges_detail ?? [])
+                  .filter((d) => editForm.recurring_charges.includes(d.id))
+                  .filter((d) => !offered.some((c) => c.id === d.id))
+                  .map((d) => ({ id: d.id, name: d.name, price: d.price, no_longer_offered: true }));
+                const rows = [...offered.map((c) => ({ ...c, no_longer_offered: false })), ...extra];
+                if (rows.length === 0) {
+                  return <p className="text-xs text-[var(--text-muted)]">No recurring charges set up yet.</p>;
+                }
+                return (
+                  <div className="max-h-40 space-y-1.5 overflow-y-auto rounded-md border border-[var(--border-hairline)] p-2">
+                    {rows.map((c) => (
+                      <label key={c.id} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={editForm.recurring_charges.includes(c.id)}
+                          onChange={(e) =>
+                            setEditForm({
+                              ...editForm,
+                              recurring_charges: e.target.checked
+                                ? [...editForm.recurring_charges, c.id]
+                                : editForm.recurring_charges.filter((id) => id !== c.id),
+                            })
+                          }
+                        />
+                        <span>{c.name}</span>
+                        <span className="text-[var(--text-muted)]">R{parseFloat(c.price).toFixed(2)}</span>
+                        {c.no_longer_offered && (
+                          <span className="text-xs text-[var(--text-muted)]">(no longer offered)</span>
+                        )}
+                      </label>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+
+            <ServiceConnectionFields
+              values={editForm}
+              onChange={(patch) => setEditForm({ ...editForm, ...patch })}
+              customerPools={customerPools}
+              poolAddresses={poolAddresses}
+              passwordIsSet={editingService.radius_password_set}
+              currentServiceId={editingService.id}
+              currentAssignedIp={editingService.assigned_ip}
+            />
+
+            <ServiceShapingFields
+              values={editForm}
+              onChange={(patch) => setEditForm({ ...editForm, ...patch })}
+              devices={devices}
+              connectionRules={connectionRules}
+            />
+
+            {editForm.device && <LiveBandwidthWidget serviceId={editingService.id} />}
+
+            {editError && (
+              <p className="mt-3 text-sm text-red-700 dark:text-red-300">{editError}</p>
+            )}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setEditingService(null)}>Cancel</button>
+              <button type="submit" disabled={editSaving} className={btnPrimary}>{editSaving ? "Saving…" : "Save changes"}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}

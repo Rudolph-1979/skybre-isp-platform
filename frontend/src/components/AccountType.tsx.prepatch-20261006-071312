@@ -1,0 +1,56 @@
+import { FormField, inputClass } from "./Modal";
+import { StatusBadge } from "./StatusBadge";
+
+// Paying / Sponsor / Deal (Rudolph, 6 Oct 2026) -- a label with its reason,
+// so anyone looking at a cheap or free account can see why. It doesn't
+// change billing; the money side stays on each service's discount.
+export type AccountType = "paying" | "sponsor" | "deal";
+
+export const ACCOUNT_TYPE_LABEL: Record<AccountType, string> = {
+  paying: "Paying",
+  sponsor: "Sponsor",
+  deal: "Deal",
+};
+
+// Borrowed StatusBadge colours: green paying, purple sponsor, blue deal.
+const BADGE_KEY: Record<AccountType, string> = { paying: "active", sponsor: "proforma", deal: "new" };
+
+export function AccountTypeBadge({ type }: { type: AccountType | undefined | null }) {
+  const t = type ?? "paying";
+  return <StatusBadge status={BADGE_KEY[t]} label={ACCOUNT_TYPE_LABEL[t]} />;
+}
+
+export function AccountTypeFields({
+  type,
+  reason,
+  onChange,
+}: {
+  type: AccountType | undefined | null;
+  reason: string | undefined | null;
+  onChange: (type: AccountType, reason: string) => void;
+}) {
+  const t = type ?? "paying";
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-[10rem_1fr]">
+      <FormField label="Account">
+        <select className={inputClass} value={t} onChange={(e) => onChange(e.target.value as AccountType, reason ?? "")}>
+          <option value="paying">Paying</option>
+          <option value="sponsor">Sponsor</option>
+          <option value="deal">Deal</option>
+        </select>
+      </FormField>
+      {t !== "paying" && (
+        <FormField label={t === "sponsor" ? "Why are they a sponsor?" : "What is the deal?"}>
+          <input
+            className={inputClass}
+            required
+            maxLength={255}
+            placeholder={t === "sponsor" ? "e.g. Rugby club sponsorship, free 20 Mbps" : "e.g. Half price for 3 months, launch special"}
+            value={reason ?? ""}
+            onChange={(e) => onChange(t, e.target.value)}
+          />
+        </FormField>
+      )}
+    </div>
+  );
+}

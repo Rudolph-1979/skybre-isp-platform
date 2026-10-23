@@ -1,0 +1,121 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block content %}
+  {% comment %}
+    NO brand block here any more. The logo now lives in the DEFAULT brand
+    block of _pdf_base.html, so every document built on that base gets it
+    from one definition rather than each one carrying its own copy --
+    which is how the full-history statement ended up without a logo while
+    this one had it.
+
+    EVERY COLUMN WIDTH IS EXPLICIT, and that is not a style preference.
+
+    _pdf_base.html sets @page margin 2cm on A4, so the content area is
+    595.28 - 113.4 = 481.9pt. Left to allocate six columns itself,
+    reportlab (under the pinned xhtml2pdf 0.2.17) squeezed one down to
+    12pt against the 6pt-a-side cell padding and raised "flowable given
+    negative availWidth" -- the whole PDF failed to render.
+
+    invoice_pdf.html pins every width in points for the same reason. The
+    numbers on the table below total 476pt, leaving a few points of slack
+    inside 481.9 so rounding cannot push it over.
+
+    Those numbers, and the 4px cell padding that goes with them, were
+    measured rather than chosen -- see the note on the table itself.
+  {% endcomment %}
+  {% comment %} The heading comes from the statement itself, because this one
+     template renders two documents: "Statement of Account" for the rolling
+     one the monthly job sends, and "Statement for August 2026" for a named
+     month asked for on demand. {% endcomment %}
+  <div class="doc-title">{{ statement.heading }}</div>
+
+  <table class="meta-table">
+    <tr><td class="meta-label">Period</td><td>{{ statement.start|date:"d/m/Y" }} to {{ statement.end|date:"d/m/Y" }}</td></tr>
+    <tr><td class="meta-label">Customer ID</td><td>{{ customer.customer_id }}</td></tr>
+    <tr><td class="meta-label">Issued</td><td>{{ generated_date|date:"d/m/Y" }}</td></tr>
+  </table>
+
+  <div class="addr-block">
+    <div class="addr-label">Customer</div>
+    <div>{{ customer.full_name }}</div>
+    {% comment %} Only when it says something the line above did not. A business whose
+       trading name IS their contact name printed itself twice. {% endcomment %}
+    {% if customer.company_name and customer.company_name != customer.full_name %}
+      <div>{{ customer.company_name }}</div>
+    {% endif %}
+    <div>{{ customer.address }}</div>
+    <div>{{ customer.city }} {{ customer.zip_code }}</div>
+    <div>{{ customer.email }}</div>
+  </div>
+
+  {% comment %}
+    WIDTHS AND PADDINGS, MEASURED. Same exercise as statement_pdf.html,
+    and the same two faults.
+
+    The dates were Django's default "Sept. 1, 2026" (56.5pt at Helvetica
+    9.5) in a column with 50pt of room. They are d/m/Y now, 47.5pt, the
+    format invoice_pdf.html has always used.
+
+    The money columns were 58pt each, and reportlab charges the 8px
+    horizontal padding TWICE on a right-aligned cell -- once insetting the
+    frame, once aligning the paragraph inside it -- so 58pt was 34pt of
+    usable room. "R 435.85" is 38.6pt. EVERY amount on this statement was
+    printing "R" above its own figure. The money cells drop to 4px
+    padding, which is what pays for the wider columns below.
+
+    Rendered against the pinned xhtml2pdf 0.2.17 and read back out with
+    pdfplumber, worst realistic cell per column:
+
+      date 58 (needs 47.5)   detail 114 (Balance brought forward, 103.5)
+      reference 96 (84.5)    debit 68 (R 123456.78, 54.4)
+      credit 68              balance 72 (R -123456.78, 57.6)
+                                                   = 476 of 478 allocated
+
+    Detail is the one column deliberately left too narrow for its longest
+    content: "Payment received - Bank Transfer" is 144.1pt and wraps to
+    two lines, which is what a description column is for. Nothing else on
+    the page wraps.
+  {% endcomment %}
+  <table class="items" style="width:478pt;">
+    <thead>
+      <tr>
+        <th style="width:58pt; padding-left:4px; padding-right:4px;">Date</th>
+        <th style="width:114pt; padding-left:4px; padding-right:4px;">Detail</th>
+        <th style="width:96pt; padding-left:4px; padding-right:4px;">Reference</th>
+        <th class="num" style="width:68pt; padding-left:4px; padding-right:4px;">Debit</th>
+        <th class="num" style="width:68pt; padding-left:4px; padding-right:4px;">Credit</th>
+        <th class="num" style="width:72pt; padding-left:4px; padding-right:4px;">Balance</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="width:58pt; padding-left:4px; padding-right:4px;">{{ statement.start|date:"d/m/Y" }}</td>
+        <td style="width:114pt; padding-left:4px; padding-right:4px;"><strong>Balance brought forward</strong></td>
+        <td style="width:96pt; padding-left:4px; padding-right:4px;"></td>
+        <td class="num" style="width:68pt; padding-left:4px; padding-right:4px;"></td>
+        <td class="num" style="width:68pt; padding-left:4px; padding-right:4px;"></td>
+        <td class="num" style="width:72pt; padding-left:4px; padding-right:4px;">R {{ statement.opening_balance|floatformat:2 }}</td>
+      </tr>
+      {% for line in statement.lines %}
+      <tr>
+        <td style="width:58pt; padding-left:4px; padding-right:4px;">{{ line.date|date:"d/m/Y" }}</td>
+        <td style="width:114pt; padding-left:4px; padding-right:4px;">{{ line.description }}</td>
+        <td style="width:96pt; padding-left:4px; padding-right:4px;">{{ line.reference }}</td>
+        <td class="num" style="width:68pt; padding-left:4px; padding-right:4px;">{% if line.debit %}R {{ line.debit|floatformat:2 }}{% endif %}</td>
+        <td class="num" style="width:68pt; padding-left:4px; padding-right:4px;">{% if line.credit %}R {{ line.credit|floatformat:2 }}{% endif %}</td>
+        <td class="num" style="width:72pt; padding-left:4px; padding-right:4px;">R {{ line.balance|floatformat:2 }}</td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="6" style="width:478pt;">No activity in this period.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table class="totals-table">
+    <tr><td>Invoiced this period</td><td class="num">R {{ statement.invoiced|floatformat:2 }}</td></tr>
+    <tr><td>Paid this period</td><td class="num">R {{ statement.paid|floatformat:2 }}</td></tr>
+    {% if statement.credited %}
+    <tr><td>Credited this period</td><td class="num">R {{ statement.credited|floatformat:2 }}</td></tr>
+    {% endif %}
+    <tr class="grand"><td>Balance carried forward</td><td class="num">R {{ statement.closing_balance|floatformat:2 }}</td></tr>
+  </table>
+{% endblock %}

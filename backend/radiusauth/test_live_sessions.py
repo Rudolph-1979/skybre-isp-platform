@@ -6,12 +6,15 @@ on interim-update=5m -- so every session read "0m" and "0.0 MB / 0.0 MB" for
 its first five minutes and then jumped.
 """
 import datetime
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
+from billing.models import Service, Tariff
+from customers.models import Customer
 from network.models import Device
 from radiusauth.models import RadAcct, RouterLiveRate
 from radiusauth.views import RadAcctViewSet
@@ -27,6 +30,21 @@ class LiveSessionTests(TestCase):
             name="Bench", ip_address="10.0.0.1", api_enabled=True,
             api_username="u", api_password="p",
         )
+        # The session belongs to a real service on this platform. That was
+        # implicit before Live Sessions learned to tell our customers from
+        # other people's (radiusauth/ownership.py); now the page filters on
+        # it by default, and a fixture without one is testing a row the
+        # page will never show.
+        tariff = Tariff.objects.create(
+            name="Bench plan", price=Decimal("1"),
+            speed_download_kbps=1024, speed_upload_kbps=1024,
+        )
+        customer = Customer.objects.create(full_name="Bench Customer", email="bench@x.com")
+        Service.objects.create(
+            customer=customer, tariff=tariff, status=Service.Status.ACTIVE,
+            radius_username="pppoe_test",
+        )
+
         self.started = timezone.now() - datetime.timedelta(minutes=3)
         self.session = RadAcct.objects.create(
             acctsessionid="s1", acctuniqueid="s1", username="pppoe_test",

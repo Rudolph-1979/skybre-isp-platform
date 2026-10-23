@@ -6,9 +6,16 @@ import { StatCard } from "../../components/StatCard";
 import { PageHeader } from "../../components/PageHeader";
 import { palette } from "../../palette";
 import { useAuth } from "../../context/AuthContext";
+import { SystemStatusCard } from "../../components/SystemStatusCard";
+import { useUispTiles } from "../../components/UispDashboardTiles";
+import { useSpeedingTile } from "../../components/SpeedingTile";
+import { DashboardTileGrid, type DashboardTile } from "../../components/DashboardTileGrid";
+import { btnSecondary } from "../../components/Modal";
+import { formatIsoDate } from "../../utils/billingTerms";
 import { canAccessSection } from "../../utils/permissions";
 import { Modal } from "../../components/Modal";
-import type { CustomerGrowth, DashboardSummary, HighAlertCustomers, OfflineCustomers, Section, UpcomingBlocks } from "../../types";
+import { usePolling } from "../../hooks/usePolling";
+import type { CustomerGrowth, DashboardSummary, HighAlertCustomers, LicenceRenewals, OfflineCustomers, RenewalStatus, Section, UpcomingBlocks } from "../../types";
 
 function formatCurrency(v: number) {
   return new Intl.NumberFormat("en-ZA", { style: "currency", currency: "ZAR", maximumFractionDigits: 0 }).format(v);
@@ -19,10 +26,25 @@ function formatCurrency(v: number) {
 // window instead of a same-day surprise.
 const BLOCK_HORIZON_DAYS = 7;
 
-function whenLabel(daysUntil: number) {
-  if (daysUntil === 0) return "Tomorrow";
-  if (daysUntil === 1) return "In 2 days";
-  return `In ${daysUntil + 1} days`;
+// Which renewal states mean somebody has to do something. Named here only
+// so the modal can filter; the COUNT on the tile comes from the server
+// (counts.action_needed), so the tile and the Renewals tab can never
+// disagree about how many things are outstanding.
+const RENEWAL_ACTION_STATES: RenewalStatus[] = ["expired", "due_soon", "unknown"];
+
+function renewalLine(daysLeft: number | null) {
+  if (daysLeft === null) return "No date on file";
+  if (daysLeft < 0) return `Expired ${Math.abs(daysLeft)} day${daysLeft === -1 ? "" : "s"} ago`;
+  if (daysLeft === 0) return "Expires today";
+  return `${daysLeft} day${daysLeft === 1 ? "" : "s"} left`;
+}
+
+// Counted from today (20 Oct 2026: "Dashboard should show exact date that
+// the service will be cut").
+function whenLabel(daysFromToday: number) {
+  if (daysFromToday <= 0) return "Today";
+  if (daysFromToday === 1) return "Tomorrow";
+  return `In ${daysFromToday} days`;
 }
 
 export function DashboardPage() {
@@ -35,9 +57,20 @@ export function DashboardPage() {
   const [blocks, setBlocks] = useState<UpcomingBlocks | null>(null);
   const [blocksError, setBlocksError] = useState("");
   const [showBlocks, setShowBlocks] = useState(false);
+  const [licences, setLicences] = useState<LicenceRenewals | null>(null);
+  const [showLicences, setShowLicences] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
+  // Network from UISP (14 Oct 2026); no tiles without Networking or UISP.
+  const uispTiles = useUispTiles(canAccessSection(user, "networking"));
+  // Webfleet speeding today (#188): Vehicles staff, when Webfleet is set up.
+  const speeding = useSpeedingTile(canAccessSection(user, "vehicles"));
+  // This person's own tile order (15 Oct 2026), kept on their account.
+  const [savedOrder, setSavedOrder] = useState<string[]>(user?.dashboard_layout?.order ?? []);
+  const [arranging, setArranging] = useState(false);
+  const savedKey = JSON.stringify(user?.dashboard_layout?.order ?? []);
+  useEffect(() => setSavedOrder(JSON.parse(savedKey)), [savedKey]);
 
   /**
    * A tile's click handler, or undefined when it shouldn't be clickable.
@@ -55,10 +88,20 @@ export function DashboardPage() {
     return canAccessSection(user, section) ? label : undefined;
   }
 
-  useEffect(() => {
+  // quiet=true (used by the background poll) suppresses every failure
+  // handler that would blank out already-loaded data with null or an error
+  // banner. Without that, a single dropped request during a routine
+  // refresh would flash the whole dashboard back to "Loading dashboard…"
+  // or spawn a stray error message, even though the person was looking at
+  // good data a second ago. The initial mount load (quiet=false) keeps the
+  // original behaviour of showing null/an error when the very first
+  // request fails.
+  function loadDashboard(quiet = false) {
     api.get<DashboardSummary>("/dashboard-summary/")
       .then((res) => setSummary(res.data))
-      .catch(() => setSummary(null));
+      .catch(() => {
+        if (!quiet) setSummary(null);
+      });
 
     // Aggregated server-side (see the backend's CustomerGrowthView) rather
     // than counted here: the customer list endpoint caps page_size at 500,
@@ -67,15 +110,30 @@ export function DashboardPage() {
     // charts this replaced.
     api.get<CustomerGrowth>("/customer-growth/?months=12")
       .then((res) => setGrowth(res.data))
-      .catch(() => setGrowthError("Could not load customer growth figures."));
+      .catch(() => {
+        if (!quiet) setGrowthError("Could not load customer growth figures.");
+      });
 
     api.get<OfflineCustomers>("/offline-customers/?hours=24")
       .then((res) => setOffline(res.data))
-      .catch(() => setOffline(null));
+      .catch(() => {
+        if (!quiet) setOffline(null);
+      });
 
     api.get<HighAlertCustomers>("/high-alert-customers/?months=6&min_tickets=3")
       .then((res) => setAlerts(res.data))
-      .catch(() => setAlertsError("Could not load high alert customers."));
+      .catch(() => {
+        if (!quiet) setAlertsError("Could not load high alert customers.");
+      });
+
+    // Vehicles-gated on the backend. Same treatment as the blocks call
+    // below: a 403 is not a fault, it just means this person doesn't have
+    // that section, so no tile rather than a tile stuck on "—".
+    api.get<LicenceRenewals>("/vehicles/renewals/")
+      .then((res) => setLicences(res.data))
+      .catch(() => {
+        if (!quiet) setLicences(null);
+      });
 
     // Finance-gated on the backend, so staff without that section get a 403.
     // Treated as "nothing to show" rather than an error banner — it isn't a
@@ -83,11 +141,20 @@ export function DashboardPage() {
     api.get<UpcomingBlocks>(`/upcoming-blocks/?days=${BLOCK_HORIZON_DAYS}`)
       .then((res) => setBlocks(res.data))
       .catch((err) => {
+        if (quiet) return;
         if (err?.response?.status !== 403) {
           setBlocksError("Could not load upcoming blocks.");
         }
       });
-  }, []);
+  }
+
+  useEffect(() => loadDashboard(false), []);
+
+  // Nobody watches this page like a live feed, so a minute-long interval
+  // keeps the tiles current without hammering six endpoints every few
+  // seconds. Visibility-gated by usePolling itself, so a background tab
+  // doesn't even do that much.
+  usePolling(() => loadDashboard(true), 60_000);
 
   // Deep link: Conecto (and anything else) can send you straight to the open
   // list with /admin?panel=blocks rather than dropping you on the dashboard
@@ -104,160 +171,270 @@ export function DashboardPage() {
 
   if (!summary) return <p className="text-[var(--text-muted)]">Loading dashboard…</p>;
 
+  // Every tile, keyed, in the built-in order; DashboardTileGrid shows them in
+  // this person's own saved order (15 Oct 2026). UISP first, as before.
+  const tiles: DashboardTile[] = [
+    ...uispTiles,
+    /* Each tile goes to the list its number came from, with the filter
+        already applied -- so "1 unpaid" lands on that one unpaid invoice,
+        not on every document you have. */
+    { key: "customers_total", node: (
+      <StatCard
+        label="Total customers"
+        value={summary.customers_total}
+        sublabel={`${summary.customers_active} active`}
+        onClick={goTo("customers", "/admin/customers")}
+        actionLabel={actionFor("customers", "View customers")}
+      />
+    ) },
+    { key: "services_online", node: (
+      <StatCard
+        label="Online services"
+        value={summary.services_online}
+        sublabel={`${summary.services_active} active`}
+        accent="series-3"
+        onClick={goTo("services", "/admin/services?status=active")}
+        actionLabel={actionFor("services", "View services")}
+      />
+    ) },
+    { key: "revenue_month", node: (
+      <StatCard
+        label="Revenue this month"
+        value={formatCurrency(summary.revenue_this_month)}
+        accent="status-good"
+        // Revenue is money received, so the payments list is where it comes
+        // from -- not the invoice list, which is money billed.
+        onClick={goTo("finance", "/admin/finance?tab=payments")}
+        actionLabel={actionFor("finance", "View payments")}
+      />
+    ) },
+    { key: "outstanding_balance", node: (
+      <StatCard
+        label="Outstanding balance"
+        value={formatCurrency(summary.outstanding_balance)}
+        sublabel={`${summary.customers_owing} client${summary.customers_owing === 1 ? "" : "s"} owing · ${summary.invoices_unpaid} unpaid · ${summary.invoices_overdue} overdue`}
+        accent="status-warning"
+        onClick={goTo("finance", "/admin/finance?doc=invoice&status=unpaid")}
+        // "32 unpaid" is every invoice still owed; "overdue" is how many of
+        // those are past their due date.
+        actionLabel={actionFor("finance", "View unpaid invoices")}
+      />
+    ) },
+    { key: "devices_online", node: (
+      <StatCard
+        label="Devices online"
+        value={`${summary.devices_online}/${summary.devices_total}`}
+        accent={summary.devices_offline > 0 ? "status-critical" : "status-good"}
+        onClick={goTo("networking", "/admin/networking?tab=devices")}
+        actionLabel={actionFor("networking", "View devices")}
+      />
+    ) },
+    { key: "tickets_open", node: (
+      <StatCard
+        label="Open tickets"
+        value={summary.tickets_open}
+        sublabel={`${summary.tickets_urgent} urgent`}
+        accent="status-warning"
+        onClick={goTo("tickets", "/admin/tickets?status=open")}
+        actionLabel={actionFor("tickets", "View open tickets")}
+      />
+    ) },
+    { key: "followups_due", node: (
+      <StatCard
+        label="Follow-ups due"
+        value={summary.leads_follow_up_due}
+        // A follow-up nobody is reminded of is the same as no follow-up:
+        // the date gets set, the day passes, and the lead goes cold
+        // without anything ever saying so. This tile is the reminder.
+        sublabel={
+          summary.leads_follow_up_due > 0
+            ? `of ${summary.leads_open} open leads`
+            : `${summary.leads_open} open leads, nothing due`
+        }
+        accent={summary.leads_follow_up_due > 0 ? "status-warning" : "series-1"}
+        onClick={goTo("sales", "/admin/leads")}
+        actionLabel={actionFor("sales", "Work the list")}
+      />
+    ) },
+    { key: "bad_debt", node: (
+      <StatCard
+        label="Bad debt"
+        value={summary.customers_bad_debt}
+        // The money, not the headcount, is what anyone reacts to -- "3
+        // customers" says far less than "3 customers, R14,200 written off".
+        sublabel={
+          summary.customers_bad_debt > 0
+            ? `${formatCurrency(summary.customers_bad_debt_value)} written off`
+            : "Nothing written off"
+        }
+        accent={summary.customers_bad_debt > 0 ? "status-critical" : "series-1"}
+        onClick={goTo("customers", "/admin/customers?status=bad_debt")}
+        actionLabel={actionFor("customers", "View bad debt")}
+      />
+    ) },
+    /* Billing suspends the LINE and leaves the customer's status alone,
+        so none of the status tiles count these people. Clickable at zero
+        too: an empty list says "nobody", which a dead tile does not. */
+    { key: "suspended_nonpayment", node: (
+      <StatCard
+        label="Suspended for non-payment"
+        value={summary.customers_suspended_nonpayment}
+        sublabel={
+          summary.customers_with_suspended_lines > 0
+            ? `${summary.customers_with_suspended_lines} with any line suspended`
+            : "No suspended lines"
+        }
+        accent={summary.customers_suspended_nonpayment > 0 ? "status-warning" : "series-1"}
+        onClick={goTo("customers", "/admin/customers?status=line_suspended_nonpayment")}
+        actionLabel={actionFor("customers", "See who")}
+      />
+    ) },
+    { key: "cancelled_customers", node: (
+      <StatCard
+        label="Cancelled customers"
+        value={summary.customers_cancelled}
+        sublabel={
+          summary.customers_cancelled_recently > 0
+            ? `${summary.customers_cancelled_recently} in the last 30 days`
+            : "None in the last 30 days"
+        }
+        // The total alone only ever goes up and says nothing; the recent
+        // figure beside it is the one worth reacting to.
+        accent={summary.customers_cancelled_recently > 0 ? "status-warning" : "series-1"}
+        onClick={goTo("customers", "/admin/customers?status=inactive")}
+        actionLabel={actionFor("customers", "View cancelled")}
+      />
+    ) },
+    /* Lines, not clients (Rudolph, 8 Oct 2026: "Maybe the dashboard
+        should show offline Services?") -- a client with one of two lines
+        down counts. Every Active line that isn't up, however long ago it
+        dropped; the 24h call list is the sublabel. Opens the Customers
+        list's Offline filter, which uses the same rule. */
+    { key: "services_offline", node: (
+      <StatCard
+        label="Offline services"
+        value={summary.services_offline ?? "—"}
+        sublabel={
+          summary.services_offline === 0
+            ? "Every active line is online"
+            : `${summary.services_offline_customers ?? 0} client${summary.services_offline_customers === 1 ? "" : "s"}` +
+              (offline ? ` · ${offline.count} dropped in the last 24h` : "")
+        }
+        accent={(summary.services_offline ?? 0) > 0 ? "status-critical" : "status-good"}
+        onClick={goTo("customers", "/admin/customers?connection=offline")}
+        actionLabel={actionFor("customers", "See who")}
+      />
+    ) },
+    { key: "high_alert", node: (
+      <StatCard
+        label="High alert customers"
+        value={alerts ? alerts.count : "—"}
+        sublabel={
+          alertsError
+            ? "Couldn't load"
+            : alerts
+              ? `Tickets on ${alerts.min_tickets}+ days in a month, last ${alerts.months} months`
+              : "Loading…"
+        }
+        accent="status-critical"
+        // Lands on the real customer list filtered to exactly these people,
+        // where every other tool on that page -- search, columns, partner
+        // filter, bulk select -- applies to them. The ranked panel that
+        // used to sit on this page could only be read.
+        // Also clickable at zero, for the same reason as the blocking tile
+        // below: an empty filtered list says "nobody qualifies", which a
+        // dead tile does not.
+        onClick={alerts ? goTo("customers", "/admin/customers?high_alert=1") : undefined}
+        actionLabel={alerts ? actionFor("customers", "See who") : undefined}
+      />
+    ) },
+    /* A licence disc or driver's card that has quietly expired is the
+        cheapest way to lose a vehicle for a day and collect a fine, and
+        nothing else on this platform was ever going to mention it. The
+        number is what needs attention -- expired, inside its notice
+        period, or never captured at all. */
+    ...(licences ? [
+      { key: "licence_renewals", node: (
+        <StatCard
+          label="Licence renewals"
+          value={licences.counts.action_needed}
+          sublabel={
+            licences.counts.action_needed === 0
+              ? "Every disc and driver's licence is current"
+              : `${licences.counts.expired} expired · ${licences.counts.due_soon} due soon · ${licences.counts.unknown} not captured`
+          }
+          accent={
+            licences.counts.expired > 0
+              ? "status-critical"
+              : licences.counts.action_needed > 0
+                ? "status-warning"
+                : "status-good"
+          }
+          // Clickable at zero, same reasoning as the blocking tile: a tile
+          // that does nothing when the number happens to be 0 is
+          // indistinguishable from a broken one.
+          onClick={canAccessSection(user, "vehicles") ? () => setShowLicences(true) : undefined}
+          actionLabel={actionFor("vehicles", "Show the list")}
+        />
+      ) },
+    ] : []),
+
+    /* Only rendered once the request has come back. Staff without
+        Finance access get a 403 and no tile at all, rather than a tile
+        reading "—" forever. */
+    ...(blocks ? [
+      { key: "blocking_soon", node: (
+        <StatCard
+          // Headline is the whole horizon (the list it opens), tomorrow's
+          // count underneath -- renamed from "Blocking tomorrow" (Rudolph,
+          // 1 Oct): the tile always covered the coming week.
+          label="Blocking soon"
+          value={blocks.count_horizon}
+          sublabel={
+            blocks.auto_suspend_enabled
+              ? `${blocks.count_tomorrow} ${blocks.next_run_is_today ? "today" : "tomorrow"} · next ${blocks.horizon_days} days`
+              : `${blocks.count_tomorrow} ${blocks.next_run_is_today ? "today" : "tomorrow"} · next ${blocks.horizon_days} days · auto-suspension OFF`
+          }
+          accent={
+            blocks.count_tomorrow > 0 ? "status-critical" : blocks.count_horizon > 0 ? "status-warning" : "status-good"
+          }
+          // Clickable even at zero. A tile that quietly does nothing when
+          // the number happens to be 0 is indistinguishable from a broken
+          // one -- and "nobody currently meets the blocking criteria" is
+          // real information, especially when auto-suspension is off.
+          onClick={canAccessSection(user, "finance") ? () => setShowBlocks(true) : undefined}
+          actionLabel={actionFor("finance", "Show the list")}
+        />
+      ) },
+    ] : []),
+    ...speeding.tiles,
+  ];
+
   return (
     <div>
-      <PageHeader title="Dashboard" subtitle="Overview of customers, billing, network health, and support." />
-
-      <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-4">
-        {/* Each tile goes to the list its number came from, with the filter
-            already applied -- so "1 unpaid" lands on that one unpaid invoice,
-            not on every document you have. */}
-        <StatCard
-          label="Total customers"
-          value={summary.customers_total}
-          sublabel={`${summary.customers_active} active`}
-          onClick={goTo("customers", "/admin/customers")}
-          actionLabel={actionFor("customers", "View customers")}
-        />
-        <StatCard
-          label="Active services"
-          value={summary.services_active}
-          accent="series-3"
-          onClick={goTo("services", "/admin/services?status=active")}
-          actionLabel={actionFor("services", "View active services")}
-        />
-        <StatCard
-          label="Revenue this month"
-          value={formatCurrency(summary.revenue_this_month)}
-          accent="status-good"
-          // Revenue is money received, so the payments list is where it comes
-          // from -- not the invoice list, which is money billed.
-          onClick={goTo("finance", "/admin/finance?tab=payments")}
-          actionLabel={actionFor("finance", "View payments")}
-        />
-        <StatCard
-          label="Outstanding balance"
-          value={formatCurrency(summary.outstanding_balance)}
-          sublabel={`${summary.invoices_unpaid} unpaid · ${summary.invoices_overdue} overdue`}
-          accent="status-warning"
-          onClick={goTo("finance", "/admin/finance?doc=invoice&status=unpaid")}
-          actionLabel={actionFor("finance", "View unpaid invoices")}
-        />
-        <StatCard
-          label="Devices online"
-          value={`${summary.devices_online}/${summary.devices_total}`}
-          accent={summary.devices_offline > 0 ? "status-critical" : "status-good"}
-          onClick={goTo("networking", "/admin/networking?tab=devices")}
-          actionLabel={actionFor("networking", "View devices")}
-        />
-        <StatCard
-          label="Open tickets"
-          value={summary.tickets_open}
-          sublabel={`${summary.tickets_urgent} urgent`}
-          accent="status-warning"
-          onClick={goTo("tickets", "/admin/tickets?status=open")}
-          actionLabel={actionFor("tickets", "View open tickets")}
-        />
-        <StatCard
-          label="Follow-ups due"
-          value={summary.leads_follow_up_due}
-          // A follow-up nobody is reminded of is the same as no follow-up:
-          // the date gets set, the day passes, and the lead goes cold
-          // without anything ever saying so. This tile is the reminder.
-          sublabel={
-            summary.leads_follow_up_due > 0
-              ? `of ${summary.leads_open} open leads`
-              : `${summary.leads_open} open leads, nothing due`
-          }
-          accent={summary.leads_follow_up_due > 0 ? "status-warning" : "series-1"}
-          onClick={goTo("sales", "/admin/leads")}
-          actionLabel={actionFor("sales", "Work the list")}
-        />
-        <StatCard
-          label="Bad debt"
-          value={summary.customers_bad_debt}
-          // The money, not the headcount, is what anyone reacts to -- "3
-          // customers" says far less than "3 customers, R14,200 written off".
-          sublabel={
-            summary.customers_bad_debt > 0
-              ? `${formatCurrency(summary.customers_bad_debt_value)} written off`
-              : "Nothing written off"
-          }
-          accent={summary.customers_bad_debt > 0 ? "status-critical" : "series-1"}
-          onClick={goTo("customers", "/admin/customers?status=bad_debt")}
-          actionLabel={actionFor("customers", "View bad debt")}
-        />
-        <StatCard
-          label="Cancelled customers"
-          value={summary.customers_cancelled}
-          sublabel={
-            summary.customers_cancelled_recently > 0
-              ? `${summary.customers_cancelled_recently} in the last 30 days`
-              : "None in the last 30 days"
-          }
-          // The total alone only ever goes up and says nothing; the recent
-          // figure beside it is the one worth reacting to.
-          accent={summary.customers_cancelled_recently > 0 ? "status-warning" : "series-1"}
-          onClick={goTo("customers", "/admin/customers?status=inactive")}
-          actionLabel={actionFor("customers", "View cancelled")}
-        />
-        <StatCard
-          label="Offline customers"
-          value={offline ? offline.count : "—"}
-          sublabel={
-            offline
-              ? offline.count === 0
-                ? "Everyone is online"
-                : "Dropped in the last 24h and not back"
-              : "Loading…"
-          }
-          accent={offline && offline.count > 0 ? "status-critical" : "status-good"}
-          onClick={goTo("customers", "/admin/offline-customers")}
-          actionLabel={actionFor("customers", "Call them")}
-        />
-        <StatCard
-          label="High alert customers"
-          value={alerts ? alerts.count : "—"}
-          sublabel={
-            alertsError
-              ? "Couldn't load"
-              : alerts
-                ? `${alerts.min_tickets}+ tickets in a month, last ${alerts.months} months`
-                : "Loading…"
-          }
-          accent="status-critical"
-          // Lands on the real customer list filtered to exactly these people,
-          // where every other tool on that page -- search, columns, partner
-          // filter, bulk select -- applies to them. The ranked panel that
-          // used to sit on this page could only be read.
-          // Also clickable at zero, for the same reason as the blocking tile
-          // below: an empty filtered list says "nobody qualifies", which a
-          // dead tile does not.
-          onClick={alerts ? goTo("customers", "/admin/customers?high_alert=1") : undefined}
-          actionLabel={alerts ? actionFor("customers", "See who") : undefined}
-        />
-        {/* Only rendered once the request has come back. Staff without
-            Finance access get a 403 and no tile at all, rather than a tile
-            reading "—" forever. */}
-        {blocks && (
-          <StatCard
-            label="Blocking tomorrow"
-            value={blocks.count_tomorrow}
-            sublabel={
-              blocks.auto_suspend_enabled
-                ? `${blocks.count_horizon} within ${blocks.horizon_days} days`
-                : `${blocks.count_horizon} within ${blocks.horizon_days} days · auto-suspension OFF`
-            }
-            accent={blocks.count_tomorrow > 0 ? "status-critical" : "status-good"}
-            // Clickable even at zero. A tile that quietly does nothing when
-            // the number happens to be 0 is indistinguishable from a broken
-            // one -- and "nobody currently meets the blocking criteria" is
-            // real information, especially when auto-suspension is off.
-            onClick={canAccessSection(user, "finance") ? () => setShowBlocks(true) : undefined}
-            actionLabel={actionFor("finance", "Show the list")}
-          />
-        )}
-      </div>
+      <PageHeader
+        title="Dashboard"
+        subtitle="Overview of customers, billing, network health, and support."
+        actions={
+          !arranging && (
+            <button type="button" className={btnSecondary} onClick={() => setArranging(true)}>
+              Arrange tiles
+            </button>
+          )
+        }
+      />
+      <DashboardTileGrid
+        tiles={tiles}
+        saved={savedOrder}
+        arranging={arranging}
+        onCancel={() => setArranging(false)}
+        onSave={async (order) => {
+          await api.patch("/me/", { dashboard_layout: { order } });
+          setSavedOrder(order);
+          setArranging(false);
+          refreshUser();
+        }}
+      />
 
       {blocksError && (
         <p className="mb-4 text-sm text-[var(--status-critical)]">{blocksError}</p>
@@ -333,6 +510,74 @@ export function DashboardPage() {
 
       </div>
 
+      {speeding.modal}
+
+      {showLicences && licences && (
+        <Modal title="Licence renewals" onClose={() => setShowLicences(false)}>
+          <p className="mb-3 text-xs text-[var(--text-muted)]">
+            Vehicle licence discs and drivers' licences, worst first, as at {licences.as_of}. A disc warns
+            30 days ahead; a driver's card warns 60, because renewing one means a testing-centre booking.
+          </p>
+
+          {licences.counts.action_needed === 0 && (
+            <p className="rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] px-3 py-4 text-sm text-[var(--text-secondary)]">
+              <strong className="text-[var(--text-primary)]">Nothing outstanding.</strong> Every active
+              vehicle has a disc date on file that is still inside its year, and every driver on the list
+              has a current licence.
+            </p>
+          )}
+
+          <ul className="divide-y divide-[var(--border-hairline)]">
+            {licences.results
+              .filter((row) => RENEWAL_ACTION_STATES.includes(row.status))
+              .slice(0, 25)
+              .map((row) => (
+                <li key={row.key} className="flex items-start justify-between gap-3 py-2.5">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-[var(--text-primary)]">{row.title}</p>
+                    <p className="text-xs text-[var(--text-muted)]">
+                      {row.document} · {row.subtitle}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p
+                      className={`text-sm font-semibold ${
+                        row.status === "expired"
+                          ? "text-[var(--status-critical)]"
+                          : row.status === "due_soon"
+                            ? "text-[#b3852e]"
+                            : "text-[var(--text-secondary)]"
+                      }`}
+                    >
+                      {renewalLine(row.days_left)}
+                    </p>
+                    <p className="text-xs text-[var(--text-muted)]">{row.expiry || "Never captured"}</p>
+                  </div>
+                </li>
+              ))}
+          </ul>
+
+          {licences.counts.action_needed > 25 && (
+            <p className="mt-2 text-xs text-[var(--text-muted)]">
+              …and {licences.counts.action_needed - 25} more.
+            </p>
+          )}
+
+          <div className="mt-4 flex justify-end">
+            <Link
+              to="/admin/vehicles?tab=renewals"
+              className="text-sm font-medium text-[var(--series-1)] hover:underline"
+              onClick={() => setShowLicences(false)}
+            >
+              Open the Renewals tab →
+            </Link>
+          </div>
+        </Modal>
+      )}
+
+      {/* Server health, admins only (7 Oct 2026). */}
+      {user?.role === "admin" && <SystemStatusCard />}
+
       {showBlocks && blocks && (
         <Modal
           title={`Blocking within ${blocks.horizon_days} days`}
@@ -348,8 +593,10 @@ export function DashboardPage() {
 
           <p className="mb-3 text-xs text-[var(--text-muted)]">
             A customer is blocked once an invoice has been overdue longer than their blocking period
-            <em> and</em> their balance is worse than their minimum balance. Dates assume a billing run
-            happens each day.
+            <em> and</em> their balance is worse than their minimum balance, on a working day after they
+            have had a reminder. A client with an approved extension is cut on the extension date itself,
+            any day of the week. The date shown is the day the line goes off; today counts while today&rsquo;s
+            billing run hasn&rsquo;t happened yet.
           </p>
 
           {blocks.results.length === 0 && (
@@ -382,7 +629,7 @@ export function DashboardPage() {
                   <p className="text-xs text-[var(--text-muted)]">
                     {b.reference} · {b.invoices_owing} invoice{b.invoices_owing === 1 ? "" : "s"} owing
                     {" · oldest due "}
-                    {b.oldest_invoice_due}
+                    {formatIsoDate(b.oldest_invoice_due)}
                   </p>
                   <p className="text-xs text-[var(--text-muted)]">
                     {b.active_services} active service{b.active_services === 1 ? "" : "s"} would be
@@ -395,9 +642,13 @@ export function DashboardPage() {
                       b.days_until === 0 ? "text-[var(--status-critical)]" : "text-[var(--text-primary)]"
                     }`}
                   >
-                    {whenLabel(b.days_until)}
+                    {whenLabel(b.days_from_today ?? b.days_until + 1)}
                   </p>
-                  <p className="text-xs text-[var(--text-muted)]">{b.block_date}</p>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    {formatIsoDate(b.block_date)}
+                    {blocks.run_time ? ` · ${blocks.run_time}` : ""}
+                  </p>
+                  {b.extension_date && <p className="text-xs text-[var(--status-warning)]">Extension date</p>}
                   <p className="tabular-nums text-xs font-medium text-[var(--text-secondary)]">
                     {formatCurrency(parseFloat(b.balance))} owing
                   </p>

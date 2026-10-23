@@ -1,6 +1,7 @@
 from django.contrib import admin
 from .models import (
     Supplier,
+    StockSite,
     Product,
     SerializedUnit,
     StockReceipt,
@@ -15,6 +16,13 @@ from .models import (
 class SupplierAdmin(admin.ModelAdmin):
     list_display = ["name", "contact_person", "phone", "email"]
     search_fields = ["name", "contact_person", "email"]
+
+
+@admin.register(StockSite)
+class StockSiteAdmin(admin.ModelAdmin):
+    list_display = ["name", "code", "site_type", "vehicle", "is_default", "is_active"]
+    list_filter = ["site_type", "is_active", "is_default"]
+    search_fields = ["name", "code", "vehicle__registration_number"]
 
 
 @admin.register(Product)

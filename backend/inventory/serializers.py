@@ -6,7 +6,9 @@ from .identifiers import InvalidMac, normalise_mac, normalise_serial, parse_seri
 
 from config.media_security import sign_media_path
 from .models import (
+    SupplierCategory,
     Supplier,
+    StockSite,
     Product,
     SerializedUnit,
     StockReceipt,
@@ -32,7 +34,38 @@ class SignedAttachmentMixin:
         return request.build_absolute_uri(url) if request else url
 
 
+class SupplierCategorySerializer(serializers.ModelSerializer):
+    default_account_code = serializers.CharField(
+        source="default_account.code", read_only=True, default=None
+    )
+    default_account_name = serializers.CharField(
+        source="default_account.name", read_only=True, default=None
+    )
+    supplier_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierCategory
+        fields = [
+            "id", "name", "default_account", "default_account_code", "default_account_name",
+            "notes", "is_active", "supplier_count", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def get_supplier_count(self, obj):
+        return obj.suppliers.count()
+
+
 class SupplierSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True, default=None)
+    # The account an expense from this supplier will pre-fill with, so the
+    # Expenses form can show it without fetching the category list and
+    # working it out for itself.
+    default_account = serializers.IntegerField(
+        source="category.default_account_id", read_only=True, default=None
+    )
+    default_account_name = serializers.CharField(
+        source="category.default_account.name", read_only=True, default=None
+    )
     # The rate the receipt form should pre-fill for this supplier: their
     # default rate while VAT-registered, 0 otherwise. Computed on the
     # model, never stored -- see Supplier.effective_vat_rate_pct for why
@@ -45,6 +78,65 @@ class SupplierSerializer(serializers.ModelSerializer):
         model = Supplier
         fields = "__all__"
         read_only_fields = ["id", "created_at"]
+
+
+class StockSiteSerializer(serializers.ModelSerializer):
+    # Labels rather than ids, so the sites table renders without the page
+    # having to fetch fleet and networking just to fill three columns.
+    site_type_display = serializers.CharField(source="get_site_type_display", read_only=True)
+    network_site_name = serializers.CharField(source="network_site.title", read_only=True, default=None)
+    # A method field, not source="vehicle.__str__" -- a dotted source walks
+    # getattr and would hand back the bound method object, not the text.
+    vehicle_label = serializers.SerializerMethodField()
+    vehicle_registration = serializers.CharField(
+        source="vehicle.registration_number", read_only=True, default=None
+    )
+    # Derived on the model: the vehicle's driver, or the named contact.
+    holder_name = serializers.CharField(read_only=True)
+    # Declared explicitly to drop the uniqueness validator DRF generates
+    # from the model's single-default constraint. That validator rejected
+    # ticking "default" on a second site -- which is the ONLY way anyone
+    # ever changes the default -- with "stock site with this is default
+    # already exists", before StockSite.save() got the chance to demote the
+    # site currently holding it. The constraint still stands in the
+    # database; it simply isn't the API's job to pre-empt the very thing
+    # save() exists to handle.
+    is_default = serializers.BooleanField(required=False)
+
+    class Meta:
+        model = StockSite
+        fields = "__all__"
+        read_only_fields = ["id", "created_at"]
+
+    def validate(self, attrs):
+        # Everything below is checked against the MERGED state -- the
+        # incoming values laid over the existing row -- so a PATCH that
+        # sends one field still gets judged on what the record will
+        # actually look like afterwards, not on what was in the request.
+        def merged(field, fallback):
+            return attrs.get(field, getattr(self.instance, field, fallback))
+
+        is_default = merged("is_default", False)
+        is_active = merged("is_active", True)
+        if is_default and not is_active:
+            raise serializers.ValidationError(
+                {"is_active": "The default site can't be inactive. Make another site the default first."}
+            )
+
+        site_type = merged("site_type", StockSite.SiteType.WAREHOUSE)
+        vehicle = attrs.get("vehicle", getattr(self.instance, "vehicle", None))
+        if site_type == StockSite.SiteType.VEHICLE and vehicle is None:
+            raise serializers.ValidationError(
+                {"vehicle": "Choose which vehicle this is. Stock in an unnamed bakkie can't be found again."}
+            )
+        if site_type != StockSite.SiteType.VEHICLE and vehicle is not None:
+            raise serializers.ValidationError(
+                {"vehicle": "Only a vehicle site can be linked to a vehicle."}
+            )
+        return attrs
+
+    def get_vehicle_label(self, obj):
+        return str(obj.vehicle) if obj.vehicle_id else None
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -66,7 +158,25 @@ class ProductSerializer(serializers.ModelSerializer):
     # what was actually paid on a receipt, never typed here.
     latest_cost_excl_vat = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     average_cost_excl_vat = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    margin_pct = serializers.DecimalField(max_digits=6, decimal_places=1, read_only=True)
+    # Wide on purpose, and it has to be. margin_pct divides by the SELL
+    # price, which is typed by hand, so a resell-price typo on an expensive
+    # item makes the percentage enormous: R10 keyed on a R25,000 splicer is
+    # -249900.0%. max_digits is not just validation here -- DRF quantizes
+    # output under a decimal context whose precision IS max_digits, so at 6
+    # that raised decimal.InvalidOperation. Not an APIException, so it
+    # escaped the serializer as a 500, and because the list serializes in
+    # one pass ONE mistyped row blanked the entire Inventory tab and every
+    # product picker that reads this endpoint (Finance invoice lines,
+    # quotes, Services). 14 digits covers the worst the model fields allow
+    # -- sell_price 0.01 against a cost of 99999999.99 is -999999999800.0,
+    # thirteen digits -- and matches the width used further down this file.
+    # The silly number is meant to show: red in the margin column is how
+    # stores staff find the typo before it reaches a customer invoice.
+    margin_pct = serializers.DecimalField(max_digits=14, decimal_places=1, read_only=True)
+    # On hand per stock site (13 Oct 2026): [{site, site_name, quantity}],
+    # only the sites holding some. With ?site= on the list, quantity_on_hand
+    # and is_low_stock are for that site instead of the total.
+    stock_by_site = serializers.SerializerMethodField()
     # Write-only, create-only: [{"serial": "...", "mac": "..."}, ...]
     initial_units = serializers.ListField(
         child=serializers.DictField(child=serializers.CharField(allow_blank=True)),
@@ -81,17 +191,103 @@ class ProductSerializer(serializers.ModelSerializer):
             "low_stock_threshold", "description", "is_active",
             "sell_price", "sell_tax_rate_pct",
             "latest_cost_excl_vat", "average_cost_excl_vat", "margin_pct",
-            "quantity_on_hand", "is_low_stock", "created_at", "initial_units",
+            "quantity_on_hand", "is_low_stock", "stock_by_site", "created_at", "initial_units",
         ]
         read_only_fields = [
             "id", "quantity_on_hand", "created_at",
             "latest_cost_excl_vat", "average_cost_excl_vat", "margin_pct",
         ]
 
+    def _site_stock(self):
+        """{product_id: {site_id: qty}} for every product, built once per
+        response (two grouped queries) rather than per row."""
+        cache = self.context.get("_site_stock")
+        if cache is None:
+            from django.db.models import Count, Sum
+
+            cache = {}
+            for row in (
+                StockMovement.objects.exclude(product__tracking_type=Product.TrackingType.SERIALIZED)
+                .values("product_id", "site_id").annotate(q=Sum("quantity"))
+            ):
+                cache.setdefault(row["product_id"], {})[row["site_id"]] = row["q"] or 0
+            for row in (
+                SerializedUnit.objects.filter(status=SerializedUnit.Status.IN_STOCK)
+                .values("product_id", "site_id").annotate(q=Count("id"))
+            ):
+                cache.setdefault(row["product_id"], {})[row["site_id"]] = row["q"]
+            names = dict(StockSite.objects.values_list("pk", "name"))
+            self.context["_site_stock"] = cache
+            self.context["_site_names"] = names
+        return cache
+
+    def get_stock_by_site(self, obj):
+        per = self._site_stock().get(obj.pk, {})
+        names = self.context.get("_site_names", {})
+        rows = [
+            {"site": sid, "site_name": names.get(sid, "No site"), "quantity": q}
+            for sid, q in per.items() if q
+        ]
+        return sorted(rows, key=lambda r: r["site_name"].lower())
+
+    def _site_filter(self):
+        request = self.context.get("request")
+        raw = request.query_params.get("site") if request is not None else None
+        return int(raw) if raw and str(raw).isdigit() else None
+
+    def to_representation(self, obj):
+        data = super().to_representation(obj)
+        site = self._site_filter()
+        if site is not None:
+            qty = self._site_stock().get(obj.pk, {}).get(site, 0)
+            data["quantity_on_hand"] = qty
+            data["is_low_stock"] = obj.low_stock_threshold is not None and qty <= obj.low_stock_threshold
+        return data
+
     def get_is_low_stock(self, obj):
         if obj.low_stock_threshold is None:
             return False
         return obj.quantity_on_hand <= obj.low_stock_threshold
+
+    def validate_tracking_type(self, value):
+        # Refused once the product already holds stock of the other kind:
+        # quantity_on_hand is computed from StockMovement rows for a quantity
+        # product and from SerializedUnit rows for a serialized one, so
+        # flipping a product that has either would make its existing stock
+        # silently vanish from the count.
+        #
+        # This is the same rule the receipt-import path already applies (see
+        # StockReceiptCreateSerializer.create), and it was missing here: an
+        # ordinary product edit could change the Tracking dropdown and 305m of
+        # cable on the shelf became 0, with nothing said about it and the
+        # issue screen then refusing to issue cable we actually have.
+        product = self.instance
+        if product is None or value == product.tracking_type:
+            return value
+        if product.tracking_type == Product.TrackingType.QUANTITY:
+            # Stock, not history. A product received and then issued out
+            # again holds nothing, so nothing can vanish from the count --
+            # and once it is serialized no further movement can be booked
+            # against it (the adjust action refuses a serialized product,
+            # and a receipt line demands serials), so those rows stay
+            # history and stay harmless. Testing movements.exists() meant a
+            # product mis-set at creation could never be put right again
+            # once a single +1/-1 correction had been booked against it.
+            held = product.quantity_on_hand
+            holding = "quantity-tracked stock"
+        else:
+            # Units, not the on-hand count. An issued or faulty unit is
+            # still this product's unit and can come back to the shelf; as
+            # a quantity product it would never be counted again.
+            held = product.serialized_units.exists()
+            holding = "individually-tracked units"
+        if held:
+            raise serializers.ValidationError(
+                f"'{product.name}' already has {holding} on record, so it can't be "
+                "switched now — its on-hand count is worked out from those. Create a "
+                "separate product for the individually-tracked version."
+            )
+        return value
 
     def validate(self, attrs):
         units = attrs.get("initial_units") or []
@@ -153,7 +349,12 @@ class ProductSerializer(serializers.ModelSerializer):
         # parsing: an empty row pair left untouched by someone who never
         # meant to use the section must not change how the product is
         # tracked.
-        if parsed:
+        #
+        # Create only. On an edit the units are thrown away again (see
+        # update), so flipping an existing product's tracking here would zero
+        # its on-hand count -- exactly what validate_tracking_type refuses --
+        # and give nothing back for it.
+        if parsed and self.instance is None:
             attrs["tracking_type"] = Product.TrackingType.SERIALIZED
         attrs["initial_units"] = parsed
         return attrs
@@ -161,9 +362,11 @@ class ProductSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         units = validated_data.pop("initial_units", [])
         product = super().create(validated_data)
+        site = StockSite.default_site()
         for serial, mac in units:
             SerializedUnit.objects.create(
                 product=product,
+                site=site,
                 serial_number=serial,
                 mac_address=mac,
                 notes="Added with the product — opening stock, no supplier invoice.",
@@ -205,18 +408,19 @@ class SerializedUnitSerializer(serializers.ModelSerializer):
     received_on = serializers.DateField(
         source="received_via_line.receipt.invoice_date", read_only=True, default=None
     )
+    site_name = serializers.CharField(source="site.name", read_only=True, default=None)
 
     class Meta:
         model = SerializedUnit
         fields = [
             "id", "product", "product_name", "serial_number", "mac_address",
-            "status", "notes", "created_at",
+            "status", "site", "site_name", "notes", "created_at",
             "supplier_id", "supplier_name", "receipt_id", "receipt_invoice_number", "received_on",
         ]
         # product and status are fixed after check-in: moving a unit to a
         # different product would falsify both products' on-hand counts, and
         # status is owned by the receipt/issue flows.
-        read_only_fields = ["id", "created_at", "product", "status"]
+        read_only_fields = ["id", "created_at", "product", "status", "site"]
 
     def validate_serial_number(self, value):
         serial = normalise_serial(value)
@@ -329,17 +533,20 @@ class StockReceiptSerializer(SignedAttachmentMixin, serializers.ModelSerializer)
     supplier_is_vat_registered = serializers.BooleanField(
         source="supplier.is_vat_registered", read_only=True
     )
+    site_name = serializers.CharField(source="site.name", read_only=True, default=None)
 
     class Meta:
         model = StockReceipt
         fields = [
-            "id", "supplier", "supplier_name", "supplier_is_vat_registered",
+            "id", "supplier", "supplier_name", "supplier_is_vat_registered", "site", "site_name",
             "invoice_number", "invoice_date", "prices_include_vat",
             "attachment", "received_by", "received_by_name", "notes", "lines",
             "total_excl_vat", "vat_total", "total_incl_vat", "has_unrecorded_vat",
             "created_at",
         ]
-        read_only_fields = ["id", "received_by", "created_at"]
+        # Where the stock went is fixed once booked: changing it here would
+        # leave the movements and units at the old site.
+        read_only_fields = ["id", "received_by", "created_at", "site"]
 
     def to_representation(self, instance):
         # Signed, short-lived download link instead of the raw MEDIA path
@@ -368,7 +575,7 @@ class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSeria
     class Meta:
         model = StockReceipt
         fields = [
-            "id", "supplier", "invoice_number", "invoice_date",
+            "id", "supplier", "site", "invoice_number", "invoice_date",
             "prices_include_vat", "attachment", "notes", "lines",
         ]
         read_only_fields = ["id"]
@@ -383,9 +590,19 @@ class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSeria
             raise serializers.ValidationError("At least one line item is required.")
         return lines
 
+    def validate_site(self, site):
+        if site is not None and not site.is_active:
+            raise serializers.ValidationError(f"'{site.name}' is retired — pick an active location.")
+        return site
+
     def create(self, validated_data):
         lines_data = validated_data.pop("lines")
         user = self.context["request"].user
+        # No location chosen (e.g. the Conecto scanner) = the default site.
+        # (Still None only on an install with no stock sites at all.)
+        if validated_data.get("site") is None:
+            validated_data["site"] = StockSite.default_site()
+        site = validated_data["site"]
 
         with transaction.atomic():
             receipt = StockReceipt.objects.create(received_by=user, **validated_data)
@@ -426,7 +643,10 @@ class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSeria
                     )
                     if wanted != product.tracking_type:
                         if product.tracking_type == Product.TrackingType.QUANTITY:
-                            held = product.movements.exists()
+                            # Stock, not history -- see validate_tracking_type
+                            # for why a product whose movements net to zero
+                            # has nothing to lose by being switched.
+                            held = product.quantity_on_hand
                             holding = "quantity-tracked stock"
                         else:
                             held = product.serialized_units.exists()
@@ -511,6 +731,7 @@ class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSeria
                     for serial_number, mac_address in parsed:
                         SerializedUnit.objects.create(
                             product=product,
+                            site=site,
                             serial_number=serial_number,
                             mac_address=mac_address,
                             received_via_line=line,
@@ -530,6 +751,7 @@ class StockReceiptCreateSerializer(SignedAttachmentMixin, serializers.ModelSeria
                     )
                     StockMovement.objects.create(
                         product=product,
+                        site=site,
                         movement_type=StockMovement.MovementType.RECEIPT,
                         quantity=quantity,
                         receipt_line=line,
@@ -572,14 +794,20 @@ class StockIssueSerializer(serializers.ModelSerializer):
     job_title = serializers.CharField(source="job.title", read_only=True, default=None)
     customer_name = serializers.CharField(source="job.customer.full_name", read_only=True, default=None)
     lines = StockIssueLineSerializer(many=True, read_only=True)
+    from_site_name = serializers.CharField(source="from_site.name", read_only=True, default=None)
+    to_site_name = serializers.CharField(source="to_site.name", read_only=True, default=None)
+    is_transfer = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = StockIssue
         fields = [
             "id", "job", "job_title", "customer_name", "issued_to", "issued_to_name",
+            "from_site", "from_site_name", "to_site", "to_site_name", "is_transfer",
             "issued_at", "notes", "lines",
         ]
-        read_only_fields = ["id", "issued_at"]
+        # The locations are fixed once booked -- the movements are already
+        # written against them.
+        read_only_fields = ["id", "issued_at", "from_site", "to_site"]
 
 
 class StockIssueCreateSerializer(serializers.ModelSerializer):
@@ -587,7 +815,7 @@ class StockIssueCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StockIssue
-        fields = ["id", "job", "issued_to", "notes", "lines"]
+        fields = ["id", "job", "issued_to", "from_site", "to_site", "notes", "lines"]
         read_only_fields = ["id"]
 
     def validate_lines(self, lines):
@@ -595,12 +823,58 @@ class StockIssueCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("At least one line item is required.")
         return lines
 
+    def validate(self, attrs):
+        # Taken from: the chosen location, else the default site.
+        # (Still None only on an install with no stock sites at all.)
+        if attrs.get("from_site") is None:
+            attrs["from_site"] = StockSite.default_site()
+        if attrs.get("to_site") is not None and attrs.get("from_site") is None:
+            raise serializers.ValidationError({"from_site": "Choose where the stock is moved from."})
+        for key in ("from_site", "to_site"):
+            site = attrs.get(key)
+            if site is not None and not site.is_active:
+                raise serializers.ValidationError({key: f"'{site.name}' is retired — pick an active location."})
+        if attrs.get("to_site") is not None and attrs["to_site"] == attrs["from_site"]:
+            raise serializers.ValidationError({"to_site": "Pick a different location to move the stock to."})
+        return attrs
+
     def create(self, validated_data):
         lines_data = validated_data.pop("lines")
         user = self.context["request"].user
 
         with transaction.atomic():
+            # Lock the quantity-tracked products before anything is checked
+            # or written. quantity_on_hand is a SUM over StockMovement, and
+            # an aggregate takes no locks and cannot see another request's
+            # uncommitted issue -- so two technicians drawing the last 3
+            # boxes of connectors at the same moment both read "5 in stock",
+            # both passed the check below, and both wrote their -3. Stock on
+            # hand ended at -1 and a job went out with kit that was not in
+            # the store. The serialized branch below has locked its unit all
+            # along; this side had nothing to contend on, because there is no
+            # counter column -- the product row is the lock.
+            #
+            # Same shape as CreditRequest.approve, which locks the request
+            # row so the Pending check and the credit that answers it are one
+            # decision rather than two.
+            #
+            # Taken up front and ordered by pk, not one at a time inside the
+            # loop, so two issues that share two products cannot grab them in
+            # opposite orders and deadlock each other.
+            quantity_product_pks = {
+                line_data["product"].pk
+                for line_data in lines_data
+                if line_data["product"].tracking_type != Product.TrackingType.SERIALIZED
+            }
+            if quantity_product_pks:
+                list(
+                    Product.objects.select_for_update()
+                    .filter(pk__in=quantity_product_pks)
+                    .order_by("pk")
+                )
+
             issue = StockIssue.objects.create(created_by=user, **validated_data)
+            from_site, to_site = issue.from_site, issue.to_site
 
             for line_data in lines_data:
                 product = line_data["product"]
@@ -624,7 +898,17 @@ class StockIssueCreateSerializer(serializers.ModelSerializer):
                             f"Serial '{serial_number}' is not currently in stock "
                             f"(status: {unit.get_status_display()})."
                         )
-                    unit.status = SerializedUnit.Status.ISSUED
+                    at = unit.site_id or getattr(StockSite.default_site(), "pk", None)
+                    if from_site is not None and at != from_site.pk:
+                        where = unit.site.name if unit.site_id else "no location"
+                        raise serializers.ValidationError(
+                            f"Serial '{serial_number}' is at {where}, not {from_site.name}."
+                        )
+                    if to_site is not None:
+                        # A transfer: still in stock, now at the other site.
+                        unit.site = to_site
+                    else:
+                        unit.status = SerializedUnit.Status.ISSUED
                     unit.save()
                     StockIssueLine.objects.create(issue=issue, product=product, quantity=1, serial_unit=unit)
                 else:
@@ -633,22 +917,42 @@ class StockIssueCreateSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError(
                             f"Enter a quantity greater than 0 for '{product.name}'."
                         )
-                    available = product.quantity_on_hand
+                    # Read while the product row is locked (above), so this
+                    # figure already includes any issue that committed while
+                    # this request was waiting for that lock.
+                    available = product.quantity_at(from_site)
                     if quantity > available:
                         raise serializers.ValidationError(
-                            f"Cannot issue {quantity} of '{product.name}' — only {available} in stock."
+                            f"Cannot issue {quantity} of '{product.name}' — only {available} "
+                            + (f"at {from_site.name}." if from_site is not None else "in stock.")
                         )
                     line = StockIssueLine.objects.create(issue=issue, product=product, quantity=quantity)
-                    note = f"Issue #{issue.pk}"
-                    if issue.job:
-                        note += f" — job: {issue.job.title}"
+                    if to_site is not None:
+                        note = f"Transfer #{issue.pk}: {from_site.name} -> {to_site.name}"
+                        kind = StockMovement.MovementType.TRANSFER
+                    else:
+                        note = f"Issue #{issue.pk}"
+                        if issue.job:
+                            note += f" — job: {issue.job.title}"
+                        kind = StockMovement.MovementType.ISSUE
                     StockMovement.objects.create(
                         product=product,
-                        movement_type=StockMovement.MovementType.ISSUE,
+                        site=from_site,
+                        movement_type=kind,
                         quantity=-quantity,
                         issue_line=line,
                         created_by=user,
                         note=note,
                     )
+                    if to_site is not None:
+                        StockMovement.objects.create(
+                            product=product,
+                            site=to_site,
+                            movement_type=kind,
+                            quantity=quantity,
+                            issue_line=line,
+                            created_by=user,
+                            note=note,
+                        )
 
         return issue

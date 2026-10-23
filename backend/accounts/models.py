@@ -5,6 +5,15 @@ from django.contrib.postgres.fields import ArrayField
 from django.db import models
 
 
+#: Automatic calendar colours: mid-tones that carry white text in light and
+#: dark mode, distinct from one another. A staff member gets one by id until
+#: someone picks their own (User.calendar_colour).
+CALENDAR_PALETTE = [
+    "#2a6fd0", "#1a9e6e", "#7652d6", "#0e8d96", "#d0661f", "#c03c78",
+    "#7d8a12", "#b8452f", "#4f8a2a", "#9a4fb8", "#2f8fc4", "#a87a12",
+]
+
+
 class User(AbstractUser):
     """Unified user model. Staff (admin/support/sales/technician/
     management/accounts) and customers both authenticate through this
@@ -50,21 +59,56 @@ class User(AbstractUser):
         BULK_EMAIL = "bulk_email", "Bulk Email"
         CONFIGS = "configs", "Configs"
         ACCOUNTANT = "accountant", "Accountant"
+        # Administration -> Reports (Rudolph, 9 Oct 2026). Granted to nobody
+        # by default; Admin always has it.
+        ADMINISTRATION = "administration", "Administration"
 
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.CUSTOMER)
     phone = models.CharField(max_length=32, blank=True)
 
-    # Per-user section access list. Empty (the default) means unrestricted
-    # -- every existing account keeps seeing everything it already could
-    # until an admin deliberately narrows it down. Admin accounts always
-    # have full access regardless of this field's contents (see
-    # accounts.permissions.user_can_access_section) -- this is a way to
-    # *restrict* non-admin staff, not a way to lock out Admin.
+    # Rudolph, 26 Sep, on the ticket escalation workflow: NOC is not a
+    # separate roster of accounts, it's a capability certain staff carry
+    # ("overlapping / same staff, different capability") -- typically a
+    # senior Support account, but not exclusively, and not tied to `role`
+    # the way is_staff_member is. A plain boolean rather than a new Role
+    # value or a Section, because it isn't a sidebar tab to show or hide
+    # (see Section above) and it isn't an account TYPE the way role is --
+    # it's permission to perform one specific action (deciding a ticket
+    # escalation, tickets.permissions.IsNOC) on top of whatever role and
+    # section access the account already has.
+    is_noc = models.BooleanField(
+        default=False,
+        help_text="Can accept or reject a ticket a support member escalates to NOC.",
+    )
+
+    # This person's colour on the Scheduling calendar (Rudolph, 6 Oct 2026:
+    # colours belong to staff, not job types; "staff colours should be
+    # editable"). Blank = an automatic colour from CALENDAR_PALETTE, so
+    # everybody has one from day one.
+    calendar_colour = models.CharField(
+        max_length=7, blank=True, help_text="Calendar colour, #rrggbb. Blank = automatic.",
+    )
+
+    @property
+    def display_colour(self):
+        return self.calendar_colour or CALENDAR_PALETTE[(self.pk or 0) % len(CALENDAR_PALETTE)]
+
+    # Per-user section access list. Empty means NO sections -- a new
+    # account starts with nothing and is granted what it needs. It used to
+    # mean unrestricted, which made the whole mechanism opt-in and left
+    # every unconfigured account able to open payroll and the credential
+    # store; the backfill migration gave the accounts that existed at the
+    # time an explicit list for their role, so flipping it took nobody's
+    # access away.
+    #
+    # Admin accounts always have full access regardless of this field's
+    # contents (see accounts.permissions.user_can_access_section) -- this
+    # is a way to *restrict* non-admin staff, not a way to lock out Admin.
     allowed_sections = ArrayField(
         models.CharField(max_length=20, choices=Section.choices),
         blank=True,
         default=list,
-        help_text="Sections this staff member can see/use. Empty = unrestricted (sees everything). Ignored for Admin.",
+        help_text="Sections this staff member can see/use. Empty = no access. Ignored for Admin, who always sees everything.",
     )
 
     # Reseller-partner visibility restriction (mirrors allowed_sections
@@ -92,6 +136,69 @@ class User(AbstractUser):
         default=list,
         help_text="Subset of allowed_partners this staff member currently wants shown by default. Empty = show all allowed.",
     )
+
+    # Dashboard tile order, per person (Rudolph, 15 Oct 2026: "Can we make
+    # the tile movable and remembered for each users profile?"). Self-service
+    # through PATCH /me/ like visible_partners. {"order": ["customers_total",
+    # ...]}; empty = the built-in order. Tiles a person can't see are simply
+    # skipped, and a tile added later that isn't in their list slots in next
+    # to its built-in neighbour.
+    dashboard_layout = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text='This person\'s own dashboard tile order: {"order": [tile keys]}. Empty = default order.',
+    )
+
+    # Which foldable panels this person keeps open, per page (#193,
+    # Rudolph 16 Oct 2026: "Make the panels foldable"). Self-service through
+    # PATCH /me/: {"vehicle": ["odometer", "fuel"]}. A page that isn't here
+    # uses its built-in default.
+    panel_state = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text='Open panels per page: {"vehicle": [panel keys]}. A page not listed = its default.',
+    )
+
+    # A stable identifier for a staff member, the way customer_id is one
+    # for a customer. Conecto gates staff registration on it: a person can
+    # only create an account in the app if we have told Conecto their code
+    # and what role it carries.
+    #
+    # Null rather than blank for the ones that have none. This is unique,
+    # and Postgres allows many NULLs in a unique column but only one empty
+    # string -- so blank="" would mean the second customer ever created
+    # collides with the first.
+    #
+    # Derived from the primary key rather than allocated sequentially.
+    # Sequential allocation means reading the highest code and adding one,
+    # which two admins creating staff at the same moment can both do and
+    # both get the same answer; the primary key is already unique and
+    # already exists. The cost is gaps -- staff share the user table with
+    # customers, so the numbers jump -- which is invisible in a code and
+    # cheaper than a retry loop around a race nobody would reproduce.
+    staff_code = models.CharField(
+        max_length=20, unique=True, null=True, blank=True,
+        help_text="Identifier shared with the Conecto app. Assigned automatically to staff accounts.",
+    )
+
+    def save(self, *args, **kwargs):
+        """Assign a staff code on the way in, once.
+
+        After the first save rather than before it, because the code is
+        built from the primary key and there is no key until the row
+        exists. That costs one extra UPDATE on the save that creates a
+        staff account, and nothing on any save after it.
+
+        Customers are skipped: they already have customer_id, and a
+        customer has no business registering in a staff app.
+        """
+        super().save(*args, **kwargs)
+        if self.is_staff_member and not self.staff_code:
+            self.staff_code = f"STF-{self.pk:06d}"
+            # `using` carried through: create_user() passes it, and a
+            # second save that quietly ignored it would write the code to a
+            # different database than the row it belongs to.
+            super().save(update_fields=["staff_code"], using=kwargs.get("using"))
 
     @property
     def is_staff_member(self):

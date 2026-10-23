@@ -19,6 +19,7 @@ from rest_framework.test import APIClient
 
 from customers.models import Customer
 from tickets.models import Ticket, TicketComment
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -27,7 +28,8 @@ class TicketCommentAuthorizationTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.agent = User.objects.create_user(
-            username="agent1", password="pw-for-tests", role=User.Role.SUPPORT
+            username="agent1", password="pw-for-tests", role=User.Role.SUPPORT,
+            allowed_sections=ALL_SECTIONS,
         )
         self.alice_login = User.objects.create_user(
             username="alice", password="pw-for-tests", role=User.Role.CUSTOMER
@@ -176,7 +178,8 @@ class TicketOwnershipTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.agent = User.objects.create_user(
-            username="agent2", password="pw-for-tests", role=User.Role.SUPPORT
+            username="agent2", password="pw-for-tests", role=User.Role.SUPPORT,
+            allowed_sections=ALL_SECTIONS,
         )
         self.alice_login = User.objects.create_user(
             username="alice2", password="pw-for-tests", role=User.Role.CUSTOMER

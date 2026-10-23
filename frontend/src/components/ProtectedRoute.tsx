@@ -3,7 +3,17 @@ import { Navigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { useViewAs } from "../context/ViewAsContext";
 
-export function ProtectedRoute({ children, staffOnly = false }: { children: ReactNode; staffOnly?: boolean }) {
+// loginNext: where to come back to after signing in (#196: the map on a
+// separate screen returns to itself rather than to the dashboard).
+export function ProtectedRoute({
+  children,
+  staffOnly = false,
+  loginNext,
+}: {
+  children: ReactNode;
+  staffOnly?: boolean;
+  loginNext?: string;
+}) {
   const { user, loading } = useAuth();
   const { target: viewingAs } = useViewAs();
 
@@ -12,7 +22,7 @@ export function ProtectedRoute({ children, staffOnly = false }: { children: Reac
       <div className="flex h-screen items-center justify-center text-[var(--text-muted)]">Loading…</div>
     );
   }
-  if (!user) return <Navigate to="/login" replace />;
+  if (!user) return <Navigate to={loginNext ? `/login?next=${encodeURIComponent(loginNext)}` : "/login"} replace />;
 
   const isStaff = user.role !== "customer";
   if (staffOnly && !isStaff) return <Navigate to="/portal" replace />;

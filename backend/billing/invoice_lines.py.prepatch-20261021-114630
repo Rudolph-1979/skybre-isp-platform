@@ -1,0 +1,259 @@
+"""The one definition of what a recurring invoice's lines are.
+
+This exists because there were two, and they disagreed about money.
+
+`recurring._generate_document` built the real invoice: a line per active
+service at the tariff price, and -- for any service carrying a live
+discount -- a second line at the negative discount amount, directly
+under the plan it reduces. `preview_export._project_invoice` built the
+projection finance reviews and approves: a line per active service at
+the tariff price, and nothing else. It had never been taught about
+discounts.
+
+So a customer on a 100% discount was projected at full price and
+invoiced at zero. The preview bundle overstated him, the grand total
+overstated the run, and the approval was an approval of a number that
+was never going to be billed. Worse, the approval FINGERPRINT is taken
+over the projection's lines -- so a discount added, changed or removed
+after approval did not change the digest, and Run's "something changed
+since this was approved" guard, the whole point of the fingerprint, let
+it straight through.
+
+The fix is not to add the discount rule to the projection as well. That
+is what produced two implementations in the first place, and the next
+rule to arrive -- pro-rata, once-off charges, a per-service credit --
+would have had to be written twice too, with the same chance of landing
+in only one of them. Both callers now ask this module what the lines
+are, and differ only in what they do with the answer: one saves
+InvoiceItem rows, the other formats CSV cells.
+
+Same reasoning as radiusauth.ownership and billing.overdue: when two
+places have to agree about a rule, the rule gets a module.
+"""
+from decimal import Decimal, ROUND_HALF_UP
+
+CENTS = Decimal("0.01")
+
+
+def billable_services(customer, run_date):
+    """The services a recurring invoice for `run_date` bills, AS THEY WILL
+    BE ON THAT DATE (package #20; Rudolph, 2026-09-24: "System should bill
+    what his service will be 1 October").
+
+    * ACTIVE services, unless their end date (the first day WITHOUT service)
+      is on or before `run_date`, or their start date is after it;
+    * PENDING services booked to start themselves (activate_on) on or before
+      `run_date`;
+    * each at the plan it will be on: a plan change booked for on or before
+      `run_date` is billed at the new plan. The service row is not changed;
+      the plan to bill is carried on the in-memory object as
+      `billing_tariff` and read by plan_invoice_lines below.
+
+    On the billing date itself the morning crons have already applied all of
+    these, so a normal run bills the same thing it always did. What changes
+    is an early run (#19) and a preview taken before the date -- which now
+    also stays valid through the morning crons instead of going stale.
+    """
+    from .models import Service
+
+    services = []
+    for service in customer.services.filter(
+        status__in=[Service.Status.ACTIVE, Service.Status.PENDING]
+    ).select_related("tariff", "pending_tariff"):
+        if service.status == Service.Status.PENDING and not (
+            service.activate_on and service.activate_on <= run_date
+        ):
+            continue
+        if service.end_date and service.end_date <= run_date:
+            continue
+        # Not started yet (7 Oct 2026, Rudolph: a service is created but only
+        # goes live two days later, and its start date is edited to match).
+        # A run before the start date doesn't bill it; the part month is
+        # invoiced pro rata by hand (Finance -> New invoice -> Pro rata).
+        if service.start_date and service.start_date > run_date:
+            continue
+        if (
+            service.pending_tariff_id
+            and service.pending_tariff_date
+            and service.pending_tariff_date <= run_date
+        ):
+            service.billing_tariff = service.pending_tariff
+        services.append(service)
+    return services
+
+
+def plan_invoice_lines(services, run_date):
+    """The lines a recurring invoice for `services` would carry on `run_date`.
+
+    Returns plain dicts, ordered exactly as they must appear on the
+    document: each plan immediately followed by its own discount, if one
+    is live on that date.
+
+    `run_date` is the day the invoice is raised, and it is what decides
+    whether a time-limited discount applies -- these lines carry no
+    period of their own to test against instead. Worth knowing when
+    setting one: end a discount the day BEFORE the next billing date,
+    not on it.
+    """
+    lines = []
+    for service in services:
+        # The plan in force on `run_date` -- see billable_services.
+        tariff = getattr(service, "billing_tariff", None) or service.tariff
+        lines.append({
+            "kind": "tariff",
+            "service": service,
+            "tariff": tariff,
+            "type": tariff.service_type,
+            "description": "%s (%s)" % (tariff.name, tariff.get_billing_period_display()),
+            "quantity": Decimal("1"),
+            # Plan price plus any "Rand amount up", as ONE figure: the client
+            # sees the price they pay and never a separate uplift line
+            # (George, 13 Oct 2026).
+            "unit_price": service.billed_price(run_date, base_price=tariff.price),
+            "tax_rate_pct": Decimal(tariff.tax_rate_pct),
+        })
+
+        # The LAST period of a service ending inside it is billed pro rata,
+        # up to its end date (#203 service cancellation, Rudolph 20 Oct
+        # 2026: one month's notice, then only the days used). The discount
+        # line below follows the same fraction.
+        from .service_cancel import dmy, final_period_fraction, money
+
+        fraction = final_period_fraction(service, run_date)
+        if fraction:
+            days, period_days, last_day = fraction
+            lines[-1]["unit_price"] = money(lines[-1]["unit_price"] * days / period_days)
+            lines[-1]["description"] += " — pro rata %s to %s (%d of %d days)" % (
+                dmy(run_date), dmy(last_day), days, period_days,
+            )
+            # The days actually charged, kept on the invoice line so a credit
+            # worked out later (billing.service_cancel) doesn't count them twice.
+            lines[-1]["period_start"], lines[-1]["period_end"] = run_date, last_day
+
+        discount = service.discount_amount_for(tariff.price, run_date)
+        if discount > 0 and fraction:
+            discount = money(Decimal(discount) * fraction[0] / fraction[1])
+        if discount > 0:
+            lines.append({
+                "kind": "discount",
+                "service": service,
+                # No tariff on a discount line: it is not a plan being sold,
+                # and hanging the tariff off it would make it count as one in
+                # anything that groups by tariff.
+                "tariff": None,
+                "type": tariff.service_type,
+                "description": service.discount_label(),
+                "quantity": Decimal("1"),
+                "unit_price": -Decimal(discount),
+                # The SAME rate as the line it reduces, on purpose. Totals are
+                # summed per line, so this contributes NEGATIVE VAT and the
+                # customer pays VAT on the discounted value -- which is what
+                # SARS expects, a discount reducing the taxable supply. A zero
+                # rate here would charge full VAT on a reduced supply:
+                # over-declaring output VAT on every discounted invoice,
+                # quietly, for as long as nobody checked.
+                "tax_rate_pct": Decimal(tariff.tax_rate_pct),
+            })
+            if fraction:
+                lines[-1]["period_start"], lines[-1]["period_end"] = run_date, fraction[2]
+
+    return lines
+
+
+def billable_customer_charges(customer, run_date):
+    """The customer's recurring charges (domain, email, hosting, IP rental)
+    live on `run_date` -- started on or before it, not yet at their
+    end_date. On the customer, not a service (Rudolph, 1 Oct), so a
+    customer with one of these and no service at all is still billed.
+
+    The catalog entry's `is_active` is NOT checked, on purpose -- same as
+    Tariff.is_active: unticking it only stops new customers being given
+    it. To stop billing one customer, end or delete their charge."""
+    return [
+        link
+        for link in customer.customer_charges.select_related("charge").order_by("charge__name", "pk")
+        if link.is_billable_on(run_date)
+    ]
+
+
+def customer_charge_lines(links, run_date=None):
+    """One invoice line per customer recurring charge, after every service
+    line, at the catalog's live price (excl. VAT) and tax rate."""
+    lines = []
+    for link in links:
+        charge = link.charge
+        description = charge.name
+        if link.note.strip():
+            description = f"{charge.name} — {link.note.strip()}"
+        lines.append({
+            "kind": "recurring_charge",
+            "service": None,
+            "tariff": None,
+            "recurring_charge": charge,
+            "type": "recurring_charge",
+            "description": description,
+            "quantity": Decimal(link.quantity),
+            # Catalog price plus any Rand amount up, as one price (13 Oct 2026).
+            "unit_price": link.billed_unit_price(run_date) if run_date else Decimal(charge.price),
+            "tax_rate_pct": Decimal(charge.tax_rate_pct),
+        })
+        # A discount on the charge: its own line, like a service's.
+        discount = link.discount_amount_for(run_date) if run_date else Decimal("0")
+        if discount > 0:
+            lines.append({
+                "kind": "discount",
+                "service": None,
+                "tariff": None,
+                "recurring_charge": None,
+                "type": "recurring_charge",
+                "description": link.discount_label(),
+                "quantity": Decimal("1"),
+                "unit_price": -Decimal(discount),
+                "tax_rate_pct": Decimal(charge.tax_rate_pct),
+            })
+    return lines
+
+
+def customer_invoice_lines(customer, run_date):
+    """Everything a recurring invoice for this customer carries on
+    `run_date`: each billable service's plan (+ discount), then each live
+    customer recurring charge. ONE function the engine and the preview
+    projection both call, so they cannot disagree about what is billed.
+    Empty means nothing to bill."""
+    return (
+        plan_invoice_lines(billable_services(customer, run_date), run_date)
+        + customer_charge_lines(billable_customer_charges(customer, run_date), run_date)
+    )
+
+
+def document_totals(rows):
+    """(subtotal, tax, total) for `rows` of (quantity, unit_price, tax_rate).
+
+    Mirrors Invoice.recalc_totals EXACTLY, and has to: the projection's
+    job is to predict the invoice to the cent, and the rounding ORDER is
+    where that quietly stops being true.
+
+    The invoice sums at full precision and rounds each of the two columns
+    once, so the tax invoice adds up by construction. The projection used
+    to round every line and add the rounded figures. On a single positive
+    line those agree; introduce a negative discount line and they need
+    not. A R999 plan at 15% with a 50% discount is R574.43 on the invoice
+    (499.50 + 74.93) and R574.42 by per-line rounding -- one cent, on
+    every such customer, between the number finance approved and the
+    number billed.
+
+    Stated once here rather than derived twice. Invoice.recalc_totals is
+    still the authority -- it is what actually writes the columns -- and
+    test_preview_discounts pins the two to each other so this cannot
+    drift back apart unnoticed.
+    """
+    rows = list(rows)
+    subtotal = sum((Decimal(q) * Decimal(p) for q, p, _ in rows), Decimal("0"))
+    tax = sum(
+        (Decimal(q) * Decimal(p) * (Decimal(r) / 100) for q, p, r in rows), Decimal("0")
+    )
+    # ROUND_HALF_UP, not Python's default half-even: it is what Postgres
+    # does to a numeric(12,2), which is what rounds the real columns.
+    subtotal = subtotal.quantize(CENTS, rounding=ROUND_HALF_UP)
+    tax = tax.quantize(CENTS, rounding=ROUND_HALF_UP)
+    return subtotal, tax, subtotal + tax

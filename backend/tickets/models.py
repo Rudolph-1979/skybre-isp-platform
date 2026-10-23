@@ -1,5 +1,15 @@
+import datetime
+
 from django.conf import settings
-from django.db import models
+from django.db import IntegrityError, models, transaction
+from django.db.models import BigIntegerField
+from django.db.models.functions import Cast, Substr
+
+
+def default_office_days():
+    """Monday to Friday (Python weekday numbers). A function, not a list
+    literal, so every SupportSettings row gets its own list."""
+    return [0, 1, 2, 3, 4]
 
 
 class Ticket(models.Model):
@@ -22,7 +32,26 @@ class Ticket(models.Model):
         ABUSE = "abuse", "Abuse/NOC"
 
     ticket_number = models.CharField(max_length=20, unique=True, editable=False)
-    customer = models.ForeignKey("customers.Customer", on_delete=models.CASCADE, related_name="tickets")
+    # NULL on an internal ticket, and only on an internal ticket -- see the
+    # check constraint in Meta. This is not a convenience; it is the guard.
+    #
+    # The customer portal reads tickets with filter(customer=<their own
+    # profile>), and NULL matches nothing. So a technician's job feedback
+    # cannot reach a customer even if every deliberate is_internal filter
+    # in this codebase were deleted tomorrow, because there is no row for
+    # the join to find. Conecto enforce nothing on their side and told us
+    # so plainly: "one guard only -- yours."
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE, related_name="tickets",
+        null=True, blank=True,
+    )
+    # Raised by a technician from a job in the Conecto app -- quote needed,
+    # stock needed, return booking. Staff and admins only, forever.
+    #
+    # Set by the internal-ticket webhook and nowhere else: it is read-only
+    # through the API, so nobody can flip an existing customer ticket into
+    # an internal one and hide a conversation the customer was part of.
+    is_internal = models.BooleanField(default=False)
     subject = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     department = models.CharField(max_length=20, choices=Department.choices, default=Department.SUPPORT)
@@ -36,18 +65,174 @@ class Ticket(models.Model):
         related_name="assigned_tickets",
         limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
     )
+    # Who opened it. Deliberately NOT limit_choices_to staff roles the way
+    # assigned_to is: a customer raising a ticket from the portal is the
+    # creator, and recording that as "nobody" would lose the one fact this
+    # field exists for. SET_NULL so removing a staff account keeps the
+    # tickets they raised rather than deleting them.
+    #
+    # Null on every ticket that predates this field -- there is nothing to
+    # backfill it from except the audit trail, and the list renders those
+    # as an em dash rather than guessing.
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_tickets",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Rudolph, 26 Sep: "Upon ticket creation a support member should
+    # accept the ticket." A ticket opens unowned -- assigned_to is set by
+    # whoever files or routes it, but accepting is a deliberate act by
+    # the person who will actually work it, and the KPI report below
+    # needs to know who that was and when, not just who it currently sits
+    # with (assigned_to can be reassigned later without that being an
+    # "acceptance").
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="accepted_tickets",
+    )
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    # Stamped by TicketViewSet.perform_update the first time a ticket's
+    # status becomes Resolved/Closed (and cleared if it's reopened) --
+    # not by save(), because "did the status just change" needs the
+    # value being replaced, which only the view (working from
+    # serializer.validated_data against serializer.instance) has to hand
+    # cheaply. `updated_at` already changes on every edit, including a
+    # priority bump or an internal note, so it can't stand in for "when
+    # was this actually closed out" -- which is exactly the date the KPI
+    # report below needs to bucket a resolution into the right year.
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    # Set the first time this ticket is reopened after being Resolved/
+    # Closed -- by a customer marking it resolved too soon then coming
+    # back, by staff walking the status dropdown back (see
+    # TicketViewSet.perform_update), or by NOC accepting an escalation on
+    # a ticket that had already been closed out (see
+    # TicketViewSet.decide_escalation). Never cleared once set, even if
+    # the ticket is later resolved again cleanly.
+    #
+    # Rudolph, 26 Sep, asked directly how a reopened ticket should affect
+    # the yearly KPI/bonus report: "That ticket stops counting as
+    # resolved at all" -- not a penalty subtracted from a score, an
+    # outright, permanent exclusion. TicketViewSet.kpi_report filters on
+    # this flag rather than trying to infer "was this ever reopened" from
+    # resolved_at's history, because a reopened-then-re-resolved ticket
+    # looks identical to a cleanly-resolved one once resolved_at is
+    # overwritten a second time -- nothing else would remember the fact.
+    disqualified_from_kpi = models.BooleanField(default=False)
+
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            # is_internal=True  <->  customer IS NULL, both directions.
+            #
+            # Forward: an internal ticket can never acquire a customer, so
+            # it can never appear in the portal. Somebody attaching one "so
+            # we know which site it was" is refused by the database rather
+            # than quietly opening the hole -- and the job link on
+            # ConectoInternalTicket already carries the site.
+            #
+            # Backward: an ordinary ticket can never LOSE its customer,
+            # which would orphan a real conversation.
+            models.CheckConstraint(
+                # `check=` rather than `condition=`: renamed in Django 5.1,
+                # and the old name works from 2.2 through 5.2.
+                check=(
+                    models.Q(is_internal=True, customer__isnull=True)
+                    | models.Q(is_internal=False, customer__isnull=False)
+                ),
+                name="ticket_internal_has_no_customer",
+            )
+        ]
+
+    _NUMBER_PREFIX = "TCK"
+
+    def _next_ticket_number(self):
+        """One past the highest TCK number ever issued.
+
+        Was `(Ticket.objects.order_by("-id").first().id + 1)` on a unique
+        column, which had two faults.
+
+        It reused numbers. The maximum came off an existing ROW, so
+        deleting the newest ticket handed its number straight to the next
+        one created -- and a customer quoting the reference they were given
+        then reached a stranger's ticket and saw somebody else's comment
+        thread. billing.IssuedNumberHighWater was created for exactly this
+        on invoices, and its docstring generalises it: "the fact being
+        recorded is about the sequence... it has to outlive every document
+        in it". Tickets were never brought onto it, so they are now.
+
+        And it had no retry. Two simultaneous creates computed the same
+        number and the loser got an unhandled IntegrityError -- a 500 on a
+        save that was perfectly valid. Both Customer.save() and
+        Invoice.save() carry a five-attempt loop for this identical race.
+        """
+        from billing.models import IssuedNumberHighWater
+        from django.db.models import Max
+
+        prefix = self._NUMBER_PREFIX
+        highest = (
+            Ticket.objects.filter(ticket_number__regex=rf"^{prefix}-\d{{1,9}}$")
+            .exclude(pk=self.pk)
+            .annotate(_seq=Cast(Substr("ticket_number", len(prefix) + 2), BigIntegerField()))
+            .aggregate(highest=Max("_seq"))["highest"]
+        )
+        watermark = (
+            IssuedNumberHighWater.objects.filter(prefix=prefix)
+            .values_list("last_seq", flat=True)
+            .first()
+        )
+        return f"{prefix}-{max(highest or 0, watermark or 0) + 1:06d}"
+
+    def _record_issued_number(self):
+        """Remember this number so it is never handed out again. After a
+        successful save, so a failed create leaves no gap."""
+        from billing.models import IssuedNumberHighWater
+        from django.db.models import Value
+        from django.db.models.functions import Greatest
+
+        prefix, _, seq = (self.ticket_number or "").rpartition("-")
+        if prefix != self._NUMBER_PREFIX or not seq.isdigit():
+            return
+        updated = IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+            last_seq=Greatest("last_seq", Value(int(seq)))
+        )
+        if not updated:
+            # Its own atomic block: a savepoint, so losing this race cannot
+            # poison the transaction the caller is holding.
+            try:
+                with transaction.atomic():
+                    IssuedNumberHighWater.objects.create(prefix=prefix, last_seq=int(seq))
+            except IntegrityError:
+                IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+                    last_seq=Greatest("last_seq", Value(int(seq)))
+                )
 
     def save(self, *args, **kwargs):
-        if not self.ticket_number:
-            last = Ticket.objects.order_by("-id").first()
-            next_num = (last.id + 1) if last else 1
-            self.ticket_number = f"TCK-{next_num:06d}"
-        super().save(*args, **kwargs)
+        if self.ticket_number:
+            return super().save(*args, **kwargs)
+
+        last_error = None
+        for _ in range(5):
+            self.ticket_number = self._next_ticket_number()
+            try:
+                with transaction.atomic():
+                    result = super().save(*args, **kwargs)
+                    self._record_issued_number()
+                    return result
+            except IntegrityError as exc:
+                if "ticket_number" not in str(exc):
+                    raise
+                last_error = exc
+                self.ticket_number = ""
+        raise last_error
 
     def __str__(self):
         return f"{self.ticket_number}: {self.subject}"
@@ -58,6 +243,29 @@ class TicketComment(models.Model):
     author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="ticket_comments")
     message = models.TextField()
     is_internal = models.BooleanField(default=False, help_text="Internal staff note, hidden from customer portal.")
+    # Who wrote this, when it was not one of our users.
+    #
+    # A reply arriving from the Conecto app is written by the customer,
+    # who has no account here, so `author` is null. Null alone is
+    # indistinguishable from a comment the platform generated, and a
+    # customer's message shown with no name against it reads as ours.
+    #
+    # Blank on every comment written by staff -- `author` covers those.
+    external_author = models.CharField(max_length=150, blank=True)
+    # The job this note was written from, for the internal notes Conecto's
+    # ticket-note-added webhook pushes -- a technician in the field jots a
+    # note against a job, and it lands here as the one place tying it back
+    # to that job as well as to the ticket. Null for every comment written
+    # any other way (there usually is no job in the picture at all).
+    job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True, related_name="ticket_comments",
+    )
+    # Names Conecto sent alongside a note (who it tagged), and any files
+    # attached to it -- both arrive only from ticket-note-added, both kept
+    # as plain JSON rather than their own tables since neither is queried
+    # on, only displayed alongside the note itself.
+    tagged_names = models.JSONField(default=list, blank=True)
+    attachments = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -65,3 +273,108 @@ class TicketComment(models.Model):
 
     def __str__(self):
         return f"Comment on {self.ticket}"
+
+
+class SupportSettings(models.Model):
+    """The numbers the Support page measures against (#212, 22 Oct 2026:
+    Rudolph approved the support dashboard mockup, "Ok build it please").
+
+    One row. Configs -> Support, Admin only. The defaults are a starting
+    point to be confirmed, not a decision anybody made: a first reply within
+    an hour, office hours 08:00-17:00 Monday to Friday, and an outage flagged
+    when 5 clients on one access point or router drop within 15 minutes.
+
+    Response times count OFFICE HOURS ONLY (public holidays from
+    billing.PublicHoliday skipped), so a ticket logged at 17:30 and answered
+    at 08:10 the next morning took 10 minutes, not 14 hours 40.
+    """
+
+    reply_target_minutes = models.PositiveIntegerField(
+        default=60, help_text="A first reply within this many office minutes counts as on target."
+    )
+    office_start = models.TimeField(default=datetime.time(8, 0))
+    office_end = models.TimeField(default=datetime.time(17, 0))
+    # Python weekday numbers: 0 = Monday ... 6 = Sunday.
+    office_days = models.JSONField(default=default_office_days, blank=True)
+    outage_min_clients = models.PositiveSmallIntegerField(
+        default=5, help_text="This many clients on one access point / router going offline together is a possible outage."
+    )
+    outage_window_minutes = models.PositiveSmallIntegerField(
+        default=15, help_text="...within this many minutes of each other."
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "Support settings"
+
+    def __str__(self):
+        return "Support settings"
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class TicketEscalation(models.Model):
+    """A support member's transfer of a ticket to NOC, and NOC's verdict.
+
+    Rudolph, 26 Sep: "...if that member feels it should be escalated to
+    NOC he must be able to transfer the ticket to NOC who should be able
+    to accept or reject if NOC feels the issue is solvable by the
+    support member." A separate row per escalation, rather than a status
+    or a pair of fields on Ticket itself, for two reasons.
+
+    First, a ticket can be escalated more than once over its life (NOC
+    rejects, the support member works it further, something changes and
+    it genuinely needs NOC after all) -- one row per attempt is the only
+    shape that doesn't lose the earlier ones.
+
+    Second, and more importantly for the KPI report this exists to
+    support (Rudolph: "Amount of tickets accepted by support member, and
+    resolved successfully should be part of a KPI performance report...
+    to calculate yearly bonus" -- clarified: "resolved successfully"
+    means resolved WITHOUT needing NOC escalation): the report only has
+    to check whether a ticket has ANY row here at all
+    (`ticket.escalations.exists()`), never mind the outcome. Whether NOC
+    accepted the escalation (took it on) or rejected it (sent it back,
+    "solvable by support") is irrelevant to that count -- needing to ask
+    NOC in the first place is what the metric is measuring, not what NOC
+    said back.
+    """
+
+    class Decision(models.TextChoices):
+        PENDING = "pending", "Pending NOC review"
+        ACCEPTED = "accepted", "Accepted by NOC"
+        REJECTED = "rejected", "Rejected by NOC (solvable by support)"
+
+    ticket = models.ForeignKey(Ticket, on_delete=models.CASCADE, related_name="escalations")
+    escalated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="ticket_escalations_raised",
+    )
+    reason = models.TextField(blank=True)
+    escalated_at = models.DateTimeField(auto_now_add=True)
+    decision = models.CharField(max_length=20, choices=Decision.choices, default=Decision.PENDING)
+    # Who at NOC accepted or rejected it -- null while PENDING. Not
+    # required to be a distinct "NOC account": Rudolph confirmed NOC is
+    # a capability (accounts.User.is_noc), not a separate roster, so the
+    # same staff member could conceivably raise an escalation on one
+    # ticket and decide another's.
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ticket_escalations_decided",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-escalated_at"]
+
+    def __str__(self):
+        return f"Escalation of {self.ticket.ticket_number} ({self.decision})"

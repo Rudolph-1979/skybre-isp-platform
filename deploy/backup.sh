@@ -1,93 +1,97 @@
 #!/usr/bin/env bash
+# Skybre platform backups -- package #113, 7 Oct 2026.
 #
-# Hourly backup for the Skybre ISP platform.
+# Run every hour by the existing cron line:
+#   0 * * * * /home/ubuntu/isp-platform/deploy/backup.sh
 #
-#  - Dumps the Postgres database from the running `db` container.
-#  - Keeps a rolling local history: the last 48 hourly backups (2 days)
-#    plus one daily snapshot per day for 30 days.
-#  - Optionally copies each backup to Google Cloud Storage, once
-#    GCS_BUCKET and GCS_KEY_FILE below are configured — safe to leave
-#    unset for now; backups still happen locally either way.
+# What it keeps, under ~/backups (local only for now -- an off-site copy is
+# still to be added; until then a lost VPS loses the backups too):
+#   db/hourly/isp-YYYY-MM-DD-HHMM.dump   every hour, kept 48 hours
+#   db/daily/                            first dump of each day, kept 30 days
+#   media/media-YYYY-MM-DD.tar.gz        uploads (logo, receipts...), daily, kept 14 days
+# A dump is checked readable (pg_restore --list) before it is kept. Log:
+# ~/isp-platform/logs/backup.log. The Dashboard's System status card shows
+# the newest dump (mounted read-only into the backend at /backups).
 #
-# Install: run hourly via cron. See BACKUP.md for full setup.
-
+# RESTORE (stops nothing by itself -- take the platform down first):
+#   cd ~/isp-platform
+#   docker compose stop backend frontend
+#   docker compose exec -T db sh -c 'pg_restore -U "${POSTGRES_USER:-postgres}" \
+#       -d "${POSTGRES_DB:-${POSTGRES_USER:-postgres}}" --clean --if-exists --no-owner' \
+#       < ~/backups/db/hourly/isp-YYYY-MM-DD-HHMM.dump
+#   docker compose start backend frontend
 set -euo pipefail
 
-# ---- configuration ----------------------------------------------------
-PROJECT_DIR="/home/ubuntu/isp-platform"
-BACKUP_ROOT="/home/ubuntu/backups"
-HOURLY_DIR="$BACKUP_ROOT/hourly"
-DAILY_DIR="$BACKUP_ROOT/daily"
-LOG_FILE="$BACKUP_ROOT/backup.log"
+PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
+BACKUP_DIR="${BACKUP_DIR:-/home/ubuntu/backups}"
+KEEP_HOURLY_HOURS=48
+KEEP_DAILY_DAYS=30
+KEEP_MEDIA_DAYS=14
+MIN_FREE_MB=2048
+DOCKER="${DOCKER:-/usr/bin/docker}"
+LOG="$PROJECT/logs/backup.log"
 
-KEEP_HOURLY=48   # 2 days of hourly backups
-KEEP_DAILY=30    # 30 days of daily backups
+mkdir -p "$BACKUP_DIR/db/hourly" "$BACKUP_DIR/db/daily" "$BACKUP_DIR/media" "$PROJECT/logs"
+chmod 750 "$BACKUP_DIR" "$BACKUP_DIR/db" "$BACKUP_DIR/db/hourly" "$BACKUP_DIR/db/daily" "$BACKUP_DIR/media"
+exec >>"$LOG" 2>&1
 
-# Fill these in once you've created a GCS bucket + service account key
-# (see BACKUP.md) to switch on off-site copying. Leave GCS_BUCKET blank
-# to skip it entirely.
-GCS_BUCKET=""
-GCS_KEY_FILE="$BACKUP_ROOT/gcs-service-account.json"
-# -------------------------------------------------------------------------
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
-mkdir -p "$HOURLY_DIR" "$DAILY_DIR"
+# One at a time: a slow dump must not be overtaken by the next hour's.
+exec 9>"$BACKUP_DIR/.lock"
+if ! flock -n 9; then log "skipped: the previous backup is still running"; exit 0; fi
 
-timestamp="$(date +%Y-%m-%d_%H-%M)"
-today="$(date +%Y-%m-%d)"
-hour="$(date +%H)"
+cd "$PROJECT"
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >>"$LOG_FILE"; }
-
-cd "$PROJECT_DIR"
-
-# Read DB credentials from the same .env docker-compose already uses, so
-# this script never needs its own copy of the password.
-DB_USER=$(grep -E '^DB_USER=' backend/.env | cut -d'=' -f2- | tr -d '\r')
-DB_NAME=$(grep -E '^DB_NAME=' backend/.env | cut -d'=' -f2- | tr -d '\r')
-
-dump_file="$HOURLY_DIR/skybre_${timestamp}.sql.gz"
-
-if docker compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip >"$dump_file.tmp"; then
-    mv "$dump_file.tmp" "$dump_file"
-    log "OK: hourly backup created ($(du -h "$dump_file" | cut -f1))"
-else
-    rm -f "$dump_file.tmp"
-    log "FAILED: pg_dump did not complete — no backup written this hour"
-    exit 1
+free_mb=$(df -Pm "$BACKUP_DIR" | awk 'NR==2 {print $4}')
+if [ "$free_mb" -lt "$MIN_FREE_MB" ]; then
+  log "FAILED: only ${free_mb} MB free on the backup disk (need ${MIN_FREE_MB} MB). Nothing written."
+  exit 1
 fi
 
-# Keep one daily snapshot per day: always refresh it at the 00:xx run,
-# and also create one immediately if today doesn't have one yet (covers
-# the first day this script runs, and any missed midnight run).
-if [ "$hour" = "00" ] || [ ! -f "$DAILY_DIR/skybre_${today}.sql.gz" ]; then
-    cp "$dump_file" "$DAILY_DIR/skybre_${today}.sql.gz"
+stamp=$(date +%Y-%m-%d-%H%M)
+today=$(date +%Y-%m-%d)
+
+# --- database ----------------------------------------------------------------
+out="$BACKUP_DIR/db/hourly/isp-$stamp.dump"
+tmp="$out.partial"
+if ! "$DOCKER" compose exec -T db sh -c \
+    'pg_dump -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-${POSTGRES_USER:-postgres}}" -Fc --no-owner' \
+    > "$tmp"; then
+  rm -f "$tmp"
+  log "FAILED: pg_dump did not finish"
+  exit 1
+fi
+if ! "$DOCKER" compose exec -T db pg_restore --list < "$tmp" > /dev/null; then
+  rm -f "$tmp"
+  log "FAILED: the dump is not readable by pg_restore -- not kept"
+  exit 1
+fi
+mv "$tmp" "$out"
+chmod 640 "$out"
+log "database: $(du -h "$out" | cut -f1) $out"
+
+if ! ls "$BACKUP_DIR/db/daily/isp-$today-"*.dump > /dev/null 2>&1; then
+  cp -p "$out" "$BACKUP_DIR/db/daily/"
+  log "database: kept as today's daily copy"
 fi
 
-# Rotate: keep only the newest N files in each directory.
-prune() {
-    local dir="$1" keep="$2"
-    ls -1t "$dir"/skybre_*.sql.gz 2>/dev/null | tail -n +"$((keep + 1))" | xargs -r rm -f
-}
-prune "$HOURLY_DIR" "$KEEP_HOURLY"
-prune "$DAILY_DIR" "$KEEP_DAILY"
-
-# Off-site copy — only runs once GCS_BUCKET + GCS_KEY_FILE are set up.
-if [ -n "$GCS_BUCKET" ] && [ -f "$GCS_KEY_FILE" ]; then
-    if ! command -v gcloud >/dev/null 2>&1; then
-        log "WARNING: GCS configured but gcloud CLI not installed — skipping off-site upload"
-    else
-        gcloud auth activate-service-account --key-file="$GCS_KEY_FILE" >/dev/null 2>&1
-        if gcloud storage cp "$dump_file" "gs://$GCS_BUCKET/hourly/$(basename "$dump_file")" >/dev/null 2>&1; then
-            log "OK: uploaded to gs://$GCS_BUCKET/hourly/"
-        else
-            log "WARNING: off-site upload failed — local backup is still safe, will retry next hour"
-        fi
-        if [ -f "$DAILY_DIR/skybre_${today}.sql.gz" ]; then
-            gcloud storage cp "$DAILY_DIR/skybre_${today}.sql.gz" "gs://$GCS_BUCKET/daily/skybre_${today}.sql.gz" >/dev/null 2>&1 || true
-        fi
-    fi
-else
-    log "INFO: off-site backup not configured yet (set GCS_BUCKET + GCS_KEY_FILE in backup.sh — see BACKUP.md)"
+# --- uploads (logo, receipts, attachments) -------------------------------------
+media="$BACKUP_DIR/media/media-$today.tar.gz"
+if [ ! -f "$media" ]; then
+  if "$DOCKER" compose exec -T backend sh -c 'test -d /app/media && tar czf - -C /app media' > "$media.partial" \
+      && [ -s "$media.partial" ]; then
+    mv "$media.partial" "$media"
+    chmod 640 "$media"
+    log "media: $(du -h "$media" | cut -f1) $media"
+  else
+    rm -f "$media.partial"
+    log "media: nothing to back up (no /app/media in the backend container) or tar failed"
+  fi
 fi
 
-log "Backup run complete."
+# --- tidy ------------------------------------------------------------------------
+find "$BACKUP_DIR/db/hourly" -name 'isp-*.dump' -mmin +$((KEEP_HOURLY_HOURS * 60)) -delete
+find "$BACKUP_DIR/db/daily" -name 'isp-*.dump' -mtime +"$KEEP_DAILY_DAYS" -delete
+find "$BACKUP_DIR/media" -name 'media-*.tar.gz' -mtime +"$KEEP_MEDIA_DAYS" -delete
+find "$BACKUP_DIR" -name '*.partial' -mmin +120 -delete

@@ -71,6 +71,57 @@ class CancellationTests(TestCase):
         self.assertEqual(service.status, Service.Status.ACTIVE)
         self.assertEqual(len(ended), 1, "a dry run should still report what it would do")
 
+    def test_dry_run_names_the_customers_it_would_cancel(self):
+        """The consequence staff most need to see is the one it hid.
+
+        customers_fully_ended asks the database which customers have no
+        service left running -- and in a dry run nothing has been
+        terminated, so the answer was always "none". The preview listed
+        the services and reported an empty cancellation list, so the
+        account-level consequence (customer marked Inactive, which is
+        what "cancelled" means to staff) was invisible in the one screen
+        that exists to show it before committing. The only way to find
+        out was to commit.
+        """
+        customer = self._customer()
+        self._service(customer, end_date=self.today)
+
+        ended, cancelled = apply_due_cancellations(as_of=self.today, commit=False)
+
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(
+            [name for _pk, name in cancelled], [customer.full_name],
+            "the dry run did not say the customer would be cancelled",
+        )
+
+    def test_dry_run_does_not_claim_a_customer_who_keeps_a_service(self):
+        """It must predict, not over-predict."""
+        customer = self._customer()
+        self._service(customer, end_date=self.today)
+        self._service(customer, end_date=None)
+
+        ended, cancelled = apply_due_cancellations(as_of=self.today, commit=False)
+
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(cancelled, [])
+
+    def test_the_dry_run_predicts_exactly_what_the_commit_does(self):
+        """The point of a preview, stated as a test."""
+        staying = self._customer("Staying Stan")
+        self._service(staying, end_date=self.today)
+        self._service(staying, end_date=None)
+        leaving = self._customer("Leaving Len")
+        self._service(leaving, end_date=self.today)
+
+        predicted_ended, predicted_cancelled = apply_due_cancellations(
+            as_of=self.today, commit=False
+        )
+        actual_ended, actual_cancelled = apply_due_cancellations(as_of=self.today, commit=True)
+
+        self.assertEqual(predicted_ended, actual_ended)
+        self.assertEqual(predicted_cancelled, actual_cancelled)
+        self.assertEqual([name for _pk, name in actual_cancelled], ["Leaving Len"])
+
     # ---- the customer is cancelled ---------------------------------------
 
     def test_the_customer_is_cancelled_when_their_last_service_ends(self):

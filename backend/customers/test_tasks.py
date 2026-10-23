@@ -15,6 +15,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from customers.models import Customer, CustomerTask, Partner
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -69,7 +70,8 @@ class CustomerTaskAPITests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.staff = User.objects.create_user(
-            username="support1", password="pw-for-tests", role=User.Role.SUPPORT
+            username="support1", password="pw-for-tests", role=User.Role.SUPPORT,
+            allowed_sections=ALL_SECTIONS,
         )
         self.customer = Customer.objects.create(full_name="API Task Co", email="api@example.com")
 
@@ -87,7 +89,8 @@ class CustomerTaskAPITests(TestCase):
 
     def test_created_by_cannot_be_spoofed(self):
         other = User.objects.create_user(
-            username="someone-else", password="pw-for-tests", role=User.Role.SALES
+            username="someone-else", password="pw-for-tests", role=User.Role.SALES,
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(self.staff)
         res = self.client.post(
@@ -145,14 +148,19 @@ class CustomerTaskAPITests(TestCase):
         restricted = User.objects.create_user(
             username="reseller-support", password="pw-for-tests",
             role=User.Role.SUPPORT, allowed_partners=[mine.id],
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(restricted)
         res = self.client.get("/api/customer-tasks/")
         self.assertEqual(res.status_code, 200)
         titles = {row["title"] for row in res.data["results"]}
-        # Direct (no-partner) customers stay visible -- they aren't owned
-        # by any reseller, same convention as CustomerViewSet.
-        self.assertEqual(titles, {"Mine to do", "Direct customer task"})
+        # Direct (no-partner) customers only with "Direct" ticked -- same
+        # rule as CustomerViewSet (Rudolph, 5 Oct 2026).
+        self.assertEqual(titles, {"Mine to do"})
+        restricted.allowed_partners = [mine.id, 0]
+        restricted.save(update_fields=["allowed_partners"])
+        res = self.client.get("/api/customer-tasks/")
+        self.assertEqual({row["title"] for row in res.data["results"]}, {"Mine to do", "Direct customer task"})
 
     def test_staff_without_the_customers_section_are_refused(self):
         CustomerTask.objects.create(customer=self.customer, title="Hidden by section")

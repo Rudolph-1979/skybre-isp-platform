@@ -78,6 +78,8 @@ export function Conecto({ audience }: { audience: "staff" | "customer" }) {
   const [glancing, setGlancing] = useState(false);
   const [tourStep, setTourStep] = useState<number | null>(null);
   const [query, setQuery] = useState("");
+  // Which answer is open in the results; null = the best match.
+  const [expanded, setExpanded] = useState<string | null>(null);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
 
   // ---- what he has to say -------------------------------------------------
@@ -101,7 +103,7 @@ export function Conecto({ audience }: { audience: "staff" | "customer" }) {
         // Deep-links straight into the open list, not just the dashboard.
         to: "/admin?panel=blocks",
         text: blocks.auto_suspend_enabled
-          ? `${blocks.count_tomorrow} customer${blocks.count_tomorrow === 1 ? "" : "s"} will be cut off tomorrow.`
+          ? `${blocks.count_tomorrow} customer${blocks.count_tomorrow === 1 ? "" : "s"} will be cut off ${blocks.next_run_is_today ? "today" : "tomorrow"}${blocks.run_time ? ` at ${blocks.run_time}` : ""}.`
           : `${blocks.count_tomorrow} customer${blocks.count_tomorrow === 1 ? "" : "s"} are overdue enough to be cut off — auto-suspension is off, so nothing will happen automatically.`,
       });
     } else if (blocks && blocks.count_horizon > 0) {
@@ -293,17 +295,26 @@ export function Conecto({ audience }: { audience: "staff" | "customer" }) {
                   language model -- so it can never invent one. */}
               <input
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => { setQuery(e.target.value); setExpanded(null); }}
                 placeholder={staff ? "What do you need? e.g. \"payment not matching\"" : "What do you need help with?"}
                 className="mb-2.5 w-full rounded-md border border-[var(--baseline)] bg-[var(--surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--series-1)] focus:outline-none focus:ring-1 focus:ring-[var(--series-1)]"
               />
 
               {searching ? (
                 results.length > 0 ? (
-                  <ul className="space-y-2.5">
-                    {results.map((r) => (
+                  <ul className="space-y-2">
+                    {/* The best match opens; the others show as titles to
+                        click, so five answers don't make a wall of text. */}
+                    {results.map((r) => {
+                      const isOpen = (expanded ?? results[0].id) === r.id;
+                      return (
                       <li key={r.id}>
-                        <p className="text-xs font-semibold text-[var(--text-primary)]">{r.title}</p>
+                        <button type="button" onClick={() => setExpanded(r.id)}
+                          className={`text-left text-xs font-semibold ${isOpen ? "text-[var(--text-primary)]" : "text-[var(--series-1)] hover:underline"}`}>
+                          {r.title}
+                        </button>
+                        {isOpen && (
+                        <>
                         <p className="mt-0.5 text-xs leading-relaxed text-[var(--text-secondary)]">{r.body}</p>
                         {r.to && (
                           <button type="button"
@@ -312,13 +323,17 @@ export function Conecto({ audience }: { audience: "staff" | "customer" }) {
                             Take me there →
                           </button>
                         )}
+                        </>
+                        )}
                       </li>
-                    ))}
+                      );
+                    })}
                   </ul>
                 ) : (
                   <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-                    I don't have an answer for that one. Try a different word — or log a ticket and a
-                    person will pick it up.
+                    {staff
+                      ? "I don't have an answer for that one. Try other words (e.g. the button or page name) — or ask an Admin or Management user."
+                      : "I don't have an answer for that one. Try a different word — or log a ticket and a person will pick it up."}
                   </p>
                 )
               ) : messages.length > 0 ? (

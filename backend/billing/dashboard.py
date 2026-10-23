@@ -1,0 +1,289 @@
+"""The numbers behind Finance -> Dashboard.
+
+Modelled on the Splynx finance dashboard Skybre is replacing, so the
+figures line up when both are open side by side. Where Splynx has
+something this platform doesn't, that is said out loud rather than
+approximated into a number nobody can check:
+
+  * LOCATIONS -- Splynx filters every panel by location as well as
+    partner. There is no location concept here, so only the partner
+    filter exists.
+  * TRANSACTIONS LEDGER -- Splynx's "Next month" panel is built from
+    projected debit and credit transactions. This platform has no
+    transactions table; the projection is built from active services and
+    their tariffs instead, using the SAME rule the recurring billing run
+    uses (billing/recurring.py: one line per active service at
+    tariff.price), so the forecast and the invoices it predicts cannot
+    disagree about what a customer is charged.
+  * CREDIT NOTES -- the nearest equivalent is an APPROVED CreditRequest.
+    Pending and rejected ones are not money off anyone's bill and are
+    excluded.
+
+TOTAL INCOME is invoiced revenue net of credits:
+
+    paid invoices + unpaid invoices - approved credits
+
+Accrual, not cash: it counts what was billed in the month whether or not
+it has been collected yet. That is deliberate -- the Payments figure
+directly above it is the cash view, and having both is the point. This
+formula reproduces the current-month "Total income" on the Splynx
+dashboard exactly.
+"""
+from calendar import monthrange
+from datetime import timedelta
+from decimal import Decimal
+
+from datetime import date
+
+from django.db.models import Count, DecimalField, F, Sum, Value
+from django.db.models.functions import Greatest
+
+from .models import CreditRequest, Invoice, Service
+from .overdue import AGE_BUCKETS, bucket_q, overdue_q, today
+
+ZERO = Decimal("0.00")
+
+#: The periods the top tiles can cover.
+PERIODS = ("month", "year", "lifetime")
+DEFAULT_PERIOD = "month"
+
+#: What is still owed on an invoice.
+#:
+#: Greatest(..., 0) because paid_amount CAN exceed total -- an overpayment,
+#: a duplicate EFT, a payment allocated to the wrong invoice. Without the
+#: floor, one overpaid invoice quietly subtracts from what every other
+#: customer owes, and the "unpaid" tile reads low for a reason nobody can
+#: see on the screen.
+OUTSTANDING = Greatest(
+    F("total") - F("paid_amount"),
+    Value(ZERO),
+    output_field=DecimalField(max_digits=12, decimal_places=2),
+)
+
+
+def month_bounds(day):
+    """First and last date of the month containing `day`."""
+    first = day.replace(day=1)
+    last = day.replace(day=monthrange(day.year, day.month)[1])
+    return first, last
+
+
+def year_bounds(day):
+    return date(day.year, 1, 1), date(day.year, 12, 31)
+
+
+def _money(value):
+    return value if value is not None else ZERO
+
+
+def _agg(queryset, amount_field="total"):
+    """{count, amount} for a queryset, with 0 rather than None when empty."""
+    row = queryset.aggregate(count=Count("pk"), amount=Sum(amount_field))
+    return {"count": row["count"] or 0, "amount": _money(row["amount"])}
+
+
+def _unpaid_agg(queryset):
+    """Unpaid invoices report TWO amounts, because two questions are being
+    asked of the same rows and one number can't answer both:
+
+      amount    what is still OWED (total - paid_amount). This is what the
+                tile shows, because "unpaid invoices: R170,000" has to mean
+                money you can still collect. Summing the full total would
+                count a R1,000 invoice with R900 already banked as R1,000
+                outstanding.
+      invoiced  what was BILLED (total). Total income is invoiced revenue,
+                so it uses this -- otherwise part-paying an invoice would
+                appear to reduce the revenue that was earned, which is not
+                what happened.
+    """
+    row = queryset.aggregate(
+        count=Count("pk"), amount=Sum(OUTSTANDING), invoiced=Sum("total")
+    )
+    return {
+        "count": row["count"] or 0,
+        "amount": _money(row["amount"]),
+        "invoiced": _money(row["invoiced"]),
+    }
+
+
+class FinanceDashboard:
+    """Every figure on the dashboard, from one set of scoped querysets.
+
+    The caller passes in querysets that are ALREADY partner-scoped and
+    permission-scoped (see ScopedByCustomerMixin.get_base_queryset), so
+    this class never has to know about users. It cannot accidentally leak
+    another partner's numbers, because it is never given them.
+    """
+
+    def __init__(self, invoices, payments, credits, services, as_of=None, period=DEFAULT_PERIOD):
+        self.invoices = invoices
+        self.payments = payments
+        self.credits = credits
+        self.services = services
+        self.as_of = as_of or today()
+        self.period = period if period in PERIODS else DEFAULT_PERIOD
+
+    # --- helpers ---------------------------------------------------------
+
+    def period_bounds(self):
+        """(start, end) for the tiles, or (None, None) for lifetime.
+
+        None means "no date bound at all" rather than some very old date,
+        so an invoice imported with a strange created date can't fall
+        outside "lifetime" -- which would be an absurd thing for a figure
+        called lifetime to do.
+        """
+        if self.period == "lifetime":
+            return None, None
+        if self.period == "year":
+            return year_bounds(self.as_of)
+        return month_bounds(self.as_of)
+
+    def _invoices_in(self, start, end):
+        if start is None:
+            return self.invoices
+        return self.invoices.filter(date_created__gte=start, date_created__lte=end)
+
+    def _payments_in(self, start, end):
+        # Payment.date is a DateTimeField; comparing __date__gte/lte uses the
+        # local calendar date rather than a UTC instant, so a payment taken
+        # at 23:30 on the last of the month counts in that month here the
+        # same way it reads on the Payments tab.
+        if start is None:
+            return self.payments
+        return self.payments.filter(date__date__gte=start, date__date__lte=end)
+
+    def _credits_in(self, start, end):
+        qs = self.credits.filter(status=CreditRequest.Status.APPROVED)
+        if start is None:
+            return qs
+        return qs.filter(decided_at__date__gte=start, decided_at__date__lte=end)
+
+    # --- the six tiles ---------------------------------------------------
+
+    def tiles(self):
+        """The six cards across the top, over whichever period is selected."""
+        start, end = self.period_bounds()
+        return self._period_figures(start, end)
+
+    def _period_figures(self, start, end):
+        invoices = self._invoices_in(start, end)
+        # credit_request__isnull=True excludes a credit note created by
+        # CreditRequest.create_credit_note_invoice -- its negative total
+        # would otherwise subtract the same credit from this tile a second
+        # time, on top of the `credits` tile just below, which already
+        # counts it via the CreditRequest itself. A credit note with no
+        # such link (the historical Splynx import, which has no
+        # CreditRequest at all) is unaffected and still counted here, same
+        # as always -- see billing.ledger_import's own docstring on why a
+        # negative invoice is the right way to carry one of those.
+        paid = _agg(invoices.filter(status=Invoice.Status.PAID, credit_request__isnull=True))
+        unpaid = _unpaid_agg(invoices.filter(status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE]))
+        credits = _agg(self._credits_in(start, end), amount_field="amount")
+
+        proformas = invoices.filter(status=Invoice.Status.PROFORMA)
+        # A pro forma is "paid" when what has been received against it
+        # covers it. There is no paid STATUS for a pro forma -- converting
+        # one to a real invoice is what changes its status -- so this is
+        # measured against the total, column to column, rather than looked
+        # up. F() so the comparison happens in the database; pulling the
+        # rows back to compare in Python would be the same answer at a few
+        # thousand times the cost.
+        paid_proformas = _agg(proformas.filter(paid_amount__gte=F("total")))
+        unpaid_proformas = _agg(proformas.filter(paid_amount__lt=F("total")))
+
+        return {
+            "payments": _agg(self._payments_in(start, end), amount_field="amount"),
+            "paid_invoices": paid,
+            "unpaid_invoices": unpaid,
+            "credit_notes": credits,
+            "paid_proformas": paid_proformas,
+            "unpaid_proformas": unpaid_proformas,
+            # See the module docstring: accrual, net of credits. Uses
+            # unpaid["invoiced"], NOT unpaid["amount"] -- income is what was
+            # billed, and part-paying an invoice does not reduce the revenue
+            # that was earned. The tile beside it shows the outstanding
+            # figure because "unpaid" there means money still collectable.
+            "total_income": paid["amount"] + unpaid["invoiced"] - credits["amount"],
+        }
+
+    def last_month(self):
+        first_this, _ = month_bounds(self.as_of)
+        start, end = month_bounds(first_this - timedelta(days=1))
+        return self._period_figures(start, end)
+
+    def current_month(self):
+        start, end = month_bounds(self.as_of)
+        return self._period_figures(start, end)
+
+    # --- next month ------------------------------------------------------
+
+    def next_month(self):
+        """What the recurring billing run is expected to produce.
+
+        Built from active services at their tariff price, which is exactly
+        what billing/recurring.py bills -- one invoice line per active
+        service at tariff.price. If that rule ever changes, this forecast
+        must change with it, which is why the comment says so here rather
+        than the number being derived independently.
+
+        Excludes VAT, because tariff.price excludes VAT.
+        """
+        active = self.services.filter(status=Service.Status.ACTIVE).select_related("tariff")
+        row = active.aggregate(count=Count("pk"), amount=Sum("tariff__price"))
+        customers_billed = active.values("customer_id").distinct().count()
+        return {
+            "services": row["count"] or 0,
+            "customers": customers_billed,
+            "planned_income": _money(row["amount"]),
+        }
+
+    # --- overdue ---------------------------------------------------------
+
+    def overdue(self):
+        """The ageing table. Buckets are exclusive and sum to the total."""
+        buckets = []
+        for label, lower, upper in AGE_BUCKETS:
+            buckets.append(
+                {"label": label, **_agg(self.invoices.filter(bucket_q(lower, upper, self.as_of)))}
+            )
+        total = _agg(self.invoices.filter(overdue_q(self.as_of)))
+        return {"buckets": buckets, "total": total}
+
+    # --- recurring revenue ----------------------------------------------
+
+    def recurring(self):
+        """MRR and ARPU, as of now.
+
+        MRR is the sum of active services' tariff prices; ARPU divides
+        that by the number of customers holding at least one, NOT by the
+        customer count -- a customer with no active service pays nothing
+        and would drag the average down for no reason.
+
+        Excludes VAT, same as planned income.
+        """
+        active = self.services.filter(status=Service.Status.ACTIVE)
+        mrr = _money(active.aggregate(total=Sum("tariff__price"))["total"])
+        paying = active.values("customer_id").distinct().count()
+        return {
+            "mrr": mrr,
+            "paying_customers": paying,
+            "arpu": (mrr / paying).quantize(Decimal("0.01")) if paying else ZERO,
+        }
+
+    # --- assembly --------------------------------------------------------
+
+    def as_dict(self):
+        return {
+            "as_of": self.as_of.isoformat(),
+            # Echoed back so the page can label the tiles with the period
+            # they actually cover, rather than assuming the server honoured
+            # what it asked for.
+            "period": self.period,
+            "tiles": self.tiles(),
+            "last_month": self.last_month(),
+            "current_month": self.current_month(),
+            "next_month": self.next_month(),
+            "overdue": self.overdue(),
+            "recurring": self.recurring(),
+        }

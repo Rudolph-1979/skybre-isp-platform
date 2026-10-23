@@ -1,0 +1,199 @@
+"""Networking -> Map API (#173).
+
+GET /api/map/geocode/?q=<address>           up to 5 matches (OpenStreetMap)
+GET /api/map/config/                         map settings for the browser (Mapbox public token, #180)
+GET /api/map/serviceability/?lat=&lng=[&h=]  nearest towers (+ line of sight, #179) + imported coverage
+GET /api/map/coverage/layers/                imported coverage layers
+POST /api/map/coverage/preview/              file -> the folders in it (nothing saved)
+POST /api/map/coverage/import/               file + ticked folders -> a layer (#178)
+PATCH/DELETE /api/map/coverage/layers/<id>/  switch on/off, delete
+GET /api/map/coverage/houses/?bbox=w,s,e,n   the serviceable-house dots in view
+"""
+from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from . import geo, uisp
+from .uisp_api import PERMS
+
+
+class MapGeocodeView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        try:
+            return Response({"results": geo.geocode(request.query_params.get("q", ""))})
+        except geo.GeoError as exc:
+            return Response({"detail": str(exc)}, status=400 if "3 characters" in str(exc) else 502)
+
+
+class NetworkingOrScheduling(permissions.BasePermission):
+    """The Map opens for Networking or Scheduling staff (#175), and Vehicles
+    staff for the Webfleet vehicles (#186)."""
+    message = "You need the Networking, Scheduling or Vehicles section."
+
+    def has_permission(self, request, view):
+        from accounts.permissions import user_can_access_section
+
+        return any(user_can_access_section(request.user, s) for s in ("networking", "scheduling", "vehicles"))
+
+
+class MapConfigView(APIView):
+    """Satellite (#180, Rudolph 15 Oct: "we dont have satelite view to check
+    for trees"): Mapbox satellite tiles, loaded only when someone switches
+    the map to Satellite."""
+
+    def get_permissions(self):
+        from accounts.permissions import IsStaffMember
+
+        return [permissions.IsAuthenticated(), IsStaffMember(), NetworkingOrScheduling()]
+
+    def get(self, request):
+        from django.conf import settings
+
+        return Response({"mapbox_token": getattr(settings, "MAPBOX_TOKEN", "") or ""})
+
+
+class MapServiceabilityView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        try:
+            lat = float(request.query_params.get("lat", ""))
+            lng = float(request.query_params.get("lng", ""))
+            client_h = float(request.query_params.get("h") or 0) or None   # client antenna height, m
+        except ValueError:
+            return Response({"detail": "lat and lng are required numbers."}, status=400)
+        if client_h is not None and not 1 <= client_h <= 60:
+            return Response({"detail": "h (client antenna height) must be 1-60 m."}, status=400)
+        try:
+            return Response(geo.check_point(lat, lng, client_height=client_h))
+        except geo.GeoError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        except uisp.UispError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+
+# --- coverage import (#178) -----------------------------------------------------------
+
+def _can_manage(user):
+    return getattr(user, "role", "") in ("admin", "management")
+
+
+def _layer_row(layer):
+    return {
+        "id": layer.pk, "name": layer.name, "provider": layer.provider, "kind": layer.kind,
+        "active": layer.active, "areas": layer.area_count, "houses": layer.point_count,
+        "folders": layer.folders, "source_file": layer.source_file, "imported_at": layer.imported_at,
+        "imported_by": (layer.imported_by.get_full_name() or layer.imported_by.username) if layer.imported_by else "",
+    }
+
+
+def _uploaded_doc(request):
+    from . import coverage
+
+    f = request.FILES.get("file")
+    if not f:
+        raise coverage.CoverageError("Choose a .kml or .kmz file.")
+    if not f.name.lower().endswith((".kml", ".kmz")):
+        raise coverage.CoverageError("Only .kml or .kmz files.")
+    if f.size > coverage.MAX_UPLOAD_BYTES:
+        raise coverage.CoverageError(f"File is larger than {coverage.MAX_UPLOAD_BYTES // (1024 * 1024)} MB -- zip it as a .kmz.")
+    return coverage.read_kml(f.read()), f.name
+
+
+class CoverageLayersView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        from .models import CoverageLayer
+
+        return Response({"results": [_layer_row(l) for l in CoverageLayer.objects.select_related("imported_by")],
+                         "can_manage": _can_manage(request.user)})
+
+
+class CoverageLayerView(APIView):
+    permission_classes = PERMS
+
+    def patch(self, request, pk):
+        from .models import CoverageLayer
+
+        if not _can_manage(request.user):
+            return Response({"detail": "Only Admin or Management can change coverage."}, status=403)
+        layer = CoverageLayer.objects.filter(pk=pk).first()
+        if not layer:
+            return Response({"detail": "Not found."}, status=404)
+        if "active" in request.data:
+            layer.active = bool(request.data["active"])
+        if request.data.get("name"):
+            layer.name = str(request.data["name"])[:120]
+        layer.save()
+        return Response(_layer_row(layer))
+
+    def delete(self, request, pk):
+        from .models import CoverageLayer
+
+        if not _can_manage(request.user):
+            return Response({"detail": "Only Admin or Management can delete coverage."}, status=403)
+        CoverageLayer.objects.filter(pk=pk).delete()
+        return Response(status=204)
+
+
+class CoveragePreviewView(APIView):
+    permission_classes = PERMS
+
+    def post(self, request):
+        from . import coverage
+
+        if not _can_manage(request.user):
+            return Response({"detail": "Only Admin or Management can import coverage."}, status=403)
+        try:
+            doc, filename = _uploaded_doc(request)
+            return Response({"file": filename, "folders": coverage.preview(doc)})
+        except coverage.CoverageError as exc:
+            return Response({"detail": str(exc)}, status=400)
+
+
+class CoverageImportView(APIView):
+    permission_classes = PERMS
+
+    def post(self, request):
+        import json
+
+        from . import coverage
+
+        if not _can_manage(request.user):
+            return Response({"detail": "Only Admin or Management can import coverage."}, status=403)
+        try:
+            doc, filename = _uploaded_doc(request)
+            try:
+                paths = json.loads(request.data.get("folders") or "[]")
+            except ValueError:
+                raise coverage.CoverageError("folders must be a JSON list.")
+            kind = request.data.get("kind") or "fibre"
+            if kind not in ("fibre", "wireless"):
+                raise coverage.CoverageError("kind must be fibre or wireless.")
+            replace = request.data.get("replace") or None
+            layer, dropped = coverage.import_layer(
+                doc, paths, name=request.data.get("name") or filename, provider=request.data.get("provider") or "",
+                kind=kind, user=request.user, source_file=filename, replace=int(replace) if replace else None,
+            )
+        except coverage.CoverageError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        return Response({**_layer_row(layer), "dropped_excluded_region": dropped}, status=201)
+
+
+class CoverageHousesView(APIView):
+    """The serviceable-house dots inside the map's view (at most 5,000)."""
+    permission_classes = PERMS
+
+    def get(self, request):
+        from .models import CoveragePoint
+
+        try:
+            w, s_, e, n = [float(x) for x in request.query_params.get("bbox", "").split(",")]
+        except ValueError:
+            return Response({"detail": "bbox=west,south,east,north is required."}, status=400)
+        qs = CoveragePoint.objects.filter(layer__active=True, lat__range=(s_, n), lng__range=(w, e))
+        rows = list(qs.values_list("lat", "lng", "kind", "name", "area")[:5001])
+        return Response({"houses": rows[:5000], "truncated": len(rows) > 5000})

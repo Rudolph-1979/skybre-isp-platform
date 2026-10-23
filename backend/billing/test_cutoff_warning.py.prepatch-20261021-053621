@@ -1,0 +1,226 @@
+"""Telling somebody their line goes off this afternoon.
+
+WHAT THIS COMMAND IS FOR
+
+The engine's countdown warning refuses to fire on the cut-off day itself,
+and gives its reason: warning and suspending in the same pass would send
+both emails in the same minute. That reasoning holds for one pass. It
+stops holding when the warning runs at 09:00 and the disconnection at
+15:00, which is the only reason this command exists.
+
+FOUR WAYS TO GET IT WRONG, one test each:
+
+  * WARNING SOMEBODY WHO IS NOT BEING CUT OFF -- the email says the line
+    goes off today, and for anyone not qualifying today that is simply
+    false;
+  * WARNING WHEN NOTHING WILL CUT ANYONE OFF -- with auto-suspension
+    disarmed the email is a threat the platform will not carry out, and
+    the next one gets ignored;
+  * WARNING TWICE -- the morning run and a re-run of it are the same
+    morning, and two identical warnings read as a system fault;
+  * RECORDING A WARNING THAT NEVER ARRIVED -- mark it sent after a mail
+    failure and nobody is warned and nobody tries again.
+
+Plus the quiet one: a customer with notifications switched off is losing
+their line today in silence, and that is worth printing rather than
+skipping.
+
+Nothing here sends real email.
+"""
+import datetime
+from decimal import Decimal
+from io import StringIO
+from unittest import mock
+
+from django.core.management import call_command
+from django.test import TestCase
+from django.utils import timezone
+
+from customers.models import Customer
+from notifications.models import EmailLog, EmailTemplate
+
+from .models import (
+    CustomerBillingConfig, Invoice, InvoiceItem, SuspensionSettings, Service, Tariff,
+)
+
+
+class CutoffWarningTests(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+        )
+        row = SuspensionSettings.objects.first() or SuspensionSettings.objects.create()
+        row.auto_suspend_enabled = True
+        row.save()
+        self.settings_row = row
+
+    def _customer(self, name, *, overdue_days=5, blocking=4, balance=Decimal("575.00")):
+        """A customer whose cut-off falls on `today` when blocking lines up."""
+        customer = Customer.objects.create(
+            full_name=name, email=f"{name.split()[0].lower()}@example.com",
+            status=Customer.Status.ACTIVE, balance=balance,
+        )
+        Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90),
+            radius_username=name.split()[0].lower(),
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.auto_create_invoices = False
+        config.blocking_period_days = blocking
+        config.save()
+
+        invoice = Invoice.objects.create(
+            customer=customer, status=Invoice.Status.UNPAID,
+            date_due=self.today - datetime.timedelta(days=overdue_days),
+        )
+        InvoiceItem.objects.create(
+            invoice=invoice, item_type=InvoiceItem.ItemType.CUSTOM,
+            description="Internet", quantity=1, unit_price=Decimal("500.00"),
+            tax_rate_pct=Decimal("15.00"),
+        )
+        Invoice.objects.filter(pk=invoice.pk).update(total=Decimal("575.00"))
+        return customer
+
+    def _spy(self):
+        sent = []
+
+        def record(template_key, customer, **kwargs):
+            sent.append((template_key, customer.pk, kwargs.get("extra_context")))
+            return EmailLog(status=EmailLog.Status.SENT)
+
+        return sent, mock.patch(
+            "notifications.services.send_customer_email", side_effect=record
+        )
+
+    def _run(self, **flags):
+        out = StringIO()
+        args = ["--commit"] if flags.get("commit") else []
+        if flags.get("client_code"):
+            args += ["--client-code", flags["client_code"]]
+        sent, patcher = self._spy()
+        with patcher:
+            call_command("send_cutoff_day_warnings", *args, stdout=out, stderr=out)
+        return sent, out.getvalue()
+
+    # --- who is warned ----------------------------------------------------
+
+    def test_somebody_cut_off_today_is_warned(self):
+        customer = self._customer("Delia Dunn", overdue_days=4, blocking=4)
+
+        sent, output = self._run(commit=True)
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], EmailTemplate.Key.SUSPENSION_WARNING)
+        self.assertEqual(sent[0][1], customer.pk)
+        self.assertEqual(sent[0][2]["days_until_suspension"], 0)
+        self.assertEqual(sent[0][2]["suspend_date"], self.today)
+
+    def test_somebody_not_yet_due_for_cut_off_is_not_warned(self):
+        """The email says the line goes off today. For anyone else that is
+        simply untrue."""
+        self._customer("Eddie Els", overdue_days=1, blocking=4)
+
+        sent, _ = self._run(commit=True)
+
+        self.assertEqual(sent, [])
+
+    def test_somebody_with_nothing_overdue_is_not_warned(self):
+        self._customer("Fiona Fry", overdue_days=-3, blocking=4)
+
+        sent, _ = self._run(commit=True)
+
+        self.assertEqual(sent, [])
+
+    def test_a_settled_customer_is_not_warned(self):
+        """The same balance gate the blocking pass uses -- and it must stay
+        shared, or the warning and the cut-off disagree about who is late."""
+        self._customer("Gus Grey", overdue_days=4, blocking=4, balance=Decimal("0.00"))
+
+        sent, _ = self._run(commit=True)
+
+        self.assertEqual(sent, [])
+
+    def test_one_customer_can_be_targeted(self):
+        self._customer("Hana Horn", overdue_days=4, blocking=4)
+        wanted = self._customer("Ivan Ing", overdue_days=4, blocking=4)
+
+        sent, _ = self._run(commit=True, client_code=wanted.customer_id)
+
+        self.assertEqual([s[1] for s in sent], [wanted.pk])
+
+    # --- the master switch ------------------------------------------------
+
+    def test_nothing_is_sent_when_auto_suspension_is_off(self):
+        """THE ONE THAT MATTERS MOST. With the cut-off disarmed, this email
+        is a threat the platform will not carry out -- and a warning nobody
+        acts on teaches customers to ignore the next one. Deliberately the
+        OPPOSITE of the engine's countdown warning, which is ungated on
+        purpose."""
+        self._customer("Jaco Joubert", overdue_days=4, blocking=4)
+        self.settings_row.auto_suspend_enabled = False
+        self.settings_row.save()
+
+        sent, output = self._run(commit=True)
+
+        self.assertEqual(sent, [])
+        self.assertIn("Auto-suspension is off", output)
+
+    # --- not saying it twice ----------------------------------------------
+
+    def test_a_second_run_the_same_morning_sends_nothing(self):
+        self._customer("Kobus Kemp", overdue_days=4, blocking=4)
+
+        first, _ = self._run(commit=True)
+        second, _ = self._run(commit=True)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [], "the customer was warned twice in one morning")
+
+    def test_a_failed_send_is_not_recorded_as_warned(self):
+        """Marked sent after a mail outage means nobody is warned and
+        nobody tries again."""
+        customer = self._customer("Lena Loots", overdue_days=4, blocking=4)
+
+        def fail(template_key, cust, **kwargs):
+            return EmailLog(status=EmailLog.Status.FAILED)
+
+        with mock.patch("notifications.services.send_customer_email", side_effect=fail):
+            call_command("send_cutoff_day_warnings", "--commit", stdout=StringIO())
+
+        config = CustomerBillingConfig.objects.get(customer=customer)
+        self.assertIsNone(config.suspension_warned_on)
+
+        sent, _ = self._run(commit=True)
+        self.assertEqual(len(sent), 1, "the failed warning was never retried")
+
+    # --- the silent ones ---------------------------------------------------
+
+    def test_a_customer_with_notifications_off_is_named_not_skipped(self):
+        """They lose their line today and hear nothing. That is a fact
+        somebody should be able to read in the log."""
+        customer = self._customer("Mia Moss", overdue_days=4, blocking=4)
+        CustomerBillingConfig.objects.filter(customer=customer).update(
+            send_billing_notifications=False
+        )
+
+        sent, output = self._run(commit=True)
+
+        self.assertEqual(sent, [])
+        self.assertIn("CUT OFF TODAY", output)
+        self.assertIn("notifications off", output)
+
+    # --- the dry run -------------------------------------------------------
+
+    def test_a_dry_run_sends_nothing_and_records_nothing(self):
+        customer = self._customer("Nadia Naidoo", overdue_days=4, blocking=4)
+
+        sent, output = self._run()
+
+        self.assertEqual(sent, [])
+        self.assertIsNone(
+            CustomerBillingConfig.objects.get(customer=customer).suspension_warned_on
+        )
+        self.assertIn("would warn 1", output)

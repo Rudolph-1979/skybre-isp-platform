@@ -1,0 +1,130 @@
+"""Scheduling -> Export Excel (George, 14 Oct 2026: "export jobs scheduled by
+date, time and technician ... from a date to a date in Excel format").
+
+Three sheets:
+  * Jobs           -- one row per scheduled job, by date and start time.
+  * By technician  -- one row per technician per job (a two-person job is on
+                      both their lists), by technician, date, time.
+  * Summary        -- per technician: jobs and scheduled hours in the range.
+Times are local (SAST). Pool (unscheduled) and deleted jobs are left out.
+"""
+import io
+from collections import defaultdict
+
+from django.utils import timezone
+
+from .serializers import staff_display_name
+
+
+def _full_name(user):
+    """First name and surname in the export (14 Oct 2026), else the calendar name."""
+    name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
+    return name or staff_display_name(user)
+
+
+def _address(job):
+    if (job.location or "").strip():
+        return job.location.strip()
+    c = job.customer
+    if c is None:
+        return ""
+    parts = [getattr(c, f, "") for f in ("address", "complex_or_area", "city")]
+    text = ", ".join(p.strip() for p in parts if (p or "").strip())
+    if not text and c.latitude is not None and c.longitude is not None:
+        text = f"GPS {c.latitude}, {c.longitude}"
+    return text
+
+
+def _hours(job):
+    if job.start and job.end and job.end > job.start:
+        return round((job.end - job.start).total_seconds() / 3600, 2)
+    return None
+
+
+def job_rows(jobs, type_names):
+    """[(job, local_start, local_end, [technician names])] in date/time order."""
+    out = []
+    for job in jobs:
+        start = timezone.localtime(job.start)
+        end = timezone.localtime(job.end) if job.end else None
+        techs = sorted((_full_name(u) for u in job.assigned_technicians.all()), key=str.lower)
+        out.append((job, start, end, techs))
+    out.sort(key=lambda r: (r[1], r[0].pk))
+    return out
+
+
+def build_jobs_xlsx(rows, type_names, date_from, date_to):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Jobs"
+    headers = ["Date", "Day", "Start", "End", "Hours", "Technician(s)", "Job type", "Title", "Client",
+               "Client code", "Phone", "Address", "Status", "Ticket", "Job #"]
+    ws.append(headers)
+
+    def cells(job, start, end, tech_text):
+        c = job.customer
+        return [
+            start.date(), start.strftime("%a"), start.strftime("%H:%M"), end.strftime("%H:%M") if end else "",
+            _hours(job), tech_text, type_names.get(job.job_type, job.job_type), job.title,
+            (c.full_name if c else "Standalone"), (c.customer_id if c else ""), (c.phone if c else ""),
+            _address(job), job.get_status_display(), (f"#{job.ticket_id}" if job.ticket_id else ""), job.pk,
+        ]
+
+    for job, start, end, techs in rows:
+        ws.append(cells(job, start, end, ", ".join(techs) or "Unassigned"))
+
+    bt = wb.create_sheet("By technician")
+    bt.append(["Technician"] + headers[:5] + headers[6:])
+    per_tech = []
+    for job, start, end, techs in rows:
+        for name in techs or ["Unassigned"]:
+            row = cells(job, start, end, name)
+            per_tech.append([name] + row[:5] + row[6:])
+    per_tech.sort(key=lambda r: (r[0].lower(), r[1], r[3]))
+    for r in per_tech:
+        bt.append(r)
+
+    sm = wb.create_sheet("Summary")
+    sm.append([f"Scheduled jobs {date_from:%d/%m/%Y} – {date_to:%d/%m/%Y}"])
+    sm.cell(row=1, column=1).font = Font(bold=True, size=12)
+    sm.append([])
+    sm.append(["Technician", "Jobs", "Scheduled hours", "Completed", "Cancelled"])
+    totals = defaultdict(lambda: [0, 0.0, 0, 0])
+    for job, _s, _e, techs in rows:
+        for name in techs or ["Unassigned"]:
+            t = totals[name]
+            t[0] += 1
+            t[1] += _hours(job) or 0
+            t[2] += job.status == "completed"
+            t[3] += job.status == "cancelled"
+    for name in sorted(totals, key=str.lower):
+        j, h, done, cancelled = totals[name]
+        sm.append([name, j, round(h, 2), done, cancelled])
+    sm.append(["All jobs (each once)", len(rows), round(sum(_hours(r[0]) or 0 for r in rows), 2),
+               sum(r[0].status == "completed" for r in rows), sum(r[0].status == "cancelled" for r in rows)])
+    for cell in sm[sm.max_row]:
+        cell.font = Font(bold=True)
+
+    for sheet, widths, header_row in (
+        (ws, [12, 6, 7, 7, 7, 26, 16, 34, 28, 12, 14, 40, 12, 8, 7], 1),
+        (bt, [22, 12, 6, 7, 7, 7, 16, 34, 28, 12, 14, 40, 12, 8, 7], 1),
+        (sm, [26, 8, 16, 11, 11], 3),
+    ):
+        for cell in sheet[header_row]:
+            cell.font = Font(bold=True)
+        for i, w in enumerate(widths, start=1):
+            sheet.column_dimensions[get_column_letter(i)].width = w
+        sheet.freeze_panes = f"A{header_row + 1}"
+    for sheet, col in ((ws, "A"), (bt, "B")):
+        for cell in sheet[col][1:]:
+            cell.number_format = "DD/MM/YYYY"
+        if sheet.max_row > 1:
+            sheet.auto_filter.ref = sheet.dimensions
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    return stream.getvalue()

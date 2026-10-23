@@ -1,0 +1,247 @@
+from django.contrib.auth.password_validation import validate_password as run_password_validators
+from django.core.exceptions import ValidationError as DjangoValidationError
+from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from .models import User, STAFF_ROLES
+from . import two_factor
+
+
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = [
+            "id", "username", "email", "first_name", "last_name", "role", "phone", "is_active",
+            "allowed_sections", "allowed_partners", "visible_partners", "is_noc",
+        ]
+        # allowed_sections/allowed_partners are read-only here -- those are
+        # only ever written through StaffPermissionsSerializer (Admin-only).
+        # visible_partners IS self-service, but it's written through
+        # accounts.views.MeView.patch's own hand-checked path (not this
+        # serializer's validated_data), so it stays read-only here too --
+        # this serializer just needs to expose the *current* user's own
+        # values so the frontend can filter its nav/Customers view on
+        # login/refresh. is_noc joins that list for the same reason: the
+        # ticket UI needs to know on login/refresh whether the logged-in
+        # staff member can decide an escalation, and it's only ever
+        # granted through StaffAccountsSerializer (Admin-only), same as
+        # role.
+        read_only_fields = ["id", "role", "allowed_sections", "allowed_partners", "visible_partners", "is_noc"]
+
+
+class StaffPermissionsSerializer(serializers.ModelSerializer):
+    """Admin-only view: lets an admin see and set which sections (and now,
+    which reseller partners' customers) another staff member can access.
+    Deliberately narrow -- everything except allowed_sections/
+    allowed_partners is read-only here, since this endpoint's only job is
+    permission management, not general user editing."""
+
+    class Meta:
+        model = User
+        fields = ["id", "username", "first_name", "last_name", "role", "is_active", "allowed_sections", "allowed_partners"]
+        read_only_fields = ["id", "username", "first_name", "last_name", "role", "is_active"]
+
+    def validate_allowed_sections(self, value):
+        valid_keys = set(User.Section.values)
+        invalid = [v for v in value if v not in valid_keys]
+        if invalid:
+            raise serializers.ValidationError(f"Unknown section(s): {', '.join(invalid)}")
+        return value
+
+    def validate_allowed_partners(self, value):
+        from customers.models import Partner  # local import: avoids a hard cross-app import at module load time
+
+        valid_ids = set(Partner.objects.values_list("id", flat=True))
+        invalid = [v for v in value if v not in valid_ids]
+        if invalid:
+            raise serializers.ValidationError(f"Unknown partner id(s): {', '.join(str(v) for v in invalid)}")
+        return value
+
+
+class StaffAccountsSerializer(serializers.ModelSerializer):
+    """Admin-only account lifecycle management: create a new staff login,
+    edit their basic details/role, and suspend/reactivate via is_active.
+    Permanent deletion is handled by the viewset's destroy(), not here.
+    Deliberately separate from StaffPermissionsSerializer (which only
+    touches allowed_sections) -- this one owns everything about the
+    account itself except section access."""
+
+    # Write-only and optional: required to create a new account (enforced
+    # in validate() below, since "required" alone would also demand it on
+    # every edit) but left blank on update to leave the password unchanged.
+    # No min_length here on purpose -- length is one of the four rules in
+    # AUTH_PASSWORD_VALIDATORS, and validate() below runs all four, so
+    # stating it twice just means two numbers to disagree with each other
+    # (this said 8 while the setting said 6).
+    password = serializers.CharField(write_only=True, required=False, style={"input_type": "password"})
+
+    # Typed by the admin creating the account, not generated. Optional at
+    # this level and required in validate() below, for the same reason the
+    # password is: declaring it required here would also demand it on
+    # every PATCH, and the Users screen patches `is_active` on its own
+    # when somebody suspends or reactivates an account.
+    #
+    # The model still assigns one when this is blank. That path is for
+    # createsuperuser, management commands and tests -- everything that
+    # creates a staff account without going near this form, none of which
+    # should start failing because a form field became mandatory.
+    staff_code = serializers.CharField(required=False, max_length=20)
+
+    class Meta:
+        model = User
+        fields = [
+            "id", "username", "password", "first_name", "last_name", "email",
+            "phone", "role", "is_active", "staff_code", "is_noc",
+        ]
+        read_only_fields = ["id"]
+
+    def validate_role(self, value):
+        if value not in STAFF_ROLES:
+            raise serializers.ValidationError(f"Role must be one of: {', '.join(STAFF_ROLES)}")
+        return value
+
+    def validate_username(self, value):
+        qs = User.objects.filter(username=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+    def validate_staff_code(self, value):
+        """Normalise, then insist it is nobody else's.
+
+        Upper-cased and stripped because a code is compared, never read
+        for meaning: "stf-000015" and "STF-000015" are the same code to
+        every person who looks at them and two different codes to a
+        database, and the day those diverge is the day one staff member
+        cannot register and nobody can see why.
+
+        The model's unique constraint would catch a collision too, but as
+        a 500 from a database error rather than a message against the
+        field. This is the same check, said in a place the admin can see.
+        """
+        value = (value or "").strip().upper()
+        if not value:
+            raise serializers.ValidationError("A staff code is required.")
+
+        clash = User.objects.filter(staff_code=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(
+                f"{value} is already used by another staff member."
+            )
+        return value
+
+
+    def validate(self, attrs):
+        # A new account needs SOMETHING to get in with: either a password set
+        # here, or an email address to send an invite to. Requiring a password
+        # unconditionally -- which is what this used to do -- forced the admin
+        # to invent one and then get it to the person somehow, which is a
+        # password chosen by the wrong person sitting somewhere it shouldn't.
+        # Required when creating, because Conecto gates app registration on
+        # it and an account made without one simply cannot be used there --
+        # a failure that surfaces days later, to the person who cannot log
+        # in, rather than here where it can be fixed in a second.
+        if self.instance is None and not attrs.get("staff_code"):
+            raise serializers.ValidationError({
+                "staff_code": "A staff code is required — the Conecto app checks it before letting them register."
+            })
+
+        if self.instance is None and not attrs.get("password") and not attrs.get("email"):
+            raise serializers.ValidationError({
+                "email": "Give an email address so they can be sent an invite, or set a password here."
+            })
+
+        # Run AUTH_PASSWORD_VALIDATORS on a password set through here.
+        # PasswordResetConfirmView has always done this; this path never did,
+        # so the only rule reaching an admin-created staff login was the
+        # field's own length check. The other three are the ones a hurried
+        # admin actually trips: "12345678" (all numeric) and "password"
+        # (top of Django's common list) were both accepted for a login that
+        # can suspend a customer or edit an invoice, while the same two
+        # strings were refused on the public forgot-password screen.
+        password = attrs.get("password")
+        if password:
+            # An unsaved candidate carries the name/email being set, so the
+            # similarity rule has something to compare against on create,
+            # where there is no row yet -- and on edit compares against the
+            # incoming values rather than the ones being replaced.
+            def field(name):
+                # `in attrs` rather than .get(name, default): a cleared field
+                # arrives as an explicit None, which a default never replaces.
+                if name in attrs:
+                    return attrs[name] or ""
+                return getattr(self.instance, name, "") or ""
+
+            candidate = User(
+                username=field("username"), email=field("email"),
+                first_name=field("first_name"), last_name=field("last_name"),
+            )
+            try:
+                run_password_validators(password, user=candidate)
+            except DjangoValidationError as e:
+                raise serializers.ValidationError({"password": list(e.messages)})
+
+        return attrs
+
+    def create(self, validated_data):
+        password = validated_data.pop("password", None)
+        user = User(**validated_data)
+        if password:
+            user.set_password(password)
+        else:
+            # No usable password at all until they set one from the invite, so
+            # the account cannot be signed into in the meantime -- not even
+            # with a guessable default.
+            user.set_unusable_password()
+        user.save()
+        return user
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop("password", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        if password:
+            instance.set_password(password)
+        instance.save()
+        return instance
+
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    # Not part of simplejwt's default fields — declared explicitly so it's
+    # actually included in `attrs` for validate() to see. Optional: most
+    # logins won't have 2FA enabled and never send this.
+    totp_code = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token["role"] = user.role
+        token["username"] = user.username
+        return token
+
+    def validate(self, attrs):
+        # super().validate() checks username/password first and raises
+        # AuthenticationFailed on bad credentials — so a wrong password
+        # never reveals whether 2FA is enabled for that account.
+        code = attrs.pop("totp_code", "")
+        data = super().validate(attrs)
+
+        device = getattr(self.user, "two_factor", None)
+        if device is not None and device.confirmed:
+            if not code:
+                raise serializers.ValidationError(
+                    {"code": "two_factor_required", "detail": "Enter your 6-digit authentication code."}
+                )
+            if not two_factor.verify_code(device, code):
+                raise serializers.ValidationError(
+                    {"code": "invalid_two_factor_code", "detail": "Invalid authentication code."}
+                )
+
+        data["user"] = UserSerializer(self.user).data
+        customer_profile = getattr(self.user, "customer_profile", None)
+        if customer_profile is not None:
+            data["customer_id"] = customer_profile.id
+        return data

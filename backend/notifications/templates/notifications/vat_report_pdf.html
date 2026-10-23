@@ -17,10 +17,10 @@
   </p>
 
   {% if vat.duplicate_claims %}
-  {# A supplier invoice captured as BOTH a stock receipt and an expense.
+  {% comment %} A supplier invoice captured as BOTH a stock receipt and an expense.
      Printed prominently because the Input VAT below counts both, so the
      return is overstated until one is removed. Nothing is auto-adjusted --
-     see expenses.views._find_duplicate_claims for why. #}
+     see expenses.views._find_duplicate_claims for why. {% endcomment %}
   <p class="proforma-note" style="border:2px solid #b3852e; padding:8px;">
     <strong>Warning — {{ vat.duplicate_claims|length }} invoice{{ vat.duplicate_claims|length|pluralize }} may be
     claimed twice.</strong> The following supplier invoices were captured as a stock receipt <em>and</em> as an

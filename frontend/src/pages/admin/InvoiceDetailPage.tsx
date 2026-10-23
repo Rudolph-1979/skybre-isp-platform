@@ -3,10 +3,12 @@ import { useParams, useNavigate, Link } from "react-router-dom";
 import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { PageHeader } from "../../components/PageHeader";
+import { SendInvoiceButton } from "../../components/SendInvoiceButton";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
-import { StatusBadge } from "../../components/StatusBadge";
+import { InvoiceStatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { PdfPreviewModal } from "../../components/PdfPreviewModal";
+import { formatIsoDate } from "../../utils/billingTerms";
 import type { Invoice, Payment, InvoiceDeletionRequest } from "../../types";
 
 export function InvoiceDetailPage() {
@@ -23,6 +25,28 @@ export function InvoiceDetailPage() {
   const [converting, setConverting] = useState(false);
   const [showPdf, setShowPdf] = useState(false);
   const [convertError, setConvertError] = useState("");
+  const [paymentError, setPaymentError] = useState("");
+  const [deletingInvoice, setDeletingInvoice] = useState(false);
+  // Comments for the client, printed on the PDF (14 Oct 2026).
+  const [editingComment, setEditingComment] = useState(false);
+  const [commentDraft, setCommentDraft] = useState("");
+  const [commentSaving, setCommentSaving] = useState(false);
+  const [commentError, setCommentError] = useState("");
+
+  async function saveComment() {
+    if (!id) return;
+    setCommentSaving(true);
+    setCommentError("");
+    try {
+      const res = await api.patch<Invoice>(`/invoices/${id}/`, { note: commentDraft.trim() });
+      setInvoice(res.data);
+      setEditingComment(false);
+    } catch {
+      setCommentError("Couldn't save the comment.");
+    } finally {
+      setCommentSaving(false);
+    }
+  }
 
   // -- Deletion request (deleting a quote/pro forma needs Management
   // approval -- see InvoiceDeletionRequest on the backend) --
@@ -34,6 +58,29 @@ export function InvoiceDetailPage() {
   const [rejectingDeletion, setRejectingDeletion] = useState(false);
   const [rejectDecisionNote, setRejectDecisionNote] = useState("");
   const [deletionBusy, setDeletionBusy] = useState(false);
+  // Cancel (20 Oct 2026): quotes / pro formas by anyone with Finance; a real
+  // invoice by Management / Admin, and only with nothing paid on it.
+  const [showCancel, setShowCancel] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelBusy, setCancelBusy] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+
+  async function handleCancel(e: FormEvent) {
+    e.preventDefault();
+    if (!invoice) return;
+    setCancelBusy(true);
+    setCancelError(null);
+    try {
+      const res = await api.post<Invoice>(`/invoices/${invoice.id}/cancel/`, { reason: cancelReason });
+      setInvoice(res.data);
+      setShowCancel(false);
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setCancelError(detail || "Couldn't cancel it.");
+    } finally {
+      setCancelBusy(false);
+    }
+  }
 
   function refetchDeletionRequest() {
     if (!id) return;
@@ -110,6 +157,25 @@ export function InvoiceDetailPage() {
     refetchDeletionRequest();
   }
 
+  // A real invoice (anything past quote/pro forma) doesn't need Management
+  // approval -- InvoiceViewSet.destroy() already refuses on its own if any
+  // payment is still recorded against it, and says so, so there's nothing
+  // extra to gate here beyond the Finance access this whole page already
+  // requires.
+  async function handleDeleteInvoice() {
+    if (!invoice) return;
+    if (!confirm(`Permanently delete ${invoice.number}? This can't be undone.`)) return;
+    setDeletingInvoice(true);
+    try {
+      await api.delete(`/invoices/${invoice.id}/`);
+      navigate("/admin/finance");
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      alert(detail || "Couldn't delete this invoice.");
+      setDeletingInvoice(false);
+    }
+  }
+
   async function handleConvert(action: "convert-to-proforma" | "convert-to-invoice") {
     if (!id) return;
     setConverting(true);
@@ -130,11 +196,30 @@ export function InvoiceDetailPage() {
     e.preventDefault();
     if (!invoice) return;
     setSaving(true);
+    setPaymentError("");
     try {
       await api.post("/payments/", { customer: invoice.customer, invoice: invoice.id, amount, method });
       setShowModal(false);
       setAmount("");
       load();
+    } catch (err) {
+      // This used to be try/finally with no catch at all, so a rejected
+      // payment closed nothing, said nothing, and left the ledger
+      // untouched while the staff member had no reason to think it had
+      // failed -- and the customer carried on being chased. The payment
+      // serializer returns FIELD-KEYED errors ("that invoice belongs to a
+      // different customer", "is still a draft and has not been issued"),
+      // not just `detail`, so the message has to be dug out of either
+      // shape.
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      let message = "Could not record this payment — please try again.";
+      if (data && typeof data === "object") {
+        const detail = (data as { detail?: unknown }).detail;
+        const first = Object.values(data as Record<string, unknown>).flat()[0];
+        if (typeof detail === "string") message = detail;
+        else if (typeof first === "string") message = first;
+      }
+      setPaymentError(message);
     } finally {
       setSaving(false);
     }
@@ -143,9 +228,14 @@ export function InvoiceDetailPage() {
   if (!invoice) return <p className="text-[var(--text-muted)]">Loading…</p>;
 
   // Wording follows the document's real state, same as the PDF's own heading
-  // (the backend picks the template from invoice.status, not from a param).
-  const docNoun =
-    invoice.status === "quote" ? "quote" : invoice.status === "proforma" ? "pro forma" : "invoice";
+  // (the backend picks the template from invoice.status, not from a param) --
+  // except a credit note, which is an Invoice row with a negative total (no
+  // separate CreditNote model) and can carry any status word, so that's
+  // checked first (see billing/statements.py's movements()).
+  const isCreditNote = parseFloat(invoice.total) < 0;
+  const docNoun = isCreditNote
+    ? "credit note"
+    : invoice.status === "quote" ? "quote" : invoice.status === "proforma" ? "pro forma" : "invoice";
 
   return (
     <div>
@@ -154,13 +244,14 @@ export function InvoiceDetailPage() {
       </Link>
       <PageHeader
         title={invoice.number}
-        subtitle={`Billed to ${invoice.customer_name} · ${invoice.status === "quote" ? "Valid until" : "Due"} ${invoice.date_due}`}
+        subtitle={`Billed to ${invoice.customer_name} · ${invoice.status === "quote" ? "Valid until" : "Due"} ${formatIsoDate(invoice.date_due)}`}
         actions={
           <>
-            <StatusBadge status={invoice.status} />
+            <InvoiceStatusBadge invoice={invoice} />
             <button type="button" className={btnSecondary} onClick={() => setShowPdf(true)}>
               Preview {docNoun}
             </button>
+            <SendInvoiceButton invoice={invoice} variant="button" onSent={load} />
             {invoice.can_convert_to_proforma && (
               <button className={btnSecondary} disabled={converting} onClick={() => handleConvert("convert-to-proforma")}>
                 {converting ? "Converting…" : "Convert to pro forma"}
@@ -185,6 +276,31 @@ export function InvoiceDetailPage() {
                 }}
               >
                 Request deletion
+              </button>
+            )}
+            {invoice.status !== "cancelled" && !isCreditNote &&
+              (invoice.status === "quote" || invoice.status === "proforma" ||
+                (canDecideDeletion && parseFloat(invoice.paid_amount || "0") === 0)) && (
+              <button
+                type="button"
+                className="text-sm font-medium text-red-600 hover:underline dark:text-red-400"
+                onClick={() => {
+                  setCancelReason("");
+                  setCancelError(null);
+                  setShowCancel(true);
+                }}
+              >
+                Cancel {docNoun}
+              </button>
+            )}
+            {invoice.status !== "quote" && invoice.status !== "proforma" && (
+              <button
+                type="button"
+                className="text-sm font-medium text-red-600 hover:underline dark:text-red-400"
+                disabled={deletingInvoice}
+                onClick={handleDeleteInvoice}
+              >
+                {deletingInvoice ? "Deleting…" : `Delete ${docNoun}`}
               </button>
             )}
           </>
@@ -281,9 +397,15 @@ export function InvoiceDetailPage() {
                     (tariff plan{item.service ? " — service active" : ""})
                   </span>
                 )}
+                {item.item_type === "recurring_charge" && (
+                  <span className="ml-2 text-xs text-[var(--text-muted)]">(recurring charge)</span>
+                )}
+                {item.item_type === "once_off_item" && (
+                  <span className="ml-2 text-xs text-[var(--text-muted)]">(once-off)</span>
+                )}
               </TD>
               <TD className="text-[var(--text-muted)]">
-                {item.period_start && item.period_end ? `${item.period_start} → ${item.period_end}` : "—"}
+                {item.period_start && item.period_end ? `${formatIsoDate(item.period_start)} → ${formatIsoDate(item.period_end)}` : "—"}
               </TD>
               <TD>{item.quantity}</TD>
               <TD className="tabular-nums">R {parseFloat(item.unit_price).toFixed(2)}</TD>
@@ -293,6 +415,47 @@ export function InvoiceDetailPage() {
           ))}
         </tbody>
       </Table>
+
+      <div className="mt-6 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className="text-sm font-semibold">Comments for the client</h2>
+          {!editingComment && invoice.status !== "cancelled" && (
+            <button
+              type="button"
+              className="text-xs font-medium text-[var(--series-1)] hover:underline"
+              onClick={() => {
+                setCommentDraft(invoice.note || "");
+                setCommentError("");
+                setEditingComment(true);
+              }}
+            >
+              {invoice.note ? "Edit" : "+ Add comment"}
+            </button>
+          )}
+        </div>
+        {editingComment ? (
+          <>
+            <textarea
+              className={inputClass}
+              rows={4}
+              maxLength={2000}
+              value={commentDraft}
+              onChange={(e) => setCommentDraft(e.target.value)}
+            />
+            {commentError && <p className="mt-1 text-sm text-[var(--status-critical)]">{commentError}</p>}
+            <div className="mt-2 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setEditingComment(false)}>Cancel</button>
+              <button type="button" className={btnPrimary} disabled={commentSaving} onClick={saveComment}>
+                {commentSaving ? "Saving…" : "Save comment"}
+              </button>
+            </div>
+          </>
+        ) : invoice.note ? (
+          <p className="whitespace-pre-line text-sm text-[var(--text-secondary)]">{invoice.note}</p>
+        ) : (
+          <p className="text-sm text-[var(--text-muted)]">None. Anything added here prints on the {docNoun} PDF.</p>
+        )}
+      </div>
 
       <h2 className="mb-2 mt-6 text-sm font-semibold">Payments</h2>
       <Table>
@@ -307,7 +470,7 @@ export function InvoiceDetailPage() {
         <tbody>
           {payments.map((p) => (
             <TR key={p.id}>
-              <TD>{new Date(p.date).toLocaleDateString()}</TD>
+              <TD>{formatIsoDate(p.date)}</TD>
               <TD className="tabular-nums">R {parseFloat(p.amount).toFixed(2)}</TD>
               <TD className="capitalize">{p.method.replace("_", " ")}</TD>
               <TD>{p.received_by_name ?? "—"}</TD>
@@ -318,8 +481,13 @@ export function InvoiceDetailPage() {
       </Table>
 
       {showModal && (
-        <Modal title="Record payment" onClose={() => setShowModal(false)}>
+        <Modal title="Record payment" onClose={() => { setShowModal(false); setPaymentError(""); }}>
           <form onSubmit={handleSubmit}>
+            {paymentError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {paymentError}
+              </p>
+            )}
             <FormField label="Amount (R)">
               <input type="number" step="0.01" required className={inputClass} value={amount} onChange={(e) => setAmount(e.target.value)} />
             </FormField>
@@ -333,8 +501,38 @@ export function InvoiceDetailPage() {
               </select>
             </FormField>
             <div className="mt-4 flex justify-end gap-2">
-              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
+              <button type="button" className={btnSecondary} onClick={() => { setShowModal(false); setPaymentError(""); }}>Cancel</button>
               <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Record payment"}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {showCancel && (
+        <Modal title={`Cancel ${invoice.number}`} onClose={() => setShowCancel(false)}>
+          <form onSubmit={handleCancel}>
+            <p className="mb-3 text-sm text-[var(--text-secondary)]">
+              {invoice.status === "quote" || invoice.status === "proforma"
+                ? `The ${docNoun} is kept, marked Cancelled, and can't be sent or converted any more.`
+                : `The invoice is kept with its number, marked Cancelled: R${parseFloat(invoice.total).toFixed(2)} comes off the client's balance and it no longer counts for VAT. If it was already declared on a VAT return, credit the client instead of cancelling.`}{" "}
+              The reason is added to its comment.
+            </p>
+            <FormField label="Reason">
+              <textarea
+                className={inputClass}
+                rows={3}
+                required
+                value={cancelReason}
+                onChange={(e) => setCancelReason(e.target.value)}
+                placeholder="e.g. Raised on the wrong client, client declined the quote…"
+              />
+            </FormField>
+            {cancelError && <p className="mb-3 text-sm text-red-700 dark:text-red-300">{cancelError}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowCancel(false)}>Keep it</button>
+              <button type="submit" disabled={cancelBusy || !cancelReason.trim()} className={btnPrimary}>
+                {cancelBusy ? "Cancelling…" : `Cancel ${docNoun}`}
+              </button>
             </div>
           </form>
         </Modal>

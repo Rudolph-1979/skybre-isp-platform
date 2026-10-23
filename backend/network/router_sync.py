@@ -23,12 +23,49 @@ def resolve_service_ip(service):
     nothing's assigned yet."""
     from billing.models import Service
 
+    from .models import IPPool
+
+    # A SUSPENDED PPPoE service is on the walled garden, and that is the
+    # address its traffic actually comes from. Its normal customer-pool
+    # address is deliberately LEFT ASSIGNED while suspended (see
+    # radiusauth.signals._allocate_walled_garden_ip) so it can be handed
+    # back on reactivation -- so the service holds two addresses, and this
+    # used to return whichever sorted first by string. That is how the
+    # firewall drop rule ended up pointing at an address the suspended
+    # customer was not using: the block did not bite, and worse, once that
+    # customer-pool address was recycled to somebody else, the rule would
+    # have started dropping a paying customer's traffic instead.
+    #
+    # Falls back to the ordinary lookup when no walled-garden address is
+    # held -- a deployment with no walled-garden pool configured never gets
+    # one, and there the last known customer address is still the best
+    # guess available.
+    if (
+        service.status == Service.Status.SUSPENDED
+        and service.radius_connection_type == Service.ConnectionType.PPPOE
+    ):
+        walled = service.ip_addresses.filter(
+            pool__category=IPPool.Category.WALLED_GARDEN
+        ).first()
+        if walled:
+            return walled.address
+
     if (
         service.radius_connection_type == Service.ConnectionType.PPPOE
         and service.ip_assignment_mode == Service.IPAssignmentMode.MANUAL
     ):
         return service.static_ip or None
-    addr = service.ip_addresses.first()
+
+    # Category-filtered, matching the allocator that handed the address
+    # out: PPPoE draws from a "customer" pool, OVPN from a "network" one.
+    # Unfiltered, a service holding both (an OVPN address from before it
+    # was moved to PPPoE, say) returned whichever sorted first.
+    category = (
+        IPPool.Category.CUSTOMER
+        if service.radius_connection_type == Service.ConnectionType.PPPOE
+        else IPPool.Category.NETWORK
+    )
+    addr = service.ip_addresses.filter(pool__category=category).first()
     return addr.address if addr else None
 
 

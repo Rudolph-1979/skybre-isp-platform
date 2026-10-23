@@ -41,6 +41,18 @@ class IsAccounts(BasePermission):
         return bool(user and user.is_authenticated and user.role in (user.Role.ACCOUNTS, user.Role.ADMIN))
 
 
+class IsNOC(BasePermission):
+    """Can decide a ticket escalation -- User.is_noc, or Admin as the
+    system-wide override used everywhere else in this app. Deliberately
+    not role-based: NOC is a capability a staff member (typically, but
+    not necessarily, Support) is individually granted, not a Role of its
+    own -- see User.is_noc's docstring."""
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user and user.is_authenticated and (user.is_noc or user.role == user.Role.ADMIN))
+
+
 class IsAccountsOrManagement(BasePermission):
     """Accounts, Management, or Admin -- who can see/work with credit
     requests at all. Narrower than IsStaffMember since this is financial
@@ -64,9 +76,22 @@ def user_can_access_section(user, section):
     this check (their own view logic already scopes what they can see).
     Admin always passes, regardless of allowed_sections, so a restriction
     can never accidentally lock the Admin account out of part of the app.
-    An empty allowed_sections list means unrestricted (the default for
-    every account until an admin deliberately narrows it), so this is
-    fully backward-compatible with accounts that predate this feature.
+
+    AN EMPTY LIST MEANS NO SECTIONS. It used to mean unrestricted, for
+    backward compatibility with accounts predating the feature -- which
+    was reasonable for that one migration and wrong as a standing rule,
+    because empty is also what every NEW account starts with. The effect
+    was that this whole mechanism was opt-in: any staff account nobody had
+    deliberately narrowed could open Accountant (every salary, the VAT
+    returns, the bank feeds) and Configs (SMTP, RADIUS and bank API
+    credentials). On this database that was nine of nine non-admin staff,
+    including three technicians.
+
+    Migration 00xx_backfill_allowed_sections gives every account that
+    existed at the time an explicit list for its role, so flipping this
+    took nobody's access away. From here a new account starts with
+    nothing and is granted what it needs, which is the only default that
+    fails safe.
     """
     if not user or not user.is_authenticated:
         return False
@@ -74,10 +99,7 @@ def user_can_access_section(user, section):
         return True
     if user.role == user.Role.ADMIN:
         return True
-    allowed = user.allowed_sections or []
-    if not allowed:
-        return True
-    return section in allowed
+    return section in (user.allowed_sections or [])
 
 
 def section_permission(section):

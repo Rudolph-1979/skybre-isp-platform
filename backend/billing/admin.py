@@ -1,5 +1,7 @@
 from django.contrib import admin
-from .models import Tariff, Service, Invoice, InvoiceItem, Payment, CreditRequest
+from .models import (
+    Tariff, Service, Invoice, InvoiceItem, Payment, CreditRequest, PublicHoliday,
+)
 
 
 @admin.register(Tariff)
@@ -11,6 +13,11 @@ class TariffAdmin(admin.ModelAdmin):
 class ServiceAdmin(admin.ModelAdmin):
     list_display = ("customer", "tariff", "status", "start_date")
     list_filter = ("status",)
+    # Same reasoning as network.DeviceAdmin: ServiceSerializer makes this
+    # write_only with a radius_password_set boolean, and the admin's
+    # default form rendered the subscriber's actual RADIUS password as
+    # editable plain text. It is set from the Services page.
+    exclude = ("radius_password",)
 
 
 class InvoiceItemInline(admin.TabularInline):
@@ -50,3 +57,14 @@ class PaymentAdmin(admin.ModelAdmin):
 class CreditRequestAdmin(admin.ModelAdmin):
     list_display = ("customer", "amount", "status", "requested_by", "decided_by", "created_at")
     list_filter = ("status",)
+
+
+@admin.register(PublicHoliday)
+class PublicHolidayAdmin(admin.ModelAdmin):
+    list_display = ("date", "name", "seeded")
+    list_filter = ("seeded",)
+    search_fields = ("name",)
+    date_hierarchy = "date"
+    # Fully editable on purpose. This table is the answer to "the government
+    # declared a holiday for next Wednesday", and that answer cannot require
+    # a deploy.

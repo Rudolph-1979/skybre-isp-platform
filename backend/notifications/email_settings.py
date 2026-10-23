@@ -14,6 +14,10 @@ django.conf.settings.EMAIL_* directly, so a change saved in the UI takes
 effect on the very next email sent -- no container restart required.
 """
 
+# Seconds to wait on the SMTP socket. See get_email_connection for why a
+# limit here is not optional.
+SMTP_TIMEOUT_SECONDS = 20
+
 from django.conf import settings
 from django.core.mail import get_connection
 
@@ -43,6 +47,20 @@ def get_email_connection():
     cfg = get_email_config()
     if not cfg["host"]:
         return get_connection(backend="django.core.mail.backends.console.EmailBackend")
+    # Under `manage.py test` Django swaps EMAIL_BACKEND for the in-memory
+    # locmem backend so a test run can never send real mail. Naming the SMTP
+    # backend explicitly below -- which this function must do, to apply the
+    # DB-stored EmailSettings -- defeated that: every test that sent an email
+    # authenticated against the live mailbox, filling the test output with
+    # 535s and risking the mail host throttling the server's IP.
+    #
+    # Narrow on purpose. "Anything that isn't SMTP" would break real sending,
+    # because settings.EMAIL_BACKEND is derived from .env's EMAIL_HOST while
+    # the host actually used can come from the DB row -- a blank .env with a
+    # configured row would start printing customer mail to the container log.
+    # locmem is only ever set by the test runner.
+    if settings.EMAIL_BACKEND.endswith("locmem.EmailBackend"):
+        return get_connection(backend=settings.EMAIL_BACKEND)
     return get_connection(
         backend="django.core.mail.backends.smtp.EmailBackend",
         host=cfg["host"],
@@ -51,4 +69,19 @@ def get_email_connection():
         password=cfg["password"],
         use_tls=cfg["use_tls"],
         use_ssl=cfg["use_ssl"],
+        # Without a timeout Django passes None to smtplib.SMTP, which is a
+        # blocking socket with no deadline -- so a half-open connection to
+        # the mail relay hangs the caller forever.
+        #
+        # That matters most where nobody is watching. A recurring-billing
+        # run sends one email per customer, serially, inside the same
+        # process: customers 1-299 get their invoices, customer 300 blocks
+        # on the socket, and 301-1592 are never billed at all, with the
+        # RecurringBillingRun row left on PROCESSED and zeroed counts
+        # because the summary write is never reached.
+        #
+        # 20 seconds is deliberately generous for a handshake and still
+        # bounded. Compare the RouterOS API at 8s and CoA at 4s -- mail was
+        # the only outbound call in the platform with no limit at all.
+        timeout=SMTP_TIMEOUT_SECONDS,
     )

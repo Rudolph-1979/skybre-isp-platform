@@ -1,18 +1,45 @@
+import datetime
+
 from django.utils import timezone
 from rest_framework import permissions, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 
 from accounts.permissions import IsStaffMember, section_permission
-from .models import FuelLog, OdometerReading, ServiceRecord, Vehicle
+# Aliased: this viewset also has an action called `renewals`, and two
+# things of that name in one file is a trap waiting for the next person.
+from . import renewals as renewal_rules
+from .models import FuelLog, OdometerReading, ServiceRecord, TripLog, TyreRotation, Vehicle
 from .serializers import (
     FuelLogSerializer,
+    TripLogSerializer,
     OdometerReadingSerializer,
     ServiceRecordSerializer,
+    TyreRotationSerializer,
     VehicleSerializer,
 )
 
 HasVehiclesAccess = section_permission("vehicles")
+
+
+def _display_name(user):
+    if not user:
+        return None
+    return user.get_full_name() or user.username
+
+
+def _service_moment(event_date):
+    """The instant a service (or tyre rotation)'s odometer reading belongs
+    at. Both get written up days after the vehicle came back, so a
+    backdated one has to be filed at the end of the day it actually
+    happened -- stamped with "now" it would be checked against readings
+    taken weeks later, and an ordinary late write-up would be refused."""
+    if event_date >= timezone.localdate():
+        return timezone.now()
+    return timezone.make_aware(
+        datetime.datetime.combine(event_date, datetime.time.max), timezone.get_current_timezone()
+    )
 
 
 class VehicleViewSet(viewsets.ModelViewSet):
@@ -20,7 +47,10 @@ class VehicleViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasVehiclesAccess]
     queryset = (
         Vehicle.objects.select_related("assigned_to")
-        .prefetch_related("odometer_readings", "service_records", "fuel_logs")
+        .prefetch_related(
+            "odometer_readings", "service_records", "fuel_logs",
+            "expenses__supplier", "expenses__service_record",
+        )
         .all()
     )
     filterset_fields = ["assigned_to", "is_active"]
@@ -32,7 +62,8 @@ class VehicleViewSet(viewsets.ModelViewSet):
         higher than the latest logged reading, also logs a fresh
         OdometerReading -- so "current km" stays in sync with what was
         actually seen at the workshop, without needing a separate manual
-        step."""
+        step. The number is checked against the vehicle's reading history
+        first, because a slipped digit here poisons both."""
         vehicle = self.get_object()
         service_date = request.data.get("service_date")
         odometer_km = request.data.get("odometer_km")
@@ -41,11 +72,103 @@ class VehicleViewSet(viewsets.ModelViewSet):
         if not service_date or odometer_km is None:
             return Response({"detail": "service_date and odometer_km are required."}, status=400)
         try:
+            service_date = datetime.date.fromisoformat(service_date)
+        except (TypeError, ValueError):
+            # It used to reach the database as a raw string and blow up
+            # with a 500, which tells whoever is on the phone nothing.
+            return Response({"detail": "service_date must be a date (YYYY-MM-DD)."}, status=400)
+        try:
             odometer_km = int(odometer_km)
         except (TypeError, ValueError):
             return Response({"detail": "odometer_km must be a whole number."}, status=400)
         if odometer_km < 0:
             return Response({"detail": "odometer_km can't be negative."}, status=400)
+
+        # The workshop invoice, optional (13 Oct 2026): an expense already
+        # captured with this vehicle picked, and not yet tied to a service.
+        expense = None
+        expense_id = request.data.get("expense")
+        if expense_id not in (None, ""):
+            from django.core.exceptions import ObjectDoesNotExist
+
+            from expenses.models import Expense
+
+            expense = Expense.objects.filter(pk=expense_id, vehicle=vehicle).first() if str(expense_id).isdigit() else None
+            if expense is None:
+                return Response({"expense": ["That invoice isn't one of this vehicle's expenses."]}, status=400)
+            try:
+                expense.service_record
+            except ObjectDoesNotExist:
+                pass
+            else:
+                return Response({"expense": ["That invoice is already linked to another service."]}, status=400)
+
+        # The odometer typed here also lands in the vehicle's reading
+        # history, so it gets the same check as a reading logged by hand --
+        # which catches a digit slipped DOWNWARDS (4500 for 45000), where
+        # the number contradicts a reading already on file.
+        #
+        # It does NOT catch one slipped upwards. 450000 for 45000 is the
+        # newest and highest reading, so nothing on file contradicts it,
+        # and no rule here can tell it from a vehicle that genuinely has
+        # not been read in a long time without inventing a threshold. An
+        # earlier version of this comment claimed the upward slip was
+        # prevented. It is not. What is true is that it is now RECOVERABLE:
+        # both the reading and the service record can be corrected from the
+        # vehicle page.
+        #
+        # A failed check does not refuse the service. The service happened;
+        # refusing to record it strands the vehicle on "In Service" with no
+        # way forward, and the odometer is the least important thing on the
+        # record. Workshop invoices routinely round -- 45 000 against a
+        # driver's 45 123 two days earlier is a rounding, not a lie -- and
+        # that used to return 400 and lose the whole service.
+        reading = OdometerReadingSerializer(
+            data={
+                "vehicle": vehicle.pk,
+                "reading_km": odometer_km,
+                "recorded_at": _service_moment(service_date),
+                "notes": "Logged automatically from a service record.",
+            }
+        )
+        # One number IS refusable without inventing a threshold: one that
+        # would make the service overdue the moment it is recorded. Next
+        # due is odometer + interval, so if that lands behind the km the
+        # vehicle has already done, the figure cannot be what the workshop
+        # saw -- 4 500 typed for 45 000 on a 10 000 km interval is due at
+        # 14 500 against 45 000 already travelled. Recording it would set
+        # the bakkie to Overdue the moment it drove out and keep it there.
+        # This is derived from the vehicle's own interval rather than a
+        # guessed tolerance, which is why it can be a hard refusal.
+        # Guarded on the interval being set at all. It is a
+        # PositiveIntegerField with no lower bound and is writable through
+        # the API, so a vehicle serviced on time rather than distance can
+        # sit at 0 -- and with 0, "next service" is wherever it was last
+        # serviced, so this test refuses every ordinary figure and no
+        # service could be recorded for that vehicle at all. Without an
+        # interval there is no born-overdue to derive, so there is nothing
+        # to refuse on.
+        if (
+            vehicle.service_interval_km
+            and odometer_km + vehicle.service_interval_km <= vehicle.current_odometer_km
+        ):
+            return Response(
+                {"odometer_km": [
+                    f"{odometer_km:,} km would put this vehicle's next service at "
+                    f"{odometer_km + vehicle.service_interval_km:,} km, which it passed a while ago "
+                    f"-- it has already done {vehicle.current_odometer_km:,} km. Check the figure "
+                    f"on the invoice."
+                ]},
+                status=400,
+            )
+
+        odometer_warning = None
+        if not reading.is_valid():
+            odometer_warning = (
+                "The service was recorded, but this odometer reading was not added to the "
+                "vehicle's history because it contradicts a reading already on file: "
+                + " ".join(str(m) for messages in reading.errors.values() for m in messages)
+            )
 
         ServiceRecord.objects.create(
             vehicle=vehicle,
@@ -53,15 +176,10 @@ class VehicleViewSet(viewsets.ModelViewSet):
             odometer_km=odometer_km,
             notes=notes,
             logged_by=request.user,
+            expense=expense,
         )
-        if odometer_km > vehicle.current_odometer_km:
-            OdometerReading.objects.create(
-                vehicle=vehicle,
-                reading_km=odometer_km,
-                recorded_at=timezone.now(),
-                recorded_by=request.user,
-                notes="Logged automatically from a service record.",
-            )
+        if odometer_warning is None and odometer_km > vehicle.current_odometer_km:
+            reading.save(recorded_by=request.user)
         # Logging the service IS the vehicle coming back from the workshop,
         # so it comes off "In Service" here rather than needing a second,
         # separate act that somebody will forget. Without this, a vehicle
@@ -71,7 +189,265 @@ class VehicleViewSet(viewsets.ModelViewSet):
             vehicle.in_service_since = None
             vehicle.save(update_fields=["in_service_since"])
         vehicle.refresh_from_db()
-        return Response(VehicleSerializer(vehicle).data, status=201)
+        payload = VehicleSerializer(vehicle).data
+        if odometer_warning:
+            # Surfaced rather than swallowed: the service saved, but the
+            # figure on the workshop invoice disagrees with the vehicle's
+            # history and somebody has to look at it.
+            payload["odometer_warning"] = odometer_warning
+        return Response(payload, status=201)
+
+    @action(detail=True, methods=["post"], url_path="mark-tyres-rotated")
+    def mark_tyres_rotated(self, request, pk=None):
+        """Logs a TyreRotation for this vehicle -- the same shape as
+        mark_serviced above (odometer cross-checked against the reading
+        history, a born-overdue figure refused, a fresh OdometerReading
+        logged if the figure given is higher than what's on file), except
+        it does NOT touch in_service_since. Being at the workshop for a
+        service is a different fact from this visit including a rotation,
+        so logging one must not silently clear the other."""
+        vehicle = self.get_object()
+        rotation_date = request.data.get("rotation_date")
+        odometer_km = request.data.get("odometer_km")
+        notes = request.data.get("notes", "")
+
+        if not rotation_date or odometer_km is None:
+            return Response({"detail": "rotation_date and odometer_km are required."}, status=400)
+        try:
+            rotation_date = datetime.date.fromisoformat(rotation_date)
+        except (TypeError, ValueError):
+            return Response({"detail": "rotation_date must be a date (YYYY-MM-DD)."}, status=400)
+        try:
+            odometer_km = int(odometer_km)
+        except (TypeError, ValueError):
+            return Response({"detail": "odometer_km must be a whole number."}, status=400)
+        if odometer_km < 0:
+            return Response({"detail": "odometer_km can't be negative."}, status=400)
+
+        reading = OdometerReadingSerializer(
+            data={
+                "vehicle": vehicle.pk,
+                "reading_km": odometer_km,
+                "recorded_at": _service_moment(rotation_date),
+                "notes": "Logged automatically from a tyre rotation record.",
+            }
+        )
+        # Same born-overdue refusal mark_serviced applies, off this
+        # vehicle's OWN tyre_rotation_interval_km rather than its service
+        # interval -- the two schedules are independent, so a figure that
+        # would be perfectly fine against one could still be impossible
+        # against the other.
+        if (
+            vehicle.tyre_rotation_interval_km
+            and odometer_km + vehicle.tyre_rotation_interval_km <= vehicle.current_odometer_km
+        ):
+            return Response(
+                {"odometer_km": [
+                    f"{odometer_km:,} km would put this vehicle's next tyre rotation at "
+                    f"{odometer_km + vehicle.tyre_rotation_interval_km:,} km, which it passed a while "
+                    f"ago -- it has already done {vehicle.current_odometer_km:,} km. Check the figure."
+                ]},
+                status=400,
+            )
+
+        odometer_warning = None
+        if not reading.is_valid():
+            odometer_warning = (
+                "The tyre rotation was recorded, but this odometer reading was not added to the "
+                "vehicle's history because it contradicts a reading already on file: "
+                + " ".join(str(m) for messages in reading.errors.values() for m in messages)
+            )
+
+        TyreRotation.objects.create(
+            vehicle=vehicle,
+            rotation_date=rotation_date,
+            odometer_km=odometer_km,
+            notes=notes,
+            logged_by=request.user,
+        )
+        if odometer_warning is None and odometer_km > vehicle.current_odometer_km:
+            reading.save(recorded_by=request.user)
+        vehicle.refresh_from_db()
+        payload = VehicleSerializer(vehicle).data
+        if odometer_warning:
+            payload["odometer_warning"] = odometer_warning
+        return Response(payload, status=201)
+
+    # ------------------------------------------------------------------
+    # Licence renewals.
+    #
+    # Two different documents expire and both are somebody's problem on the
+    # same morning: the vehicle's licence disc, and the driver's licence of
+    # whoever is behind the wheel. They are served from one endpoint
+    # because they are read as one list -- "what is going to make one of
+    # our vehicles illegal, and when". Split across two screens, whoever
+    # checks one forgets the other, which is the failure this exists to
+    # prevent.
+    #
+    # It lives under the vehicles section rather than payroll for the same
+    # reason. What is exposed here is a name and a date, not pay; and if
+    # seeing the list needed one permission while fixing half of it needed
+    # another, the person who checks would not be the person who can act.
+    # ------------------------------------------------------------------
+
+    def _driver_profiles(self):
+        """Staff whose licence belongs on the renewals list.
+
+        Somebody with a vehicle assigned, OR with a licence number or a
+        date already captured. Not every employee: the office staff who
+        will never drive a company bakkie would be noise on this list, and
+        a list that is mostly noise gets skimmed.
+
+        The first arm matters more than it looks. A driver assigned a
+        vehicle with NOTHING captured still appears -- as "unknown", which
+        is the row somebody has to go and fill in. Filtering on captured
+        data alone would have made the people nobody has checked exactly
+        the people who never show up.
+        """
+        from django.db.models import Q
+        from payroll.models import StaffProfile
+
+        drivers = Vehicle.objects.filter(
+            is_active=True, assigned_to__isnull=False
+        ).values_list("assigned_to_id", flat=True)
+        return (
+            StaffProfile.objects.filter(is_active=True)
+            .filter(Q(user_id__in=list(drivers)) | ~Q(license_number="") | Q(license_expiry__isnull=False))
+            .select_related("user")
+            .distinct()
+        )
+
+    @action(detail=False, methods=["get"])
+    def renewals(self, request):
+        """Everything that expires, worst first.
+
+        The dashboard tile and the Renewals tab both read this one
+        endpoint, so the number on the tile and the number of rows on the
+        tab cannot drift apart -- which they would within a week if the
+        tile were counted from a separate summary query.
+        """
+        today = timezone.localdate()
+        rows = []
+
+        for vehicle in Vehicle.objects.filter(is_active=True).select_related("assigned_to"):
+            rows.append({
+                "kind": "vehicle_disc",
+                "key": f"vehicle-{vehicle.pk}",
+                "vehicle_id": vehicle.pk,
+                "staff_profile_id": None,
+                "title": vehicle.registration_number,
+                "subtitle": f"{vehicle.year} {vehicle.make} {vehicle.model}",
+                "holder": _display_name(vehicle.assigned_to) or "Unassigned",
+                "document": "Licence disc",
+                "expiry": vehicle.licence_expiry,
+                "days_left": vehicle.licence_days_left,
+                "status": vehicle.licence_status,
+                "notice_days": Vehicle.RENEWAL_NOTICE_DAYS,
+                "term_years": Vehicle.LICENCE_TERM_YEARS,
+            })
+
+        for profile in self._driver_profiles():
+            rows.append({
+                "kind": "driver_licence",
+                "key": f"driver-{profile.pk}",
+                "vehicle_id": None,
+                "staff_profile_id": profile.pk,
+                "title": profile.user.get_full_name() or profile.user.username,
+                "subtitle": profile.license_number or "No licence number on file",
+                "holder": profile.employee_number,
+                "document": "Driver's licence",
+                "expiry": profile.license_expiry,
+                "days_left": profile.license_days_left,
+                "status": profile.license_status,
+                "notice_days": profile.RENEWAL_NOTICE_DAYS,
+                "term_years": profile.LICENCE_TERM_YEARS,
+            })
+
+        rows.sort(key=lambda r: (
+            renewal_rules.sort_key(r["status"], r["expiry"], r["days_left"]), r["title"]
+        ))
+
+        counts = {
+            state: 0
+            for state in (
+                renewal_rules.EXPIRED, renewal_rules.DUE_SOON,
+                renewal_rules.UNKNOWN, renewal_rules.OK,
+            )
+        }
+        for row in rows:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        # One number for the tile, defined here rather than added up in the
+        # browser, so "needs attention" means the same thing everywhere it
+        # is shown. Unknown counts towards it: a date nobody has captured
+        # could already have passed.
+        counts["action_needed"] = sum(counts[s] for s in renewal_rules.ACTION_NEEDED)
+
+        return Response({
+            "as_of": today,
+            "vehicle_notice_days": Vehicle.RENEWAL_NOTICE_DAYS,
+            "counts": counts,
+            "results": rows,
+        })
+
+    @action(detail=True, methods=["post"], url_path="renew-licence")
+    def renew_licence(self, request, pk=None):
+        """Record that this vehicle's disc has been renewed.
+
+        With no date in the body it moves a year on from the CURRENT
+        expiry, not from today -- renewing three weeks early should not
+        throw those three weeks away, and early is exactly when people
+        renew. Once the old date has passed there is nothing left to
+        extend, so it counts from today instead. See renewals.next_expiry.
+        """
+        vehicle = self.get_object()
+        supplied, problem = renewal_rules.isoparse(request.data.get("licence_expiry"))
+        if problem:
+            return Response({"licence_expiry": [problem]}, status=400)
+        new_expiry = supplied or renewal_rules.next_expiry(
+            vehicle.licence_expiry, Vehicle.LICENCE_TERM_YEARS
+        )
+        serializer = VehicleSerializer(
+            vehicle, data={"licence_expiry": new_expiry.isoformat()}, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["post"], url_path="renew-driver-licence")
+    def renew_driver_licence(self, request):
+        """Record that a staff member's driver's licence has been renewed.
+
+        On this viewset, not on payroll's, on purpose: it is pressed from
+        the Renewals tab, by whoever runs the fleet. Writing through
+        payroll's own viewset would mean that person needs the payroll
+        section -- which is pay, tax and leave balances -- to type a date
+        off a licence card.
+
+        Only the one date is written (`update_fields`), so nothing else on
+        a payroll record can be touched through this door.
+        """
+        from payroll.models import StaffProfile
+        from payroll.serializers import StaffProfileSerializer
+
+        profile_id = request.data.get("staff_profile")
+        try:
+            profile = StaffProfile.objects.select_related("user").get(pk=profile_id)
+        except (StaffProfile.DoesNotExist, TypeError, ValueError):
+            return Response({"staff_profile": ["No such staff member."]}, status=400)
+
+        supplied, problem = renewal_rules.isoparse(request.data.get("license_expiry"))
+        if problem:
+            return Response({"license_expiry": [problem]}, status=400)
+        new_expiry = supplied or renewal_rules.next_expiry(
+            profile.license_expiry, StaffProfile.LICENCE_TERM_YEARS
+        )
+        sanity = renewal_rules.expiry_is_sane(new_expiry, StaffProfile.LICENCE_TERM_YEARS)
+        if sanity:
+            return Response({"license_expiry": [sanity]}, status=400)
+
+        profile.license_expiry = new_expiry
+        profile.save(update_fields=["license_expiry"])
+        return Response(StaffProfileSerializer(profile).data)
 
     @action(detail=True, methods=["post"], url_path="book-in")
     def book_in(self, request, pk=None):
@@ -106,11 +482,32 @@ class OdometerReadingViewSet(viewsets.ModelViewSet):
 class ServiceRecordViewSet(viewsets.ModelViewSet):
     serializer_class = ServiceRecordSerializer
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasVehiclesAccess]
-    queryset = ServiceRecord.objects.select_related("vehicle", "logged_by").all()
+    queryset = ServiceRecord.objects.select_related("vehicle", "logged_by", "expense__supplier").all()
     filterset_fields = ["vehicle"]
 
     def perform_create(self, serializer):
         serializer.save(logged_by=self.request.user)
+
+
+class TyreRotationViewSet(viewsets.ModelViewSet):
+    serializer_class = TyreRotationSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasVehiclesAccess]
+    queryset = TyreRotation.objects.select_related("vehicle", "logged_by").all()
+    filterset_fields = ["vehicle"]
+
+    def perform_create(self, serializer):
+        serializer.save(logged_by=self.request.user)
+
+
+class TripLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """Trips technicians logged in the Conecto app (7 Oct 2026)."""
+
+    serializer_class = TripLogSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasVehiclesAccess]
+    filterset_fields = ["vehicle"]
+
+    def get_queryset(self):
+        return TripLog.objects.select_related("vehicle", "driver").all()
 
 
 class FuelLogViewSet(viewsets.ModelViewSet):
@@ -121,3 +518,37 @@ class FuelLogViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(logged_by=self.request.user)
+
+    @action(detail=False, methods=["post"], url_path="import-fleetcard", parser_classes=[MultiPartParser])
+    def import_fleetcard(self, request):
+        """FNB Fleetcard statement file -> fuel log (#201). POST the file as
+        `file`; without `commit=1` it only shows what would happen."""
+        from . import fleetcard
+
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "Choose the FNB Fleetcard file (e.g. 84389.txt)."}, status=400)
+        if upload.size > 5 * 1024 * 1024:
+            return Response({"detail": "That file is over 5 MB — not an FNB Fleetcard statement."}, status=400)
+        try:
+            parsed = fleetcard.parse(upload.read().decode("latin-1"))
+        except fleetcard.FleetcardError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        rows = fleetcard.plan(parsed)
+        commit = str(request.data.get("commit") or request.query_params.get("commit") or "") in ("1", "true", "yes")
+        created = readings = 0
+        if commit:
+            created, readings = fleetcard.commit(rows, request.user)
+        counts = {}
+        for row in rows:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        return Response({
+            "client": parsed["client"],
+            "statement_date": parsed["statement_date"],
+            "committed": commit,
+            "created": created,
+            "odometer_readings": readings,
+            "counts": counts,
+            "errors": parsed["errors"],
+            "rows": [fleetcard.row_json(r) for r in rows],
+        })

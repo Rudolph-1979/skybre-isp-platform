@@ -1,0 +1,128 @@
+import { useEffect, useRef, useState } from "react";
+
+export interface MultiSelectOption {
+  value: number | string;
+  label: string;
+}
+
+/**
+ * A filter that means "these ones", not "this one".
+ *
+ * Modelled on ColumnToggle's checkbox dropdown rather than a native
+ * `<select multiple>`: the native control needs ctrl-click to add a second
+ * item, silently drops the rest of the selection on a plain click, and
+ * renders as a scrolling box that takes up a fixed slab of the page. On a
+ * filter bar that is three wrong behaviours and a layout problem.
+ *
+ * EMPTY MEANS ALL, the same convention the platform already uses for a
+ * device's visible_partners and a staff account's allowed_partners. So the
+ * unfiltered state is the natural one, and there is no way to land on
+ * "nothing selected, nothing shown" and wonder where the data went.
+ *
+ * That convention is right for a FILTER (nothing ticked = don't narrow the
+ * list) and wrong for a FIELD (nothing ticked = a real, distinct value --
+ * an unassigned job, say -- not "assign to everyone"). Pass `emptyLabel`
+ * for the second kind: zero selected reads as that label instead of
+ * `allLabel`, and a full selection is shown as a plain count rather than
+ * collapsed to "All", because picking every single option is a real,
+ * deliberate choice there, not the same as applying no filter.
+ */
+export function MultiSelect({
+  options,
+  selected,
+  onChange,
+  allLabel = "All",
+  emptyLabel,
+  nounPlural = "selected",
+  className = "",
+  buttonClassName,
+}: {
+  options: MultiSelectOption[];
+  selected: (number | string)[];
+  onChange: (next: (number | string)[]) => void;
+  allLabel?: string;
+  emptyLabel?: string;
+  nounPlural?: string;
+  className?: string;
+  /** Replaces the trigger button's look, e.g. to match a row of <select>s. */
+  buttonClassName?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function onClickOutside(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, []);
+
+  function toggle(value: number | string) {
+    onChange(
+      selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value]
+    );
+  }
+
+  // "3 of 9 selected" rather than a list of names: the names are one click
+  // away, and a filter button that grows with the selection pushes the rest
+  // of the toolbar around every time somebody ticks a box.
+  const summary =
+    emptyLabel !== undefined
+      ? selected.length === 0
+        ? emptyLabel
+        : `${selected.length} of ${options.length} ${nounPlural}`
+      : selected.length === 0 || selected.length === options.length
+      ? allLabel
+      : `${selected.length} of ${options.length} ${nounPlural}`;
+
+  return (
+    <div className={`relative ${className}`} ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className={
+          buttonClassName
+            ? `flex items-center gap-2 ${buttonClassName}`
+            : "flex items-center gap-2 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-1)] px-3 py-1.5 text-sm text-[var(--text-primary)] hover:bg-[var(--tint-hover)]"
+        }
+      >
+        {summary}
+        <span aria-hidden className="text-[var(--text-muted)]">▾</span>
+      </button>
+
+      {open && (
+        <div className="absolute left-0 z-20 mt-1 max-h-72 w-64 overflow-auto rounded-md border border-[var(--border-hairline)] bg-[var(--surface-1)] p-2 shadow-lg">
+          <div className="mb-1 flex gap-2 border-b border-[var(--border-hairline)] pb-2">
+            <button
+              type="button"
+              className="text-xs text-[var(--series-1)] hover:underline"
+              onClick={() => onChange(options.map((o) => o.value))}
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              className="text-xs text-[var(--series-1)] hover:underline"
+              onClick={() => onChange([])}
+            >
+              Clear
+            </button>
+          </div>
+          {options.length === 0 && (
+            <p className="px-2 py-1.5 text-sm text-[var(--text-muted)]">Nothing to choose from.</p>
+          )}
+          {options.map((o) => (
+            <label
+              key={o.value}
+              className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--tint-hover)]"
+            >
+              <input type="checkbox" checked={selected.includes(o.value)} onChange={() => toggle(o.value)} />
+              {o.label}
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

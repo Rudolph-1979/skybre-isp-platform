@@ -1,0 +1,2513 @@
+from decimal import ROUND_HALF_UP, Decimal
+
+from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import IntegrityError, models, transaction
+from django.db.models import BigIntegerField, Max
+from django.db.models.functions import Cast, Substr
+from django.utils import timezone
+
+
+class Tariff(models.Model):
+    class ServiceType(models.TextChoices):
+        INTERNET = "internet", "Internet"
+        VOICE = "voice", "Voice"
+        BUNDLE = "bundle", "Bundle"
+        OTHER = "other", "Other"
+
+    class BillingPeriod(models.TextChoices):
+        MONTHLY = "monthly", "Monthly"
+        QUARTERLY = "quarterly", "Quarterly"
+        ANNUALLY = "annually", "Annually"
+
+    name = models.CharField(max_length=150)
+    service_type = models.CharField(max_length=20, choices=ServiceType.choices, default=ServiceType.INTERNET)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    billing_period = models.CharField(max_length=20, choices=BillingPeriod.choices, default=BillingPeriod.MONTHLY)
+    # Kbps, matching network.ConnectionRule's speed_down_kbps/speed_up_kbps
+    # so there is one speed unit across the platform. 4 Mbps is 4096.
+    speed_download_kbps = models.PositiveIntegerField(
+        null=True, blank=True, verbose_name="Download speed (Kbps)",
+        help_text="In Kbps — 4 Mbps is 4096, 10 Mbps is 10240.",
+    )
+    speed_upload_kbps = models.PositiveIntegerField(
+        null=True, blank=True, verbose_name="Upload speed (Kbps)",
+        help_text="In Kbps — 4 Mbps is 4096, 10 Mbps is 10240.",
+    )
+    data_cap_gb = models.PositiveIntegerField(null=True, blank=True, help_text="Blank = unlimited")
+
+    # --- Fair use -------------------------------------------------------
+    # Deliberately SEPARATE from data_cap_gb above, and not a rename of it.
+    # A cap is a bundle somebody bought and can run out of; fair use is a
+    # threshold on an uncapped plan past which heavy users are shaped so
+    # everyone else keeps working. They are different promises to the
+    # customer, and the usage page shows data_cap_gb to the CUSTOMER -- so
+    # enforcing fair use through that field would start showing people a
+    # "cap" on a plan sold to them as uncapped.
+    #
+    # Blank = no fair-use policy, which is every existing plan. Nothing
+    # changes for anybody until a number is put in here.
+    fup_threshold_gb = models.PositiveIntegerField(
+        null=True, blank=True,
+        verbose_name="Fair-use threshold (GB)",
+        help_text="Blank = no fair-use shaping. Usage past this in a calendar month shapes the line.",
+    )
+    fup_speed_pct = models.PositiveIntegerField(
+        default=30,
+        verbose_name="Shaped speed (% of plan)",
+        help_text="What the line runs at once past the threshold. 30 = 30% of plan speed.",
+    )
+    tax_rate_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    # What one line on this plan costs Skybre a month, excl. VAT -- the
+    # wholesale or partner fee, bandwidth share, whatever it takes to deliver
+    # it (George, 13 Oct 2026). Feeds the markup columns on Administration ->
+    # Clients per tariff and the client's Services table. Blank = not known
+    # yet, which is NOT the same as free: an uncosted plan is left out of
+    # every markup figure and counted as uncosted instead.
+    cost_price = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        verbose_name="Cost per month (excl. VAT)",
+        help_text="What one line on this plan costs you a month, excl. VAT. Blank = not known yet.",
+    )
+    is_active = models.BooleanField(default=True)
+    description = models.TextField(blank=True)
+    # --- Whose plan this is ------------------------------------------------
+    # The partner this tariff belongs to -- MTD, Vumatel, Skybre Wireless.
+    # A customer is tagged to a partner when they are created, and from then
+    # on the only tariffs offered for their services are that partner's. So
+    # this field is what makes "an MTD customer cannot be put on a Vuma
+    # plan" true, rather than a rule staff have to remember.
+    #
+    # NULLABLE, and null means available to EVERY partner -- the same
+    # "empty means unrestricted" convention as User.allowed_partners and
+    # Device.visible_partners. Two reasons it has to work that way: every
+    # tariff that existed before this field was added starts null, and
+    # nothing should stop being sellable the moment this deploys; and a
+    # genuinely shared plan (a once-off installation fee, say) has no one
+    # partner to belong to.
+    #
+    # SET_NULL rather than CASCADE: deleting a partner must not delete the
+    # plans customers are billed on. It makes them available to everyone,
+    # which is visible on the Tariffs page and recoverable, where a cascade
+    # would take the tariff and every service's price reference with it.
+    partner = models.ForeignKey(
+        "customers.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tariffs",
+        help_text="Which partner sells this plan. Blank = available to every partner.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.price}/{self.billing_period})"
+
+    def available_to(self, partner_id):
+        """Whether a customer on `partner_id` may be put on this tariff.
+
+        ONE definition, used by the serializer that enforces the rule AND
+        by the queryset filter that narrows the dropdown -- so the list
+        staff are shown and the rule the API applies cannot disagree. A
+        dropdown offering a choice the server then rejects is worse than no
+        filtering at all.
+        """
+        if self.partner_id is None:
+            return True          # shared plan: anyone's customer can take it
+        if partner_id is None:
+            return True          # direct customer: not tied to any partner
+        return self.partner_id == partner_id
+
+
+class RecurringCharge(models.Model):
+    """A catalog of standard recurring add-on charges -- IP Rental, Domain
+    Rental, and the like (Rudolph, 30 Sep: "In tariffs there need to be a
+    option to add standard recurring billing like IP rental, Domain
+    Rental etc").
+
+    Deliberately its own catalog rather than another Tariff.service_type:
+    a client is given a charge like this (CustomerRecurringCharge) on top
+    of -- or instead of -- any plan, and several can apply at once --
+    neither is true of switching Tariffs.
+
+    Reaches the invoice exactly the way a discount does: its own
+    InvoiceItem, immediately under the service it was opted onto, at its
+    OWN live price and tax rate (see
+    billing.invoice_lines.plan_invoice_lines) -- never folded into the
+    tariff price, so the invoice, and whoever reads it later, can still
+    see what was charged and why.
+    """
+
+    name = models.CharField(max_length=150)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    tax_rate_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    # Unticking takes this off the list staff can newly opt a service onto
+    # (RecurringChargeViewSet's ?is_active= filter feeds that dropdown) --
+    # same "does not touch what already exists" convention as
+    # Tariff.is_active. A service already carrying this charge keeps being
+    # billed for it; detach it from that service to actually stop.
+    is_active = models.BooleanField(
+        default=True,
+        help_text=(
+            "Unticking takes it off the list staff can newly opt a service onto. Services already "
+            "carrying it keep being billed -- remove it from the service instead to stop billing there."
+        ),
+    )
+    description = models.TextField(blank=True)
+    # Same nullable "empty means every partner" convention as Tariff.partner
+    # -- see that field's docstring for why it has to work this way.
+    partner = models.ForeignKey(
+        "customers.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recurring_charges",
+        help_text="Which partner may opt a service onto this charge. Blank = available to every partner.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} (R{self.price})"
+
+    def available_to(self, partner_id):
+        """Same rule as Tariff.available_to -- see there for why it has to
+        be the one definition the serializer and the queryset filter both
+        read."""
+        if self.partner_id is None:
+            return True
+        if partner_id is None:
+            return True
+        return self.partner_id == partner_id
+
+
+class OnceOffItem(models.Model):
+    """The list of standard once-off charges -- Installation, Relocation,
+    6 m pole, Call-out (Rudolph, 6 Oct 2026: "Once off invoice line items
+    should be creatable"). Picked as a line on a new invoice or quote, which
+    fills its name, price and VAT rate; the line keeps its own copy of the
+    price, so changing it here never changes an invoice already made.
+
+    The once-off counterpart of RecurringCharge, edited beside it under
+    Configs -> Tariffs. Price excl. VAT, like every other catalogue price."""
+
+    name = models.CharField(max_length=150)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    tax_rate_pct = models.DecimalField(max_digits=5, decimal_places=2, default=15)
+    description = models.TextField(blank=True)
+    # Unticking takes it off the New invoice / New quote picker; invoices
+    # already carrying it are untouched.
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} (R{self.price})"
+
+
+class CustomerRecurringCharge(models.Model):
+    """One recurring charge (a RecurringCharge catalog entry) a customer is
+    billed for every cycle -- a domain, email, web hosting, IP rental.
+
+    On the CUSTOMER, not a service (Rudolph, 1 Oct: "Recurring billing
+    adding should not be dependable on a service, some clients only take a
+    domain, email or web hosting"). A customer with one of these and no
+    service at all is still invoiced for it; see
+    billing.invoice_lines.billable_customer_charges.
+
+    Billed at the catalog's LIVE price and tax rate, times `quantity` --
+    never a copy stored here, so a catalog price correction reaches
+    everyone, same as a Tariff price edit. Excluding VAT, like every other
+    price on the platform.
+
+    start_date / end_date follow Service's convention: billed on a run date
+    on or after start_date and before end_date (the first day it is NOT
+    billed). Leave end_date blank for "until stopped".
+    """
+
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE, related_name="customer_charges",
+    )
+    charge = models.ForeignKey(
+        RecurringCharge, on_delete=models.PROTECT, related_name="customer_links",
+    )
+    quantity = models.PositiveIntegerField(default=1)
+    start_date = models.DateField()
+    end_date = models.DateField(
+        null=True, blank=True,
+        help_text="First day it is no longer billed. Blank = until stopped.",
+    )
+    note = models.CharField(max_length=255, blank=True, help_text="e.g. the domain name.")
+    # Custom pricing, the same options as a service (George, 13 Oct 2026:
+    # "add all custom pricing options to Recurring invoicing as well"):
+    # percentage off / rand amount off (a visible discount line) or rand
+    # amount up (folded into the line price; office-only, never shown to the
+    # client). Amounts are excl. VAT and for the whole line (all units).
+    PRICING_CHOICES = [
+        ("none", "No discount"),
+        ("percentage", "Percentage off"),
+        ("amount", "Rand amount off"),
+        ("surcharge", "Rand amount up"),
+    ]
+    discount_type = models.CharField(max_length=12, choices=PRICING_CHOICES, default="none")
+    discount_value = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0"))
+    discount_starts_on = models.DateField(null=True, blank=True)
+    discount_ends_on = models.DateField(null=True, blank=True)
+    discount_reason = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["charge__name", "pk"]
+
+    def __str__(self):
+        return f"{self.customer} — {self.charge.name} x{self.quantity}"
+
+    def is_billable_on(self, run_date):
+        if self.start_date > run_date:
+            return False
+        return self.end_date is None or self.end_date > run_date
+
+    # --- Custom pricing (13 Oct 2026), same rules as Service's ---------------
+    def base_total(self):
+        return Decimal(self.charge.price or 0) * Decimal(self.quantity or 1)
+
+    def discount_applies_on(self, on_date):
+        if self.discount_type == "none" or Decimal(self.discount_value or 0) <= 0:
+            return False
+        if self.discount_starts_on and on_date < self.discount_starts_on:
+            return False
+        if self.discount_ends_on and on_date > self.discount_ends_on:
+            return False
+        return True
+
+    def discount_amount_for(self, on_date):
+        """Rand amount (excl. VAT) off the whole line; 0 for Rand amount up."""
+        if self.discount_type not in ("percentage", "amount") or not self.discount_applies_on(on_date):
+            return Decimal("0")
+        base = self.base_total()
+        if base <= 0:
+            return Decimal("0")
+        raw = base * Decimal(self.discount_value) / 100 if self.discount_type == "percentage" else Decimal(self.discount_value)
+        raw = raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return min(max(raw, Decimal("0")), base)
+
+    def surcharge_amount_for(self, on_date):
+        """Rand amount up (excl. VAT) on the whole line; 0 when none is live."""
+        if self.discount_type != "surcharge" or not self.discount_applies_on(on_date):
+            return Decimal("0")
+        return Decimal(self.discount_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def billed_unit_price(self, on_date):
+        """The unit price the client is billed: catalog price plus any Rand
+        amount up spread over the units, so the line carries ONE price."""
+        up = self.surcharge_amount_for(on_date)
+        price = Decimal(self.charge.price or 0)
+        if not up:
+            return price
+        return (price + up / Decimal(self.quantity or 1)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+    def discount_label(self):
+        if self.discount_type == "percentage":
+            shape = f"{Decimal(self.discount_value).normalize():f}%"
+        else:
+            shape = f"R{Decimal(self.discount_value):.2f}"
+        reason = self.discount_reason.strip()
+        return f"Discount — {reason} ({shape})" if reason else f"Discount ({shape})"
+
+
+class IssuedNumberHighWater(models.Model):
+    """The highest sequence number ever issued under each document prefix.
+
+    Invoice._next_number_for_status takes one past the highest number on
+    an EXISTING row, which is right until a row stops existing.
+    InvoiceViewSet.destroy permits hard-deleting a real invoice, and
+    deleting the newest one dropped the maximum back down -- so the next
+    invoice created was issued a number a customer was already holding a
+    PDF for. Two customers, one tax invoice number, which is the same
+    failure 91e0b03 fixed from the other direction.
+
+    A separate row per prefix rather than a column on Invoice, because the
+    fact being recorded is about the sequence, not about any one document
+    -- and it has to outlive every document in it.
+
+    Consulted alongside the row maximum rather than instead of it, so the
+    counter self-heals: an import that inserts numbers above it, or a
+    counter that is somehow behind, still produces a number above
+    everything that exists. Bumped only AFTER a successful save, so a
+    create that fails does not burn a number and leave a gap in a
+    sequence that has to explain itself to SARS.
+    """
+
+    prefix = models.CharField(max_length=10, unique=True)
+    last_seq = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "issued number high-water mark"
+        verbose_name_plural = "issued number high-water marks"
+
+    def __str__(self):
+        return f"{self.prefix}-{self.last_seq:06d}"
+
+
+class Service(models.Model):
+    """A customer's active subscription to a tariff/plan."""
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        SUSPENDED = "suspended", "Suspended"
+        TERMINATED = "terminated", "Terminated"
+        PENDING = "pending", "Pending Activation"
+
+    class ConnectionType(models.TextChoices):
+        OVPN = "ovpn", "OVPN"
+        PPPOE = "pppoe", "PPPoE"
+
+    class IPAssignmentMode(models.TextChoices):
+        MANUAL = "manual", "Manual (static public IP)"
+        POOL = "pool", "Select from Customer IP Pool"
+        AUTO = "auto", "Automatically assign from Customer IP Pool"
+
+    customer = models.ForeignKey("customers.Customer", on_delete=models.CASCADE, related_name="services")
+    tariff = models.ForeignKey(Tariff, on_delete=models.PROTECT, related_name="services")
+    # The partner THIS line is with, when it differs from the client's own
+    # (Rudolph, 5 Oct 2026: "Select multiple partners to a client") -- a
+    # Vumatel fibre line and a Skybre Wireless line on one client. Blank =
+    # same as the client's partner, which is every service that existed
+    # before this. The tariff list for the line follows it, and a staff
+    # member restricted to this partner can see the client.
+    partner = models.ForeignKey(
+        "customers.Partner",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="partner_services",
+        help_text="Blank = same as the client's partner.",
+    )
+    # --- a tariff change booked for a future date -------------------------
+    # An upgrade or downgrade agreed today but taking effect later, which is
+    # how it actually happens: the customer phones mid-month and the change
+    # belongs at the start of their next billing period.
+    #
+    # Deliberately NOT applied by editing `tariff` early -- that would bill
+    # and rate-limit them on the new plan from the moment you saved it. These
+    # two fields hold the intent; billing.tariff_changes applies it on the day
+    # and then clears them.
+    pending_tariff = models.ForeignKey(
+        Tariff, on_delete=models.SET_NULL, null=True, blank=True, related_name="pending_services",
+        help_text="Tariff to switch this service to on the effective date below.",
+    )
+    pending_tariff_date = models.DateField(
+        null=True, blank=True,
+        verbose_name="Change takes effect",
+        help_text=(
+            "The date the new tariff starts applying. Set it to the first day of a billing period — "
+            "a mid-period change is not prorated, so the whole period bills at the new price."
+        ),
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    # Set when this service was suspended *because the customer* was set to
+    # Suspended, rather than for a reason of its own (non-payment, a fault, a
+    # staff decision about this one service).
+    #
+    # It exists so putting the customer back to Active restores exactly the
+    # services that customer-level action took down, and leaves alone anything
+    # suspended for its own reasons. Without it, reactivating a customer would
+    # quietly un-suspend a service that the billing run had blocked for
+    # non-payment -- handing back internet to someone who still hasn't paid.
+    auto_suspended_with_customer = models.BooleanField(default=False, editable=False)
+    # THE SAME IDEA, FOR THE OTHER DIRECTION. The field above says "the
+    # customer cascade took this down, so putting the customer back up may
+    # restore it". This one says "the billing run took this down for
+    # non-payment, so money arriving may restore it".
+    #
+    # It has to be separate. A service suspended by hand -- abuse, hardware
+    # recovery, a dispute, a customer who asked to be paused -- must never
+    # be reconnected because a payment landed, and nothing about
+    # Service.status can tell those apart. Set only by
+    # billing.recurring._process_blocking, cleared the moment anybody
+    # changes this service's status themselves (customers.signals), and
+    # read only by billing.reactivation.
+    #
+    # Its absence is why no payment had ever reconnected anybody: the
+    # billing run suspended services and left nothing behind saying it had.
+    suspended_for_nonpayment = models.BooleanField(default=False, editable=False)
+    device = models.ForeignKey(
+        "network.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="services"
+    )
+    # WHERE THE CLIENT PHYSICALLY CONNECTS -- the tower AP or sector their
+    # dish points at, the OLT their fibre lands on, the switch their cable
+    # goes into.
+    #
+    # Deliberately separate from `device` above, which is the NAS: the
+    # router PPPoE terminates on, and the one every RADIUS, shaper and
+    # blocking action gets pushed to. On a wireless network those are
+    # routinely different boxes -- fifty customers spread across six sector
+    # radios can all terminate on one core router. Overloading `device` to
+    # mean both would make "which customers does this AP serve"
+    # unanswerable, and would break enforcement the first time somebody
+    # pointed it at an AP that has no RADIUS relationship with the service.
+    #
+    # Nothing is enforced against this field. It documents the physical
+    # path, and it earns its keep on the other side: the device page can
+    # now answer "this AP is down, who is affected".
+    access_device = models.ForeignKey(
+        "network.Device", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="access_services",
+        help_text="The AP, sector, OLT or switch this client actually connects to. Not the NAS — see `device`.",
+    )
+    # One field rather than three, because the answer is the same shape at
+    # every layer and staff should not have to decide which box to use: a
+    # sector on an AP, a PON port on an OLT, a port on a switch.
+    access_detail = models.CharField(
+        max_length=120, blank=True,
+        help_text='Port, sector or SSID on that device — e.g. "Sector B 120°", "PON 1/3", "ether7".',
+    )
+
+    # --- Where this line is installed ------------------------------------
+    # One account can have several lines at different addresses (Rudolph,
+    # 1 Oct). use_customer_address=True (the default, and every existing
+    # line) means "at the client's main address"; False means the site_*
+    # fields below are this line's own address. See site_address_display.
+    use_customer_address = models.BooleanField(default=True)
+    site_address = models.CharField(max_length=255, blank=True, help_text="Street number and name.")
+    site_complex_or_area = models.CharField(max_length=255, blank=True)
+    site_city = models.CharField(max_length=100, blank=True)
+    site_zip_code = models.CharField(max_length=20, blank=True)
+    # GPS for a separate address (Rudolph, 5 Oct 2026) -- a farm or plot
+    # often has no street a technician can navigate to. Both or neither;
+    # either is enough on its own to locate the line (street optional when
+    # these are set).
+    site_latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    site_longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+
+    def site_address_display(self):
+        """This line's installation address as one line: its own, or the
+        client's main address when use_customer_address is set. A separate
+        address with only coordinates reads as "GPS <lat>, <lng>"."""
+        if self.use_customer_address:
+            c = self.customer
+            parts = [c.address, c.complex_or_area, c.city, c.zip_code]
+        else:
+            parts = [self.site_address, self.site_complex_or_area, self.site_city, self.site_zip_code]
+        text = ", ".join(p.strip() for p in parts if p and p.strip())
+        if not text and not self.use_customer_address and self.site_latitude is not None:
+            text = f"GPS {self.site_latitude}, {self.site_longitude}"
+        if not text and self.use_customer_address and getattr(self.customer, "latitude", None) is not None:
+            text = f"GPS {self.customer.latitude}, {self.customer.longitude}"
+        return text
+
+    # --- Discount on this line -------------------------------------------
+    #
+    # A reduction on THIS service's tariff price: a percentage or a flat
+    # rand amount, optionally bounded by dates.
+    #
+    # Deliberately NOT done by editing the tariff price, or by inventing a
+    # discounted tariff per customer. Both lose the fact that a discount
+    # was given -- six months on the invoice says R450 and nothing says
+    # why -- or fill the tariff list with "Home 50Mbps (Sept special)"
+    # variants that then need maintaining in parallel forever.
+    #
+    # It reaches the invoice as its own InvoiceItem with a NEGATIVE
+    # unit_price at the TARIFF'S OWN tax rate (see
+    # billing.recurring._generate_document). Invoice.recalc_totals already
+    # sums VAT per item, so the negative line contributes negative VAT by
+    # itself and the customer pays VAT on the discounted value -- which is
+    # what SARS expects, since a discount reduces the taxable supply.
+    #
+    # No change to recalc_totals was needed for this, and none should be
+    # added: the moment discounts are special-cased there, the subtotal and
+    # the VAT can stop agreeing, which is the exact failure its own
+    # docstring was written to prevent.
+
+    class DiscountType(models.TextChoices):
+        NONE = "none", "No discount"
+        PERCENTAGE = "percentage", "Percentage off"
+        AMOUNT = "amount", "Rand amount off"
+        # Special pricing the other way (George, 13 Oct 2026: "a special
+        # pricing option where a client is being charged more"): a rand
+        # amount ADDED to the plan price, excl. VAT like the price. Never a
+        # discount -- discount_amount_for() is 0 for it; surcharge_amount_for()
+        # gives it, and it reaches the invoice as its own positive line.
+        SURCHARGE = "surcharge", "Rand amount up"
+
+    discount_type = models.CharField(
+        max_length=12, choices=DiscountType.choices, default=DiscountType.NONE,
+        help_text="Percentage off the plan price, a flat rand amount off, or none.",
+    )
+    discount_value = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal("0"),
+        help_text="The percentage (10 = 10%) or the rand amount, depending on the type above.",
+    )
+    # Both optional. Blank start = applies from now; blank end = until
+    # somebody removes it. A promo with an end date expires on its own,
+    # which is the whole point -- the alternative is trusting that whoever
+    # gave "three months half price" in March still remembers it in June.
+    discount_starts_on = models.DateField(
+        null=True, blank=True, help_text="Blank = applies immediately.",
+    )
+    discount_ends_on = models.DateField(
+        null=True, blank=True,
+        help_text="Blank = runs until removed. Applies ON this date and stops the day after.",
+    )
+    # Free text, and it earns its column. "Why is this line R180?" is a
+    # question somebody asks months later, and this is the difference
+    # between a one-line answer and an afternoon of archaeology.
+    # default="" rather than bare blank=True so `makemigrations` can add the
+    # column without stopping to ask for a value for existing rows. A deploy
+    # step that opens an interactive prompt is a deploy step that hangs when
+    # it is run with `-T` from a script.
+    discount_reason = models.CharField(
+        max_length=255, blank=True, default="",
+        help_text='Why this line is discounted — e.g. "Loyalty, 5 years", "Retention offer, Sept".',
+    )
+
+    def discount_applies_on(self, on_date):
+        """Is the discount live on `on_date`?"""
+        if self.discount_type == self.DiscountType.NONE or self.discount_value <= 0:
+            return False
+        if self.discount_starts_on and on_date < self.discount_starts_on:
+            return False
+        if self.discount_ends_on and on_date > self.discount_ends_on:
+            return False
+        return True
+
+    def discount_amount_for(self, base_price, on_date):
+        """Rand amount to take off `base_price` (VAT-exclusive) on `on_date`.
+
+        Always >= 0, and never more than base_price. That cap is not
+        defensive tidiness: a discount bigger than the line makes the
+        invoice net negative, which hands the customer a credit nobody
+        approved and leaves PaymentAllocation trying to allocate against
+        it. Validation rejects an over-large discount on the way in, and
+        this caps it on the way out -- because the tariff price can be
+        lowered after the discount was agreed, and nothing revisits the
+        service when it is.
+        """
+        if not self.discount_applies_on(on_date):
+            return Decimal("0")
+        if self.discount_type == self.DiscountType.SURCHARGE:
+            return Decimal("0")
+        base = Decimal(base_price or 0)
+        if base <= 0:
+            return Decimal("0")
+        if self.discount_type == self.DiscountType.PERCENTAGE:
+            raw = base * (Decimal(self.discount_value) / Decimal("100"))
+        else:
+            raw = Decimal(self.discount_value)
+        raw = raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return min(max(raw, Decimal("0")), base)
+
+    def surcharge_amount_for(self, on_date):
+        """Rand amount (excl. VAT) ADDED to the plan price on `on_date` --
+        "Rand amount up" special pricing. 0 when none is live."""
+        if self.discount_type != self.DiscountType.SURCHARGE or not self.discount_applies_on(on_date):
+            return Decimal("0")
+        return Decimal(self.discount_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def billed_price(self, on_date=None, base_price=None):
+        """The plan price this line is billed at, excl. VAT: the tariff
+        price plus any live "Rand amount up". The client only ever sees this
+        figure -- the uplift is never shown to them as its own amount
+        (George, 13 Oct 2026). Discounts are NOT folded in; they stay a
+        visible line of their own."""
+        from django.utils import timezone
+
+        on_date = on_date or timezone.localdate()
+        base = Decimal(self.tariff.price if base_price is None else base_price or 0)
+        return base + self.surcharge_amount_for(on_date)
+
+    def discount_label(self):
+        """How the discount reads on the invoice.
+
+        Names the reason and the shape, so the PDF says
+        `Discount — Loyalty (10%)` rather than an unexplained negative
+        number that somebody then has to account for on the phone.
+        """
+        if self.discount_type == self.DiscountType.PERCENTAGE:
+            shape = f"{Decimal(self.discount_value).normalize():f}%"
+        elif self.discount_type == self.DiscountType.AMOUNT:
+            shape = f"R{Decimal(self.discount_value):.2f}"
+        elif self.discount_type == self.DiscountType.SURCHARGE:
+            reason = self.discount_reason.strip()
+            shape = f"+R{Decimal(self.discount_value):.2f}"
+            return f"Special pricing — {reason} ({shape})" if reason else f"Special pricing ({shape})"
+        else:
+            return "Discount"
+        reason = self.discount_reason.strip()
+        return f"Discount — {reason} ({shape})" if reason else f"Discount ({shape})"
+
+    # Recurring add-ons (IP rental, domain, email, hosting) used to be
+    # opted onto a service here (Service.recurring_charges). They now sit
+    # on the customer instead -- see CustomerRecurringCharge -- because
+    # some customers take only a domain or hosting and have no service at
+    # all (Rudolph, 1 Oct). Migration 0046 moved every existing one across.
+
+    # --- Fair-use overrides for this one line ---------------------------
+    # Null means "whatever the tariff says", so a plan's policy stays in
+    # one place and an exception does not require inventing a new plan for
+    # one customer. 0 in fup_threshold_gb is a real value meaning "shape
+    # them immediately" -- which is why these are nullable rather than
+    # zero-defaulted.
+    fup_threshold_gb = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Overrides the tariff's fair-use threshold for this line only. Blank = use the tariff's.",
+    )
+    fup_speed_pct = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Overrides the tariff's shaped speed for this line only. Blank = use the tariff's.",
+    )
+    fup_exempt = models.BooleanField(
+        default=False,
+        help_text="Never shape this line, whatever the tariff says. For business lines and staff.",
+    )
+    # The last Mikrotik-Rate-Limit actually pushed to this line's live
+    # session. Not a setting -- a record of what the router was last told,
+    # so the scheduled policy run can push only what CHANGED. Without it a
+    # five-minute cron would re-send an identical limit to every session
+    # every run: hundreds of pointless packets an hour, and a router log
+    # nobody can read.
+    last_pushed_rate_limit = models.CharField(max_length=64, blank=True, editable=False)
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    # A Pending Activation service that switches itself to Active on this
+    # date (package #20) -- a new line booked ahead, e.g. a partner move on
+    # the 1st. Cleared once applied. See billing.scheduled_changes.
+    activate_on = models.DateField(
+        null=True, blank=True,
+        help_text="Switch this Pending service to Active on this date.",
+    )
+    # The service this one takes over from, if any (package #22) -- a
+    # genuinely new service record for a partner/plan move that keeps the
+    # SAME PPPoE login and IP, instead of the old row holding both forever
+    # (see billing.scheduled_changes.apply_service_handover). One
+    # replacement each: OneToOneField enforces that at the database level.
+    replaces = models.OneToOneField(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="replaced_by",
+        help_text="The service this one takes over from -- carries over its PPPoE login and IP at cutover.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    # --- RADIUS / OVPN (Mikrotik @ Teraco JHB) -----------------------------
+    # Staff set these manually per service (not auto-generated, not tied to
+    # the customer's portal login). When set, radiusauth's sync signals
+    # (see radiusauth/signals.py) mirror them into the standard FreeRADIUS
+    # `radcheck`/`radreply` tables so the customer's OVPN client can
+    # authenticate against this Service and automatically receive their
+    # tariff's speed as a Mikrotik-Rate-Limit reply attribute.
+    #
+    # radius_password is intentionally stored in a form FreeRADIUS's SQL
+    # `Cleartext-Password` check-item can use directly -- RADIUS PAP/CHAP
+    # requires the server to hold a recoverable value (the wire protocol
+    # itself encrypts credentials via the shared secret; FreeRADIUS decrypts
+    # to plaintext to compare). This is unlike portal login passwords, which
+    # remain one-way hashed and unrecoverable -- see the accounts app. The
+    # API still exposes this write-only/masked, same pattern as elsewhere.
+    radius_username = models.CharField(
+        max_length=150, blank=True, null=True, unique=True,
+        help_text="Login name the customer's Mikrotik/OVPN client authenticates with. Blank = RADIUS login disabled for this service.",
+    )
+    radius_password = models.CharField(max_length=128, blank=True, null=True)
+
+    # --- PPPoE public IP assignment -----------------------------------
+    # radius_connection_type distinguishes this service's RADIUS/NAS use
+    # case: "ovpn" (the original Teraco Mikrotik OVPN setup -- its
+    # Framed-IP-Address is always auto-allocated from a "network"-category
+    # IP Pool via radiusauth.signals._allocate_network_ip, a path this
+    # feature leaves completely unchanged) vs "pppoe" (a customer's PPPoE
+    # router login, where staff choose how its public IP is handed out via
+    # ip_assignment_mode below). Defaults to "ovpn" so every service that
+    # existed before this field was added keeps behaving exactly as it did.
+    radius_connection_type = models.CharField(
+        max_length=10, choices=ConnectionType.choices, default=ConnectionType.OVPN,
+        help_text="Which RADIUS/NAS setup this service's radius_username authenticates against.",
+    )
+    # Only meaningful when radius_connection_type='pppoe':
+    #   manual -> static_ip below is sent verbatim as Framed-IP-Address.
+    #   pool   -> staff pick one specific free address from ip_pool (see
+    #             ServiceSerializer's write-only `ip_address` field).
+    #   auto   -> the system auto-picks the next free address in ip_pool
+    #             and keeps reusing it on every reconnect -- the same
+    #             mechanism _allocate_network_ip already uses for OVPN,
+    #             just scoped to a Customer-category pool instead of a Net
+    #             one (see radiusauth/signals.py::_allocate_customer_ip).
+    ip_assignment_mode = models.CharField(
+        max_length=10, choices=IPAssignmentMode.choices, default=IPAssignmentMode.AUTO,
+        help_text="How this PPPoE service's public IP is handed out. Ignored for OVPN services.",
+    )
+    static_ip = models.GenericIPAddressField(
+        null=True, blank=True,
+        help_text="Static public IP sent as Framed-IP-Address when ip_assignment_mode='manual'. Not tracked in any IP Pool.",
+    )
+    ip_pool = models.ForeignKey(
+        "network.IPPool", on_delete=models.SET_NULL, null=True, blank=True, related_name="pppoe_services",
+        help_text="Customer IP Pool this service's address comes from when ip_assignment_mode is 'pool' or 'auto'.",
+    )
+
+    # --- Live-API shaper override ---------------------------------------
+    # Optional per-service speed override, used instead of the tariff's own
+    # plan speed when this device's Shaper is on (see
+    # network.router_sync.effective_speed_kbps). Must belong to the same
+    # device this service is on -- enforced in ServiceSerializer.
+    connection_rule = models.ForeignKey(
+        "network.ConnectionRule", on_delete=models.SET_NULL, null=True, blank=True, related_name="services",
+        help_text="Optional speed override for this specific service instead of its tariff's plan speed. Must belong to this service's device.",
+    )
+
+    @property
+    def effective_partner_id(self):
+        """This line's partner: its own, else the client's."""
+        return self.partner_id or self.customer.partner_id
+
+    def __str__(self):
+        return f"{self.customer} -> {self.tariff}"
+
+    @property
+    def has_pending_tariff_change(self):
+        return bool(self.pending_tariff_id and self.pending_tariff_date)
+
+    @property
+    def public_ip(self):
+        """The public address this service is actually handing out, or None.
+
+        One definition, because two screens show it now -- the service row on
+        a customer's page and the Public IP column on the customer list -- and
+        two copies of this rule would eventually disagree about the same
+        customer.
+
+        Deliberately loops over ip_addresses.all() in Python rather than
+        .filter(...).first(): a filtered related manager issues its own query
+        and ignores prefetch_related entirely, which on a 50-row customer list
+        is 50 extra queries for one column.
+        """
+        from network.models import IPPool
+
+        if self.radius_connection_type != Service.ConnectionType.PPPOE:
+            # An OVPN service's address comes from the VPN server, not from
+            # anything stored on the service, so static_ip here is stale.
+            return None
+        if self.ip_assignment_mode == Service.IPAssignmentMode.MANUAL:
+            return self.static_ip or None
+        for addr in self.ip_addresses.all():
+            if addr.pool.category == IPPool.Category.CUSTOMER:
+                return addr.address
+        return None
+
+
+class Invoice(models.Model):
+    class Status(models.TextChoices):
+        QUOTE = "quote", "Quote"
+        PROFORMA = "proforma", "Pro Forma Invoice"
+        DRAFT = "draft", "Draft"
+        UNPAID = "unpaid", "Unpaid"
+        PAID = "paid", "Paid"
+        OVERDUE = "overdue", "Overdue"
+        CANCELLED = "cancelled", "Cancelled"
+
+    # Statuses that come *before* a document is a real (or soon-to-be-real)
+    # tax invoice. A record starts life as a Quote, can be converted to a
+    # Pro Forma, and from either of those can be converted to a real
+    # Invoice -- one-directional, no going back. See convert_to_proforma()/
+    # convert_to_invoice() below.
+    PRE_INVOICE_STATUSES = (Status.QUOTE, Status.PROFORMA)
+
+    # The statuses at which this IS a tax invoice: money is owed and output
+    # VAT is due on it. CANCELLED is deliberately absent -- a document
+    # cancelled out of draft was never issued, and one cancelled after
+    # being issued already carries its date_issued from then.
+    ISSUED_STATUSES = (Status.UNPAID, Status.PAID, Status.OVERDUE)
+
+    # `number` prefix used at each stage of that lifecycle. Quote and Pro
+    # Forma each get their own separate, clearly-labelled sequence so
+    # neither one consumes a number from the real invoice sequence --
+    # important since some of them will never convert. Every other status
+    # (draft/unpaid/paid/overdue/cancelled) is a real invoice and they all
+    # share one continuous "INV" sequence, same as before this feature.
+    _NUMBER_PREFIXES = {
+        Status.QUOTE: "QUO",
+        Status.PROFORMA: "PF",
+    }
+    _DEFAULT_PREFIX = "INV"
+    # A credit note (see CreditRequest.create_credit_note_invoice) is, in
+    # every other respect, an ordinary Invoice at status UNPAID/PAID -- it
+    # has no Status of its own to key _NUMBER_PREFIXES off. So its prefix
+    # is chosen the same way QUOTE/PROFORMA are looked up above, but keyed
+    # off a transient `_credit_note_prefix` flag on the instance instead
+    # of `status` -- see _next_number() below.
+    _CREDIT_NOTE_PREFIX = "CN"
+
+    number = models.CharField(max_length=30, unique=True, editable=False)
+    customer = models.ForeignKey("customers.Customer", on_delete=models.CASCADE, related_name="invoices")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    date_created = models.DateField(auto_now_add=True)
+    # The day this became a real tax invoice, which is NOT date_created.
+    # date_created is auto_now_add: it is stamped when the row is first
+    # written and never moves again. A quote raised in March and converted
+    # in June therefore still says March, so the output VAT on it fell down
+    # the gap between two returns -- March's return excluded it because it
+    # was still a quote, and June's return never saw it because it was
+    # dated March. It was declared in neither. Null until the document is
+    # actually issued; see save().
+    date_issued = models.DateField(null=True, blank=True)
+    date_due = models.DateField()
+    # The run_date of the last payment reminder actually SENT for this
+    # invoice, and the whole of the reminder dedupe. Keyed on the invoice
+    # and the date the run was for -- not on the real calendar day, which
+    # is what let a backdated Run repeated a day later chase every
+    # customer a second time. Written only after the mailer reports the
+    # send succeeded, so a mail outage delays the day's reminders instead
+    # of skipping them. See billing.recurring._process_reminders.
+    last_reminder_run_date = models.DateField(null=True, blank=True, editable=False)
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    note = models.TextField(blank=True)
+    # Set only when this document was generated by the recurring-billing
+    # engine (see RecurringBillingRun below) rather than the "+ New quote"/
+    # "+ New invoice" buttons -- lets a run's History row show exactly what
+    # it created, purely for traceability. SET_NULL so deleting a run
+    # record (there's no UI for that today, but just in case) never takes
+    # the invoice down with it.
+    created_by_run = models.ForeignKey(
+        "RecurringBillingRun", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoices_created"
+    )
+    # Whether this invoice's total is currently included in
+    # Customer.balance. THREE states, not two:
+    #
+    #   True  -- this invoice's total is in the balance; releasing it
+    #            takes the total back off.
+    #   False -- it is not, and this invoice is managed by
+    #            apply_balance_debit(), so issuing it will add it.
+    #   NULL  -- unknown. Every row that predates this feature. The
+    #            balance already reflects whatever the old code did to it
+    #            (recurring._generate_document debited; nothing else did),
+    #            and there is no way to tell after the fact which is which:
+    #            a run-created invoice born UNPAID is indistinguishable
+    #            from a run-created pro forma that was later converted.
+    #
+    # NULL is inert -- apply_balance_debit() and release_balance_debit()
+    # both leave it completely alone. That matters because the first
+    # version of this field defaulted every existing row to False, which
+    # is not neutral: False means "not yet debited", so the first PATCH of
+    # any legacy UNPAID invoice re-added a total that was already in the
+    # balance and silently doubled the customer's debt. Reasoning only
+    # about the reversal direction missed it.
+    #
+    # Historical rows therefore keep exactly the balance contribution they
+    # have today, right or wrong. What that contribution actually is, is a
+    # data question -- answered by `manage.py balance_drift`, and repaired
+    # deliberately, never guessed at by a migration.
+    balance_debited = models.BooleanField(default=False, null=True, editable=False)
+
+    # Statuses whose total counts toward what the customer owes: issued,
+    # and not cancelled. A draft is not issued yet; a quote/pro forma is
+    # not an invoice; a cancelled invoice is not owed. PAID is included
+    # because the debit stays and the payment's own credit offsets it --
+    # removing it would double-count the payment.
+    DEBITED_STATUSES = (Status.UNPAID, Status.PAID, Status.OVERDUE)
+
+    class Meta:
+        ordering = ["-date_created"]
+
+    def _prefix_for_status(self, status):
+        return self._NUMBER_PREFIXES.get(status, self._DEFAULT_PREFIX)
+
+    def _next_number_for_status(self, status):
+        """One past the HIGHEST sequence number ever issued under this
+        status's prefix. See _next_number_for_prefix -- this is just that,
+        with the prefix looked up from `status`."""
+        return self._next_number_for_prefix(self._prefix_for_status(status))
+
+    def _next_number(self):
+        """The prefix save() generates a fresh number under, when none is
+        set explicitly. Normally derived from status. A credit note (see
+        CreditRequest.create_credit_note_invoice) sets a transient
+        `_credit_note_prefix` attribute before its first save -- never a
+        model field, never persisted -- because it needs its own "CN"
+        sequence and has no Status of its own to key one off; every other
+        real invoice is unaffected.
+        """
+        if getattr(self, "_credit_note_prefix", False):
+            return self._next_number_for_prefix(self._CREDIT_NOTE_PREFIX)
+        return self._next_number_for_status(self.status)
+
+    def _next_number_for_prefix(self, prefix):
+        """One past the HIGHEST sequence number ever issued under this
+        prefix.
+
+        Deliberately the maximum, not the number on the most recently
+        created row. Those are the same thing right up until they aren't:
+        an imported or backdated invoice carrying a lower number than the
+        newest row would otherwise drag the sequence backwards and start
+        handing out numbers that are already taken -- and because the
+        clash is on a unique column, every subsequent create walks
+        forward one number at a time hitting the same wall.
+
+        Rows whose number doesn't parse as `<prefix>-<digits>` (legacy
+        imports, hand-edited references) are skipped rather than guessed
+        at: they're excluded by the regex before the cast, so a single
+        unparseable row can't take the sequence down with it. The digit
+        bound keeps the cast safe -- nine digits is ~1000x more invoices
+        than this platform will ever issue, and anything longer is
+        malformed by definition.
+        """
+        qs = Invoice.objects.filter(number__regex=rf"^{prefix}-\d{{1,9}}$")
+        if self.pk:
+            qs = qs.exclude(pk=self.pk)
+        highest = qs.annotate(
+            _seq=Cast(Substr("number", len(prefix) + 2), BigIntegerField())
+        ).aggregate(highest=Max("_seq"))["highest"]
+        # ...and never below a number that has already been issued once,
+        # even if the row carrying it has since been deleted. See
+        # IssuedNumberHighWater: taking the maximum of existing rows alone
+        # meant deleting the newest invoice handed its number straight to
+        # the next one.
+        watermark = (
+            IssuedNumberHighWater.objects.filter(prefix=prefix)
+            .values_list("last_seq", flat=True)
+            .first()
+        )
+        return f"{prefix}-{max(highest or 0, watermark or 0) + 1:06d}"
+
+    def _record_issued_number(self):
+        """Remember that this number has been used, so it is never reused.
+
+        After the save rather than before it, so a create that fails
+        leaves no gap. Written with Greatest() so two concurrent creates
+        cannot move the mark backwards.
+        """
+        from django.db.models import Value
+        from django.db.models.functions import Greatest
+
+        prefix, _, seq = (self.number or "").rpartition("-")
+        if not prefix or not seq.isdigit():
+            return
+        updated = IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+            last_seq=Greatest("last_seq", Value(int(seq)))
+        )
+        if not updated:
+            try:
+                IssuedNumberHighWater.objects.create(prefix=prefix, last_seq=int(seq))
+            except IntegrityError:
+                # Another create got there first; its own Greatest() call
+                # covers this number too.
+                IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+                    last_seq=Greatest("last_seq", Value(int(seq)))
+                )
+
+    def save(self, *args, **kwargs):
+        # Stamp the issue date the first time this is a real tax invoice --
+        # here rather than in convert_to_invoice(), because that is not the
+        # only way a document becomes one: it can be created as an invoice
+        # outright, or moved out of draft. Only ever set once, so a later
+        # edit (or a status bouncing to PAID and back) cannot move the VAT
+        # period of an invoice already declared on a return.
+        if self.date_issued is None and self.status in self.ISSUED_STATUSES:
+            self.date_issued = timezone.localdate()
+            # Several callers save just the fields they touched (e.g.
+            # Payment.reverse_ledger_effect saves paid_amount + status).
+            # Without adding it here the new date would be computed and
+            # then dropped on the floor.
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = list(kwargs["update_fields"]) + ["date_issued"]
+
+        if self.number:
+            return super().save(*args, **kwargs)
+
+        # Two simultaneous creates can compute the same next number --
+        # `number` is unique, so the constraint is the only thing that
+        # actually serialises them, and the loser gets an IntegrityError.
+        # Retry rather than surfacing a 500; inside a recurring-billing
+        # run, an unhandled clash here used to be enough to take that
+        # customer's whole invoice down with it.
+        #
+        # Mirrors customers.Customer.save()'s handling of exactly this
+        # race on customer_id, down to the attempt count. Each attempt
+        # gets its own atomic block so the failed INSERT can be rolled
+        # back and retried; anything that isn't a number clash is
+        # re-raised untouched. Retries converge because
+        # _next_number_for_prefix re-reads the maximum each time, so the
+        # winner's number is visible to the next attempt.
+        last_error = None
+        for _ in range(5):
+            self.number = self._next_number()
+            try:
+                with transaction.atomic():
+                    result = super().save(*args, **kwargs)
+                    self._record_issued_number()
+                    return result
+            except IntegrityError as exc:
+                if "number" not in str(exc):
+                    raise
+                last_error = exc
+                self.number = ""
+        raise last_error
+
+    @property
+    def balance_due(self):
+        return self.total - self.paid_amount
+
+    @property
+    def is_overdue(self):
+        """Still owed, and past its own due date.
+
+        CORRECTED 1 Oct 2026: this used to be checked (in the frontend's
+        InvoiceStatusBadge) as `status == "overdue"` directly -- but that
+        value is never actually assigned to a real invoice anywhere in
+        this codebase (see billing.overdue's module docstring and
+        customers.filters.CustomerFilter.filter_overdue, which both
+        already document this). "Overdue" has always been a derived,
+        date-based fact, not a stored one: still owed (unpaid, or the
+        rarely-used literal OVERDUE status) AND past date_due. Computed
+        server-side, like CustomerTask.is_overdue, rather than in the
+        browser, so this agrees with billing.overdue.overdue_q() -- the
+        same definition the ageing report and the Invoices page's
+        overdue quick-filters use -- instead of silently drifting from
+        them the way the old frontend check did.
+        """
+        if not self.date_due:
+            return False
+        if self.status not in (self.Status.UNPAID, self.Status.OVERDUE):
+            return False
+        return self.date_due < timezone.localdate()
+
+    def apply_balance_debit(self):
+        """Bring Customer.balance in line with whether this invoice is owed.
+
+        Idempotent, and driven by the gap between `balance_debited` (what
+        the balance currently reflects) and DEBITED_STATUSES (what it
+        should reflect). Safe to call after any save, and safe to call
+        twice.
+
+        Before this, only the recurring-billing engine ever debited a
+        balance -- recurring._generate_document did it inline, with a
+        comment noting that "manually-created invoices are
+        unaffected/unchanged". But PaymentSerializer.create credited the
+        balance for ANY payment. So the two halves of the ledger disagreed
+        for every invoice not raised by the engine: staff raise a R1,000
+        invoice by hand (balance unchanged), the customer pays it (balance
+        -R1,000), and the customer's portal, their statement PDF and every
+        email now show R1,000 of credit that does not exist -- while
+        blocking_candidate_services' `balance <= minimum_balance` test
+        exempts them from suspension permanently.
+
+        Every path that can change whether an invoice is owed calls this:
+        creation, quote/pro forma conversion, a status edit, and deletion
+        (which calls it after moving the status to cancelled, or via
+        release_balance_debit below).
+
+        F() rather than read-modify-write, for the same reason
+        Payment.reverse_ledger_effect uses it: the balance is the field
+        two concurrent finance actions race on.
+        """
+        from django.db.models import F
+
+        # NULL means this invoice predates the flag and the balance already
+        # reflects whatever the old code did. Touching it would either
+        # double a debit that is already there or credit one that never
+        # was, so it is left alone entirely. See the field's comment.
+        if self.balance_debited is None:
+            return
+
+        should_be_debited = self.status in self.DEBITED_STATUSES
+        if should_be_debited == self.balance_debited:
+            return
+
+        delta = self.total if should_be_debited else -self.total
+        type(self.customer).objects.filter(pk=self.customer_id).update(
+            balance=F("balance") + delta
+        )
+        self.balance_debited = should_be_debited
+        # update() rather than save(), so this can never recurse through a
+        # save-triggered signal and can never write a stale copy of any
+        # other field back over a concurrent edit.
+        Invoice.objects.filter(pk=self.pk).update(balance_debited=self.balance_debited)
+
+        # Allocation follows the debt (5 Oct 2026). Newly owed: settle it
+        # from any money the client already has unapplied (paid ahead,
+        # overpaid, an earlier credit). No longer owed (cancelled): free
+        # whatever was allocated to it so that money settles their other
+        # invoices instead of sitting on a cancelled one.
+        from .allocation import release_invoice, sweep_after_commit
+
+        if not should_be_debited:
+            release_invoice(self)
+        sweep_after_commit(self.customer_id)
+
+    def release_balance_debit(self):
+        """Drop this invoice's debit off the customer's balance, for a
+        delete rather than a status change.
+
+        Deleting an invoice used to leave its debit behind forever: the
+        recurring engine had already added the total to the balance, and
+        InvoiceViewSet.destroy removed the only record of why. The
+        customer was then chased for -- and eventually suspended over --
+        money that no invoice claimed.
+        """
+        from django.db.models import F
+
+        # An imported credit note going away takes back whatever it settled
+        # (see CreditNoteAllocation), so those invoices read owed again.
+        if self.pk and (self.total or 0) < 0:
+            from .allocation import release_credit_note
+
+            release_credit_note(self)
+        if not self.balance_debited:
+            return
+        type(self.customer).objects.filter(pk=self.customer_id).update(
+            balance=F("balance") - self.total
+        )
+        self.balance_debited = False
+        Invoice.objects.filter(pk=self.pk).update(balance_debited=False)
+
+    def can_convert_to_proforma(self):
+        return self.status == self.Status.QUOTE
+
+    def can_convert_to_invoice(self):
+        return self.status in self.PRE_INVOICE_STATUSES
+
+    def convert_to_proforma(self):
+        """Quote -> Pro Forma only. One-directional: a Pro Forma or real
+        Invoice can never be converted back into a Quote."""
+        if not self.can_convert_to_proforma():
+            raise ValueError("Only a quote can be converted to a pro forma invoice.")
+        self.status = self.Status.PROFORMA
+        # Cleared rather than assigned here so save() is the single place
+        # that issues a number -- and so this path gets its retry-on-clash
+        # protection too, instead of 500ing on a race the create path
+        # already survives.
+        self.number = ""
+        self.save()
+
+    def convert_to_invoice(self):
+        """Quote -> Invoice or Pro Forma -> Invoice. Assigns a real,
+        gapless invoice number the moment this stops being a quote/pro
+        forma and becomes an actual tax invoice, and activates any
+        tariff-plan line items into real Service subscriptions."""
+        if not self.can_convert_to_invoice():
+            raise ValueError("Only a quote or a pro forma invoice can be converted to an invoice.")
+        self.status = self.Status.UNPAID
+        # See convert_to_proforma: save() issues the number, with retries.
+        self.number = ""
+        self.save()
+        # The moment it stops being a quote/pro forma it is money owed.
+        self.apply_balance_debit()
+        self.activate_tariff_services()
+
+    def recalc_totals(self):
+        # Round each component to cents and then add, rather than adding at
+        # full precision and leaving the database to round each column on its
+        # own. Rounded independently the three need not agree. A quarter
+        # month of a R50.10 line at 15% is subtotal R12.525 -> R12.53, tax
+        # R1.87875 -> R1.88, total R14.40375 -> R14.40 -- and R12.53 + R1.88
+        # is R14.41. The customer's tax invoice then prints an exclusive
+        # amount and a VAT amount that do not add up to the total it asks
+        # them to pay, and the VAT on the document is not the VAT the return
+        # declares. Deriving the total from the two stored numbers makes the
+        # invoice add up by construction.
+        # ROUND_HALF_UP because that is what Postgres does to a numeric(12,2),
+        # which is what was rounding these before. Python's default is
+        # half-even, and quietly switching to it would move a cent on every
+        # exact tie -- a fix for a rounding complaint must not itself restate
+        # what customers were charged.
+        cents = Decimal("0.01")
+
+        def to_cents(value):
+            return Decimal(value).quantize(cents, rounding=ROUND_HALF_UP)
+
+        items = self.items.all()
+        self.subtotal = to_cents(
+            sum((i.quantity * i.unit_price for i in items), start=Decimal("0"))
+        )
+        self.tax_total = to_cents(
+            sum(
+                (i.quantity * i.unit_price * (i.tax_rate_pct / 100) for i in items),
+                start=Decimal("0"),
+            )
+        )
+        self.total = self.subtotal + self.tax_total
+        # A quote/pro forma has no payments against it -- never auto-flip
+        # those to "paid" just because totals happen to net to zero/match.
+        #
+        # The second condition used to be `self.total > 0`, which was
+        # standing in for "this document has lines yet". It does stop an
+        # invoice created empty and saved before its items are added from
+        # flashing up as Paid -- but it also permanently stranded a
+        # LEGITIMATELY zero invoice at Unpaid. A customer on a 100% discount
+        # is billed R999 and discounted R999: nothing is owed, nothing can
+        # be paid, and the invoice sat there as an unpaid debt of R0.00,
+        # ageing into Overdue and collecting payment reminders chasing
+        # nothing. (It could not get them suspended -- blocking needs the
+        # customer's BALANCE to be worse than their minimum, and a zero
+        # invoice debits the balance by zero -- but the emails alone are
+        # enough to make a customer phone in.)
+        #
+        # So the condition now says what it was always trying to say: a
+        # document with lines on it, whose total is covered. An empty draft
+        # has no lines and is left alone; a fully discounted invoice has two
+        # lines that cancel out, and is settled, because it is.
+        # UNALLOCATABLE_STATUSES rather than PRE_INVOICE_STATUSES: the same
+        # set PaymentSerializer and the allocator already refuse money
+        # against -- quotes, pro formas, cancelled, and drafts. It is the
+        # platform's existing definition of "this document cannot be
+        # settled", and settling is what this is deciding. The old check let
+        # a draft or a cancelled invoice flip to Paid, which mattered little
+        # while a zero total was excluded and would matter now.
+        from .allocation import UNALLOCATABLE_STATUSES  # local: allocation imports this module
+
+        has_lines = bool(items)
+        if (
+            self.status not in UNALLOCATABLE_STATUSES
+            and has_lines
+            and self.paid_amount >= self.total
+        ):
+            self.status = self.Status.PAID
+        self.save()
+
+    def activate_tariff_services(self):
+        """Once this document is a real invoice (created directly as one,
+        or just converted from a Quote/Pro Forma), any tariff-plan line
+        item that quoted a from/till period gets turned into a real
+        Service subscription for this customer -- that's the point where
+        the customer has actually committed, not just been quoted.
+        Idempotent: skips any item that already has a service attached.
+
+        The line's Till date is deliberately NOT carried into
+        Service.end_date. They are not the same kind of date. Till is the
+        period this line is CHARGING for -- it is `required` in the
+        invoice editor and enforced in InvoiceItemSerializer.validate, so
+        every tariff line has one and staff cannot decline to give it.
+        Service.end_date is an instruction: billing.cancellations
+        terminates the service on that date and cancels the customer if
+        it was their last one, and its module docstring is explicit that
+        the end date is "the first day WITHOUT service".
+
+        Copying one into the other meant accepting a quote booked the
+        customer's own disconnection, at the end of the very period they
+        had just paid for -- and a day early on top, from reading an
+        inclusive period end as an exclusive start-of-no-service. Every
+        customer who signed up on a quote carried it, silently, until the
+        nightly job disconnected them and marked them Cancelled.
+
+        A genuine fixed term is still expressible, on the field that
+        means it: staff set Service.end_date on the service. Failing to
+        auto-terminate a contract somebody must end by hand is
+        recoverable; disconnecting and cancelling a paying customer is
+        not.
+
+        AN EXISTING SERVICE ON THE SAME PLAN IS USED, NOT DOUBLED (#202,
+        Rudolph 20 Oct 2026, Vossie Voster). Staff routinely add the line on
+        the client's Services tab first and then raise the pro-rata invoice
+        for it; that invoice used to create a second, identical service --
+        billed every month on top of the real one. So a tariff line is now
+        attached to the client's own service on that tariff when there is
+        one that isn't terminated and isn't already taken by another line
+        of this same document; only otherwise is a new service started. The
+        service found is left exactly as staff set it up (status, start
+        date, login). A genuine second line on the same plan is added on the
+        Services tab, as any line can be.
+        """
+        taken = set(
+            self.items.filter(service__isnull=False).values_list("service_id", flat=True)
+        )
+        for item in self.items.filter(item_type=InvoiceItem.ItemType.TARIFF, tariff__isnull=False, service__isnull=True):
+            service = (
+                Service.objects.filter(customer=self.customer, tariff=item.tariff)
+                .exclude(status=Service.Status.TERMINATED)
+                .exclude(pk__in=taken)
+                .order_by("pk")
+                .first()
+            )
+            if service is None:
+                service = Service.objects.create(
+                    customer=self.customer,
+                    tariff=item.tariff,
+                    status=Service.Status.ACTIVE,
+                    start_date=item.period_start,
+                )
+            taken.add(service.pk)
+            item.service = service
+            item.save(update_fields=["service"])
+
+    def __str__(self):
+        return self.number
+
+
+class InvoiceItem(models.Model):
+    class ItemType(models.TextChoices):
+        CUSTOM = "custom", "Custom"
+        PRODUCT = "product", "Stock item"
+        TARIFF = "tariff", "Tariff plan"
+        RECURRING_CHARGE = "recurring_charge", "Recurring charge"
+        ONCE_OFF_ITEM = "once_off_item", "Once-off item"
+
+    class BillingKind(models.TextChoices):
+        ONCE_OFF = "once_off", "Once-off"
+        RECURRING = "recurring", "Monthly recurring"
+
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="items")
+    service = models.ForeignKey(Service, on_delete=models.SET_NULL, null=True, blank=True)
+    item_type = models.CharField(max_length=20, choices=ItemType.choices, default=ItemType.CUSTOM)
+    # Whether this line is charged once or every month -- which is what lets
+    # a quote for a router plus a service report two figures instead of
+    # adding them together into one that is true of neither.
+    #
+    # BLANK IS NOT "UNKNOWN". Blank means "decide from item_type", which
+    # billing.quote_totals.kind_of does: a tariff-plan line is recurring
+    # because accepting the quote turns it into a Service and the recurring
+    # engine bills Services monthly; anything else is once-off. A custom
+    # line can be either, which is the whole reason this field exists.
+    #
+    # Derived rather than back-filled deliberately -- see migration 0037.
+    billing_kind = models.CharField(
+        max_length=10, choices=BillingKind.choices, blank=True, default="",
+        help_text=(
+            "Leave blank to decide from the line type: a tariff plan or a "
+            "recurring charge is recurring, anything else is once-off. Set "
+            "it explicitly on a custom line that is one or the other."
+        ),
+    )
+    # Set for item_type=PRODUCT -- a stock item being quoted/invoiced.
+    product = models.ForeignKey(
+        "inventory.Product", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoice_items"
+    )
+    # Set for item_type=TARIFF -- a plan being quoted/invoiced.
+    tariff = models.ForeignKey(
+        Tariff, on_delete=models.SET_NULL, null=True, blank=True, related_name="invoice_items"
+    )
+    # Set for item_type=RECURRING_CHARGE -- which catalog entry this line
+    # bills (see billing.invoice_lines.plan_invoice_lines). Kept alongside
+    # the plain-text description for the same reason `tariff` is: so a
+    # report can still ask "how much did IP Rental bring in this month"
+    # after the catalog item's own price has since changed.
+    recurring_charge = models.ForeignKey(
+        RecurringCharge, on_delete=models.SET_NULL, null=True, blank=True, related_name="invoice_items"
+    )
+    # Set for item_type=ONCE_OFF_ITEM -- which entry of the once-off list
+    # this line came from (6 Oct 2026). Price/description are the line's
+    # own copy; this is kept for reporting ("how many installs this month").
+    once_off_item = models.ForeignKey(
+        "billing.OnceOffItem", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoice_items"
+    )
+    description = models.CharField(max_length=255)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=1)
+    # FOUR decimal places, not two, and the reason is arithmetic rather than
+    # fussiness. VAT is derived from this figure -- recalc_totals computes
+    # tax as quantity * unit_price * rate -- so rounding the price to cents
+    # BEFORE taxing it changes the answer.
+    #
+    # A R379.00 VAT-inclusive line is R329.5652 ex. Store that and 15% comes
+    # to R49.43478, which rounds to R49.43, and R329.57 + R49.43 is R379.00.
+    # Store R329.57 instead and 15% is R49.4355, which rounds to R49.44, and
+    # the invoice totals R379.01 -- a cent the customer never paid, on every
+    # invoice at that price.
+    #
+    # This is how the system these invoices came from stores them too: its
+    # own documents show "Price 329.5652 / Tax 15 / With Tax 379.0000".
+    # Widening was the only way to reproduce a historical invoice exactly.
+    #
+    # Existing rows are unaffected: every 2-decimal value is a valid
+    # 4-decimal one, and everything that displays money still quantizes to
+    # cents on the way out.
+    unit_price = models.DecimalField(max_digits=12, decimal_places=4)
+    # The FULL monthly price (excl. VAT, per unit) of a pro-rata line
+    # (16 Oct 2026). unit_price on such a line is only the part month --
+    # that is what the first invoice charges -- so without this a quote
+    # could only print the part-month figure as "Monthly thereafter".
+    # Null on every other line: there unit_price already is the monthly
+    # price. Read by billing.quote_totals; charges nothing by itself.
+    monthly_price = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    tax_rate_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    # Only meaningful for item_type=TARIFF -- the contract/service period
+    # being quoted (e.g. a 12-month term). See Invoice.activate_tariff_services().
+    period_start = models.DateField(null=True, blank=True)
+    period_end = models.DateField(null=True, blank=True)
+
+    @property
+    def total(self):
+        return self.quantity * self.unit_price * (1 + self.tax_rate_pct / 100)
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+
+class Payment(models.Model):
+    class Method(models.TextChoices):
+        CASH = "cash", "Cash"
+        CARD = "card", "Card"
+        BANK_TRANSFER = "bank_transfer", "Bank Transfer"
+        MOBILE_MONEY = "mobile_money", "Mobile Money"
+        MANUAL = "manual", "Manual Adjustment"
+
+    customer = models.ForeignKey("customers.Customer", on_delete=models.CASCADE, related_name="payments")
+    invoice = models.ForeignKey(Invoice, on_delete=models.SET_NULL, null=True, blank=True, related_name="payments")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    method = models.CharField(max_length=20, choices=Method.choices, default=Method.CASH)
+    date = models.DateTimeField(auto_now_add=True)
+    note = models.CharField(max_length=255, blank=True)
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="payments_received"
+    )
+
+    class Meta:
+        ordering = ["-date"]
+
+    def __str__(self):
+        return f"Payment {self.amount} - {self.customer}"
+
+    def reverse_ledger_effect(self):
+        """Undo what recording this payment did to the ledger.
+
+        There was no reversal path anywhere in billing before this. All the
+        arithmetic lived in PaymentSerializer.create, so deleting a payment
+        -- the obvious way to correct one applied to the wrong invoice --
+        left the customer's balance credited and the invoice still marked
+        Paid, and the money simply vanished from what the customer owed.
+
+        The bank feed made that worse rather than better: deleting a
+        payment deliberately puts its bank transaction back in the review
+        queue (bankfeeds.signals._revert_to_review_queue) so it can be
+        confirmed again against the right invoice -- which, with nothing
+        reversing the first one, credited a single EFT to the customer
+        twice.
+
+        Uses F() and a locked invoice row rather than read-modify-write,
+        because the balance is exactly the field two concurrent finance
+        actions race on. Caller wraps this and the delete in one atomic
+        block. Idempotent it is NOT -- call it once, immediately before
+        deleting the row.
+        """
+        from django.db.models import F
+
+        from .allocation import reverse_allocations
+
+        # Allocation rows moved invoice.paid_amount and never the
+        # balance, so they come off on their own terms -- before the
+        # single-invoice path below, and regardless of whether this
+        # payment also used it. Without this, deleting a mapped payment
+        # leaves its invoices reading as settled by money that no longer
+        # exists, and bankfeeds puts the transaction back in the review
+        # queue to be confirmed a second time.
+        reverse_allocations(self)
+
+        type(self.customer).objects.filter(pk=self.customer_id).update(
+            balance=F("balance") + self.amount
+        )
+        if self.invoice_id is None:
+            return
+        invoice = Invoice.objects.select_for_update().get(pk=self.invoice_id)
+        invoice.paid_amount = invoice.paid_amount - self.amount
+        # A payment that had flipped the invoice to Paid no longer covers
+        # it. The status it held before that flip isn't recoverable, so it
+        # goes back to Unpaid -- the state an invoice with money still
+        # outstanding is in. Anything that wasn't Paid is left alone: a
+        # cancelled or draft invoice doesn't become unpaid because a
+        # payment against it was reversed.
+        if invoice.status == Invoice.Status.PAID and invoice.paid_amount < invoice.total:
+            invoice.status = Invoice.Status.UNPAID
+        invoice.save(update_fields=["paid_amount", "status"])
+
+
+class CreditRequest(models.Model):
+    """A request to credit a customer's account for a stated reason --
+    billing error, goodwill gesture, service outage compensation, etc.
+    Submitted by Accounts (or an admin standing in), and must be approved
+    by Management (or an admin) before it takes effect. Approving reduces
+    the customer's balance directly by the requested amount; rejecting
+    leaves it untouched.
+
+    CORRECTED 1 Oct 2026 -- `invoice`, below, lets this credit be aimed at
+    one specific invoice instead of only ever moving the customer's
+    overall balance. Found on a real account: CN-00002 was raised against
+    Jayden van Wyk's partially-paid TXN92206. It reduced her balance by
+    the right amount -- but TXN92206 itself never heard about it, so it
+    stayed UNPAID (and, days later, OVERDUE) forever, regardless of the
+    fact that nothing was really owing on it any more. Nothing downstream
+    reads invoice status alongside balance either -- the suspension rule
+    (billing.recurring.blocking_candidate_services) and the reconnection
+    rule (billing.reactivation.is_clear) both key off exactly that
+    "has an overdue invoice" question, so a credit note that only moves
+    the balance and never settles the invoice it was for is a standing
+    trap for the next customer this happens to, not just a cosmetic
+    wrong status on one invoice. See CreditRequest.create_credit_note_invoice."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        # Approved, then undone: its credit note was deleted, which puts the
+        # amount back on the balance and takes back whatever it settled
+        # (see reverse()).
+        REVERSED = "reversed", "Reversed"
+
+    customer = models.ForeignKey("customers.Customer", on_delete=models.CASCADE, related_name="credit_requests")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    reason = models.TextField()
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    decision_note = models.CharField(max_length=255, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    # Set once approved (see create_credit_note_invoice below): the visible,
+    # customer-facing side of this credit -- a real Invoice with a single
+    # negative line, under its own "CN-" number sequence. NULL for every
+    # credit decided before this field existed, and for one that has not
+    # been backfilled yet (see the backfill_credit_note_invoices
+    # management command). SET_NULL rather than CASCADE: deleting the
+    # invoice by hand should not take the decision record -- and the
+    # balance it already moved -- down with it.
+    credit_note = models.OneToOneField(
+        "Invoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="credit_request",
+    )
+    # The invoice this credit is actually FOR, if it's for one in
+    # particular -- as opposed to `credit_note`, which is the new invoice
+    # THIS credit creates. Optional, and defaults to the old behaviour
+    # (None): a goodwill gesture or an outage credit isn't settling any
+    # one invoice, and stays exactly a balance movement with a visible
+    # credit-note line, same as before this field existed.
+    #
+    # When it IS set, approving this request also moves its amount onto
+    # `invoice`'s own paid_amount (capped at what's still outstanding,
+    # same convention billing.allocation uses for an over-sized payment --
+    # see CreditRequest.create_credit_note_invoice), so that invoice's own
+    # status reflects the credit instead of silently staying unpaid while
+    # only the customer's overall balance looks clear.
+    invoice = models.ForeignKey(
+        "Invoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="credit_requests_applied",
+    )
+    # True for every credit approved since 5 Oct 2026: what it settled is
+    # recorded as CreditAllocation rows, exactly like a payment's
+    # PaymentAllocations, so it can be swept onto invoices, reversed, and
+    # explained. False for credits approved before that -- they moved the
+    # balance (and, if linked, an invoice's paid_amount) with no record of
+    # which invoice got what, so the allocation sweep leaves them alone
+    # rather than apply the same money twice. Set by migration 0047.
+    allocation_tracked = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Credit {self.amount} — {self.customer} ({self.status})"
+
+    def create_credit_note_invoice(self):
+        """Create the visible customer-facing side of this credit: a real
+        Invoice carrying this credit's amount as a single negative line,
+        so approving a credit request leaves something on the customer's
+        Invoices tab and statement, not just a balance figure that moved
+        with nothing to explain why.
+
+        Requires decided_at to already be set -- the note is dated to it,
+        not to whenever this happens to run, so a request approved months
+        ago and backfilled today (see backfill_credit_note_invoices) lands
+        in the right place on a statement instead of looking like the
+        newest thing on the account.
+
+        BALANCE: approving a CreditRequest already moves Customer.balance
+        directly, with an F() update, inside CreditRequestViewSet.approve's
+        atomic block (see that method, and the double-click race it
+        guards against). This invoice must NOT also move the balance --
+        that would apply the same credit twice. So it is created with
+        balance_debited=None, the same "inert" state a pre-balance_debited
+        legacy row carries: apply_balance_debit() and release_balance_debit()
+        both leave a None row alone unconditionally (see that field's own
+        comment on Invoice), so nothing that later edits, converts or
+        deletes this credit note can accidentally touch the balance it was
+        never meant to manage.
+
+        TAX: tax_rate_pct is 0 (zero-rated), not the standard rate
+        billing.ledger_import uses for an imported historical credit note.
+        That import always reverses one specific prior invoice, so VAT
+        reverses with it. A CreditRequest can be raised for anything --
+        "billing error, goodwill gesture, service outage compensation" per
+        this model's own docstring above -- and this platform has no way
+        to know which of those is actually undoing a taxed supply.
+        Zero-rating it is the conservative default: it changes nothing
+        about output VAT that nobody asked to change. Staff can edit the
+        line's tax rate on the invoice afterwards for the specific credits
+        that do need one.
+
+        NUMBERING: gets its own "CN-" sequence, not "INV-" -- Rudolph,
+        seeing the first one land as `INV-000015` next to the historical
+        Splynx-imported `CN202605000020`, asked for "CN" instead. Set via
+        a transient `_credit_note_prefix` flag (see Invoice._next_number),
+        never a model field, because a credit note has no Status of its
+        own to key a prefix off the normal way -- it is an ordinary
+        Invoice at status UNPAID/PAID in every other respect. The
+        sequence starts fresh at CN-000001, independent of the legacy
+        import's numbers, which don't match `CN-<digits>` and so were
+        never part of any live sequence to begin with.
+        """
+        if self.decided_at is None:
+            raise ValueError(
+                "create_credit_note_invoice can only be called after this "
+                "request has been decided (decided_at is not set)."
+            )
+        issued = self.decided_at.date()
+        invoice = Invoice(
+            customer=self.customer,
+            status=Invoice.Status.UNPAID,
+            date_due=issued,
+            # Set explicitly, exactly as billing.ledger_import does for a
+            # backdated document -- otherwise save() stamps today's date
+            # the moment it sees a blank date_issued on an issued status,
+            # which would misdate a credit note backfilled for a credit
+            # decided months ago.
+            date_issued=issued,
+            balance_debited=None,
+        )
+        invoice._credit_note_prefix = True
+        invoice.save()
+        InvoiceItem.objects.create(
+            invoice=invoice,
+            item_type=InvoiceItem.ItemType.CUSTOM,
+            description=(self.reason or "Credit").strip()[:255] or "Credit",
+            quantity=1,
+            unit_price=-self.amount,
+            tax_rate_pct=0,
+        )
+        invoice.recalc_totals()
+        # recalc_totals() already flipped status to Paid -- paid_amount (0)
+        # is >= a negative total, so nothing is left owing -- but it never
+        # touches paid_amount itself. Set it to match the total so the
+        # Invoices tab shows a document that is actually settled (Paid: the
+        # same figure as Total) rather than "Paid R0.00" beside a negative
+        # total, the same convention billing.ledger_import uses for an
+        # imported credit note that was "Settled in the old system".
+        invoice.paid_amount = invoice.total
+        invoice.save(update_fields=["paid_amount"])
+        self.credit_note = invoice
+        # What the credit SETTLES is no longer done here: approve() allocates
+        # it (linked invoice first, the rest oldest-first) once the credit is
+        # saved as Approved -- see billing.allocation.allocate_approved_credit.
+        return invoice
+
+    def reverse(self, *, note="", invoice_take_back=None):
+        """Undo an approved credit: the amount goes back on the customer's
+        balance and whatever it settled comes back off those invoices (a
+        Paid invoice returns to Unpaid). Called when its credit note is
+        deleted (InvoiceViewSet.destroy) and by reverse_deleted_credits.
+
+        A tracked credit undoes its own CreditAllocation rows. A legacy one
+        (allocation_tracked=False) has no record of what it settled; the
+        clean-up command works that out and passes `invoice_take_back` for
+        its linked invoice. Caller holds the transaction. Re-suspension is
+        left to the normal billing run.
+        """
+        from django.db.models import F
+
+        from customers.models import Customer
+
+        from .allocation import _unapply, release_credit
+
+        Customer.objects.filter(pk=self.customer_id).update(balance=F("balance") + self.amount)
+        if self.allocation_tracked:
+            release_credit(self)
+        elif invoice_take_back and invoice_take_back > 0 and self.invoice_id:
+            target = Invoice.objects.select_for_update().filter(pk=self.invoice_id).first()
+            if target is not None:
+                _unapply(target, min(invoice_take_back, target.paid_amount))
+        self.status = self.Status.REVERSED
+        if note:
+            self.decision_note = (f"{self.decision_note} | {note}" if self.decision_note else note)[:255]
+        self.save(update_fields=["status", "decision_note"])
+
+
+class InvoiceDeletionRequest(models.Model):
+    """Deleting a Quote or Pro Forma Invoice isn't a plain staff action --
+    same trust tier as deleting a Customer (see
+    customers.CustomerDeletionRequest, whose request/decide shape this
+    mirrors). Any staff member with Finance access can submit one; only
+    Management (or Admin) can approve or reject it -- approving actually
+    deletes the Invoice (and its line items, via cascade).
+
+    Deliberately scoped to quote/pro-forma-status invoices only -- see
+    InvoiceViewSet.destroy (which blocks direct DELETE for exactly those
+    two statuses, same as CustomerViewSet.destroy does for Customer) and
+    InvoiceDeletionRequestSerializer.validate_invoice. Real invoices
+    (draft/unpaid/paid/overdue/cancelled) are untouched by this feature --
+    they can still be deleted directly by staff with Finance access, same
+    as before this was added."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
+    # SET_NULL, not CASCADE: once approved, the invoice itself is deleted,
+    # but this request row survives as the audit trail of what happened and
+    # why -- see invoice_display_number/customer below, snapshotted before
+    # that happens since `invoice` will no longer be there to read them from.
+    invoice = models.ForeignKey(
+        Invoice, on_delete=models.SET_NULL, null=True, blank=True, related_name="deletion_requests"
+    )
+    invoice_display_number = models.CharField(max_length=30, editable=False, blank=True)
+    invoice_display_customer = models.CharField(max_length=255, editable=False, blank=True)
+    reason = models.TextField()
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    decision_note = models.CharField(max_length=255, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if self.invoice and not self.invoice_display_number:
+            self.invoice_display_number = self.invoice.number
+            self.invoice_display_customer = self.invoice.customer.full_name
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Delete {self.invoice_display_number or 'invoice'} ({self.status})"
+
+
+class SuspensionExtensionRequest(models.Model):
+    """A request to pause suspension AND the reminder/warning chasers for
+    one customer through a given date -- e.g. "they promised to pay by
+    Friday." Same trust tier as CreditRequest and InvoiceDeletionRequest:
+    any staff member with Finance access can submit one, only Management
+    (or Admin) can approve or reject it.
+
+    Approving writes `extend_until` onto that customer's
+    CustomerBillingConfig.suspension_extended_until, which
+    blocking_candidate_services, suspension_block_date and
+    _process_reminders (billing/recurring.py) all check and skip while
+    run_date is on or before it. Rejecting leaves the customer's config
+    untouched.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE, related_name="suspension_extension_requests"
+    )
+    extend_until = models.DateField(
+        help_text="Don't suspend, remind or warn this customer through this date (inclusive)."
+    )
+    reason = models.TextField()
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    decision_note = models.CharField(max_length=255, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Extend {self.customer} until {self.extend_until} ({self.status})"
+
+
+class PaymentTermsMixin(models.Model):
+    """When money is expected, and what happens when it doesn't arrive:
+    due date, blocking, deactivation, minimum balance, reminders, pro
+    formas.
+
+    Split out of RecurringBillingFieldsMixin so PaymentMethod can carry
+    the same terms without a payment_method FK pointing at itself. Both
+    mixins are abstract and no field definition changed in the split, so
+    BillingDefaults and CustomerBillingConfig keep exactly the columns
+    they already have -- this adds no migration for either of them.
+    """
+
+    class PaymentPeriod(models.TextChoices):
+        MONTHLY = "monthly", "1 month"
+        QUARTERLY = "quarterly", "3 months"
+        BIANNUALLY = "biannually", "6 months"
+        ANNUALLY = "annually", "12 months"
+
+    class ProformaTarget(models.TextChoices):
+        CURRENT_MONTH = "current_month", "Current month"
+        NEXT_MONTH = "next_month", "Next month"
+
+    payment_period = models.CharField(max_length=20, choices=PaymentPeriod.choices, default=PaymentPeriod.MONTHLY)
+    # Capped at 1-28 (not 1-31) so a "billing day" is always a real day in
+    # every month -- sidesteps the whole short-month/clamping question
+    # rather than guessing what staff would want for day 29-31.
+    billing_day = models.PositiveSmallIntegerField(
+        default=1, validators=[MinValueValidator(1), MaxValueValidator(28)],
+        help_text="Day of the month recurring invoices are generated (1-28).",
+    )
+    use_date_of_customer_creation = models.BooleanField(
+        default=False, help_text="Bill on the anniversary of the customer's creation date instead of billing_day."
+    )
+    payment_due_days = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="Days after the document date payment is due. Blank = due the same day it's issued."
+    )
+    blocking_period_days = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        help_text="Days after payment is due before this customer's services are automatically suspended. Blank = never auto-suspend.",
+    )
+    deactivation_period_days = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        help_text="Days after blocking before further action is taken. Configurable, but not yet wired to any action -- reserved for a future release.",
+    )
+    minimum_balance = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text="How far into credit/negative a customer's balance can go before the blocking period above starts counting.",
+    )
+    auto_create_invoices = models.BooleanField(default=True)
+    send_billing_notifications = models.BooleanField(default=True)
+    auto_proforma_enabled = models.BooleanField(
+        default=False, help_text="Generate a pro forma invoice instead of a real invoice each cycle."
+    )
+    proforma_day = models.PositiveSmallIntegerField(
+        null=True, blank=True, validators=[MinValueValidator(1), MaxValueValidator(28)]
+    )
+    proforma_payment_period = models.CharField(max_length=20, choices=PaymentPeriod.choices, blank=True)
+    create_proforma_for = models.CharField(
+        max_length=20, choices=ProformaTarget.choices, default=ProformaTarget.CURRENT_MONTH
+    )
+    # Per-customer day offsets -- only actually fire if the matching
+    # reminder is ALSO enabled globally, see ReminderSettings below.
+    #
+    # SIGNED, and the sign is the entire point of the field type. The
+    # engine's test is
+    #
+    #     (invoice.date_due - run_date).days in offsets
+    #
+    # so a POSITIVE offset fires that many days BEFORE the due date, and a
+    # NEGATIVE one that many days AFTER it.
+    #
+    # These were PositiveSmallIntegerField, which made the second kind
+    # impossible to express. The arithmetic always handled it; the field
+    # could not hold the number. So the platform could warn a customer
+    # that a bill was coming and could not once chase them for one that
+    # was late -- while the settings screen said "before/after due date"
+    # as though it could. For an ISP the chaser is the reminder that
+    # matters, and it was the one that could not be configured.
+    reminder_enabled = models.BooleanField(default=False)
+    reminder_1_day = models.SmallIntegerField(
+        null=True, blank=True,
+        help_text=(
+            "Days from the due date. Positive fires before it (7 = a week's "
+            "notice), negative after it (-7 = chased a week late). Blank "
+            "disables this slot."
+        ),
+    )
+    reminder_2_day = models.SmallIntegerField(
+        null=True, blank=True,
+        help_text="As above. Positive is before the due date, negative after it.",
+    )
+    reminder_3_day = models.SmallIntegerField(
+        null=True, blank=True,
+        help_text="As above. Positive is before the due date, negative after it.",
+    )
+
+    class Meta:
+        abstract = True
+
+    # Everything a payment method hands to a customer. payment_method_id
+    # is deliberately NOT here: a PaymentMethod has no payment method of
+    # its own, and the customer's is set to the method being applied
+    # rather than copied off it -- see
+    # CustomerBillingConfig.apply_payment_method.
+    TERMS_FIELDS = [
+        "payment_period", "billing_day", "use_date_of_customer_creation",
+        "payment_due_days", "blocking_period_days", "deactivation_period_days", "minimum_balance",
+        "auto_create_invoices", "send_billing_notifications", "auto_proforma_enabled", "proforma_day",
+        "proforma_payment_period", "create_proforma_for", "reminder_enabled",
+        "reminder_1_day", "reminder_2_day", "reminder_3_day",
+    ]
+
+
+class PaymentMethod(PaymentTermsMixin):
+    """A named set of payment terms -- "EFT 1st", "Netcash Debit Order
+    15th", "Cash".
+
+    This was a bare label (name + is_active) whose docstring said the
+    timing "comes from CustomerBillingConfig's own fields". It now carries
+    those terms itself, so selecting a method on a customer sets how that
+    customer is billed, chased and blocked -- a debit order that fails on
+    a known date can reasonably block sooner than an EFT that does not.
+
+    Selecting a method COPIES its terms onto the customer; it does not
+    link them. Editing a method therefore changes nothing for anyone
+    already on it until someone explicitly applies it (see
+    PaymentMethodViewSet.apply_to_existing). That is the same
+    copy-on-create convention BillingDefaults uses, and it is the reason
+    an absent-minded edit here cannot quietly suspend a customer base at
+    the next billing run.
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class RecurringBillingFieldsMixin(PaymentTermsMixin):
+    """Payment terms (see PaymentTermsMixin) plus the payment_method FK --
+    what BillingDefaults (the org-wide template) and CustomerBillingConfig
+    (one customer's actual settings) share, kept in one place so the two
+    can never drift on what a "reset to default" / "apply to existing
+    customers" copies. See SHARED_FIELDS for exactly what that is."""
+
+    payment_method = models.ForeignKey(
+        PaymentMethod, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Meta:
+        abstract = True
+
+    # Every field a "reset to default" / "apply to existing customers"
+    # bulk-copy touches -- deliberately excludes billing_enabled (opt-in,
+    # see CustomerBillingConfig's docstring) and anything model-specific
+    # (customer FK, billing_name/street/zip/city, next_billing_date,
+    # timestamps).
+    #
+    # Derived from TERMS_FIELDS rather than restated, so a field added to
+    # the terms can never be silently left out of the copy.
+    SHARED_FIELDS = ["payment_method_id"] + PaymentTermsMixin.TERMS_FIELDS
+
+
+class BillingDefaults(RecurringBillingFieldsMixin):
+    """Singleton (pk=1) org-wide template for recurring billing -- seeds a
+    new CustomerBillingConfig the first time one is created for a customer
+    (see CustomerBillingConfig.for_customer()) and is what every field's
+    "Reset to default" pulls from on an individual customer's own config.
+
+    Deliberately has NO billing_enabled field: whether billing actually
+    runs for a given customer is always a specific, deliberate decision
+    made on that customer's own config, never something a global default
+    (or "Apply to existing customers") can switch on in bulk."""
+
+    # Skybre's own VAT registration number -- deliberately lives here
+    # (not on RecurringBillingFieldsMixin, so it never gets copied onto a
+    # per-customer CustomerBillingConfig) since it's a single company-wide
+    # fact, not something that varies per customer. Shown on the
+    # Accountant -> VAT Returns report so the SARS submission has it on
+    # hand; blank until set from Configs -> Billing -> Billing Defaults.
+    vat_number = models.CharField(max_length=32, blank=True, help_text="Skybre's own SARS VAT registration number.")
+
+    # --- Company identity, as printed on tax invoices --------------------
+    # A tax invoice has to carry the supplier's registered name, address and
+    # VAT number to be valid, and none of that existed anywhere in the
+    # platform before this -- the PDF was printing a bare brand name.
+    company_legal_name = models.CharField(
+        max_length=200, blank=True,
+        help_text='Registered name as it must appear on a tax invoice, e.g. "Skybre Pty Ltd".',
+    )
+    company_address = models.CharField(
+        max_length=255, blank=True, help_text="Street address line, e.g. Cnr Reitz & Botha Street.",
+    )
+    company_city = models.CharField(max_length=100, blank=True)
+    company_postal_code = models.CharField(max_length=20, blank=True)
+    company_country = models.CharField(max_length=100, blank=True, default="South Africa")
+    company_phone = models.CharField(max_length=40, blank=True)
+    company_email = models.EmailField(
+        blank=True, help_text="Billing address shown on invoices, e.g. accounts@skybre.co.za.",
+    )
+    logo = models.ImageField(
+        upload_to="branding/", null=True, blank=True,
+        help_text="Printed top-left on invoices and statements. A PNG with a transparent background works best.",
+    )
+
+    # --- Banking, for the payment-details block on an invoice ------------
+    # Deliberately separate from bankfeeds.BankAccount: that model is about
+    # importing transactions from a bank API, may hold several accounts, and
+    # none of them is necessarily the one customers should pay into. What
+    # gets printed on an invoice is a single deliberate choice.
+    bank_name = models.CharField(max_length=100, blank=True, help_text="e.g. FNB.")
+    bank_account_number = models.CharField(max_length=40, blank=True)
+    bank_branch_code = models.CharField(max_length=20, blank=True, help_text="e.g. 250655.")
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Billing defaults"
+        verbose_name_plural = "Billing defaults"
+
+    def __str__(self):
+        return "Billing defaults"
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class ReminderSettings(models.Model):
+    """Singleton (pk=1) global kill-switches for payment reminders. A
+    customer's own reminder_1_day/2/3 (see CustomerBillingConfig /
+    RecurringBillingFieldsMixin) only take effect if the matching switch
+    here is also on -- individual customer settings can't override this,
+    same convention the Splynx reference uses."""
+
+    static_days = models.BooleanField(
+        default=True,
+        help_text="Reminders fire this many days before/after due date (a fixed number per reminder). Dynamic day calculation isn't implemented yet.",
+    )
+    reminder_1_enabled = models.BooleanField(default=True)
+    reminder_2_enabled = models.BooleanField(default=True)
+    reminder_3_enabled = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Reminder settings"
+        verbose_name_plural = "Reminder settings"
+
+    def __str__(self):
+        return "Reminder settings"
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class SuspensionSettings(models.Model):
+    """Singleton (pk=1) global master switch for auto-suspension --
+    mirrors ReminderSettings' "global kill-switch on top of per-customer
+    settings" shape. A customer's own blocking_period_days (see
+    RecurringBillingFieldsMixin) only actually suspends anything if this
+    switch is ALSO on; individual customers can't override this, same
+    convention as ReminderSettings. Deliberately its own tiny model rather
+    than a field on BillingDefaults -- BillingDefaults is a per-customer
+    *template* (each field gets copied onto, and can then be overridden
+    per, a CustomerBillingConfig), whereas this is a true platform-wide
+    switch nothing per-customer can bypass, the same role ReminderSettings
+    already plays for reminders.
+
+    Defaults to OFF on a fresh install/migrate, matching the behavior this
+    replaces (auto-suspension was previously only reachable by editing
+    every customer's blocking_period_days by hand, with no single place to
+    confirm or flip it off in a hurry)."""
+
+    auto_suspend_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "Master switch for auto-suspension. When off, the recurring-billing engine never "
+            "suspends anyone, regardless of any customer's own blocking_period_days. When on, "
+            "suspension still only applies to customers who are billing_enabled AND have a "
+            "blocking_period_days set."
+        ),
+    )
+    # The warning, and its own switch.
+    #
+    # Separate from auto_suspend_enabled on purpose, and usable while that
+    # is OFF: warning people their line is heading for a cut-off is
+    # something you might well want to do for a cycle or two before
+    # arming the cut-off itself. The reverse -- suspending without ever
+    # having warned -- is the situation this field exists to end.
+    warning_enabled = models.BooleanField(
+        default=True,
+        help_text=(
+            "Email customers before their line is suspended, naming the date. Independent of "
+            "the master switch above: warnings can run while auto-suspension is still off."
+        ),
+    )
+    warning_days = models.PositiveSmallIntegerField(
+        default=3,
+        help_text=(
+            "How many days before the cut-off the warning goes out. 3 means a customer due to "
+            "be suspended on the 25th is warned on the 22nd."
+        ),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Suspension settings"
+        verbose_name_plural = "Suspension settings"
+
+    def __str__(self):
+        return "Suspension settings"
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class CustomerBillingConfig(RecurringBillingFieldsMixin):
+    """Per-customer recurring-billing configuration -- see
+    RecurringBillingFieldsMixin for the shared fields this mirrors from
+    BillingDefaults. Deliberately opt-in: billing_enabled defaults to False
+    for every customer (including ones touched by
+    BillingDefaults.apply_to_existing_customers()), so turning this
+    feature on for a given customer is always a specific action a staff
+    member takes, never a side effect of a global settings change."""
+
+    customer = models.OneToOneField("customers.Customer", on_delete=models.CASCADE, related_name="billing_config")
+    billing_enabled = models.BooleanField(
+        default=False,
+        help_text="Whether recurring invoicing/reminders/auto-suspension run for this customer at all.",
+    )
+    # Optional override for finance documents -- customer's own
+    # address/city/etc. is used if these are left blank.
+    billing_name = models.CharField(max_length=255, blank=True)
+    billing_street = models.CharField(max_length=255, blank=True)
+    billing_zip = models.CharField(max_length=20, blank=True)
+    billing_city = models.CharField(max_length=100, blank=True)
+    # Tracks the next date this customer is due to be (re-)invoiced -- set
+    # the first time the recurring-billing engine bills them, then advanced
+    # by payment_period each time, so re-running the engine on the same (or
+    # a later, still-within-cycle) day never double-bills them.
+    next_billing_date = models.DateField(null=True, blank=True)
+    # The DAY a suspension warning was last sent to this customer.
+    #
+    # The warning is a daily countdown -- "3 days", "2 days", "1 day" --
+    # so a customer is warned once on each day of the notice period, and
+    # this field exists to stop a second send on the same day when the
+    # command and a Run both happen, or when either is re-run.
+    #
+    # On the CONFIG rather than the invoice, because a cut-off is about the
+    # customer's overall position (balance against minimum balance, plus
+    # their oldest owing invoice), not about one document.
+    suspension_warned_on = models.DateField(null=True, blank=True)
+    # Pauses suspension AND the reminder/warning chasers for this customer
+    # through this date (inclusive) -- e.g. "they promised to pay by
+    # Friday." Set only by SuspensionExtensionRequestViewSet.approve, never
+    # edited directly (see CustomerBillingConfigSerializer). Checked by
+    # blocking_candidate_services, suspension_block_date and
+    # _process_reminders in billing/recurring.py -- once run_date passes
+    # this date it simply stops having any effect, so no expiry job is
+    # needed and the date is left in place afterwards as a record of the
+    # last extension granted.
+    suspension_extended_until = models.DateField(null=True, blank=True)
+    #: The last month ("2026-09") this customer was sent a statement for.
+    #:
+    #: Keyed on the PERIOD rather than on a send date, for the reason the
+    #: reminder dedupe gives: a date says "something was attempted today",
+    #: which a re-run on a later day sails straight past, and which a
+    #: failed send sets just as readily as a successful one. The period is
+    #: the thing actually being deduplicated -- this customer, this month,
+    #: once -- and it is written only after the mailer says the send
+    #: succeeded.
+    statement_sent_for = models.CharField(max_length=7, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Billing config for {self.customer}"
+
+    @classmethod
+    def for_customer(cls, customer):
+        """Get-or-create, seeded from BillingDefaults the first time --
+        same lazy-singleton convention as EmailSettings.load(), just keyed
+        per customer rather than platform-wide."""
+        obj, created = cls.objects.get_or_create(customer=customer)
+        if created:
+            obj.apply_defaults(BillingDefaults.load())
+        return obj
+
+    def apply_defaults(self, defaults):
+        """Copies every SHARED_FIELDS value from BillingDefaults onto this
+        customer's config -- deliberately never touches billing_enabled.
+        Used both the first time a config is created and by "Apply to
+        existing customers" (see BillingDefaultsView.apply_to_existing)."""
+        for field in self.SHARED_FIELDS:
+            setattr(self, field, getattr(defaults, field))
+        self.save()
+
+    def apply_payment_method(self, method):
+        """Copy a payment method's terms onto this customer's config and
+        point the customer at that method.
+
+        A copy, not a link -- see PaymentMethod's docstring for why.
+        Never touches billing_enabled, same as apply_defaults."""
+        for field in PaymentTermsMixin.TERMS_FIELDS:
+            setattr(self, field, getattr(method, field))
+        self.payment_method = method
+        self.save()
+
+
+class RecurringBillingRun(models.Model):
+    """One row per committed run of the recurring-billing engine (see
+    billing.recurring.run_recurring_billing) -- what Finance -> Recurring
+    Billing's History table lists. A *preview* (commit=False) never
+    creates one of these; only an actual Run does, whether it succeeds or
+    fails partway (see status/status_message)."""
+
+    class Status(models.TextChoices):
+        # The state a run is created in, and the one it is left in if it
+        # never reaches the end. The default used to be PROCESSED, so a
+        # run killed halfway -- a container restart, a deploy, the
+        # process going away -- left a row reading "Processed, 0
+        # invoices" on top of invoices that had committed, balances that
+        # had been debited and PDFs already in customers' inboxes.
+        # Nothing on the row said otherwise, and the obvious recovery
+        # from it (run it again, History says nothing happened) is
+        # exactly what would double-bill everybody.
+        IN_PROGRESS = "in_progress", "In progress"
+        PROCESSED = "processed", "Processed"
+        FAILED = "failed", "Failed"
+
+    run_date = models.DateField(help_text="The billing date this run was for.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.IN_PROGRESS)
+    status_message = models.CharField(max_length=255, blank=True)
+    partners = models.ManyToManyField(
+        "customers.Partner", blank=True, related_name="recurring_billing_runs",
+        help_text="Which partners' customers this run was scoped to. Empty = every partner.",
+    )
+    invoices_created_count = models.PositiveIntegerField(default=0)
+    proforma_invoices_created_count = models.PositiveIntegerField(default=0)
+    reminders_sent_count = models.PositiveIntegerField(default=0)
+    suspension_warnings_sent_count = models.PositiveIntegerField(default=0)
+    suspensions_applied_count = models.PositiveIntegerField(default=0)
+    triggered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+        help_text="The staff member who clicked Run. Every run is staff-triggered this release -- see the design doc's phased rollout.",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Recurring billing run {self.run_date} ({self.status})"
+
+
+class BillingPreviewSnapshot(models.Model):
+    """A saved recurring-billing Preview -- the document finance reviews, and
+    the approval that unlocks Run for it.
+
+    Why the sheets are stored rather than regenerated on download: an
+    approval has to be an approval OF something. If the CSV were rebuilt at
+    download time, the file someone signed off on and the file they later
+    open could differ, and there would be no way to tell. The sheets here are
+    exactly the bytes that were reviewed.
+
+    `fingerprint` is taken over the projected numbers only (see
+    preview_export.projection_digest), not over the moment they were
+    produced -- so re-previewing unchanged data reproduces the same
+    fingerprint, and any change to a tariff, service or customer in between
+    produces a different one. Run recomputes the fingerprint and refuses if
+    it no longer matches the approved snapshot, which is what stops a stale
+    approval from billing something nobody agreed to.
+
+    Snapshots are kept, not cleaned up: they are the audit trail of who
+    approved which billing run. A month of previews is a few hundred KB.
+    """
+
+    run_date = models.DateField(help_text="The billing date this preview was taken for.")
+    # Stored as ids rather than an M2M so a snapshot's scope is frozen even
+    # if a partner is later renamed or deleted -- and so scope comparison at
+    # Run time is a plain equality check against the same sorted list the
+    # request produced.
+    partner_ids = models.JSONField(default=list, blank=True)
+    fingerprint = models.CharField(max_length=16, db_index=True)
+    engine = models.CharField(max_length=10, default="", editable=False)
+
+    counts = models.JSONField(default=dict)
+    grand_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    # {"invoice": "<csv text>", "transaction": ..., "reminder": ..., "suspension": ...}
+    sheets = models.JSONField(default=dict)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    generated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # Set once this approval has been spent, so the History row and the
+    # approval that authorised it can be read together.
+    run = models.ForeignKey(
+        "billing.RecurringBillingRun", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="approvals",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["run_date", "approved_at"])]
+
+    def __str__(self):
+        return "Preview %s %s (%s)" % (self.run_date, self.fingerprint, "approved" if self.approved_at else "pending")
+
+    @property
+    def is_approved(self) -> bool:
+        return self.approved_at is not None
+
+    @property
+    def is_spent(self) -> bool:
+        return self.run_id is not None
+
+
+class PaymentAllocation(models.Model):
+    """Which invoice a slice of a payment settles.
+
+    Payment.invoice already existed, but it is a single FK: one payment
+    could only ever settle one invoice, and a bank-feed confirmation
+    (which posts a customer and no invoice at all) settled none. A
+    customer paying one round R2,000 against three outstanding invoices
+    had no representable answer.
+
+    Rows here move `Invoice.paid_amount` only. `Customer.balance` is moved
+    exactly once, when the payment is recorded (PaymentSerializer.create),
+    and allocation distributes money that balance has already accounted
+    for. See billing/allocation.py -- anything here that touches balance
+    is a double-count.
+
+    Kept rather than folded into paid_amount so a mapping is auditable and
+    reversible: who allocated what, when, and enough detail to undo one
+    line without deleting and re-recording the payment.
+    """
+
+    payment = models.ForeignKey(
+        "billing.Payment", on_delete=models.CASCADE, related_name="allocations"
+    )
+    # CASCADE, deliberately: if an invoice is deleted its allocations go
+    # with it, and the money stays on the customer's balance as
+    # unallocated credit -- which is the truthful outcome, since the debt
+    # it was paying against no longer exists.
+    invoice = models.ForeignKey(
+        "billing.Invoice", on_delete=models.CASCADE, related_name="allocations"
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Meta:
+        ordering = ["invoice__date_due", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["payment", "invoice"], name="unique_payment_invoice_allocation"
+            ),
+        ]
+        indexes = [models.Index(fields=["invoice"]), models.Index(fields=["payment"])]
+
+    def __str__(self):
+        return "R%s of payment %s -> %s" % (
+            self.amount, self.payment_id, self.invoice.number if self.invoice_id else "?",
+        )
+
+
+class CreditAllocation(models.Model):
+    """Which invoice a slice of an approved credit settles -- the credit
+    counterpart of PaymentAllocation (5 Oct 2026). Moves Invoice.paid_amount
+    only; the credit moved Customer.balance once, on approval. CASCADE on
+    the invoice for the same reason as PaymentAllocation: delete the debt
+    and the credit is free to settle something else (the sweep re-applies
+    it)."""
+
+    credit = models.ForeignKey("billing.CreditRequest", on_delete=models.CASCADE, related_name="allocations")
+    invoice = models.ForeignKey("billing.Invoice", on_delete=models.CASCADE, related_name="credit_allocations")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Meta:
+        ordering = ["invoice__date_due", "pk"]
+        constraints = [
+            models.UniqueConstraint(fields=["credit", "invoice"], name="unique_credit_invoice_allocation"),
+        ]
+
+    def __str__(self):
+        return "R%s of credit %s -> %s" % (
+            self.amount, self.credit_id, self.invoice.number if self.invoice_id else "?",
+        )
+
+
+class CreditNoteAllocation(models.Model):
+    """Which invoice a slice of an IMPORTED credit note settles (6 Oct 2026).
+
+    Splynx brought credit notes over as negative invoices (status Paid) that
+    were never set against the invoice they cancelled -- Dawid Griesel
+    (SWF2581) is invoiced and credited the same amount every month, so his
+    balance is R0.00 while 24 invoices still read Unpaid. Same rules as
+    CreditAllocation: moves Invoice.paid_amount only, never the balance (the
+    credit note already moved it), and only up to what the balance proves is
+    covered (billing.allocation.balance_backed_cover). Credit notes this
+    platform makes from a CreditRequest settle through CreditAllocation and
+    are never used here."""
+
+    credit_note = models.ForeignKey(
+        "billing.Invoice", on_delete=models.CASCADE, related_name="credit_note_settlements",
+    )
+    invoice = models.ForeignKey(
+        "billing.Invoice", on_delete=models.CASCADE, related_name="credit_note_allocations",
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["invoice__date_due", "pk"]
+        constraints = [
+            models.UniqueConstraint(fields=["credit_note", "invoice"], name="unique_credit_note_invoice_allocation"),
+        ]
+
+    def __str__(self):
+        return "R%s of %s -> %s" % (
+            self.amount,
+            self.credit_note.number if self.credit_note_id else "?",
+            self.invoice.number if self.invoice_id else "?",
+        )
+
+
+class PublicHoliday(models.Model):
+    """A day the platform will not disconnect anybody on.
+
+    DATA RATHER THAN CODE, deliberately. South Africa's statutory list is
+    stable but not fixed: election days get declared at short notice, the
+    Public Holidays Act pushes a Sunday holiday onto the Monday, and a
+    business may want its own December shutdown treated the same way.
+    Something declared three weeks before it happens cannot be something
+    that needs a deploy.
+
+    Seeded by `manage.py seed_public_holidays`, and editable by hand
+    afterwards -- the seed is a starting point, not the authority.
+
+    ONLY SUSPENSION CONSULTS THIS. Invoices still go out on the 1st
+    whatever day that is, because an invoice dated the 3rd for a period
+    beginning the 1st is a bookkeeping problem, and nobody is harmed by an
+    email arriving on a public holiday. Being disconnected on one is a
+    different matter entirely -- see billing.business_days.
+    """
+
+    date = models.DateField(unique=True)
+    name = models.CharField(max_length=120)
+    #: Where the row came from. A seeded row can be regenerated; one
+    #: somebody added by hand must never be overwritten by a re-seed.
+    seeded = models.BooleanField(
+        default=False,
+        help_text="Created by seed_public_holidays. Rows added by hand stay untouched by a re-seed.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["date"]
+        verbose_name = "Public holiday"
+        verbose_name_plural = "Public holidays"
+
+    def __str__(self):
+        return f"{self.date} {self.name}"

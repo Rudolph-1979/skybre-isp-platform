@@ -1,0 +1,263 @@
+import { Fragment, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { api } from "../../api/client";
+import { PageHeader } from "../../components/PageHeader";
+import { MultiSelect } from "../../components/MultiSelect";
+import { StatusBadge } from "../../components/StatusBadge";
+import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { btnSecondary, filterSelectClass } from "../../components/Modal";
+import type { ClientsReport, ClientsReportClient } from "../../types";
+
+/**
+ * Administration -> Reports: clients per partner / clients per tariff
+ * (Rudolph, 9 Oct 2026). One page, two reports -- they differ only in what
+ * a row is. How clients are counted lives in the backend
+ * (customers/admin_reports.py) and is summarised under the table.
+ */
+
+export type ClientsReportKind = "partner" | "tariff";
+
+const STATUS_OPTIONS = [
+  { value: "new", label: "New" },
+  { value: "active", label: "Active" },
+  { value: "online", label: "Online" },
+  { value: "suspended", label: "Suspended" },
+  { value: "bad_debt", label: "Bad Debt" },
+  { value: "inactive", label: "Inactive" },
+];
+const DEFAULT_STATUSES = ["active", "online"];
+
+const COPY: Record<ClientsReportKind, { title: string; subtitle: string; column: string; endpoint: string; file: string }> = {
+  partner: {
+    title: "Clients per partner",
+    subtitle: "How many clients each partner has, with their lines and monthly value.",
+    column: "Partner",
+    endpoint: "/reports/clients-per-partner/",
+    file: "clients-per-partner",
+  },
+  tariff: {
+    title: "Clients per tariff",
+    subtitle: "How many clients are on each tariff, with their lines and monthly value.",
+    column: "Tariff",
+    endpoint: "/reports/clients-per-tariff/",
+    file: "clients-per-tariff",
+  },
+};
+
+function rands(value: string | number) {
+  return `R ${Number(value).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function csvCell(value: string | number) {
+  const text = String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+export function ClientsReportPage({ kind }: { kind: ClientsReportKind }) {
+  const copy = COPY[kind];
+  const [statuses, setStatuses] = useState<string[]>(DEFAULT_STATUSES);
+  // Clients per tariff: which tariffs to show (empty = all), 9 Oct 2026.
+  const [tariffs, setTariffs] = useState<string[]>([]);
+  const [data, setData] = useState<ClientsReport | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [clients, setClients] = useState<ClientsReportClient[] | null>(null);
+  const [clientsError, setClientsError] = useState("");
+
+  const statusParam = statuses.join(",");
+  const filterQuery =
+    `status=${encodeURIComponent(statusParam)}` +
+    (kind === "tariff" && tariffs.length ? `&tariff=${encodeURIComponent(tariffs.join(","))}` : "");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setOpenKey(null);
+    api
+      .get<ClientsReport>(`${copy.endpoint}?${filterQuery}`)
+      .then((res) => {
+        if (cancelled) return;
+        setData(res.data);
+        setError("");
+      })
+      .catch(() => {
+        if (!cancelled) setError("Couldn't load the report.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [copy.endpoint, filterQuery]);
+
+  function toggleRow(key: string) {
+    if (openKey === key) {
+      setOpenKey(null);
+      return;
+    }
+    setOpenKey(key);
+    setClients(null);
+    setClientsError("");
+    api
+      .get<{ key: string; results: ClientsReportClient[] }>(
+        `${copy.endpoint}clients/?key=${encodeURIComponent(key)}&status=${encodeURIComponent(statusParam)}`
+      )
+      .then((res) => setClients(res.data.results))
+      .catch(() => setClientsError("Couldn't load the clients."));
+  }
+
+  function exportCsv() {
+    if (!data) return;
+    const lines = [
+      [copy.column, "Clients", "Live services", "Active services", "Monthly excl. VAT"],
+      ...data.rows.map((r) => [r.name, r.clients, r.services, r.active_services, r.monthly_excl]),
+      ["Total (distinct clients)", data.total.clients, data.total.services, data.total.active_services, data.total.monthly_excl],
+    ];
+    const csv = lines.map((row) => row.map(csvCell).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${copy.file}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const rows = data?.rows ?? [];
+
+  return (
+    <div>
+      <PageHeader
+        title={copy.title}
+        subtitle={copy.subtitle}
+        actions={
+          <>
+            <Link to="/admin/administration" className={btnSecondary}>All reports</Link>
+            <button type="button" className={btnSecondary} disabled={!data || rows.length === 0} onClick={exportCsv}>
+              Export CSV
+            </button>
+          </>
+        }
+      />
+
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <MultiSelect
+          options={STATUS_OPTIONS}
+          selected={statuses}
+          onChange={(next) => setStatuses(next.map(String))}
+          allLabel="All statuses"
+          nounPlural="statuses"
+          buttonClassName={filterSelectClass}
+        />
+        {kind === "tariff" && (
+          <MultiSelect
+            options={(data?.options ?? []).map((o) => ({ value: o.key, label: o.name }))}
+            selected={tariffs}
+            onChange={(next) => setTariffs(next.map(String))}
+            allLabel="All tariffs"
+            nounPlural="tariffs"
+            buttonClassName={filterSelectClass}
+          />
+        )}
+        {kind === "tariff" && tariffs.length > 0 && (
+          <button type="button" className="text-xs text-[var(--series-1)] hover:underline" onClick={() => setTariffs([])}>
+            Clear tariffs
+          </button>
+        )}
+        {loading && data && <span className="text-xs text-[var(--text-muted)]">Updating…</span>}
+      </div>
+
+      {error ? (
+        <p className="text-sm text-[var(--status-critical)]">{error}</p>
+      ) : loading && !data ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] px-3 py-4 text-sm text-[var(--text-secondary)]">
+          No clients with these statuses.
+        </p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>{copy.column}</TH>
+              <TH>Clients</TH>
+              <TH>Live services</TH>
+              <TH>Monthly excl. VAT</TH>
+            </tr>
+          </THead>
+          <tbody>
+            {rows.map((r) => (
+              <Fragment key={r.key}>
+                <TR onClick={() => toggleRow(r.key)} className={openKey === r.key ? "bg-[var(--tint-subtle)]" : ""}>
+                  <TD>
+                    <span className="mr-2 inline-block w-3 text-xs text-[var(--text-muted)]">{openKey === r.key ? "▾" : "▸"}</span>
+                    <span className="font-medium">{r.name}</span>
+                  </TD>
+                  <TD className="tabular-nums">{r.clients}</TD>
+                  <TD className="tabular-nums">
+                    {r.services}
+                    {r.services !== r.active_services && (
+                      <span className="ml-1 text-xs text-[var(--text-muted)]">({r.active_services} active)</span>
+                    )}
+                  </TD>
+                  <TD className="tabular-nums">{rands(r.monthly_excl)}</TD>
+                </TR>
+                {openKey === r.key && (
+                  <tr className="border-b border-[var(--border-hairline)] bg-[var(--surface-2)]">
+                    <td colSpan={4} className="px-4 py-3">
+                      {clientsError ? (
+                        <p className="text-sm text-[var(--status-critical)]">{clientsError}</p>
+                      ) : clients === null ? (
+                        <p className="text-sm text-[var(--text-muted)]">Loading clients…</p>
+                      ) : (
+                        <table className="w-full text-sm">
+                          <tbody>
+                            {clients.map((c) => (
+                              <tr key={c.id} className="border-b border-[var(--border-hairline)] last:border-0">
+                                <td className="py-1.5 pr-4">
+                                  <Link to={`/admin/customers/${c.id}`} className="font-medium text-[var(--series-1)] hover:underline">
+                                    {c.full_name}
+                                  </Link>
+                                  <span className="ml-2 text-xs text-[var(--text-muted)]">{c.customer_ref}</span>
+                                </td>
+                                <td className="py-1.5 pr-4"><StatusBadge status={c.status} /></td>
+                                <td className="py-1.5 pr-4 text-[var(--text-secondary)]">
+                                  {c.services.length === 0
+                                    ? "No live service"
+                                    : c.services.map((s) => (s.status === "active" ? s.tariff : `${s.tariff} (${s.status})`)).join(", ")}
+                                </td>
+                                <td className="py-1.5 text-right tabular-nums">{rands(c.monthly_excl)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+            {data && (
+              <tr className="border-t-2 border-[var(--border-hairline)] font-semibold">
+                <td className="px-4 py-2.5">Total (distinct clients)</td>
+                <td className="px-4 py-2.5 tabular-nums">{data.total.clients}</td>
+                <td className="px-4 py-2.5 tabular-nums">{data.total.services}</td>
+                <td className="px-4 py-2.5 tabular-nums">{rands(data.total.monthly_excl)}</td>
+              </tr>
+            )}
+          </tbody>
+        </Table>
+      )}
+
+      <p className="mt-3 max-w-3xl text-xs text-[var(--text-muted)]">
+        Live services are the client's lines that aren't terminated (active, suspended or pending).{" "}
+        {kind === "partner"
+          ? "A client counts under the partner of each live line (the line's own partner, otherwise the client's), so a client with lines at two partners is in both rows. A client with no live line counts under their own partner."
+          : "A client counts under the tariff of each live line, so a client on two tariffs is in both rows. Clients with no live line are in “No live service”."}{" "}
+        The total counts each client once. Monthly is the tariff price of active lines, excl. VAT — the same figure
+        as the dashboard's MRR; suspended and pending lines add nothing, and discounts aren't taken off.
+      </p>
+    </div>
+  );
+}

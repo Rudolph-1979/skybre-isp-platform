@@ -19,10 +19,12 @@ so that surfaces as a message naming the Location header instead.
 from datetime import date
 from unittest import mock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
-from bankfeeds.fnb_client import FNBClient, FNBClientError
+from bankfeeds import tokens
+from bankfeeds.fnb_client import FNBClient, FNBClientError, validate_api_base_url
 from bankfeeds.models import BankAccount
+from bankfeeds.serializers import BankAccountSerializer
 
 SECRET = "super-secret-client-credential"
 
@@ -51,6 +53,8 @@ class FNBTokenRequestTests(TestCase):
             api_base_url="https://bank.example",
             api_client_id="skybre",
             api_client_secret=SECRET,
+            # Connected, access token expired: every token call is a refresh.
+            api_refresh_token_enc=tokens.encrypt("refresh-1"),
         )
         self.client_obj = FNBClient(self.account)
 
@@ -87,7 +91,7 @@ class FNBTokenRequestTests(TestCase):
         self.assertEqual(post.call_args_list[1].args[0], "https://bank.example/v2/oauth/token")
         # Both hops carry the grant, and neither lets requests follow.
         for call in post.call_args_list:
-            self.assertEqual(call.kwargs["data"]["grant_type"], "client_credentials")
+            self.assertEqual(call.kwargs["data"]["grant_type"], "refresh_token")
             self.assertIs(call.kwargs["allow_redirects"], False)
 
     def test_a_permanent_redirect_is_followed_too(self):
@@ -277,6 +281,7 @@ class FNBTransactionFetchTests(TestCase):
             api_base_url="https://bank.example",
             api_client_id="skybre",
             api_client_secret=SECRET,
+            api_refresh_token_enc=tokens.encrypt("refresh-1"),
         )
         self.client_obj = FNBClient(self.account)
 
@@ -311,10 +316,10 @@ class FNBTransactionFetchTests(TestCase):
             get.return_value = _response(200, json_data={"transactions": [
                 {"id": 7, "date": "2026-08-02", "description": "EFT IN", "amount": "1200.00"},
             ]})
-            rows = self.client_obj.fetch_transactions(date(2026, 8, 1))
+            rows = self.client_obj.fetch_transactions(date(2026, 8, 1))["transactions"]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["external_id"], "7")
-        self.assertEqual(rows[0]["amount"], "1200.00")
+        self.assertEqual(rows[0]["external_id"], "fnb:7")
+        self.assertEqual(str(rows[0]["amount"]), "1200.00")
 
     def test_a_missing_base_url_is_refused_before_any_request(self):
         account = BankAccount.objects.create(
@@ -323,3 +328,110 @@ class FNBTransactionFetchTests(TestCase):
         with self.assertRaises(FNBClientError) as caught:
             FNBClient(account)
         self.assertIn("CSV import", str(caught.exception))
+
+
+@override_settings(ALLOWED_HOSTS=["portal.skybre.co.za", "154.65.111.61"], SITE_URL="https://skybre.co.za")
+class BaseUrlValidationTests(TestCase):
+    """The base URL field was once filled in with this platform's own
+    address. Every hourly sync then POSTed the client credentials to
+    Skybre's own web server and logged a bare "405 Client Error", nine
+    times over, while FNB was never contacted at all.
+
+    Nothing in the request path could have caught it: the cross-host
+    guard in _resolve_token_redirect only inspects redirects, and a base
+    URL that is wrong from the first request never redirects.
+    """
+
+    def _account(self, url):
+        return BankAccount.objects.create(
+            name="FNB Business", account_number="62000000001", api_base_url=url,
+            api_client_id="skybre", api_client_secret=SECRET,
+        )
+
+    # ---- the address that actually caused this --------------------------
+
+    def test_the_platforms_own_domain_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_api_base_url("https://portal.skybre.co.za")
+        message = str(caught.exception)
+        self.assertIn("this platform's own address", message)
+        self.assertIn("CSV import", message)
+
+    def test_the_refusal_happens_before_any_request_is_sent(self):
+        account = self._account("https://portal.skybre.co.za")
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            with self.assertRaises(FNBClientError) as caught:
+                FNBClient(account)
+        post.assert_not_called()
+        self.assertIn("this platform's own address", str(caught.exception))
+
+    def test_the_credential_is_never_sent_to_our_own_server(self):
+        """The point of the whole check: the secret stops moving."""
+        account = self._account("https://portal.skybre.co.za/oauth/token")
+        with mock.patch("bankfeeds.fnb_client.requests.post") as post:
+            with self.assertRaises(FNBClientError):
+                FNBClient(account)
+        post.assert_not_called()
+
+    def test_a_bare_ip_from_allowed_hosts_is_refused_too(self):
+        with self.assertRaises(ValueError):
+            validate_api_base_url("https://154.65.111.61")
+
+    def test_the_site_url_host_is_refused_even_if_not_in_allowed_hosts(self):
+        with self.assertRaises(ValueError):
+            validate_api_base_url("https://skybre.co.za/api")
+
+    def test_localhost_is_refused(self):
+        for url in ("http://localhost:8000", "http://127.0.0.1/oauth/token"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                validate_api_base_url(url)
+
+    # ---- the other row in that failure log -------------------------------
+
+    def test_a_missing_scheme_says_what_to_type_instead(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_api_base_url("bank.example")
+        self.assertIn("https://bank.example", str(caught.exception))
+
+    def test_a_non_http_scheme_is_refused(self):
+        with self.assertRaises(ValueError):
+            validate_api_base_url("ftp://bank.example")
+
+    # ---- what must still be allowed --------------------------------------
+
+    def test_a_real_bank_url_passes(self):
+        self.assertEqual(validate_api_base_url("https://bank.example/v1"), "https://bank.example/v1")
+
+    def test_blank_still_means_csv_only(self):
+        """Blank is FNBClient's own message about CSV import, not this
+        check's business -- it must not be turned into a format error."""
+        self.assertEqual(validate_api_base_url(""), "")
+        self.assertEqual(validate_api_base_url(None), "")
+
+    def test_an_http_bank_url_is_still_allowed(self):
+        """Guards test_an_http_base_url_may_still_be_upgraded_to_https:
+        http:// is deliberately accepted so the bank's own redirect to
+        https can be followed and re-POSTed."""
+        self.assertEqual(validate_api_base_url("http://bank.example"), "http://bank.example")
+        FNBClient(self._account("http://bank.example"))
+
+    def test_surrounding_whitespace_is_trimmed_not_rejected(self):
+        self.assertEqual(validate_api_base_url("  https://bank.example  "), "https://bank.example")
+
+    # ---- and the same answer through the API -----------------------------
+
+    def test_the_serializer_refuses_it_on_save(self):
+        serializer = BankAccountSerializer(data={
+            "name": "FNB Business", "account_number": "62000000003",
+            "api_base_url": "https://portal.skybre.co.za",
+        })
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("api_base_url", serializer.errors)
+        self.assertIn("this platform's own address", str(serializer.errors["api_base_url"][0]))
+
+    def test_the_serializer_still_accepts_a_bank_url(self):
+        serializer = BankAccountSerializer(data={
+            "name": "FNB Business", "account_number": "62000000004",
+            "api_base_url": "https://bank.example",
+        })
+        self.assertTrue(serializer.is_valid(), serializer.errors)

@@ -1,11 +1,26 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 
-from .views import FuelLogViewSet, OdometerReadingViewSet, ServiceRecordViewSet, VehicleViewSet
+from .views import (
+    FuelLogViewSet,
+    OdometerReadingViewSet,
+    TripLogViewSet,
+    ServiceRecordViewSet,
+    TyreRotationViewSet,
+    VehicleViewSet,
+)
+from .webfleet_api import WebfleetPositionsView, WebfleetSpeedingView
 
 router = DefaultRouter()
 router.register("vehicles", VehicleViewSet, basename="vehicle")
 router.register("odometer-readings", OdometerReadingViewSet, basename="odometerreading")
 router.register("service-records", ServiceRecordViewSet, basename="servicerecord")
+router.register("tyre-rotations", TyreRotationViewSet, basename="tyrerotation")
 router.register("fuel-logs", FuelLogViewSet, basename="fuellog")
+router.register("trip-logs", TripLogViewSet, basename="triplog")
 
-urlpatterns = router.urls
+# Webfleet vehicles on the map (#186).
+urlpatterns = router.urls + [
+    path("webfleet/positions/", WebfleetPositionsView.as_view()),
+    path("webfleet/speeding/", WebfleetSpeedingView.as_view()),
+]

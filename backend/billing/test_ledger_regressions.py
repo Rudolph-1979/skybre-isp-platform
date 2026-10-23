@@ -26,6 +26,7 @@ from rest_framework.test import APIClient
 
 from billing.models import Invoice, InvoiceItem, Payment, Tariff
 from customers.models import Customer
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -34,7 +35,8 @@ class _Base(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.staff = User.objects.create_user(
-            username="finance3", password="pw-for-tests", role=User.Role.ACCOUNTS
+            username="finance3", password="pw-for-tests", role=User.Role.ACCOUNTS,
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(self.staff)
         self.customer = Customer.objects.create(
@@ -129,6 +131,16 @@ class LegacyInvoicesAreInertTests(_Base):
 class DeletingAPaidInvoiceTests(_Base):
     """Defect 2. Payment.invoice is SET_NULL, so the payments outlive the
     invoice with their credit still applied."""
+
+    def setUp(self):
+        super().setUp()
+        # Since 5 Oct 2026 a payment reaches its invoice as an allocation
+        # made right after it commits; TestCase never commits.
+        from unittest import mock
+
+        self.enterContext(mock.patch(
+            "django.db.transaction.on_commit", side_effect=lambda fn, using=None, robust=False: fn(),
+        ))
 
     def test_an_invoice_with_a_payment_cannot_be_deleted(self):
         invoice_id = self._create("1000.00").data["id"]

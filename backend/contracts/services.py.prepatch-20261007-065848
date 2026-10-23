@@ -1,0 +1,575 @@
+"""Making, sending and signing contracts. See models.py for the why."""
+import base64
+import datetime
+import hashlib
+import io
+import logging
+from decimal import Decimal
+
+from django.core import signing
+from django.db import transaction
+from django.template import Context, Template, TemplateSyntaxError
+from django.utils import timezone
+from django.utils.html import format_html, format_html_join
+from django.utils.safestring import mark_safe
+
+from .models import Contract, ContractEvent, ContractSettings, ContractTemplate
+
+logger = logging.getLogger(__name__)
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_SIGNATURE_BYTES = 600 * 1024
+SIGNED_COPY_DAYS = 30
+WITNESS_SECONDS = 4 * 3600
+_WITNESS_SALT = "contracts.in-person"
+
+#: Shown on Configs -> Contracts and documented for template authors.
+PLACEHOLDERS = [
+    ("client_name", "Client's full name"),
+    ("client_company", "Client's company name (blank for individuals)"),
+    ("client_code", "Client code, e.g. SWF2879"),
+    ("id_number", "ID / registration number"),
+    ("vat_number", "Client's VAT number"),
+    ("client_email", "Client's email"),
+    ("client_phone", "Client's phone"),
+    ("client_address", "Client's address, one line"),
+    ("services_table", "Table of the client's plans: plan, installation address, monthly excl./incl. VAT"),
+    ("plan", "The plan (first active line, or the accepted quote's plan)"),
+    ("monthly_excl", "Monthly price excl. VAT"),
+    ("monthly_incl", "Monthly price incl. VAT"),
+    ("once_off_table", "Once-off items from the accepted sales quote (blank if none)"),
+    ("once_off_incl", "Once-off total incl. VAT from the accepted quote"),
+    ("start_date", "Client's sign-up date"),
+    ("contract_reference", "This contract's reference, e.g. CTR-00012"),
+    ("today", "Today's date"),
+    ("company_name", "Our registered name"),
+    ("company_address", "Our address"),
+    ("company_vat_number", "Our VAT number"),
+    ("company_phone", "Our phone"),
+    ("company_email", "Our email"),
+]
+
+
+class ContractError(ValueError):
+    pass
+
+
+# --- placeholders ----------------------------------------------------------
+
+
+def _money(value):
+    return f"{Decimal(value or 0).quantize(Decimal('0.01')):,.2f}".replace(",", " ")
+
+
+def _vat(amount, rate_pct):
+    amount = Decimal(amount or 0)
+    return (amount * (Decimal("1") + Decimal(rate_pct or 0) / Decimal("100"))).quantize(Decimal("0.01"))
+
+
+def _client_address(customer):
+    parts = [customer.address, getattr(customer, "complex_or_area", ""), customer.city, customer.zip_code]
+    return ", ".join(p.strip() for p in parts if p and p.strip())
+
+
+def _table(head, rows):
+    head_html = format_html_join("", "<th>{}</th>", ((h,) for h in head))
+    body_html = format_html_join(
+        "", "<tr>{}</tr>",
+        ((format_html_join("", "<td>{}</td>", ((c,) for c in row)),) for row in rows),
+    )
+    return format_html('<table class="items"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>',
+                       head_html, body_html)
+
+
+def merge_context(customer, lead=None, reference=""):
+    from billing.models import Service
+    from notifications.pdf import _company_block
+
+    company, _ = _company_block()
+    services = [] if customer.pk is None else list(
+        Service.objects.filter(customer=customer)
+        .exclude(status__in=["terminated", "cancelled"])
+        .select_related("tariff", "customer")
+        .order_by("pk")
+    )
+    rows = [
+        (s.tariff.name, s.site_address_display() or "—",
+         f"R {_money(s.tariff.price)}", f"R {_money(_vat(s.tariff.price, s.tariff.tax_rate_pct))}")
+        for s in services
+    ]
+    plan, monthly_excl, monthly_incl = "", "", ""
+    once_off_table, once_off_incl = "", ""
+    if lead is not None and lead.interested_tariff_id:
+        from sales.workflow import quote_totals
+
+        totals = quote_totals(lead)
+        plan = lead.interested_tariff.name
+        monthly_excl, monthly_incl = _money(totals["monthly"]["excl"]), _money(totals["monthly"]["incl"])
+        if not rows:
+            rate = lead.interested_tariff.tax_rate_pct
+            rows = [(plan, _client_address(customer) or "—",
+                     f"R {_money(totals['plan']['excl'])}", f"R {_money(totals['plan']['incl'])}")]
+            rows += [(i["label"], "", f"R {_money(i['amount'])}", f"R {_money(_vat(i['amount'], rate))}")
+                     for i in lead.quote_recurring or []]
+        if lead.quote_items:
+            rate = lead.interested_tariff.tax_rate_pct
+            once_off_table = _table(
+                ["Once-off", "Excl. VAT", "Incl. VAT"],
+                [(i["label"], f"R {_money(i['amount'])}", f"R {_money(_vat(i['amount'], rate))}")
+                 for i in lead.quote_items],
+            )
+            once_off_incl = _money(totals["once_off"]["incl"])
+    elif services:
+        first = services[0].tariff
+        plan = first.name
+        monthly_excl, monthly_incl = _money(first.price), _money(_vat(first.price, first.tax_rate_pct))
+    services_table = (
+        _table(["Plan", "Installation address", "Monthly excl. VAT", "Monthly incl. VAT"], rows) if rows else ""
+    )
+    start = getattr(customer, "effective_signup_date", None)
+    return {
+        "client_name": customer.full_name,
+        "client_company": customer.company_name,
+        "client_code": customer.customer_id,
+        "id_number": customer.id_number,
+        "vat_number": customer.vat_number,
+        "client_email": customer.email,
+        "client_phone": customer.phone,
+        "client_address": _client_address(customer),
+        "services_table": services_table,
+        "plan": plan,
+        "monthly_excl": monthly_excl,
+        "monthly_incl": monthly_incl,
+        "once_off_table": once_off_table,
+        "once_off_incl": once_off_incl,
+        "start_date": start.strftime("%d/%m/%Y") if start else "",
+        "contract_reference": reference,
+        "today": timezone.localdate().strftime("%d/%m/%Y"),
+        "company_name": company["name"],
+        "company_address": ", ".join(p for p in (company["address"], company["city"], company["postal_line"]) if p),
+        "company_vat_number": company["vat_number"],
+        "company_phone": company["phone"],
+        "company_email": company["email"],
+    }
+
+
+def fill(body_html, context):
+    try:
+        return Template(body_html).render(Context(context))
+    except TemplateSyntaxError as exc:
+        raise ContractError(f"The template has a mistake in it: {exc}")
+
+
+# --- PDFs ------------------------------------------------------------------
+
+
+def _pdf_context():
+    from notifications.email_settings import get_email_config
+    from notifications.pdf import _company_block, _logo_path
+
+    company, defaults = _company_block()
+    from .brand import SKYBRE_ICON_DATA_URI
+
+    return {
+        "company": company,
+        "company_name": get_email_config()["company_name"],
+        "logo_path": _logo_path(defaults),
+        "brand_icon": SKYBRE_ICON_DATA_URI,
+        "generated_date": timezone.localdate(),
+    }
+
+
+def render_contract_pdf(contract):
+    from notifications.pdf import _render_pdf
+
+    ctx = _pdf_context()
+    ctx.update({"contract": contract, "customer": contract.customer, "body": mark_safe(contract.body_html)})
+    return _render_pdf("contracts/contract_pdf.html", ctx)
+
+
+def check_pdf(data):
+    """An uploaded PDF must be a real, readable, unencrypted PDF."""
+    from pypdf import PdfReader
+
+    if not data:
+        raise ContractError("Choose a PDF file.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ContractError("That PDF is larger than 10 MB.")
+    if not data.lstrip()[:5] == b"%PDF-":
+        raise ContractError("That file isn't a PDF.")
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            raise ContractError("That PDF is password-protected. Upload one without a password.")
+        if len(reader.pages) == 0:
+            raise ContractError("That PDF has no pages.")
+    except ContractError:
+        raise
+    except Exception:  # noqa: BLE001
+        raise ContractError("That PDF couldn't be read. Save it again as PDF and retry.")
+    return len(reader.pages)
+
+
+def page_count(data):
+    from pypdf import PdfReader
+
+    try:
+        return len(PdfReader(io.BytesIO(bytes(data))).pages)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# --- making ----------------------------------------------------------------
+
+
+def _event(contract, kind, user=None, ip=None, user_agent="", detail=""):
+    return ContractEvent.objects.create(
+        contract=contract, kind=kind, user=user if getattr(user, "pk", None) else None,
+        ip=ip, user_agent=(user_agent or "")[:400], detail=(detail or "")[:400],
+    )
+
+
+@transaction.atomic
+def create_from_template(customer, template, user=None, lead=None):
+    if template is None or not template.is_active:
+        raise ContractError("Choose an active contract template.")
+    contract = Contract(customer=customer, kind=Contract.Kind.TEMPLATE, template=template, lead=lead,
+                        title=template.title, created_by=user if getattr(user, "pk", None) else None)
+    contract.document_pdf = b""
+    contract.save()
+    contract.body_html = fill(template.body_html, merge_context(customer, lead, contract.reference))
+    contract.set_document(render_contract_pdf(contract), f"{contract.reference} {contract.title}.pdf")
+    contract.save()
+    _event(contract, ContractEvent.Kind.CREATED, user, detail=f"From template \"{template.name}\"")
+    return contract
+
+
+@transaction.atomic
+def create_from_upload(customer, data, filename, title, user=None):
+    check_pdf(data)
+    title = (title or "").strip() or (filename or "Contract").rsplit(".", 1)[0]
+    contract = Contract(customer=customer, kind=Contract.Kind.UPLOAD, title=title[:200],
+                        created_by=user if getattr(user, "pk", None) else None)
+    contract.set_document(data, filename or f"{title}.pdf")
+    contract.save()
+    _event(contract, ContractEvent.Kind.CREATED, user, detail=f"Uploaded {contract.document_filename}")
+    return contract
+
+
+# --- links -----------------------------------------------------------------
+
+
+def _site_url():
+    from notifications.email_settings import get_email_config
+
+    return get_email_config()["site_url"].rstrip("/")
+
+
+def signing_url(contract):
+    return f"{_site_url()}/sign/{contract.token}"
+
+
+def in_person_url(contract, user):
+    witness = signing.TimestampSigner(salt=_WITNESS_SALT).sign(f"{contract.pk}:{user.pk}")
+    return f"{signing_url(contract)}?witness={witness}"
+
+
+def witness_from(contract, value):
+    """The staff member who opened this contract for signing on their own
+    device, or None (an ordinary link, or a stale/forged witness value)."""
+    from django.contrib.auth import get_user_model
+
+    if not value:
+        return None
+    try:
+        raw = signing.TimestampSigner(salt=_WITNESS_SALT).unsign(value, max_age=WITNESS_SECONDS)
+        contract_pk, user_pk = (int(x) for x in raw.split(":"))
+    except (signing.BadSignature, ValueError):
+        return None
+    if contract_pk != contract.pk:
+        return None
+    return get_user_model().objects.filter(pk=user_pk, is_active=True).first()
+
+
+# --- email -----------------------------------------------------------------
+
+
+def _send_email(contract, template_key, to, user=None, attachment=None, extra=None):
+    """Render one of the contract email templates and send it, logging it
+    in the client's Communication tab like every other email."""
+    from django.core.mail import EmailMultiAlternatives
+    from django.utils.html import strip_tags
+
+    from notifications.email_settings import get_email_config, get_email_connection
+    from notifications.models import EmailLog, EmailTemplate
+    from notifications.services import build_context, render_template_strings
+
+    customer = contract.customer
+    sent_by = user if getattr(user, "pk", None) else None
+    subject = ""
+    try:
+        template = EmailTemplate.objects.get(key=template_key)
+        context = build_context(template_key, customer, extra={
+            "contract_title": contract.title,
+            "contract_reference": contract.reference,
+            "signing_url": signing_url(contract),
+            "link_expires": timezone.localtime(contract.expires_at).strftime("%d/%m/%Y") if contract.expires_at else "",
+            **(extra or {}),
+        })
+        subject, body = render_template_strings(template, context)
+        message = EmailMultiAlternatives(
+            subject=subject, body=strip_tags(body), from_email=get_email_config()["from_email"],
+            to=[to], connection=get_email_connection(),
+        )
+        message.attach_alternative(body, "text/html")
+        if attachment:
+            message.attach(*attachment)
+        message.send()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Contract %s: %s email to %s failed", contract.pk, template_key, to)
+        EmailLog.objects.create(customer=customer, template_key=template_key, recipient_email=to,
+                                subject=subject[:255], status=EmailLog.Status.FAILED,
+                                error_message=str(exc), sent_by=sent_by)
+        return str(exc) or exc.__class__.__name__
+    EmailLog.objects.create(customer=customer, template_key=template_key, recipient_email=to,
+                            subject=subject[:255], status=EmailLog.Status.SENT, sent_by=sent_by)
+    return None
+
+
+def send(contract, user=None, email=None):
+    """Email the signing link. Also (re)starts the link's validity, so a
+    resend after expiry works. Raises ContractError if it can't send."""
+    if not contract.is_open:
+        raise ContractError("This contract is already signed or cancelled.")
+    to = (email or contract.sent_to or contract.customer.email or "").strip()
+    if not to:
+        raise ContractError("This client has no email address. Add one, or sign in person.")
+    days = ContractSettings.load().link_valid_days or 14
+    contract.expires_at = timezone.now() + datetime.timedelta(days=days)
+    contract.save(update_fields=["expires_at", "updated_at"])
+    error = _send_email(contract, "contract", to, user)
+    if error:
+        _event(contract, ContractEvent.Kind.SEND_FAILED, user, detail=f"To {to}: {error}")
+        raise ContractError(f"The email to {to} didn't go: {error}")
+    contract.sent_to = to
+    contract.sent_at = timezone.now()
+    if contract.status == Contract.Status.DRAFT:
+        contract.status = Contract.Status.SENT
+    contract.save(update_fields=["sent_to", "sent_at", "status", "updated_at"])
+    _event(contract, ContractEvent.Kind.SENT, user, detail=f"To {to}, link valid {days} days")
+    return to
+
+
+def start_in_person(contract, user):
+    if not contract.is_open:
+        raise ContractError("This contract is already signed or cancelled.")
+    if contract.expires_at is None or contract.expires_at < timezone.now():
+        contract.expires_at = timezone.now() + datetime.timedelta(seconds=WITNESS_SECONDS)
+        contract.save(update_fields=["expires_at", "updated_at"])
+    _event(contract, ContractEvent.Kind.IN_PERSON, user)
+    return in_person_url(contract, user)
+
+
+def cancel(contract, user=None, reason=""):
+    if not contract.is_open:
+        raise ContractError("Only an unsigned contract can be cancelled.")
+    contract.status = Contract.Status.CANCELLED
+    contract.save(update_fields=["status", "updated_at"])
+    _event(contract, ContractEvent.Kind.CANCELLED, user, detail=reason)
+
+
+# --- the client's side -----------------------------------------------------
+
+
+def mark_viewed(contract, ip=None, user_agent=""):
+    # A "Not sent" one counts too: its link may have gone out by WhatsApp.
+    if contract.status in (Contract.Status.DRAFT, Contract.Status.SENT):
+        contract.status = Contract.Status.VIEWED
+        contract.viewed_at = timezone.now()
+        contract.save(update_fields=["status", "viewed_at", "updated_at"])
+        _event(contract, ContractEvent.Kind.VIEWED, ip=ip, user_agent=user_agent)
+
+
+def mark_document_opened(contract, ip=None, user_agent=""):
+    recent = timezone.now() - datetime.timedelta(minutes=10)
+    if not contract.events.filter(kind=ContractEvent.Kind.DOCUMENT_OPENED, at__gte=recent).exists():
+        _event(contract, ContractEvent.Kind.DOCUMENT_OPENED, ip=ip, user_agent=user_agent)
+
+
+def decode_signature(data_url):
+    """A finger-drawn signature from the page's canvas, as PNG bytes,
+    re-encoded through Pillow (so nothing but pixels is stored) onto white."""
+    from PIL import Image
+
+    value = str(data_url or "")
+    prefix = "data:image/png;base64,"
+    if not value.startswith(prefix):
+        raise ContractError("Draw your signature in the box.")
+    try:
+        raw = base64.b64decode(value[len(prefix):], validate=True)
+    except (ValueError, TypeError):
+        raise ContractError("The signature didn't come through. Clear it and draw it again.")
+    if len(raw) > MAX_SIGNATURE_BYTES:
+        raise ContractError("The signature image is too large.")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception:  # noqa: BLE001
+        raise ContractError("The signature didn't come through. Clear it and draw it again.")
+    if image.width > 3000 or image.height > 2000:
+        raise ContractError("The signature image is too large.")
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    flat = Image.alpha_composite(background, rgba).convert("L")
+    inked = sum(1 for px in flat.getdata() if px < 160)
+    if inked < 60:
+        raise ContractError("Draw your signature in the box.")
+    bbox = flat.point(lambda p: 255 if p < 160 else 0).getbbox()
+    if bbox:
+        pad = 12
+        flat = flat.crop((max(0, bbox[0] - pad), max(0, bbox[1] - pad),
+                          min(flat.width, bbox[2] + pad), min(flat.height, bbox[3] + pad)))
+    out = io.BytesIO()
+    flat.convert("RGB").save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+def _certificate_pdf(contract, pages):
+    from notifications.pdf import _render_pdf
+
+    ctx = _pdf_context()
+    ctx.update({
+        "contract": contract,
+        "customer": contract.customer,
+        "pages": pages,
+        "signature_src": "data:image/png;base64," + base64.b64encode(bytes(contract.signature_png)).decode(),
+        "signed_at": timezone.localtime(contract.signed_at),
+        "events": list(contract.events.select_related("user").order_by("at", "pk")),
+    })
+    return _render_pdf("contracts/certificate_pdf.html", ctx)
+
+
+def _merge(contract, certificate):
+    """The document exactly as sent, then the certificate page."""
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for data in (contract.document_pdf, certificate):
+        for page in PdfReader(io.BytesIO(bytes(data))).pages:
+            writer.add_page(page)
+    writer.add_metadata({"/Title": f"{contract.reference} {contract.title} (signed)"})
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def sign(contract, signer_name, signature_data_url, agreed, id_number="", ip=None, user_agent="", witness=None):
+    """The client signs. Raises ContractError with a message for the page."""
+    with transaction.atomic():
+        contract = Contract.objects.select_for_update().select_related("customer").get(pk=contract.pk)
+        if contract.status == Contract.Status.SIGNED:
+            raise ContractError("This contract has already been signed.")
+        if not contract.is_open:
+            raise ContractError("This contract was cancelled. Ask us for a new one.")
+        if contract.is_expired and witness is None:
+            raise ContractError("This signing link has expired. Ask us to send it again.")
+        name = " ".join(str(signer_name or "").split())
+        if len(name) < 3:
+            raise ContractError("Type your full name.")
+        if agreed is not True:
+            raise ContractError("Tick the box to agree to the terms and to signing electronically.")
+        if hashlib.sha256(bytes(contract.document_pdf)).hexdigest() != contract.document_sha256:
+            raise ContractError("This contract's document has changed since it was sent. Ask us for a new one.")
+        contract.signature_png = decode_signature(signature_data_url)
+        contract.signer_name = name[:200]
+        contract.signer_id_number = " ".join(str(id_number or "").split())[:40]
+        contract.signed_at = timezone.now()
+        contract.signer_ip = ip
+        contract.signer_user_agent = (user_agent or "")[:400]
+        contract.signed_in_person = witness is not None
+        contract.witnessed_by = witness
+        contract.status = Contract.Status.SIGNED
+        contract.save()
+        detail = f"By {contract.signer_name}" + (
+            f", in person with {witness.get_full_name() or witness.username}" if witness else ", online"
+        )
+        _event(contract, ContractEvent.Kind.SIGNED, witness, ip=ip, user_agent=user_agent, detail=detail)
+        signed = _merge(contract, _certificate_pdf(contract, page_count(contract.document_pdf)))
+        contract.signed_pdf = signed
+        contract.signed_sha256 = hashlib.sha256(signed).hexdigest()
+        contract.save(update_fields=["signed_pdf", "signed_sha256", "updated_at"])
+    to = (contract.sent_to or contract.customer.email or "").strip()
+    if to:
+        pk = contract.pk
+        transaction.on_commit(lambda: _email_signed_copy(pk, to))
+    return contract
+
+
+def _email_signed_copy(pk, to):
+    contract = Contract.objects.select_related("customer").filter(pk=pk).first()
+    if contract is None or not contract.signed_pdf:
+        return
+    _send_email(contract, "contract_signed", to,
+                attachment=(signed_filename(contract), bytes(contract.signed_pdf), "application/pdf"))
+
+
+def signed_filename(contract):
+    return f"{contract.reference} {contract.title} (signed).pdf".replace("/", "-")
+
+
+def signed_copy_available(contract):
+    return (
+        contract.status == Contract.Status.SIGNED and contract.signed_at is not None
+        and contract.signed_at >= timezone.now() - datetime.timedelta(days=SIGNED_COPY_DAYS)
+    )
+
+
+# --- automatic sends -------------------------------------------------------
+
+
+def auto_send(customer_pk, trigger, user_pk=None, lead_pk=None):
+    """Called after a new client is saved or a lead is accepted, when that
+    switch is on in Configs -> Contracts. Never raises: a contract that
+    can't be made must not undo the client. Skips a client who already has
+    a contract open or signed."""
+    from django.contrib.auth import get_user_model
+
+    from customers.models import Customer
+    from sales.models import Lead
+
+    settings_ = ContractSettings.load()
+    enabled = settings_.auto_send_lead_accepted if trigger == "lead_accepted" else settings_.auto_send_new_client
+    template = settings_.default_template
+    if not enabled or template is None or not template.is_active:
+        return None
+    try:
+        customer = Customer.objects.get(pk=customer_pk)
+        if customer.contracts.filter(status__in=[*Contract.OPEN_STATUSES, Contract.Status.SIGNED]).exists():
+            return None
+        user = get_user_model().objects.filter(pk=user_pk).first() if user_pk else None
+        lead = Lead.objects.filter(pk=lead_pk).first() if lead_pk else None
+        contract = create_from_template(customer, template, user, lead=lead)
+        if customer.email:
+            try:
+                send(contract, user)
+            except ContractError:
+                pass  # recorded as a send_failed event; staff see "Not sent"
+        return contract
+    except Exception:  # noqa: BLE001
+        logger.exception("Automatic contract for customer %s (%s) failed", customer_pk, trigger)
+        return None
+
+
+def schedule_auto_send(customer, trigger, user=None, lead=None):
+    customer_pk, user_pk, lead_pk = customer.pk, getattr(user, "pk", None), getattr(lead, "pk", None)
+    transaction.on_commit(lambda: auto_send(customer_pk, trigger, user_pk, lead_pk))
+
+
+def contract_status_for(customer):
+    """For the profile header: signed / awaiting / none."""
+    statuses = set(customer.contracts.values_list("status", flat=True))
+    if Contract.Status.SIGNED in statuses:
+        return "signed"
+    if statuses & {Contract.Status.SENT, Contract.Status.VIEWED, Contract.Status.DRAFT}:
+        return "awaiting"
+    return "none"

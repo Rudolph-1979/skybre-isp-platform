@@ -24,15 +24,25 @@ from rest_framework.test import APIClient
 
 from billing.models import Invoice, InvoiceItem, Payment, Tariff
 from customers.models import Customer
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
 
 class PaymentLedgerTests(TestCase):
     def setUp(self):
+        # Since 5 Oct 2026 a payment reaches its invoice as an allocation
+        # made right after the payment commits (billing.signals); TestCase
+        # never commits, so run those callbacks straight away here.
+        from unittest import mock
+
+        self.enterContext(mock.patch(
+            "django.db.transaction.on_commit", side_effect=lambda fn, using=None, robust=False: fn(),
+        ))
         self.client = APIClient()
         self.staff = User.objects.create_user(
-            username="finance1", password="pw-for-tests", role=User.Role.ACCOUNTS
+            username="finance1", password="pw-for-tests", role=User.Role.ACCOUNTS,
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(self.staff)
         self.tariff = Tariff.objects.create(
@@ -196,3 +206,64 @@ class PaymentLedgerTests(TestCase):
         )
         self.assertEqual(res.status_code, 200, res.data)
         self.assertEqual(res.data["note"], "FNB ref 8812")
+
+    # ---- concurrency -----------------------------------------------------
+
+    def test_a_credit_approved_while_the_payment_form_is_open_is_not_lost(self):
+        """Accounts opens a payment against Alice's R1,000 balance and
+        Management approves a R200 credit before Save is clicked. Both are
+        real money and both must land. The old read-modify-write saved the
+        balance it had read before the credit existed, so the credit
+        vanished and the API still answered 201 -- the mirror image of the
+        race CreditRequestViewSet.approve was already fixed for."""
+        from django.db.models import F
+        from rest_framework.test import APIRequestFactory
+
+        from billing.serializers import PaymentSerializer
+
+        request = APIRequestFactory().post("/api/payments/")
+        request.user = self.staff
+        serializer = PaymentSerializer(
+            data={"customer": self.alice.id, "amount": "600.00", "method": "bank_transfer"},
+            context={"request": request},
+        )
+        # is_valid() is where this request reads the customer row. The
+        # credit lands in the window between that read and the write.
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        Customer.objects.filter(pk=self.alice.pk).update(balance=F("balance") - Decimal("200.00"))
+        serializer.save()
+
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.balance, Decimal("200.00"))
+
+    def test_a_second_payment_does_not_wipe_the_first_off_the_invoice(self):
+        """Two EFTs confirmed against one invoice at almost the same
+        moment -- routine on the bank feed's review queue when two staff
+        work the list together. Each request added its amount to the
+        paid_amount it had read, so one of the two simply disappeared: a
+        fully settled invoice stayed Unpaid and the customer kept being
+        chased for money already in the bank."""
+        from rest_framework.test import APIRequestFactory
+
+        from billing.serializers import PaymentSerializer
+
+        invoice = self._invoice(self.alice, "1000.00")
+        request = APIRequestFactory().post("/api/payments/")
+        request.user = self.staff
+        second = PaymentSerializer(
+            data={"customer": self.alice.id, "invoice": invoice.id,
+                  "amount": "600.00", "method": "bank_transfer"},
+            context={"request": request},
+        )
+        # is_valid() loads this request's copy of the invoice, at
+        # paid_amount 0. The other R400 is banked before it is saved.
+        self.assertTrue(second.is_valid(), second.errors)
+        res = self._pay(self.alice, "400.00", invoice=invoice)
+        self.assertEqual(res.status_code, 201, res.data)
+        second.save()
+
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.paid_amount, Decimal("1000.00"))
+        self.assertEqual(invoice.status, Invoice.Status.PAID)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.balance, Decimal("0.00"))

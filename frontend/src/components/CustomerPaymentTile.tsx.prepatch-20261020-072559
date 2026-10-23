@@ -1,0 +1,62 @@
+import { useEffect, useState } from "react";
+import { api } from "../api/client";
+import { formatIsoDate } from "../utils/billingTerms";
+
+type Summary = {
+  payment_method: string;
+  billing_enabled: boolean;
+  next_billing_date: string | null;
+  blocking_period_days: number | null;
+  extended_until: string | null;
+  auto_suspend_enabled: boolean;
+  block_date: string | null;
+  days_until_block: number | null;
+  block_note: string;
+};
+
+/**
+ * Overview tile (Rudolph, 7 Oct 2026): the client's payment method and when
+ * they will next be blocked -- the same date the dashboard's Blocking panel
+ * and the billing run work from (billing.recurring.upcoming_blocks).
+ */
+export function CustomerPaymentTile({ customerId }: { customerId: number }) {
+  const [data, setData] = useState<Summary | null>(null);
+
+  useEffect(() => {
+    api
+      .get<Summary>(`/customers/${customerId}/payment-summary/`)
+      .then((res) => setData(res.data))
+      .catch(() => setData(null));
+  }, [customerId]);
+
+  if (!data) return null;
+  const soon = data.days_until_block !== null && data.days_until_block <= 7;
+  return (
+    <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+      <p className="text-[var(--text-muted)]">Payment</p>
+      <p className="mt-1">{data.payment_method || "No payment method set"}</p>
+      {data.next_billing_date && data.billing_enabled && (
+        <p className="text-xs text-[var(--text-muted)]">Next invoice {formatIsoDate(data.next_billing_date)}</p>
+      )}
+      <p className="mt-2 text-[var(--text-muted)]">Blocked next</p>
+      {data.block_date ? (
+        <p className={soon ? "font-semibold text-[var(--status-critical)]" : ""}>
+          {formatIsoDate(data.block_date)}
+          <span className="ml-1 text-xs font-normal text-[var(--text-muted)]">
+            {data.days_until_block !== null && data.days_until_block <= 0
+              ? "(next billing run)"
+              : `(in ${data.days_until_block} day${data.days_until_block === 1 ? "" : "s"})`}
+          </span>
+        </p>
+      ) : (
+        <p className="text-xs text-[var(--text-muted)]">{data.block_note}</p>
+      )}
+      {data.block_date && !data.auto_suspend_enabled && (
+        <p className="text-xs text-[var(--text-muted)]">Auto-suspension is switched off, so nothing will cut them off.</p>
+      )}
+      {data.extended_until && (
+        <p className="text-xs text-[var(--text-muted)]">Extension until {formatIsoDate(data.extended_until)}</p>
+      )}
+    </div>
+  );
+}

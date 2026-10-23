@@ -1,0 +1,168 @@
+Client,Name,Partner,Balance,Minimum,Unpaid invoices,Overdue invoices,Oldest due,Countdown from,Blocking days,Cut-off date,Line,Email on file,Reminder days,Reminders sent,Last reminder,Reminders failed,Warnings sent,Last warning,Warnings failed,Suspension emails,Flags
+SBF1621,Eddie Mccabe,Vumatel,50.00,50.00,1,1,2026-10-05,,4,,no active line,yes,-3 -2,1,2026-10-17,0,0,,0,0,under minimum balance
+SBF1898,Smile Savers,Vumatel,30.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,under minimum balance
+SCF0005,Devon Jordaan,Carfone,248.00,50.00,1,1,2026-10-12,2026-10-12,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SCF0008,Pablo Gomes,Carfone,0.02,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SCF0013,Eben Smith,Carfone,144.00,50.00,1,1,2026-10-01,2026-10-01,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SCF0038,Ansie Greyling,Carfone,3.95,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SCF0041,P.A Prinsloo,Carfone,0.10,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SCF0043,Siska Rogers,Carfone,192.20,50.00,2,2,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-13,0,1,2026-10-13,0,0,extension to 05/11/2026
+SCF0044,Kaylan Hunter,Carfone,23.45,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,2,2026-10-20,0,1,2026-10-13,0,0,under minimum balance
+SCF0059,Jean Pieterse,Carfone,250.00,50.00,1,1,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-13,0,1,2026-10-13,0,0,extension to 05/11/2026
+SMF019,Johan Theron,MTD,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF114,Gerhard Supra,MTD,1324.20,50.00,3,3,2026-09-01,2026-09-01,4,,no active line,yes,-3 -2,1,2026-10-19,0,0,,0,0,
+SMF122,Maletsatsi Mokhethea,MTD,18.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF123,Morakane Kotsamere,MTD,45.85,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF143,Pieter Cronje,MTD,13.60,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF144,Thereza Pretorius,MTD,43.10,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF182,Elma Cambell,MTD,11.00,50.00,1,1,2026-10-01,,18,,no active line,yes,-15 -14,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF200,Charl Bruce Cartwright,MTD,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF202,Rika Myburgh,MTD,17.10,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF226,Nandus Potgieter,MTD,474.24,50.00,2,2,2026-10-01,2026-10-01,18,,suspended (other),yes,-15 -14,0,,0,0,,0,0,
+SMF227,Christa Human,MTD,14.45,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF266,Christo Van Der Merwe,MTD,0.00,50.00,1,1,2024-11-01,,18,,active,yes,-15 -14,0,,0,0,,0,0,under minimum balance
+SMF332,Ciska Nel,MTD,51.52,50.00,1,1,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-19,0,1,2026-10-19,0,0,extension to 09/11/2026
+SMF337,Mandy Weir,MTD,8.65,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF356,Betty Mboya,MTD,430.95,50.00,1,1,2026-10-01,2026-08-01,18,2026-10-26,active,yes,-15 -14,0,,0,0,,0,0,"over minimum, no reminder yet"
+SMF372,Daniel Radebe,MTD,4.68,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,0,,0,0,,0,0,under minimum balance
+SMF374,Seruwe Bocheli,MTD,854.60,50.00,3,3,2026-09-01,2026-09-01,4,,suspended (other),yes,-3 -2,1,2026-10-20,0,0,,0,0,
+SMF418,Amo Hardware,MTD,52.91,50.00,2,2,2026-10-01,2026-10-01,18,,active,yes,-15 -14,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 17/11/2026"
+SMF425,Breshton Batloung,MTD,65.00,50.00,2,2,2026-10-01,2026-10-01,4,2026-10-22,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet"
+SMF426,Puleng Sikosana,MTD,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,0,,0,0,,0,0,under minimum balance
+SMF438,Madisemelo Tsolanku,MTD,0.00,50.00,2,2,2024-11-01,,18,,active,yes,-15 -14,0,,0,0,,0,0,under minimum balance
+SMF440,Laura Melville,MTD,1.15,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF443,Jan Swanepoel,MTD,2.01,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF457,James Baba,MTD,0.09,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,0,,0,0,,0,0,under minimum balance
+SMF467,Montshiua Morake,MTD,57.65,50.00,2,2,2026-10-01,2026-09-01,4,,active,yes,-3 -2,1,2026-10-19,0,0,,0,0,extension to 09/11/2026
+SMF482,Kiewiet Van Der Westhuizen,MTD,11.00,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF486,Kutu Chepape,MTD,21.98,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF510,Dimakatso Moteane,MTD,16.47,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF529,Julie-Anne Lin,MTD,16.55,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF538,Tsoaeli Morena,MTD,467.15,50.00,2,2,2026-10-01,2026-10-01,18,2026-10-26,active,yes,-15 -14,0,,0,0,,0,0,"over minimum, no reminder yet"
+SMF609,Tino Motseke,MTD,31.61,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF626,Keneuwe Sondag,MTD,0.40,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF640,Monique Van Wyk,MTD,453.10,50.00,1,1,2026-10-01,2026-10-01,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SMF643,Teboho Elisha,MTD,63.80,50.00,1,1,2026-10-01,2026-09-01,18,2026-10-23,active,yes,-15 -14,1,2026-10-20,0,0,,0,0,
+SMF657,Dunlop Pty Ltd,MTD,250.00,50.00,1,1,2026-10-01,2026-10-01,4,2026-10-22,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet"
+SMF667,Dimakatso Annah,MTD,73.43,50.00,2,2,2026-10-01,2026-10-01,4,2026-10-21,active,yes,-3 -2,1,2026-10-20,0,1,2026-10-20,0,0,
+SMF689,Andrea Wiid,MTD,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance; extension to 05/11/2026
+SMF726,MD Shahin Rana,MTD,503.10,50.00,2,2,2026-10-01,2026-10-01,4,2026-10-22,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet"
+SMF740,Maleshoane Lenong,MTD,46.37,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,0,,0,0,,0,0,under minimum balance
+SMF741,Nellie Calitz,MTD,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-20,0,0,,0,0,under minimum balance
+SMF743,Lungelwa Maghale,MTD,0.20,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-19,0,0,,0,0,under minimum balance
+SMF755,Matseko Khambule,MTD,33.10,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,0,,0,0,,0,0,under minimum balance
+SMF759,Patricia Lala,MTD,503.10,50.00,2,2,2026-09-28,2026-10-01,18,2026-10-26,active,yes,-15 -14,0,,0,0,,0,0,"over minimum, no reminder yet"
+SMF779,Tumelo Litabe,MTD,954.02,50.00,3,3,2026-09-01,2026-09-01,18,2026-10-22,active,yes,-15 -14,1,2026-10-19,0,0,,0,0,
+SMF838,Corne Benson,MTD,5.40,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,0,,0,0,,0,0,under minimum balance
+SMF894,Andre Visagie,MTD,0.56,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,under minimum balance
+SR2251,Johannes Dao,Skybre Wireless,50.09,50.00,2,2,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-15,0,1,2026-10-15,0,0,extension to 05/11/2026
+SR2322,Emma Labuschagne,Skybre Wireless,5.90,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SR2388,Louwtjie Van Der Walt,Skybre Wireless,19.16,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SR2389,R82 Truck and Trailer,Skybre Wireless,0.85,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SR2416,Deonie Du Plessis,Skybre Wireless,3.85,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SR2420,Marieta Jansen Van Rensburg,Skybre Wireless,0.10,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SR2426,Ledwaba Kholane,Skybre Wireless,6.46,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SR2427,Bruk Bokore,Skybre Wireless,3.27,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SR2521,Messi Ayele,Skybre Wireless,124.85,50.00,2,2,2026-10-01,2026-08-01,4,,active,yes,-3 -2,1,2026-10-15,0,1,2026-10-15,0,0,extension to 05/11/2026
+SR2526,Mange Woriseso,Skybre Wireless,10.69,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,2,2026-10-16,0,0,,0,0,under minimum balance
+SVF2132,Gerhardus Smith,Vumatel,88.00,50.00,2,2,2026-10-01,,,,active,yes,-3 -2,1,2026-10-17,0,1,2026-10-19,0,0,no blocking period
+SVF2146,Joey Luus,Vumatel,116.86,50.00,2,2,2026-10-01,2026-08-01,4,,active,yes,-3 -2,1,2026-10-17,0,2,2026-10-19,0,0,extension to 05/11/2026
+SVF2166,Johan Zaaiman,Vumatel,0.45,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-17,0,0,,0,0,under minimum balance
+SVF2180,Scotts Plumbing,Vumatel,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,under minimum balance
+SVF2208,Pompo Makate,Vumatel,450.00,50.00,1,1,2026-10-20,2026-10-20,4,2026-10-26,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet"
+SVF2215,Elzaan van Staden,Vumatel,0.60,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-17,0,0,,0,0,under minimum balance
+SVF2236,Hester Van Der Westhuizen,Vumatel,1.20,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-17,0,0,,0,0,under minimum balance
+SVF2244,Jessie Jordaan,Vumatel,718.62,50.00,1,1,2026-10-13,2026-10-13,4,,active,yes,-3 -2,1,2026-10-17,0,1,2026-10-19,0,0,extension to 05/11/2026
+SVF2251,Magda Brink,Vumatel,1027.73,50.00,2,2,2026-09-30,2026-09-30,4,,active,yes,-3 -2,1,2026-10-16,0,1,2026-10-18,0,0,extension to 31/01/2027
+SW1116,Danelle Trust,Skybre Wireless,1244.05,50.00,2,2,2026-09-01,2026-07-01,0,,active,yes,off,1,2026-10-14,0,1,2026-10-14,0,0,reminders off; billing emails off; extension to 05/11/2026
+SW1130,Tefo Rampai,Skybre Wireless,1.05,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SW1131,School of Engineers NPF 1,Skybre Wireless,2289.95,50.00,2,2,2026-09-01,2026-01-01,18,,active,yes,-15 -14,3,2026-10-16,0,3,2026-10-19,0,1,extension to 17/11/2026
+SW1313,Jean Mienie,Skybre Wireless,0.15,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,2,2026-10-16,0,3,2026-10-20,0,1,under minimum balance; extension to 22/10/2026
+SW1388,John Parsons,Skybre Wireless,0.85,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SW1442,Gerhard Japp,Skybre Wireless,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SW1481,Louw Erasmus Snr,Skybre Wireless,1.49,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SW1504,Anton Bredell,Skybre Wireless,100.00,50.00,2,2,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-12,0,2,2026-10-13,0,1,extension to 05/11/2026
+SW1519,Willem Klemp,Skybre Wireless,197.30,50.00,2,2,2026-10-01,2026-09-28,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SW1522,Carel Wessels,Skybre Wireless,1.25,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SW1578,Alina Mofutsana,Skybre Wireless,0.50,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SW1610,Janetta Susara Cronje,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,2,2026-10-08,0,0,,0,1,under minimum balance
+SW1613,Theuns Botha,Skybre Wireless,648.50,50.00,3,3,2026-08-28,2026-05-01,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SW1657,Louis Steyn,Skybre Wireless,36.56,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SW1748,Fanie Serfontein,Skybre Wireless,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SW1769,Kobus Smit,Skybre Wireless,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,1,2026-10-12,0,0,under minimum balance
+SW1811,Heinrich Venter,Skybre Wireless,11.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SW1822,Emily Smit,Skybre Wireless,3.60,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-20,0,0,,0,0,under minimum balance
+SW1863,Sophia Holmes,Skybre Wireless,3.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SW1901,Willem Jacobus Griesel,Skybre Wireless,0.60,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SW1946,IWM Venter,Skybre Wireless,1.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SW1948,Aubrey Pie,Skybre Wireless,668.02,50.00,2,2,2026-10-01,2026-10-20,4,2026-10-26,active,yes,-3 -2,0,2026-10-12,0,0,,0,1,"over minimum, no reminder yet"
+SW1955,Johan Neethling,Skybre Wireless,2.85,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SW1964,SS Tau,Skybre Wireless,19.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SW1967,Adri Viljoen,Skybre Wireless,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,1,2026-10-12,0,0,under minimum balance
+SW1996,JPA Boerdery,Skybre Wireless,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,1,2026-10-12,0,0,under minimum balance
+SWF2004,Thomas Van Biljon,Skybre Wireless,0.10,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-16,0,1,2026-10-18,0,0,under minimum balance; extension to 17/11/2026
+SWF2012,Nkosi Mkwanazi,Skybre Wireless,73.53,50.00,2,2,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-12,0,2,2026-10-13,0,0,extension to 05/11/2026
+SWF2044,Johanna Da Silva,Skybre Wireless,14.05,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,under minimum balance
+SWF2047,Dean Klopper,Skybre Wireless,23.54,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SWF2076,Mpho Lithupa,Skybre Wireless,13.04,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,under minimum balance
+SWF2086,David Tau,Skybre Wireless,17.20,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2098,Phillip Chigayo,Skybre Wireless,4.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2153,Donald Metsing,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SWF2178,Wrangler Beefmaster (Pty)Ltd,Skybre Wireless,7.32,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SWF2218,Puseletso Mthembu,Skybre Wireless,49.37,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,3,2026-10-16,0,2,2026-10-18,0,0,under minimum balance
+SWF2247,Hilda Wium,Skybre Wireless,0.03,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2249,Marius Voigt,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-12,0,1,2026-10-12,0,0,under minimum balance
+SWF2254,Monica Mohutsiwa,Skybre Wireless,9.05,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,2,2026-10-08,0,0,,0,0,under minimum balance
+SWF2272,Japie Victor Moeti,Skybre Wireless,405.15,50.00,3,3,2026-09-01,2026-10-01,4,,suspended (other),yes,-3 -2,1,2026-10-16,0,0,,0,0,
+SWF2298,Palesa Nkomo,Skybre Wireless,10.22,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-19,0,0,,0,1,under minimum balance
+SWF2300,Jenny Roos,Skybre Wireless,250.00,50.00,1,1,2026-10-02,2026-10-02,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SWF2331,Muhmmad Ikram,Skybre Wireless,379.17,50.00,3,3,2026-09-16,2026-09-16,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,extension to 22/10/2026
+SWF2347,Ronel Marais,Skybre Wireless,0.10,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2370,Stola Sebongile,Skybre Wireless,1.31,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,2,2026-10-08,0,0,,0,0,under minimum balance
+SWF2381,Rebecca Mankhe,Skybre Wireless,29.68,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,2,2026-10-08,0,0,,0,0,under minimum balance
+SWF2386,Simon Venter,Skybre Wireless,27.70,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2408,Oasis Sports Club,Skybre Wireless,49.02,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2422,Riane Capazorio,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-12,0,1,2026-10-12,0,0,under minimum balance
+SWF2442,Tsholohelo Lebona,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SWF2480,Ferdinand Franz Zitzke,Skybre Wireless,0.35,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SWF2481,Mannini Mabitsela,Skybre Wireless,471.70,50.00,2,2,2026-10-01,2026-10-01,4,,suspended (other),yes,-3 -2,1,2026-10-16,0,0,,0,0,
+SWF2525,HJ Eeden,Skybre Wireless,0.03,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SWF2537,Selloane Pitso,Skybre Wireless,21.26,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-13,0,0,,0,0,under minimum balance
+SWF2540,JH Erasmus,Skybre Wireless,0.35,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2550,Lefu Samuel Motaung,Skybre Wireless,450.00,50.00,2,2,2026-09-28,2026-09-28,4,,active,yes,-3 -2,1,2026-10-12,0,2,2026-10-13,0,1,extension to 05/11/2026
+SWF2577,Funeka Makhetha,Skybre Wireless,52.65,50.00,2,2,2026-10-01,2026-07-01,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SWF2587,Marchelle Roux,Skybre Wireless,0.07,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-12,0,0,,0,0,under minimum balance
+SWF2595,John Austin,Skybre Wireless,33.00,50.00,1,1,2026-10-01,,4,,active,NO,-3 -2,0,,7,0,,0,0,no email address; under minimum balance; email send FAILED
+SWF2610,Sipho Mosia,Skybre Wireless,0.31,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SWF2613,Tapiwa Mashava,Skybre Wireless,1568.80,50.00,7,7,2026-07-01,2026-03-26,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SWF2621,Rolien Havenga,Skybre Wireless,50.00,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SWF2648,Evodia Dhlamini,Skybre Wireless,0.48,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-14,0,0,,0,0,under minimum balance
+SWF2662,Theuns Kleynhans,Skybre Wireless,250.00,50.00,1,1,2026-10-01,2026-09-28,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 30/10/2026"
+SWF2668,Gerhard Olivier,Skybre Wireless,0.80,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2674,Lorensha Lourens,Skybre Wireless,47.20,50.00,1,1,2026-10-05,,4,,active,NO,-3 -2,0,,6,0,,0,0,no email address; under minimum balance; email send FAILED
+SWF2685,Gordon Hamel,Skybre Wireless,7.20,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2691,Eliza Roets,Skybre Wireless,0.20,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2692,Natalie Erasmus,Skybre Wireless,38.20,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2693,Bernadette Van der Berg,Skybre Wireless,2.74,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,1,2026-10-15,0,0,,0,0,under minimum balance; extension to 17/11/2026
+SWF2709,Tigabu Tumebo,Skybre Wireless,1.20,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2732,Ali Tuckshop,Skybre Wireless,48.88,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2762,Ahmed Reshid,Skybre Wireless,46.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2767,Lebohang Malebo,Skybre Wireless,103.60,50.00,2,2,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-15,0,1,2026-10-15,0,0,extension to 05/11/2026
+SWF2768,Cecilia Thoabala,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2776,Madala Tuckshop,Skybre Wireless,242.40,50.00,1,1,2026-10-01,2026-10-01,4,,suspended (non-payment),yes,-3 -2,1,2026-10-15,0,2,2026-10-20,0,1,
+SWF2782,Brenda Goosen,Skybre Wireless,8.42,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2787,Solomon Markos Gebre Hamdino,Skybre Wireless,411.21,50.00,3,3,2026-09-01,2026-09-01,18,,suspended (non-payment),yes,-15 -14,2,2026-10-16,0,2,2026-10-19,0,1,
+SWF2788,Busisiwe Khumalo,Skybre Wireless,0.20,50.00,1,1,2026-10-01,,18,,active,yes,-15 -14,3,2026-10-16,0,1,2026-10-14,0,0,under minimum balance
+SWF2797,Sello Matli,Skybre Wireless,7.20,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2819,Sandra Prinsloo,Skybre Wireless,12.81,50.00,1,1,2026-10-01,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2823,Sam Kwagile,Skybre Wireless,392.76,50.00,1,1,2026-10-01,2026-10-01,18,,no active line,yes,-15 -14,1,2026-10-16,0,0,,0,0,
+SWF2824,Johan Combrinck,Skybre Wireless,50.00,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2827,Molefi John Tigedi,Skybre Wireless,445.55,50.00,1,1,2026-10-07,2026-10-01,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 05/11/2026"
+SWF2833,Modiehi Maria Mphiyani,Skybre Wireless,37.26,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2839,Jana Boerdery,Skybre Wireless,100.00,50.00,2,2,2026-10-01,2026-10-01,4,,active,yes,-3 -2,1,2026-10-15,0,1,2026-10-15,0,0,extension to 05/11/2026
+SWF2840,Dibura Moerane,Skybre Wireless,517.20,50.00,4,4,2026-09-01,2026-09-01,4,,active,yes,-3 -2,1,2026-10-16,0,0,,0,0,extension to 05/11/2026
+SWF2845,Christa Nel,Skybre Wireless,657.65,50.00,1,1,2026-10-09,2026-10-09,4,,active,yes,-3 -2,1,2026-10-15,0,2,2026-10-20,0,1,extension to 05/11/2026
+SWF2850,Koppies Landelike Beveiliging,Skybre Wireless,11305.96,50.00,1,1,2026-10-20,2026-10-19,4,,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet; extension to 09/11/2026"
+SWF2853,Selemeng Mofokeng,Skybre Wireless,463.75,50.00,1,1,2026-10-20,2026-10-20,4,2026-10-26,active,yes,-3 -2,0,,0,0,,0,0,"over minimum, no reminder yet"
+SWF2871,Leonard Mohlabi,Skybre Wireless,10.21,50.00,1,1,2026-10-05,,4,,active,yes,-3 -2,1,2026-10-15,0,0,,0,0,under minimum balance
+SWF2877,Transglaze Solutions,Skybre Wireless,305.52,50.00,2,2,2026-10-01,2026-09-15,4,,active,yes,-3 -2,1,2026-10-15,0,1,2026-10-15,0,0,extension to 25/10/2026

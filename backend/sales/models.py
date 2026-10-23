@@ -21,21 +21,43 @@ from django.db import models
 from django.utils import timezone
 
 
+
+def _discount_amount(spec, base):
+    """{"type": "percentage"|"amount", "value": "10"} off `base`, in rand,
+    rounded to cents and capped at the base. Anything else is no discount."""
+    from decimal import ROUND_HALF_UP, InvalidOperation
+
+    if not spec or spec.get("type") not in ("percentage", "amount"):
+        return Decimal("0.00")
+    try:
+        value = Decimal(str(spec.get("value") or "0"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0.00")
+    base = Decimal(base or 0)
+    if value <= 0 or base <= 0:
+        return Decimal("0.00")
+    raw = base * value / Decimal("100") if spec["type"] == "percentage" else value
+    return min(raw, base).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
 class Lead(models.Model):
+    # Rudolph's flow (6 Oct 2026): New -> Qualify -> Coverage check
+    # (Electronic LOS / Scan LOS / Fibre check) -> Quote -> Accept or
+    # Reject, with Lost possible at any step. "Contacted" was dropped --
+    # the follow-up date and the timeline already say that -- and its
+    # leads moved back to New (migration 0002). "won" keeps its key and
+    # now reads "Accepted".
     class Status(models.TextChoices):
         NEW = "new", "New"
-        CONTACTED = "contacted", "Contacted"
-        # Coverage confirmed and they can afford it -- the point where a
-        # lead stops being a phone number and starts being a real
-        # prospect worth a rep's time.
+        # Worth pursuing: they want it and could pay for it.
         QUALIFIED = "qualified", "Qualified"
+        COVERAGE = "coverage", "Coverage check"
         QUOTED = "quoted", "Quoted"
-        WON = "won", "Won"
+        WON = "won", "Accepted"
         LOST = "lost", "Lost"
 
     # Stages a lead is still moving through. Named once so the follow-up
     # queries and the pipeline totals can't drift apart.
-    OPEN_STATUSES = (Status.NEW, Status.CONTACTED, Status.QUALIFIED, Status.QUOTED)
+    OPEN_STATUSES = (Status.NEW, Status.QUALIFIED, Status.COVERAGE, Status.QUOTED)
     CLOSED_STATUSES = (Status.WON, Status.LOST)
 
     class Source(models.TextChoices):
@@ -53,6 +75,9 @@ class Lead(models.Model):
         # First on the list because it is the one worth acting on: it is
         # not a sales failure, it is a coverage gap, and phase 2 turns
         # these into the case for where the next tower goes.
+        NO_LOS = "no_los", "No line of sight"
+        NO_FIBRE = "no_fibre", "Fibre not available"
+        QUOTE_REJECTED = "quote_rejected", "Quote rejected"
         NO_COVERAGE = "no_coverage", "No coverage"
         PRICE = "price", "Price"
         COMPETITOR = "competitor", "Went with a competitor"
@@ -111,6 +136,76 @@ class Lead(models.Model):
 
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.NEW, db_index=True)
     lost_reason = models.CharField(max_length=20, choices=LostReason.choices, blank=True)
+    # The stage a lead was at when it was lost, so the funnel report can say
+    # WHERE people drop out, not only why. Stamped by save().
+    lost_at_stage = models.CharField(max_length=20, blank=True)
+
+    # Where they are, for a farm with no street address -- and where a scan
+    # job and the installation job are sent.
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+
+    # --- Coverage check (6 Oct 2026) --------------------------------------
+    class CoverageMethod(models.TextChoices):
+        ELECTRONIC = "electronic", "Electronic LOS"
+        SCAN = "scan", "Scan LOS"
+        FIBRE = "fibre", "Fibre check"
+
+    class CoverageResult(models.TextChoices):
+        PASS = "pass", "Pass"
+        FAIL = "fail", "Fail"
+        FIBRE_CONFIRMED = "fibre_confirmed", "Fibre confirmed"
+        FIBRE_UNAVAILABLE = "fibre_unavailable", "Fibre not available"
+
+    #: Results that let the lead go on to a quote.
+    COVERAGE_OK = (CoverageResult.PASS, CoverageResult.FIBRE_CONFIRMED)
+
+    coverage_method = models.CharField(max_length=12, choices=CoverageMethod.choices, blank=True)
+    coverage_result = models.CharField(max_length=20, choices=CoverageResult.choices, blank=True)
+    coverage_tower = models.CharField(max_length=100, blank=True)
+    coverage_sector = models.CharField(max_length=100, blank=True)
+    coverage_signal = models.CharField(max_length=50, blank=True)
+    coverage_notes = models.TextField(blank=True)
+    # The fibre network found at the address (a Partner, e.g. Vumatel).
+    coverage_partner = models.ForeignKey(
+        "customers.Partner", on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    coverage_checked_at = models.DateTimeField(null=True, blank=True)
+    coverage_checked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # The Site Visit job a Scan LOS booked in Scheduling.
+    scan_job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True, related_name="scan_for_leads",
+    )
+
+    # --- Quote ------------------------------------------------------------
+    # The plan is interested_tariff; these are the once-off extras,
+    # [{"label": "Installation", "amount": "1500.00"}, ...], excl. VAT.
+    quote_items = models.JSONField(default=list, blank=True)
+    # Monthly extras on top of the plan (7 Oct 2026): recurring charges such
+    # as IP rental, [{"label": "IP Rental", "amount": "100.00",
+    # "recurring_charge": 3}, ...], excl. VAT. recurring_charge is the
+    # Configs -> Tariffs -> Recurring Charges entry it came from, or absent.
+    quote_recurring = models.JSONField(default=list, blank=True)
+    # The day the service starts (7 Oct 2026, Rudolph: clients come on
+    # halfway into the month and are charged from that date to month end,
+    # then recurring billing). Drives the quote's pro-rata line. Blank = no
+    # pro rata on the quote.
+    quote_start_date = models.DateField(null=True, blank=True)
+    # Discounts on the quote (7 Oct 2026), the same two kinds a service has
+    # (percentage / rand amount, excl. VAT):
+    # {"monthly": {"type": "percentage", "value": "10", "months": 3},
+    #  "once_off": {"type": "amount", "value": "500"}, "reason": "Launch special"}.
+    # The monthly one comes off the PLAN price -- exactly how the service
+    # discount bills it later -- and months blank = ongoing.
+    quote_discount = models.JSONField(default=dict, blank=True)
+    quote_valid_until = models.DateField(null=True, blank=True)
+    quote_sent_at = models.DateTimeField(null=True, blank=True)
+    # The installation job Accept put in the job pool.
+    install_job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True, related_name="install_for_leads",
+    )
 
     # A date, not a datetime. Nobody follows up at 14:30 -- they work a
     # list for the day, and asking for a time would make the field
@@ -156,11 +251,42 @@ class Lead(models.Model):
         excluding it would quietly shrink the pipeline count as well as
         its value, and the count is the number people trust.
         """
+        return self.plan_value - self.monthly_discount + self.recurring_value
+
+    @property
+    def plan_value(self):
+        """The plan's monthly price excl. VAT, or the explicit override."""
         if self.estimated_monthly_value is not None:
             return self.estimated_monthly_value
         if self.interested_tariff_id and self.interested_tariff:
             return self.interested_tariff.price
         return Decimal("0.00")
+
+    @property
+    def monthly_discount(self):
+        """Rand amount off the plan per month (excl. VAT), never more than it."""
+        return _discount_amount((self.quote_discount or {}).get("monthly"), self.plan_value)
+
+    @property
+    def once_off_discount(self):
+        gross = Decimal("0.00")
+        for item in self.quote_items or []:
+            try:
+                gross += Decimal(str(item.get("amount") or "0"))
+            except Exception:  # noqa: BLE001
+                continue
+        return _discount_amount((self.quote_discount or {}).get("once_off"), gross)
+
+    @property
+    def recurring_value(self):
+        """The quoted recurring charges (IP rental...), monthly excl. VAT."""
+        total = Decimal("0.00")
+        for item in self.quote_recurring or []:
+            try:
+                total += Decimal(str(item.get("amount") or "0"))
+            except Exception:  # noqa: BLE001 -- a bad row counts as nothing
+                continue
+        return total
 
     @property
     def is_open(self):
@@ -199,6 +325,17 @@ class Lead(models.Model):
             self.closed_at = timezone.now()
         elif self.status not in self.CLOSED_STATUSES:
             self.closed_at = None
+        # Which stage it was lost at -- read from the row as it stands
+        # before this save. Cleared when a lost lead is reopened.
+        if self.status == self.Status.LOST and not self.lost_at_stage:
+            before = (
+                Lead.objects.filter(pk=self.pk).values_list("status", flat=True).first() if self.pk else None
+            )
+            self.lost_at_stage = before if before and before != self.Status.LOST else self.Status.NEW
+        elif self.status != self.Status.LOST:
+            self.lost_at_stage = ""
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = list(set(kwargs["update_fields"]) | {"closed_at", "lost_at_stage"})
         super().save(*args, **kwargs)
 
     def convert_to_customer(self, actor=None):
@@ -232,7 +369,15 @@ class Lead(models.Model):
             address=self.address,
             city=self.city,
             zip_code=self.zip_code,
-            partner=self.partner,
+            latitude=self.latitude,
+            longitude=self.longitude,
+            # Fibre confirmed on a network: the client belongs to that
+            # partner -- its plans are what the quote offered.
+            partner=(
+                self.coverage_partner
+                if self.coverage_result == self.CoverageResult.FIBRE_CONFIRMED and self.coverage_partner_id
+                else self.partner
+            ),
             assigned_staff=self.assigned_to,
             status=Customer.Status.NEW,
             notes=self.notes,

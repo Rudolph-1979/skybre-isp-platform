@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+#
+# Installs the admin-panel-generated clients.conf into FreeRADIUS, but only
+# if it validates AS THE SERVICE USER, only if it still contains clients,
+# and only if FreeRADIUS is still healthy afterwards. Triggered by
+# skybre-radius-clients.path.
+#
+# WHY THE CLIENT COUNT IS CHECKED AT ALL (2026-09-20).
+#
+# Every safety check in this script used to ask the same question: does
+# FreeRADIUS accept this config? None of them asked whether the config was
+# CORRECT. Those are not the same question, and a clients.conf containing no
+# client blocks is the case where they come apart completely: it parses
+# perfectly, FreeRADIUS starts cleanly and reports itself healthy, and every
+# NAS on the network is silently unknown. An unknown client is not rejected,
+# it is ignored -- so routers retransmit into a void, accounting stops, and
+# every customer reads as offline while the daemon looks fine.
+#
+# That is exactly what happened. At 18:21:17 an empty render was the only
+# candidate all evening that passed validation, so it was installed and the
+# daemon restarted onto it. Twelve later attempts to install the real
+# seven-client config were rejected and rolled back -- to that empty file,
+# because "previous" was assumed to mean "good". Ten hours of invisible
+# customers, with the journal reporting a healthy restart.
+#
+# So: a config with zero clients is never installed over one that has them,
+# and a rollback that would restore a client-less config says so loudly
+# rather than quietly completing.
+#
+set -uo pipefail
+
+SPOOL_DIR="/var/lib/skybre/radius"
+SPOOL_FILE="${SPOOL_DIR}/clients.conf"
+TARGET="/etc/freeradius/3.0/clients.conf.d/skybre_clients.conf"
+RADDB="/etc/freeradius/3.0"
+FR_BIN="/usr/sbin/freeradius"
+FR_USER="freerad"
+FR_GROUP="freerad"
+RADIUS_LOG="/var/log/freeradius/radius.log"
+
+# Deliberate, out-of-band override for the one legitimate case: genuinely
+# emptying the client list. A flag file rather than a config setting, so it
+# takes a conscious act on the host and leaves a mtime behind.
+OVERRIDE_FLAG="${SPOOL_DIR}/ALLOW_EMPTY_CLIENTS"
+
+# Written on every run and bind-mounted into the backend container, so the
+# platform can SHOW that RADIUS clients are not applied instead of leaving
+# it in a journal nobody is reading. The whole cost of the 2026-09-20
+# outage was that it was silent, not that it happened.
+STATUS_FILE="${SPOOL_DIR}/apply_status.json"
+
+# One log per failure, kept. The single overwritten /tmp file meant twelve
+# consecutive validation failures left exactly zero evidence of why -- the
+# successful run the next morning wrote over the last of them.
+CHECK_LOG_DIR="/var/log/skybre"
+CHECK_LOG_KEEP=20
+
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+mkdir -p "${CHECK_LOG_DIR}" 2>/dev/null
+CHECK_LOG="${CHECK_LOG_DIR}/radius-check-${STAMP}.log"
+
+say() { logger -t skybre-radius-clients "$*"; }
+
+# Count of `client "..." {` blocks in a file. Nothing here parses FreeRADIUS
+# config properly and it does not need to: the only distinction that matters
+# is "has clients" versus "has none".
+count_clients() {
+    local n
+    [ -f "${1:-}" ] || { echo 0; return; }
+    # grep -c prints 0 and exits 1 when there is no match, so no `|| echo`
+    # fallback -- that would print a SECOND line and every later numeric
+    # test would die with "integer expression expected". Same trap as
+    # ready_count() below, which was written after being caught by it.
+    n="$(grep -c '^client ' "$1" 2>/dev/null)"
+    case "${n}" in ''|*[!0-9]*) n=0 ;; esac
+    echo "${n}"
+}
+
+# {"state": "...", "detail": "...", "spool_clients": N, "live_clients": N,
+#  "at": "..."} -- hand-rolled because this host has no jq and this file is
+# read by exactly one consumer.
+write_status() {
+    local state="$1" detail="$2" spool_n="$3" live_n="$4"
+    # Detail is our own text, but escape quotes and backslashes anyway
+    # rather than trusting that it always will be.
+    detail="${detail//\\/\\\\}"
+    detail="${detail//\"/\\\"}"
+    printf '{"state":"%s","detail":"%s","spool_clients":%s,"live_clients":%s,"at":"%s"}\n' \
+        "${state}" "${detail}" "${spool_n}" "${live_n}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "${STATUS_FILE}.tmp" 2>/dev/null \
+        && mv -f "${STATUS_FILE}.tmp" "${STATUS_FILE}" 2>/dev/null
+    chmod 0644 "${STATUS_FILE}" 2>/dev/null || true
+}
+
+# Keep the last CHECK_LOG_KEEP failure logs and drop the rest.
+prune_check_logs() {
+    local old
+    old="$(ls -1t "${CHECK_LOG_DIR}"/radius-check-*.log 2>/dev/null | tail -n +$((CHECK_LOG_KEEP + 1)))"
+    [ -n "${old}" ] && echo "${old}" | xargs -r rm -f
+    return 0
+}
+
+# How many times FreeRADIUS has completed a FULL startup. Used to prove a
+# restart actually happened rather than a no-op or a mere module reload --
+# see the long comment at the restart below.
+ready_count() {
+    local n
+    if [ -r "${RADIUS_LOG}" ]; then
+        # No '|| echo 0' here: grep -c already PRINTS 0 when there is no
+        # match, and also exits 1 -- so the fallback would append a second
+        # line and every later [ -gt ] would die with "integer expression
+        # expected", silently turning this safety check into a failure.
+        n="$(grep -c 'Ready to process requests' "${RADIUS_LOG}" 2>/dev/null)"
+        case "${n}" in ''|*[!0-9]*) n=0 ;; esac
+        echo "${n}"
+    else
+        # -1 means "can't tell", handled explicitly at the call site rather
+        # than being mistaken for "no startups".
+        echo -1
+    fi
+}
+
+say "spool change detected"
+[ -f "${SPOOL_FILE}" ] || { say "spool file missing, nothing to do"; exit 0; }
+
+SPOOL_N="$(count_clients "${SPOOL_FILE}")"
+LIVE_N="$(count_clients "${TARGET}")"
+
+if [ -f "${TARGET}" ] && cmp -s "${SPOOL_FILE}" "${TARGET}"; then
+    say "content unchanged, nothing to apply"
+    write_status ok "content unchanged" "${SPOOL_N}" "${LIVE_N}"
+    exit 0
+fi
+
+# THE GUARD. A config with no clients in it, replacing one that has them, is
+# a silent network outage dressed as a valid config. Refuse it here, before
+# anything is touched, and keep saying so until somebody looks.
+#
+# Narrowed deliberately to zero-over-nonzero rather than "any decrease":
+# removing one NAS client is an ordinary thing to do from the admin panel,
+# and a guard that blocks ordinary work gets disabled within a week. Going
+# from some clients to none is not ordinary -- it has no legitimate cause
+# short of decommissioning the network, which is what the override is for.
+if [ "${SPOOL_N}" -eq 0 ] && [ "${LIVE_N}" -gt 0 ]; then
+    if [ -f "${OVERRIDE_FLAG}" ]; then
+        say "WARNING: spool has NO clients and ${TARGET} has ${LIVE_N} -- proceeding only because ${OVERRIDE_FLAG} exists"
+    else
+        say "CRITICAL: REFUSING to install a clients.conf with NO clients over one with ${LIVE_N}. FreeRADIUS would start cleanly and ignore every NAS on the network. The live config is untouched. If this is really intended, create ${OVERRIDE_FLAG} and save again."
+        write_status refused "spool rendered 0 clients, live config has ${LIVE_N}; refused to install" "${SPOOL_N}" "${LIVE_N}"
+        exit 1
+    fi
+fi
+
+# Not a refusal -- see the note above about ordinary deletions -- but worth a
+# line in the journal, because "three clients disappeared" is the kind of
+# thing that is obvious in hindsight and invisible at the time.
+if [ "${SPOOL_N}" -lt "${LIVE_N}" ] && [ "${SPOOL_N}" -gt 0 ]; then
+    say "note: client count is going DOWN, ${LIVE_N} -> ${SPOOL_N}"
+fi
+
+# Health check FIRST: if FreeRADIUS is already down, do not touch anything --
+# we'd only obscure a pre-existing problem and get blamed for it.
+if ! systemctl is-active --quiet freeradius; then
+    say "ERROR: FreeRADIUS is not active BEFORE any change (state: $(systemctl is-active freeradius 2>/dev/null)). Refusing to touch config."
+    write_status failed "FreeRADIUS was already down before this apply; config untouched" "${SPOOL_N}" "${LIVE_N}"
+    exit 1
+fi
+
+BACKUP="$(mktemp /tmp/skybre-clients-backup.XXXXXX)"
+HAD_TARGET=no
+if [ -f "${TARGET}" ]; then cp -p "${TARGET}" "${BACKUP}"; HAD_TARGET=yes; fi
+
+restore() {
+    if [ "${HAD_TARGET}" = yes ]; then cp -p "${BACKUP}" "${TARGET}"; else rm -f "${TARGET}"; fi
+    rm -f "${BACKUP}"
+
+    # The step whose absence turned one bad evening into a ten-hour outage.
+    # Rolling back to "whatever was there before" is only safe if what was
+    # there before actually works, and on 2026-09-20 it did not -- it was an
+    # empty file that had been installed forty seconds earlier. If we are
+    # restoring a client-less config while the candidate had clients, the
+    # network is down right now and nothing else is going to say so.
+    if [ "${LIVE_N}" -eq 0 ] && [ "${SPOOL_N}" -gt 0 ]; then
+        say "CRITICAL: rolled back to a clients.conf containing NO clients, so FreeRADIUS is now ignoring every NAS on the network. This is an OUTAGE, not a safe fallback. The ${SPOOL_N}-client config from the admin panel could not be applied -- see ${CHECK_LOG}."
+        write_status outage "rolled back to a config with 0 clients; ${SPOOL_N}-client config could not be applied (see ${CHECK_LOG})" "${SPOOL_N}" 0
+    fi
+}
+
+# Install with the same ownership as the containing directory, then 0640.
+cp "${SPOOL_FILE}" "${TARGET}"
+chown --reference="$(dirname "${TARGET}")" "${TARGET}" 2>/dev/null || chown "root:${FR_GROUP}" "${TARGET}" 2>/dev/null || true
+chmod 0640 "${TARGET}"
+
+# The check that would have prevented the 2026-08-20 outage: can the user
+# FreeRADIUS actually runs as read this file?
+if ! runuser -u "${FR_USER}" -- test -r "${TARGET}"; then
+    say "ERROR: ${FR_USER} cannot read ${TARGET} ($(stat -c '%A %U:%G' "${TARGET}")); rolling back without touching the daemon"
+    write_status failed "${FR_USER} cannot read the installed file" "${SPOOL_N}" "${LIVE_N}"
+    restore
+    exit 1
+fi
+
+# Validate as the service user, NOT root. Root can read what the daemon
+# cannot, which is exactly how a bad config slipped through before.
+if ! runuser -u "${FR_USER}" -- "${FR_BIN}" -CX -d "${RADDB}" >"${CHECK_LOG}" 2>&1; then
+    # Kept for anything still pointing at the old path; the timestamped
+    # file is the one that survives the next run.
+    cp -f "${CHECK_LOG}" /tmp/skybre-radius-check.log 2>/dev/null || true
+    say "ERROR: generated clients.conf FAILED validation as ${FR_USER}; rolling back (see ${CHECK_LOG})"
+    write_status failed "config failed validation as ${FR_USER} (see ${CHECK_LOG})" "${SPOOL_N}" "${LIVE_N}"
+    restore
+    prune_check_logs
+    exit 1
+fi
+cp -f "${CHECK_LOG}" /tmp/skybre-radius-check.log 2>/dev/null || true
+
+# MUST be a restart, never a reload.
+#
+# FreeRADIUS's HUP handler re-reads modules and virtual servers but NOT
+# clients or listen sections. A reload therefore leaves a newly added NAS
+# client completely absent from the running server while reporting
+# success. Proven on 2026-08-21: a client installed at 08:19:31 was still
+# rejected as "unknown client 102.23.159.102" at 08:21:48, and started
+# working the instant the daemon was restarted, with nothing else changed.
+#
+# The previous version of this line was:
+#     systemctl reload freeradius || systemctl restart freeradius
+# which is worse than either alone -- reload SUCCEEDS, so the restart
+# fallback never ran. Every client added in the admin panel silently
+# failed to apply until some unrelated event happened to restart the
+# daemon. The journal said "reloaded and healthy" the whole time, so the
+# one place you'd look for trouble actively reassured you.
+#
+# A restart drops in-flight requests for roughly a second. That is the
+# correct trade against a client that never applies at all.
+READY_BEFORE="$(ready_count)"
+
+if systemctl restart freeradius >/dev/null 2>&1; then
+    sleep 2
+    if ! systemctl is-active --quiet freeradius; then
+        say "ERROR: FreeRADIUS is NOT active after restart; rolling back"
+        write_status failed "FreeRADIUS did not come back after restart" "${SPOOL_N}" "${LIVE_N}"
+    else
+        # Active isn't sufficient: confirm a full startup really occurred,
+        # because "active" is also true of a daemon that never restarted.
+        READY_AFTER="$(ready_count)"
+        if [ "${READY_BEFORE}" -lt 0 ]; then
+            say "config valid, installed, FreeRADIUS restarted and healthy (could not read ${RADIUS_LOG} to confirm a full startup); ${SPOOL_N} client(s) live"
+            write_status ok "installed ${SPOOL_N} client(s); could not read ${RADIUS_LOG} to confirm a full startup" "${SPOOL_N}" "${SPOOL_N}"
+            rm -f "${BACKUP}"
+            prune_check_logs
+            exit 0
+        elif [ "${READY_AFTER}" -gt "${READY_BEFORE}" ]; then
+            say "config valid, installed, FreeRADIUS restarted and healthy (clients reloaded); ${SPOOL_N} client(s) live"
+            write_status ok "installed ${SPOOL_N} client(s)" "${SPOOL_N}" "${SPOOL_N}"
+            rm -f "${BACKUP}"
+            prune_check_logs
+            exit 0
+        else
+            say "ERROR: FreeRADIUS is active but no new startup appeared in ${RADIUS_LOG} -- the new clients are probably NOT live; rolling back"
+            write_status failed "no new startup in ${RADIUS_LOG}; the new clients were probably not live" "${SPOOL_N}" "${LIVE_N}"
+        fi
+    fi
+else
+    say "ERROR: FreeRADIUS would not restart; rolling back"
+    write_status failed "FreeRADIUS would not restart" "${SPOOL_N}" "${LIVE_N}"
+fi
+
+# Rollback, then confirm the daemon is actually back -- the step whose
+# absence turned a failed apply into a silent outage.
+restore
+systemctl restart freeradius >/dev/null 2>&1 || true
+sleep 2
+if systemctl is-active --quiet freeradius; then
+    say "rolled back and FreeRADIUS is healthy again"
+    prune_check_logs
+    exit 1
+fi
+
+# Last resort: our file is the only thing we introduced, so drop it entirely
+# and try once more. Better a missing NAS client than no RADIUS at all.
+say "CRITICAL: FreeRADIUS still not active after rollback — removing ${TARGET} entirely as a last resort"
+rm -f "${TARGET}"
+systemctl restart freeradius >/dev/null 2>&1 || true
+sleep 2
+if systemctl is-active --quiet freeradius; then
+    say "CRITICAL: recovered by removing ${TARGET}. RADIUS clients from the admin panel are NOT applied. Investigate before relying on this."
+    write_status outage "recovered by removing ${TARGET}; NO admin-panel RADIUS clients are applied" "${SPOOL_N}" 0
+else
+    say "CRITICAL: FreeRADIUS is DOWN and removing our file did not fix it — the cause is elsewhere. Run: freeradius -X"
+    write_status outage "FreeRADIUS is DOWN and removing ${TARGET} did not fix it; the cause is elsewhere" "${SPOOL_N}" 0
+fi
+prune_check_logs
+exit 1

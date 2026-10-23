@@ -46,24 +46,53 @@ logger = logging.getLogger(__name__)
 DUE_FILTER = "lte"
 
 
-def due_services(as_of=None):
-    """Services whose end date has arrived and which are still running."""
+def due_services(as_of=None, partner_ids=None):
+    """Services whose end date has arrived and which are still running.
+
+    `partner_ids` scopes the work to those resellers' customers. A
+    recurring-billing run can be scoped to selected partners on the
+    Finance screen and calls this job as part of itself -- unscoped, it
+    disconnected customers belonging to resellers the operator had
+    deliberately left out of the run. None (the cron default) means every
+    customer, which is what the nightly job wants.
+
+    The scope is `partner_id__in`, so a customer with NO partner -- which
+    most of Skybre's own customers are -- is only ever touched by an
+    unscoped run. They belong to no reseller, so no reseller's run should
+    end their service.
+    """
     from .models import Service
 
     as_of = as_of or timezone.localdate()
     lookup = {f"end_date__{DUE_FILTER}": as_of}
+    qs = Service.objects.filter(end_date__isnull=False, **lookup)
+    if partner_ids:
+        qs = qs.filter(customer__partner_id__in=partner_ids)
     return (
-        Service.objects.filter(end_date__isnull=False, **lookup)
-        .exclude(status=Service.Status.TERMINATED)
+        qs.exclude(status=Service.Status.TERMINATED)
         .select_related("customer")
         .order_by("pk")
     )
 
 
-def customers_fully_ended(customer_ids):
+def customers_fully_ended(customer_ids, ending_service_ids=()):
     """Of these customers, the ones whose every service is now terminated.
 
     Excludes customers with no services at all -- see the module docstring.
+
+    `ending_service_ids` are services the caller is about to terminate but
+    has not yet. It exists for the dry run, and without it the dry run
+    could not answer this question at all: it asked the database which
+    customers have nothing left running, and in a dry run nothing has
+    been terminated, so the answer was always "none". The preview listed
+    the services it would end and an empty cancellation list -- hiding
+    the consequence staff actually care about, that the customer gets
+    marked Inactive, in the one screen that exists to show it before
+    committing.
+
+    On the commit path these services are already terminated, so passing
+    them changes nothing; the two paths now compute the same answer from
+    the same inputs, which is what makes the preview worth reading.
     """
     from customers.models import Customer
 
@@ -72,6 +101,7 @@ def customers_fully_ended(customer_ids):
     still_running = set(
         Service.objects.filter(customer_id__in=customer_ids)
         .exclude(status=Service.Status.TERMINATED)
+        .exclude(pk__in=ending_service_ids)
         .values_list("customer_id", flat=True)
     )
     has_any = set(
@@ -81,19 +111,21 @@ def customers_fully_ended(customer_ids):
     return Customer.objects.filter(pk__in=finished).exclude(status=Customer.Status.INACTIVE)
 
 
-def apply_due_cancellations(as_of=None, commit=True):
+def apply_due_cancellations(as_of=None, commit=True, partner_ids=None):
     """End every due service, then cancel any customer left with none running.
 
     Returns (ended, cancelled) as lists of (id, label) so a caller -- a cron
     run, a billing run, or a dry run -- can report exactly what happened
     rather than a bare count.
+
+    `partner_ids` scopes it to those resellers' customers; see due_services.
     """
     from customers.models import Customer
 
     from .models import Service
 
     as_of = as_of or timezone.localdate()
-    services = list(due_services(as_of))
+    services = list(due_services(as_of, partner_ids=partner_ids))
     ended = []
     touched_customers = set()
 
@@ -109,7 +141,9 @@ def apply_due_cancellations(as_of=None, commit=True):
 
     cancelled = []
     if touched_customers:
-        for customer in customers_fully_ended(touched_customers):
+        for customer in customers_fully_ended(
+            touched_customers, ending_service_ids=[pk for pk, _label in ended]
+        ):
             cancelled.append((customer.pk, customer.full_name))
             if commit:
                 # Through .save() so the customer signals run -- though by

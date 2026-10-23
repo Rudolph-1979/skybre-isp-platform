@@ -55,5 +55,21 @@ class Command(BaseCommand):
             f"{counts['invoices_created']} invoice(s), {counts['proforma_invoices_created']} pro forma(s), "
             f"{counts['reminders_sent']} reminder(s), {counts['suspensions_applied']} suspension(s)."
         ))
+        # LOUD, and on stderr, because this is what cron mails and what a
+        # human scrolling logs/billing.log on the 2nd needs to see. A
+        # withheld run is not an error -- it is the gate doing its job --
+        # but a silent one is a month of customers nobody billed.
+        if result.get("invoicing_withheld"):
+            note = (
+                "the approved preview no longer matches this run (something "
+                "changed after sign-off)"
+                if result.get("approval_reason") == "stale"
+                else "no approved preview for this date and partner scope"
+            )
+            self.stderr.write(self.style.WARNING(
+                f"NO INVOICES CREATED for {run_date}: {note}. Reminders, warnings "
+                f"and suspensions ran as usual. Preview and approve it under "
+                f"Finance -> Recurring Billing, then run."
+            ))
         if result["status"] == "failed":
             self.stdout.write(self.style.ERROR(f"Run FAILED: {result['status_message']}"))

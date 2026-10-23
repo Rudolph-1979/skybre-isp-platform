@@ -1,0 +1,346 @@
+from decimal import Decimal
+
+from django.utils import timezone
+from rest_framework import serializers
+
+from .models import FuelLog, OdometerReading, ServiceRecord, TripLog, TyreRotation, Vehicle
+
+
+def _display_name(user):
+    if not user:
+        return None
+    return user.get_full_name() or user.username
+
+
+class OdometerReadingSerializer(serializers.ModelSerializer):
+    recorded_by_name = serializers.SerializerMethodField()
+    trip_start_place = serializers.SerializerMethodField()
+    trip_end_place = serializers.SerializerMethodField()
+    trip_start_km = serializers.SerializerMethodField()
+    trip_end_km = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OdometerReading
+        fields = [
+            "id", "vehicle", "reading_km", "recorded_at", "recorded_by",
+            "recorded_by_name", "notes", "source", "trip_start_km", "trip_start_place", "trip_end_km", "trip_end_place",
+            "created_at",
+        ]
+        read_only_fields = ["id", "recorded_by", "source", "created_at"]
+
+    def _trip_places(self, obj):
+        """Km and place where the Webfleet trip this reading ends started and
+        stopped (#191/#192, Rudolph 16 Oct: Start and Stop columns). One
+        query per vehicle per response, not one per row."""
+        if obj.source != "webfleet":
+            return (None, "", None, "")
+        cache = self.context.setdefault("_webfleet_trip_places", {})
+        if obj.vehicle_id not in cache:
+            cache[obj.vehicle_id] = {
+                row[0]: row[1:]
+                for row in TripLog.objects.filter(vehicle_id=obj.vehicle_id, webfleet_trip_id__isnull=False)
+                .values_list("ended_at", "start_odometer", "start_place", "end_odometer", "end_place")
+            }
+        return cache[obj.vehicle_id].get(obj.recorded_at, (None, "", None, ""))
+
+    def get_trip_start_km(self, obj):
+        return self._trip_places(obj)[0]
+
+    def get_trip_start_place(self, obj):
+        return self._trip_places(obj)[1]
+
+    def get_trip_end_km(self, obj):
+        return self._trip_places(obj)[2]
+
+    def get_trip_end_place(self, obj):
+        return self._trip_places(obj)[3]
+
+    def get_recorded_by_name(self, obj):
+        if obj.recorded_by_id is None and obj.source == "webfleet":
+            return "Webfleet"
+        return _display_name(obj.recorded_by)
+
+    def validate(self, attrs):
+        vehicle = attrs.get("vehicle") or getattr(self.instance, "vehicle", None)
+        reading_km = attrs.get("reading_km", getattr(self.instance, "reading_km", None))
+        recorded_at = attrs.get("recorded_at", getattr(self.instance, "recorded_at", None))
+        if vehicle is not None and reading_km is not None and recorded_at is not None:
+            qs = vehicle.odometer_readings.all()
+            if self.instance is not None:
+                qs = qs.exclude(pk=self.instance.pk)
+            # An odometer only counts up, so a reading is impossible only
+            # when it contradicts its neighbours IN TIME -- below what the
+            # vehicle already read before it, or above what it read after
+            # it. This used to compare against the highest reading ever
+            # logged, whenever it was taken, which broke two real jobs. A
+            # driver's logbook typed up a week late was refused outright,
+            # so the trip could never be recorded. And a slipped digit
+            # (450000 for 45000) became permanent: it was the highest
+            # reading, so every honest reading afterwards sat below it and
+            # was rejected, the vehicle's current km froze at the typo,
+            # and the fleet list read Overdue for the rest of its life.
+            # __lt, not __lte: a reading stamped at the same instant as an
+            # existing one is not "after" it. A vehicle cannot read two
+            # different numbers at once, and treating an equal timestamp as
+            # later let the higher of the pair straight through -- which is
+            # the poisoning route all over again, reachable with the
+            # timestamp the log-reading form pre-fills.
+            same_instant = qs.filter(recorded_at=recorded_at).exclude(reading_km=reading_km)
+            if same_instant.exists():
+                raise serializers.ValidationError(
+                    f"There is already a reading of {same_instant.first().reading_km} km at exactly "
+                    "this time. A vehicle can only read one number at one moment -- correct that "
+                    "reading instead, or give this one the time it was actually taken."
+                )
+            earlier = qs.filter(recorded_at__lt=recorded_at).order_by("-recorded_at", "-id").first()
+            if earlier and reading_km < earlier.reading_km:
+                raise serializers.ValidationError(
+                    f"Odometer reading can't be lower than the {earlier.reading_km} km already "
+                    f"recorded on {timezone.localtime(earlier.recorded_at):%Y-%m-%d}."
+                )
+            later = qs.filter(recorded_at__gt=recorded_at).order_by("recorded_at", "id").first()
+            if later and reading_km > later.reading_km:
+                raise serializers.ValidationError(
+                    f"Odometer reading can't be higher than the {later.reading_km} km recorded "
+                    f"later, on {timezone.localtime(later.recorded_at):%Y-%m-%d}."
+                )
+        return attrs
+
+
+class ServiceRecordSerializer(serializers.ModelSerializer):
+    logged_by_name = serializers.SerializerMethodField()
+    # The linked workshop invoice (13 Oct 2026). Set by mark_serviced only.
+    expense_amount_excl_vat = serializers.DecimalField(
+        source="expense.amount_excl_vat", max_digits=12, decimal_places=2, read_only=True, default=None
+    )
+    expense_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ServiceRecord
+        fields = [
+            "id", "vehicle", "service_date", "odometer_km", "notes",
+            "logged_by", "logged_by_name", "created_at",
+            "expense", "expense_amount_excl_vat", "expense_label",
+        ]
+        read_only_fields = ["id", "logged_by", "created_at", "expense"]
+
+    def get_expense_label(self, obj):
+        expense = obj.expense if obj.expense_id else None
+        if expense is None:
+            return None
+        supplier = expense.supplier.name if expense.supplier_id else expense.supplier_name
+        return " · ".join(b for b in (supplier, expense.invoice_number) if b) or expense.description
+
+    def get_logged_by_name(self, obj):
+        return _display_name(obj.logged_by)
+
+
+class TyreRotationSerializer(serializers.ModelSerializer):
+    logged_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TyreRotation
+        fields = [
+            "id", "vehicle", "rotation_date", "odometer_km", "notes",
+            "logged_by", "logged_by_name", "created_at",
+        ]
+        read_only_fields = ["id", "logged_by", "created_at"]
+
+    def get_logged_by_name(self, obj):
+        return _display_name(obj.logged_by)
+
+
+class FuelLogSerializer(serializers.ModelSerializer):
+    logged_by_name = serializers.SerializerMethodField()
+    price_per_litre = serializers.DecimalField(
+        max_digits=10, decimal_places=2, read_only=True, allow_null=True
+    )
+
+    # Rand per litre in South Africa has spent this decade between roughly
+    # R18 and R26. These bounds sit nowhere near that -- they exist to catch
+    # the two mistakes that actually happen at a fuel station: the litres
+    # typed into the cost box (R47.84 for 47.84 L, so R1 a litre) and a
+    # decimal point slipped (R9,568 for the same tank, so R200 a litre).
+    # Either one lands in the monthly spend looking like a real number, and
+    # is then very hard to find again.
+    MIN_PRICE_PER_LITRE = Decimal("5")
+    MAX_PRICE_PER_LITRE = Decimal("80")
+
+    class Meta:
+        model = FuelLog
+        fields = [
+            "id", "vehicle", "filled_at", "litres", "cost", "price_per_litre",
+            "odometer_km", "notes", "logged_by", "logged_by_name", "created_at",
+            "source", "station", "slip_url", "amount_mismatch",
+        ]
+        read_only_fields = ["id", "logged_by", "created_at", "source", "station", "slip_url", "amount_mismatch"]
+
+    def get_logged_by_name(self, obj):
+        return _display_name(obj.logged_by)
+
+    def validate(self, attrs):
+        cost = attrs.get("cost", getattr(self.instance, "cost", None))
+        litres = attrs.get("litres", getattr(self.instance, "litres", None))
+        if cost is None or not litres:
+            return attrs
+        if cost < 0:
+            raise serializers.ValidationError({"cost": "A fill-up cannot cost less than nothing."})
+
+        per_litre = Decimal(cost) / Decimal(litres)
+        if not (self.MIN_PRICE_PER_LITRE <= per_litre <= self.MAX_PRICE_PER_LITRE):
+            raise serializers.ValidationError({
+                "cost": (
+                    f"R{cost} for {litres} L is R{per_litre:.2f} a litre, which is outside "
+                    "anything a South African pump charges. Check that the total and the "
+                    "litres are not the wrong way round."
+                )
+            })
+        return attrs
+
+
+class VehicleSerializer(serializers.ModelSerializer):
+    assigned_to_name = serializers.SerializerMethodField()
+    current_odometer_km = serializers.IntegerField(read_only=True)
+    last_service_date = serializers.DateField(read_only=True)
+    last_service_km = serializers.IntegerField(read_only=True)
+    next_service_due_km = serializers.IntegerField(read_only=True)
+    km_until_due = serializers.IntegerField(read_only=True)
+    service_status = serializers.CharField(read_only=True)
+    # Same shape as the service fields above, one dimension over: its own
+    # interval, its own last-done date/km, its own due/status. See
+    # TyreRotation and Vehicle.tyre_rotation_status for why this is a
+    # separate schedule rather than folded into the service one.
+    last_tyre_rotation_date = serializers.DateField(read_only=True, allow_null=True)
+    last_tyre_rotation_km = serializers.IntegerField(read_only=True)
+    next_tyre_rotation_due_km = serializers.IntegerField(read_only=True)
+    km_until_tyre_rotation_due = serializers.IntegerField(read_only=True)
+    tyre_rotation_status = serializers.CharField(read_only=True)
+    # The annual licence disc. The date itself is writable (it is captured
+    # on the vehicle's Edit form); the two derived fields are not, so they
+    # can never disagree with it. See fleet/renewals.py.
+    licence_days_left = serializers.IntegerField(read_only=True, allow_null=True)
+    licence_status = serializers.CharField(read_only=True)
+    # How long it has been at the workshop. Null when it isn't there.
+    days_in_service = serializers.IntegerField(read_only=True, allow_null=True)
+    total_litres_used = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    average_km_per_litre = serializers.FloatField(read_only=True)
+    # {"month", "year", "lifetime", "average_rand_per_litre", "rand_per_km",
+    #  "missing_cost_count", "month_missing_cost_count"} -- see
+    # Vehicle.fuel_summary for why the missing counts travel with the money.
+    fuel_summary = serializers.SerializerMethodField()
+    # Webfleet (#186): the tracker number (Edit form) and OptiDrive.
+    optidrive_30d = serializers.SerializerMethodField()
+
+    def get_fuel_summary(self, obj):
+        # Decimals as strings, the way DRF's own DecimalField renders money
+        # by default. Left as Decimals they would go out as JSON floats,
+        # which is the one representation a currency amount should never
+        # travel in -- and it would be the only place on this platform that
+        # did it.
+        return {
+            key: (str(value) if isinstance(value, Decimal) else value)
+            for key, value in obj.fuel_summary().items()
+        }
+
+    # Expenses linked to this vehicle (13 Oct 2026) -- see
+    # Vehicle.maintenance_summary.
+    maintenance_summary = serializers.SerializerMethodField()
+    maintenance_invoices = serializers.SerializerMethodField()
+
+    def get_maintenance_summary(self, obj):
+        return {
+            key: (str(value) if isinstance(value, Decimal) else value)
+            for key, value in obj.maintenance_summary().items()
+        }
+
+    def get_maintenance_invoices(self, obj):
+        from django.conf import settings
+        from django.core.exceptions import ObjectDoesNotExist
+
+        from config.media_security import sign_media_path
+
+        rows = []
+        for e in sorted(obj.expenses.all(), key=lambda e: (e.date, e.pk), reverse=True):
+            try:
+                service = e.service_record
+            except ObjectDoesNotExist:
+                service = None
+            attachment = None
+            if e.attachment:
+                attachment = f"{settings.MEDIA_URL}{e.attachment.name}?sig={sign_media_path(e.attachment.name)}"
+            rows.append({
+                "id": e.pk,
+                "date": e.date.isoformat(),
+                "supplier": (e.supplier.name if e.supplier_id else e.supplier_name) or "",
+                "description": e.description,
+                "invoice_number": e.invoice_number,
+                "amount_excl_vat": str(e.amount_excl_vat),
+                "amount_incl_vat": str(e.amount_incl_vat),
+                "attachment": attachment,
+                "service_record": service.pk if service is not None else None,
+                "service_date": service.service_date.isoformat() if service is not None else None,
+            })
+        return rows
+
+    class Meta:
+        model = Vehicle
+        fields = [
+            "id", "make", "model", "year", "registration_number", "fuel_type",
+            "assigned_to", "assigned_to_name", "service_interval_km",
+            "licence_expiry", "licence_days_left", "licence_status",
+            "is_active", "in_service_since", "days_in_service", "notes", "created_at",
+            "current_odometer_km", "last_service_date", "last_service_km",
+            "next_service_due_km", "km_until_due", "service_status",
+            "tyre_rotation_interval_km", "last_tyre_rotation_date", "last_tyre_rotation_km",
+            "next_tyre_rotation_due_km", "km_until_tyre_rotation_due", "tyre_rotation_status",
+            "total_litres_used", "average_km_per_litre", "fuel_summary",
+            "maintenance_summary", "maintenance_invoices",
+            "webfleet_objectno", "optidrive_30d",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def get_assigned_to_name(self, obj):
+        return _display_name(obj.assigned_to)
+
+    def get_optidrive_30d(self, obj):
+        """Webfleet's OptiDrive driving score, average of the last 30 days
+        (0..1), or None without Webfleet figures (#186)."""
+        import datetime
+
+        from django.db.models import Avg
+        from django.utils import timezone
+
+        since = timezone.localdate() - datetime.timedelta(days=30)
+        avg = obj.webfleet_days.filter(date__gte=since, optidrive__isnull=False).aggregate(a=Avg("optidrive"))["a"]
+        return None if avg is None else round(avg, 2)
+
+    def validate_webfleet_objectno(self, value):
+        value = (value or "").strip()
+        if value and Vehicle.objects.exclude(pk=getattr(self.instance, "pk", None)).filter(webfleet_objectno=value).exists():
+            raise serializers.ValidationError("That Webfleet tracker is already linked to another vehicle.")
+        return value
+
+    def validate_licence_expiry(self, value):
+        # The failure worth catching is a slipped year -- 2036 typed for
+        # 2026. It is a perfectly valid date, it sorts to the bottom of the
+        # renewals list, and the vehicle then never appears on that list
+        # again. Nothing else on the screen would ever contradict it.
+        from .renewals import expiry_is_sane
+
+        problem = expiry_is_sane(value, Vehicle.LICENCE_TERM_YEARS)
+        if problem:
+            raise serializers.ValidationError(problem)
+        return value
+
+
+class TripLogSerializer(serializers.ModelSerializer):
+    """Trips logged in the Conecto app -- read-only here."""
+
+    class Meta:
+        model = TripLog
+        fields = [
+            "id", "vehicle", "driver", "driver_name", "start_odometer", "end_odometer", "km_driven",
+            "start_place", "end_place", "started_at", "ended_at", "start_photo_url", "end_photo_url", "notes", "odometer_recorded",
+            "created_at",
+        ]
+        read_only_fields = fields

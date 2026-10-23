@@ -1,0 +1,209 @@
+from django.conf import settings
+from django.db import IntegrityError, models, transaction
+from django.db.models import BigIntegerField
+from django.db.models.functions import Cast, Substr
+
+
+class Ticket(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        PENDING = "pending", "Pending Customer"
+        RESOLVED = "resolved", "Resolved"
+        CLOSED = "closed", "Closed"
+
+    class Priority(models.TextChoices):
+        LOW = "low", "Low"
+        MEDIUM = "medium", "Medium"
+        HIGH = "high", "High"
+        URGENT = "urgent", "Urgent"
+
+    class Department(models.TextChoices):
+        SUPPORT = "support", "Technical Support"
+        BILLING = "billing", "Billing"
+        SALES = "sales", "Sales"
+        ABUSE = "abuse", "Abuse/NOC"
+
+    ticket_number = models.CharField(max_length=20, unique=True, editable=False)
+    # NULL on an internal ticket, and only on an internal ticket -- see the
+    # check constraint in Meta. This is not a convenience; it is the guard.
+    #
+    # The customer portal reads tickets with filter(customer=<their own
+    # profile>), and NULL matches nothing. So a technician's job feedback
+    # cannot reach a customer even if every deliberate is_internal filter
+    # in this codebase were deleted tomorrow, because there is no row for
+    # the join to find. Conecto enforce nothing on their side and told us
+    # so plainly: "one guard only -- yours."
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE, related_name="tickets",
+        null=True, blank=True,
+    )
+    # Raised by a technician from a job in the Conecto app -- quote needed,
+    # stock needed, return booking. Staff and admins only, forever.
+    #
+    # Set by the internal-ticket webhook and nowhere else: it is read-only
+    # through the API, so nobody can flip an existing customer ticket into
+    # an internal one and hide a conversation the customer was part of.
+    is_internal = models.BooleanField(default=False)
+    subject = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    department = models.CharField(max_length=20, choices=Department.choices, default=Department.SUPPORT)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
+    priority = models.CharField(max_length=20, choices=Priority.choices, default=Priority.MEDIUM)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_tickets",
+        limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
+    )
+    # Who opened it. Deliberately NOT limit_choices_to staff roles the way
+    # assigned_to is: a customer raising a ticket from the portal is the
+    # creator, and recording that as "nobody" would lose the one fact this
+    # field exists for. SET_NULL so removing a staff account keeps the
+    # tickets they raised rather than deleting them.
+    #
+    # Null on every ticket that predates this field -- there is nothing to
+    # backfill it from except the audit trail, and the list renders those
+    # as an em dash rather than guessing.
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_tickets",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # is_internal=True  <->  customer IS NULL, both directions.
+            #
+            # Forward: an internal ticket can never acquire a customer, so
+            # it can never appear in the portal. Somebody attaching one "so
+            # we know which site it was" is refused by the database rather
+            # than quietly opening the hole -- and the job link on
+            # ConectoInternalTicket already carries the site.
+            #
+            # Backward: an ordinary ticket can never LOSE its customer,
+            # which would orphan a real conversation.
+            models.CheckConstraint(
+                # `check=` rather than `condition=`: renamed in Django 5.1,
+                # and the old name works from 2.2 through 5.2.
+                check=(
+                    models.Q(is_internal=True, customer__isnull=True)
+                    | models.Q(is_internal=False, customer__isnull=False)
+                ),
+                name="ticket_internal_has_no_customer",
+            )
+        ]
+
+    _NUMBER_PREFIX = "TCK"
+
+    def _next_ticket_number(self):
+        """One past the highest TCK number ever issued.
+
+        Was `(Ticket.objects.order_by("-id").first().id + 1)` on a unique
+        column, which had two faults.
+
+        It reused numbers. The maximum came off an existing ROW, so
+        deleting the newest ticket handed its number straight to the next
+        one created -- and a customer quoting the reference they were given
+        then reached a stranger's ticket and saw somebody else's comment
+        thread. billing.IssuedNumberHighWater was created for exactly this
+        on invoices, and its docstring generalises it: "the fact being
+        recorded is about the sequence... it has to outlive every document
+        in it". Tickets were never brought onto it, so they are now.
+
+        And it had no retry. Two simultaneous creates computed the same
+        number and the loser got an unhandled IntegrityError -- a 500 on a
+        save that was perfectly valid. Both Customer.save() and
+        Invoice.save() carry a five-attempt loop for this identical race.
+        """
+        from billing.models import IssuedNumberHighWater
+        from django.db.models import Max
+
+        prefix = self._NUMBER_PREFIX
+        highest = (
+            Ticket.objects.filter(ticket_number__regex=rf"^{prefix}-\d{{1,9}}$")
+            .exclude(pk=self.pk)
+            .annotate(_seq=Cast(Substr("ticket_number", len(prefix) + 2), BigIntegerField()))
+            .aggregate(highest=Max("_seq"))["highest"]
+        )
+        watermark = (
+            IssuedNumberHighWater.objects.filter(prefix=prefix)
+            .values_list("last_seq", flat=True)
+            .first()
+        )
+        return f"{prefix}-{max(highest or 0, watermark or 0) + 1:06d}"
+
+    def _record_issued_number(self):
+        """Remember this number so it is never handed out again. After a
+        successful save, so a failed create leaves no gap."""
+        from billing.models import IssuedNumberHighWater
+        from django.db.models import Value
+        from django.db.models.functions import Greatest
+
+        prefix, _, seq = (self.ticket_number or "").rpartition("-")
+        if prefix != self._NUMBER_PREFIX or not seq.isdigit():
+            return
+        updated = IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+            last_seq=Greatest("last_seq", Value(int(seq)))
+        )
+        if not updated:
+            # Its own atomic block: a savepoint, so losing this race cannot
+            # poison the transaction the caller is holding.
+            try:
+                with transaction.atomic():
+                    IssuedNumberHighWater.objects.create(prefix=prefix, last_seq=int(seq))
+            except IntegrityError:
+                IssuedNumberHighWater.objects.filter(prefix=prefix).update(
+                    last_seq=Greatest("last_seq", Value(int(seq)))
+                )
+
+    def save(self, *args, **kwargs):
+        if self.ticket_number:
+            return super().save(*args, **kwargs)
+
+        last_error = None
+        for _ in range(5):
+            self.ticket_number = self._next_ticket_number()
+            try:
+                with transaction.atomic():
+                    result = super().save(*args, **kwargs)
+                    self._record_issued_number()
+                    return result
+            except IntegrityError as exc:
+                if "ticket_number" not in str(exc):
+                    raise
+                last_error = exc
+                self.ticket_number = ""
+        raise last_error
+
+    def __str__(self):
+        return f"{self.ticket_number}: {self.subject}"
+
+
+class TicketComment(models.Model):
+    ticket = models.ForeignKey(Ticket, on_delete=models.CASCADE, related_name="comments")
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="ticket_comments")
+    message = models.TextField()
+    is_internal = models.BooleanField(default=False, help_text="Internal staff note, hidden from customer portal.")
+    # Who wrote this, when it was not one of our users.
+    #
+    # A reply arriving from the Conecto app is written by the customer,
+    # who has no account here, so `author` is null. Null alone is
+    # indistinguishable from a comment the platform generated, and a
+    # customer's message shown with no name against it reads as ours.
+    #
+    # Blank on every comment written by staff -- `author` covers those.
+    external_author = models.CharField(max_length=150, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"Comment on {self.ticket}"

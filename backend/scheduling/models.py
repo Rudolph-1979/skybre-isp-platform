@@ -1,12 +1,55 @@
+import datetime
+
 from django.conf import settings
 from django.db import models
+
+
+class JobType(models.Model):
+    """A kind of job, added and named by staff under Scheduling -> Job types
+    (Rudolph, 5 Oct 2026: "Create a option to create job types").
+
+    Job.job_type stores `key`, which is fixed once created, so renaming a
+    type relabels every job already carrying it. The six that used to be
+    hard-coded choices (Job.JobType below) are seeded by migration 0005 with
+    their old colours. A type in use can't be deleted -- switch it off
+    instead, which takes it out of the New job list but keeps old jobs
+    labelled.
+    """
+
+    key = models.SlugField(max_length=50, unique=True)
+    name = models.CharField(max_length=60, unique=True)
+    colour = models.CharField(max_length=7, default="#898781", help_text="Calendar colour, #rrggbb.")
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
 
 
 class Job(models.Model):
     """A scheduled piece of work — a field job (install, repair, site
     visit) usually tied to a customer, or a standalone task (office work,
-    internal errand) with no customer at all."""
+    internal errand) with no customer at all.
 
+    A job with `start`/`end` both blank is IN THE POOL (Rudolph, 30 Sep:
+    "create a Job pool where jobs land before scheduled... Jobs can then
+    be pulled from the pool to better schedule route and times") -- it
+    exists, but hasn't been given a time yet. There is no separate
+    "pooled" flag; pool membership is exactly "no start" (JobSerializer.
+    validate enforces start and end are always set together, so a job
+    never has one without the other). A pool job also cannot carry
+    assigned_technicians -- see the serializer for why: Conecto's
+    post_save push (conecto/signals.py's _schedule_job) fires off whoever
+    is assigned regardless of whether the job has a time, so a technician
+    assigned before a time exists would get a real dispatch with a blank
+    start. Assignment happens together with scheduling, not before."""
+
+    # The original built-in types. No longer the field's choices -- the
+    # JobType table is (see above) -- but kept as named constants.
     class JobType(models.TextChoices):
         INSTALLATION = "installation", "Installation"
         REPAIR = "repair", "Repair"
@@ -32,31 +75,77 @@ class Job(models.Model):
     ticket = models.ForeignKey(
         "tickets.Ticket", on_delete=models.SET_NULL, null=True, blank=True, related_name="jobs"
     )
-    assigned_to = models.ForeignKey(
+    # The client's quote this job carries out (Rudolph, 8 Oct 2026: "Allow
+    # me to attach a customers quote to a job"). A quote or pro forma of the
+    # job's own client when attached (JobSerializer.validate); it keeps
+    # pointing at the same document after that is converted to an invoice.
+    quote = models.ForeignKey(
+        "billing.Invoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="jobs",
+    )
+    assigned_technicians = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
         blank=True,
         related_name="scheduled_jobs",
         limit_choices_to={"role__in": ["admin", "support", "sales", "technician", "management", "accounts"]},
+        help_text="A job can go out to more than one person at once (Rudolph, 29 Sep: "
+        "\"allow me to assign to two technicians\"). No cap -- a bigger install can "
+        "carry a whole crew. Was a single ForeignKey (assigned_to) until then.",
     )
-    job_type = models.CharField(max_length=20, choices=JobType.choices, default=JobType.SITE_VISIT)
+    # A JobType.key (the table above), checked by JobSerializer.
+    job_type = models.CharField(max_length=50, default=JobType.SITE_VISIT)
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.SCHEDULED)
-    start = models.DateTimeField()
-    end = models.DateTimeField()
+    start = models.DateTimeField(
+        null=True, blank=True, help_text="Blank (with end also blank) means this job is in the pool, unscheduled."
+    )
+    end = models.DateTimeField(null=True, blank=True)
     location = models.CharField(
         max_length=255, blank=True, help_text="Defaults to the customer's address if left blank."
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    # Deleting a job moves it to the "Deleted jobs" pool instead of erasing
+    # it (Rudolph, 6 Oct 2026: "a job that is deleted accidentally must move
+    # to a pre delete job pool and only final delete once deleted from delete
+    # pool"). Set = deleted: off the calendar and the job pool, withdrawn
+    # from technicians' phones, restorable until someone deletes it from
+    # the Deleted pool.
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # Sent back to the pool (Rudolph, 6 Oct 2026): by a technician pressing
+    # Return instead of Complete in the app, or by the daily sweep of jobs
+    # nobody completed. Shown on the pool card so the office knows why it's
+    # back. See scheduling.pool.return_to_pool.
+    returned_at = models.DateTimeField(null=True, blank=True)
+    return_reason = models.CharField(max_length=255, blank=True)
+    return_count = models.PositiveIntegerField(default=0)
+    # Urgent tag (Rudolph, 15 Oct 2026: "Can we create a Urgent Tag to
+    # Jobs?"): red on the calendar, top of the pool, "URGENT" at the start
+    # of the notes the technician's phone gets.
+    urgent = models.BooleanField(default=False, db_index=True)
 
     class Meta:
         ordering = ["start"]
 
     def __str__(self):
         return f"{self.title} — {self.customer or 'standalone'}"
+
+    def save(self, *args, **kwargs):
+        # No client picked, but the title names one by code ("... SR2547
+        # ...")? Link it, so the technician's app gets the client's name,
+        # phone and address (7 Oct 2026; scheduling.client_link).
+        if not self.customer_id and self.title:
+            from .client_link import client_from_title
+
+            customer = client_from_title(self.title)
+            if customer is not None:
+                self.customer = customer
+                if kwargs.get("update_fields") is not None:
+                    kwargs["update_fields"] = list(set(kwargs["update_fields"]) | {"customer"})
+        super().save(*args, **kwargs)
 
 
 class Shift(models.Model):
@@ -88,3 +177,99 @@ class Shift(models.Model):
 
     def __str__(self):
         return f"{self.staff} shift {self.start:%Y-%m-%d %H:%M}"
+
+
+class SchedulingSettings(models.Model):
+    """Singleton (pk=1): the daily return of uncompleted jobs to the pool
+    (Rudolph, 6 Oct 2026: "uncompleted jobs should return to the pool as
+    well daily on a editable time"). Run by the return_jobs_to_pool command
+    every few minutes; it acts once a day, at or after `auto_return_time`.
+    """
+
+    auto_return_enabled = models.BooleanField(default=True)
+    auto_return_time = models.TimeField(default=datetime.time(18, 0))
+    last_auto_return_on = models.DateField(null=True, blank=True)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class SupportRotation(models.Model):
+    """A weekly support rota that repeats on its own (Rudolph, 16 Oct 2026:
+    "We have staff that is on weekly support rotating ... 2 is on vehicle
+    support and one is on phone support").
+
+    Each week, from `handover_weekday` at `handover_time` to the same moment
+    a week later, the next `people_per_week` members in `members` order are
+    on support. Members cycle: with four people and two per week the pairs
+    are 1+2, 3+4, 1+2, ...; with an odd count the pairs mix.
+
+    Week 0 starts on `first_week_start`. Which week someone is in is worked
+    out, never stored -- only exceptions are stored (SupportRotationOverride),
+    so changing the member list re-plans every week, past ones included.
+    """
+
+    name = models.CharField(max_length=60, unique=True, help_text="e.g. 'Vehicle support', 'Phone support'.")
+    people_per_week = models.PositiveSmallIntegerField(default=1)
+    handover_weekday = models.PositiveSmallIntegerField(default=0, help_text="0 = Monday ... 6 = Sunday.")
+    handover_time = models.TimeField(default=datetime.time(8, 0))
+    first_week_start = models.DateField(help_text="A date on the handover weekday: the start of week 0.")
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class SupportRotationMember(models.Model):
+    """One person in a rotation, at a position in the order."""
+
+    rotation = models.ForeignKey(SupportRotation, on_delete=models.CASCADE, related_name="members")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="support_rotations")
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["position", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["rotation", "user"], name="uniq_support_rotation_member"),
+        ]
+
+    def __str__(self):
+        return f"{self.rotation} #{self.position} {self.user}"
+
+
+class SupportRotationOverride(models.Model):
+    """One week where someone else stands in: `user` was due on support in
+    the week starting `week_start` and `replacement` does it instead.
+
+    A cover is one row. A swap is two rows -- the other person's week is
+    covered back -- so each row stays a plain "who instead of whom".
+    """
+
+    rotation = models.ForeignKey(SupportRotation, on_delete=models.CASCADE, related_name="overrides")
+    week_start = models.DateField()
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
+    replacement = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
+    reason = models.CharField(max_length=255, blank=True)
+    # The swap this row belongs to (both rows of a swap share it), so undoing
+    # one side undoes the other. Blank for a plain cover.
+    swap_group = models.CharField(max_length=36, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["week_start", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["rotation", "week_start", "user"], name="uniq_support_override"),
+        ]
+
+    def __str__(self):
+        return f"{self.rotation} {self.week_start}: {self.replacement} for {self.user}"

@@ -6,6 +6,9 @@ import { PageHeader } from "../../components/PageHeader";
 import { SearchableSelect } from "../../components/SearchableSelect";
 import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
+import { PauseServiceModal, ServicePauseNote, pauseLabel, resumeService } from "../../components/ServicePause";
+import { useAuth } from "../../context/AuthContext";
+import { ServiceSuspensionReason } from "../../components/LineSuspension";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
@@ -17,12 +20,19 @@ import {
   ServiceShapingFields, serviceShapingPayload, emptyServiceShapingValues,
   type ServiceShapingValues,
 } from "../../components/ServiceShapingFields";
+import {
+  ServiceAddressFields, serviceAddressPayload, serviceAddressValuesFrom, emptyServiceAddressValues,
+  type ServiceAddressValues,
+} from "../../components/ServiceAddressFields";
 import { LiveBandwidthWidget } from "../../components/LiveBandwidthWidget";
 import type { Service, Customer, Tariff, IPPool, IPAddress, Device, ConnectionRule } from "../../types";
+import { formatIsoDate } from "../../utils/billingTerms";
+import { exclFromIncl, inclVatText } from "../../utils/vatAmounts";
 
 const COLUMNS: ColumnDef[] = [
   { key: "customer", label: "Customer" },
   { key: "tariff", label: "Tariff" },
+  { key: "partner", label: "Partner" },
   { key: "price", label: "Price" },
   { key: "status", label: "Status" },
   { key: "start_date", label: "Start date" },
@@ -30,15 +40,30 @@ const COLUMNS: ColumnDef[] = [
 ];
 
 type NewServiceForm = { customer: string; tariff: string; status: Service["status"] } & ServiceConnectionValues &
-  ServiceShapingValues;
+  ServiceShapingValues & ServiceAddressValues;
 
 const emptyNewServiceForm: NewServiceForm = {
   customer: "", tariff: "", status: "pending", ...emptyServiceConnectionValues, ...emptyServiceShapingValues,
+  ...emptyServiceAddressValues,
 };
 
-type EditForm = { status: Service["status"] } & ServiceConnectionValues & ServiceShapingValues;
+type EditForm = {
+  status: Service["status"];
+  // A reduction on this line's plan price. Strings because they come straight
+  // off <input> elements; the backend parses them and is the only thing that
+  // decides whether a discount is legal.
+  discount_type: "none" | "percentage" | "amount" | "surcharge";
+  discount_value: string;
+  discount_starts_on: string;
+  discount_ends_on: string;
+  discount_reason: string;
+} & ServiceConnectionValues & ServiceShapingValues & ServiceAddressValues;
 
-const emptyEditForm: EditForm = { status: "pending", ...emptyServiceConnectionValues, ...emptyServiceShapingValues };
+const emptyEditForm: EditForm = {
+  status: "pending",
+  discount_type: "none", discount_value: "", discount_starts_on: "", discount_ends_on: "", discount_reason: "",
+  ...emptyServiceConnectionValues, ...emptyServiceShapingValues, ...emptyServiceAddressValues,
+};
 
 export function ServicesPage() {
   const [ordering, setOrdering] = useState("-created_at");
@@ -48,6 +73,10 @@ export function ServicesPage() {
   // state the user is free to change.
   const [searchParams] = useSearchParams();
   const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") ?? "");
+  // Pause / resume (#211): Admin / Management only, as on the client's page.
+  const { user: currentUser } = useAuth();
+  const canPause = currentUser?.role === "admin" || currentUser?.role === "management";
+  const [pausing, setPausing] = useState<Service | null>(null);
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("services", ["customer"]);
   const { items, loading, refetch } = useApiList<Service>(
     `/services/?page_size=200&ordering=${ordering}${statusFilter ? `&status=${statusFilter}` : ""}`
@@ -58,6 +87,15 @@ export function ServicesPage() {
     setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "-created_at" : field));
   }
   const [tariffs, setTariffs] = useState<Tariff[]>([]);
+  // The VAT rate of a service's plan: from the tariff list, else worked out
+  // from the line's own excl./incl. price.
+  function vatRateOf(service: Service): number {
+    const t = tariffs.find((x) => x.id === service.tariff);
+    if (t) return parseFloat(t.tax_rate_pct || "0");
+    const excl = parseFloat(String(service.price ?? "0"));
+    const incl = parseFloat(String(service.price_incl_vat ?? "0"));
+    return excl > 0 && incl > 0 ? Math.round(((incl / excl) - 1) * 10000) / 100 : 0;
+  }
   const [showModal, setShowModal] = useState(false);
   const [saving, setSaving] = useState(false);
   const [newError, setNewError] = useState<string | null>(null);
@@ -71,9 +109,68 @@ export function ServicesPage() {
   const [poolAddresses, setPoolAddresses] = useState<IPAddress[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [connectionRules, setConnectionRules] = useState<ConnectionRule[]>([]);
+  // Which plans this customer may actually be put on.
+  //
+  // Asked of the SERVER (?for_customer=) rather than filtered here, so the
+  // dropdown and the rule the API enforces are the same query. Filtering in
+  // the browser would mean writing the rule a second time, and the copy
+  // that drifts is always the one nobody tests.
+  const [tariffsForCustomer, setTariffsForCustomer] = useState<Tariff[] | null>(null);
+
+  // Re-ask whenever the chosen customer changes. Clearing the tariff at the
+  // same time matters: without it, picking customer A, choosing their plan,
+  // then switching to customer B leaves B's form holding A's partner's
+  // tariff — which the server would refuse, after the form looked fine.
+  useEffect(() => {
+    if (!form.customer) {
+      setTariffsForCustomer(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ results: Tariff[] }>(`/tariffs/?page_size=200&is_active=true&for_customer=${form.customer}`)
+      .then((res) => {
+        if (!cancelled) setTariffsForCustomer(res.data.results);
+      })
+      .catch(() => {
+        // Fall back to the full list rather than an empty dropdown: the
+        // server still refuses a mismatched tariff, so the worst case is a
+        // rejected save with a message naming both partners.
+        if (!cancelled) setTariffsForCustomer(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.customer]);
+
+  // How many services the chosen client already has -- so the address
+  // question can ask "same address as their other line?" (Rudolph, 1 Oct).
+  const [otherServiceCount, setOtherServiceCount] = useState(0);
+  useEffect(() => {
+    if (!form.customer) {
+      setOtherServiceCount(0);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ count: number }>(`/services/?customer=${form.customer}&page_size=1`)
+      .then((res) => {
+        if (!cancelled) setOtherServiceCount(res.data.count ?? 0);
+      })
+      .catch(() => {
+        if (!cancelled) setOtherServiceCount(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.customer]);
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
+    // Tariffs are re-fetched per customer below, once one is chosen. This
+    // initial call fills the list for the edit modal and for the moment
+    // before a customer is picked.
     api.get<{ results: Tariff[] }>("/tariffs/?page_size=100").then((res) => setTariffs(res.data.results));
     // Used by the PPPoE IP-assignment section of the create/edit modals
     // below -- fetched once up front the same way customers/tariffs are.
@@ -124,6 +221,7 @@ export function ServicesPage() {
         start_date: new Date().toISOString().slice(0, 10),
         ...serviceConnectionPayload(form),
         ...serviceShapingPayload(form),
+        ...serviceAddressPayload(form),
       });
       setShowModal(false);
       refetch();
@@ -155,6 +253,21 @@ export function ServicesPage() {
       fup_threshold_gb: service.fup_threshold_gb == null ? "" : String(service.fup_threshold_gb),
       fup_speed_pct: service.fup_speed_pct == null ? "" : String(service.fup_speed_pct),
       fup_exempt: service.fup_exempt ?? false,
+      ...serviceAddressValuesFrom(service),
+      discount_type: service.discount_type ?? "none",
+      // "0" would read as a discount that exists and is worth nothing, which
+      // is not what none means -- so an absent discount shows an empty box.
+      // Rand amounts shown incl. VAT, the same as on the client's page
+      // (20 Oct 2026); stored excl. VAT.
+      discount_value:
+        service.discount_type === "amount" || service.discount_type === "surcharge"
+          ? inclVatText(service.discount_value ?? 0, vatRateOf(service))
+          : service.discount_type && service.discount_type !== "none"
+          ? String(service.discount_value ?? "")
+          : "",
+      discount_starts_on: service.discount_starts_on ?? "",
+      discount_ends_on: service.discount_ends_on ?? "",
+      discount_reason: service.discount_reason ?? "",
     });
   }
 
@@ -166,8 +279,23 @@ export function ServicesPage() {
     try {
       await api.patch(`/services/${editingService.id}/`, {
         status: editForm.status,
+        // Sent whole, every save. The backend zeroes the value when the type
+        // is none, so switching a discount off cannot leave a stale figure
+        // waiting to apply itself the next time somebody turns the type back
+        // on without looking at the amount.
+        discount_type: editForm.discount_type,
+        discount_value:
+          editForm.discount_type === "none"
+            ? 0
+            : editForm.discount_type === "amount" || editForm.discount_type === "surcharge"
+            ? exclFromIncl(editForm.discount_value || 0, vatRateOf(editingService))
+            : Number(editForm.discount_value || 0),
+        discount_starts_on: editForm.discount_starts_on || null,
+        discount_ends_on: editForm.discount_ends_on || null,
+        discount_reason: editForm.discount_reason,
         ...serviceConnectionPayload(editForm),
         ...serviceShapingPayload(editForm),
+        ...serviceAddressPayload(editForm),
       });
       setEditingService(null);
       refetch();
@@ -218,6 +346,7 @@ export function ServicesPage() {
           <option value="active">Active</option>
           <option value="suspended">Suspended</option>
           <option value="terminated">Terminated</option>
+          <option value="paused">Paused</option>
         </select>
         {statusFilter && (
           <button type="button" className={btnSecondary} onClick={() => setStatusFilter("")}>
@@ -237,6 +366,7 @@ export function ServicesPage() {
             <tr>
               <SortableTH field="customer__full_name" ordering={ordering} onSort={toggleSort}>Customer</SortableTH>
               {isVisible("tariff") && <SortableTH field="tariff__name" ordering={ordering} onSort={toggleSort}>Tariff</SortableTH>}
+              {isVisible("partner") && <SortableTH field="tariff__partner__name" ordering={ordering} onSort={toggleSort}>Partner</SortableTH>}
               {isVisible("price") && <SortableTH field="tariff__price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
               {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
               {isVisible("start_date") && <SortableTH field="start_date" ordering={ordering} onSort={toggleSort}>Start date</SortableTH>}
@@ -249,15 +379,39 @@ export function ServicesPage() {
               <TR key={s.id}>
                 <TD>{s.customer_name}</TD>
                 {isVisible("tariff") && <TD>{s.tariff_name}</TD>}
+                {/* An em dash means the tariff belongs to no partner — a
+                    shared plan available to everyone — not missing data. */}
+                {isVisible("partner") && <TD>{s.partner_name ?? "—"}</TD>}
                 {isVisible("price") && <TD className="tabular-nums">R {parseFloat(s.price).toFixed(2)}</TD>}
-                {isVisible("status") && <TD><StatusBadge status={s.status} /></TD>}
-                {isVisible("start_date") && <TD>{s.start_date ?? "—"}</TD>}
+                {isVisible("status") && (
+                  <TD>
+                    <StatusBadge status={s.status} label={pauseLabel(s)} />
+                    <ServiceSuspensionReason status={s.status} suspendedForNonpayment={s.suspended_for_nonpayment} />
+                    <ServicePauseNote service={s} />
+                  </TD>
+                )}
+                {isVisible("start_date") && <TD>{s.start_date ? formatIsoDate(s.start_date) : "—"}</TD>}
                 {isVisible("radius") && <TD>{s.radius_username ?? "—"}</TD>}
                 <TD>
                   <div className="flex gap-3">
                     <button className="text-[var(--series-1)] hover:underline" onClick={() => openEdit(s)}>
                       Edit
                     </button>
+                    {canPause && s.status === "active" && !s.pause && (
+                      <button className="text-[var(--series-1)] hover:underline" onClick={() => setPausing(s)}>
+                        Pause
+                      </button>
+                    )}
+                    {canPause && s.pause && (
+                      <button
+                        className="whitespace-nowrap text-[var(--series-1)] hover:underline"
+                        onClick={async () => {
+                          if (await resumeService(s)) refetch();
+                        }}
+                      >
+                        {s.pause.status === "scheduled" ? "Cancel pause" : "Resume"}
+                      </button>
+                    )}
                     <button
                       className="text-red-600 hover:underline dark:text-red-400"
                       onClick={() => handleDelete(s)}
@@ -272,6 +426,17 @@ export function ServicesPage() {
         </Table>
       )}
 
+      {pausing && (
+        <PauseServiceModal
+          service={pausing}
+          onClose={() => setPausing(null)}
+          onDone={() => {
+            setPausing(null);
+            refetch();
+          }}
+        />
+      )}
+
       {showModal && (
         <Modal title="New service" onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
@@ -284,19 +449,38 @@ export function ServicesPage() {
                   searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
                 }))}
                 value={form.customer}
-                onChange={(v) => setForm({ ...form, customer: v })}
+                onChange={(v) => setForm({ ...form, customer: v, tariff: "" })}
                 placeholder="Select customer…"
                 hint="Search by name or payment reference."
                 required
               />
             </FormField>
             <FormField label="Tariff">
-              <select className={inputClass} required value={form.tariff} onChange={(e) => setForm({ ...form, tariff: e.target.value })}>
-                <option value="">Select tariff…</option>
-                {tariffs.map((t) => (
-                  <option key={t.id} value={t.id}>{t.name} — R{t.price}</option>
+              <select
+                className={inputClass}
+                required
+                disabled={!form.customer}
+                value={form.tariff}
+                onChange={(e) => setForm({ ...form, tariff: e.target.value })}
+              >
+                <option value="">
+                  {form.customer ? "Select tariff…" : "Choose a customer first…"}
+                </option>
+                {(tariffsForCustomer ?? tariffs).map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} — R{t.price}
+                  </option>
                 ))}
               </select>
+              {/* Says why the list is short, rather than leaving someone
+                  hunting for a plan that was deliberately left out. */}
+              {form.customer && tariffsForCustomer !== null && (
+                <p className="mt-1 text-xs text-[var(--text-muted)]">
+                  {tariffsForCustomer.length === 0
+                    ? "No plans are available to this customer's partner yet. Assign partners to tariffs under Configs → Tariffs."
+                    : "Showing this customer's partner's plans, plus any available to everyone."}
+                </p>
+              )}
             </FormField>
             <FormField label="Status">
               <select className={inputClass} value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value as Service["status"] })}>
@@ -312,6 +496,12 @@ export function ServicesPage() {
               onChange={(patch) => setForm({ ...form, ...patch })}
               customerPools={customerPools}
               poolAddresses={newPoolAddresses}
+            />
+
+            <ServiceAddressFields
+              values={form}
+              onChange={(patch) => setForm({ ...form, ...patch })}
+              otherServiceCount={otherServiceCount}
             />
 
             <ServiceShapingFields
@@ -338,14 +528,117 @@ export function ServicesPage() {
               <select
                 className={inputClass}
                 value={editForm.status}
+                disabled={editForm.status === "paused"}
                 onChange={(e) => setEditForm({ ...editForm, status: e.target.value as Service["status"] })}
               >
                 <option value="pending">Pending Activation</option>
                 <option value="active">Active</option>
                 <option value="suspended">Suspended</option>
                 <option value="terminated">Terminated</option>
+                {editForm.status === "paused" && <option value="paused">Paused — use Resume</option>}
               </select>
             </FormField>
+
+            {/* --- Discount on this line -------------------------------
+                Only Management/Admin can SAVE one -- the backend rejects the
+                change from anyone else -- but the fields stay readable for
+                everyone, so staff can see why an invoice does not match the
+                plan price instead of guessing. */}
+            <div className="mb-4 rounded-md border border-[var(--border-hairline)] p-3">
+              <div className="mb-2 text-sm font-medium text-[var(--text-primary)]">Discount</div>
+
+              <div className="flex flex-wrap items-end gap-3">
+                <FormField label="Type">
+                  <select
+                    className={inputClass}
+                    value={editForm.discount_type}
+                    onChange={(e) =>
+                      setEditForm({
+                        ...editForm,
+                        discount_type: e.target.value as EditForm["discount_type"],
+                        // 10 as a percentage and 10 as rands are not the same
+                        // discount, so changing the type clears the number
+                        // rather than silently reinterpreting it.
+                        discount_value: "",
+                      })
+                    }
+                  >
+                    <option value="none">No discount</option>
+                    <option value="percentage">Percentage off</option>
+                    <option value="amount">Rand amount off</option>
+                    <option value="surcharge">Rand amount up</option>
+                  </select>
+                </FormField>
+
+                {editForm.discount_type !== "none" && (
+                  <FormField
+                    label={
+                      editForm.discount_type === "percentage"
+                        ? "Percent off"
+                        : editForm.discount_type === "surcharge"
+                        ? "Rands up (incl. VAT)"
+                        : "Rands off (incl. VAT)"
+                    }
+                  >
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      max={editForm.discount_type === "percentage" ? "100" : undefined}
+                      className={`${inputClass} w-32`}
+                      value={editForm.discount_value}
+                      onChange={(e) => setEditForm({ ...editForm, discount_value: e.target.value })}
+                    />
+                  </FormField>
+                )}
+              </div>
+
+              {editForm.discount_type !== "none" && (
+                <>
+                  <div className="mt-3 flex flex-wrap items-end gap-3">
+                    <FormField label="Starts">
+                      <input
+                        type="date"
+                        className={`${inputClass} w-auto`}
+                        value={editForm.discount_starts_on}
+                        onChange={(e) => setEditForm({ ...editForm, discount_starts_on: e.target.value })}
+                      />
+                    </FormField>
+                    <FormField label="Ends">
+                      <input
+                        type="date"
+                        className={`${inputClass} w-auto`}
+                        value={editForm.discount_ends_on}
+                        onChange={(e) => setEditForm({ ...editForm, discount_ends_on: e.target.value })}
+                      />
+                    </FormField>
+                  </div>
+
+                  <FormField label="Reason">
+                    <input
+                      className={inputClass}
+                      placeholder="Loyalty — 5 years · Retention offer, Sept"
+                      value={editForm.discount_reason}
+                      onChange={(e) => setEditForm({ ...editForm, discount_reason: e.target.value })}
+                    />
+                  </FormField>
+
+                  <p className="mt-2 text-xs text-[var(--text-muted)]">
+                    Appears on the invoice as its own line under the plan, with VAT charged on the
+                    reduced amount. Leave <em>Starts</em> blank to apply it immediately and{" "}
+                    <em>Ends</em> blank to run until you remove it. The end date is checked on the day
+                    the invoice is raised — <strong>end it the day before the next billing date</strong>,
+                    not on it, or that invoice still carries the discount.
+                  </p>
+                </>
+              )}
+
+              {editingService.discount_active && (
+                <p className="mt-2 text-xs text-[var(--series-1)]">
+                  Currently taking <strong>R{editingService.discount_amount_now}</strong> off each invoice.
+                </p>
+              )}
+            </div>
 
             <ServiceConnectionFields
               values={editForm}
@@ -356,6 +649,8 @@ export function ServicesPage() {
               currentServiceId={editingService.id}
               currentAssignedIp={editingService.assigned_ip}
             />
+
+            <ServiceAddressFields values={editForm} onChange={(patch) => setEditForm({ ...editForm, ...patch })} />
 
             <ServiceShapingFields
               values={editForm}

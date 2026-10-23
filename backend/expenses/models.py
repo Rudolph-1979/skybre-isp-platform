@@ -50,6 +50,37 @@ class Expense(models.Model):
         help_text="Supplier/payee name, if not linked to a Supplier record above.",
     )
     category = models.CharField(max_length=20, choices=Category.choices, default=Category.OTHER)
+    # The chart account this expense belongs to.
+    #
+    # Kept ALONGSIDE `category` rather than replacing it. category still
+    # drives the salaries/VAT rule and the existing reporting, and swapping
+    # one for the other in a single release would mean rewriting both in a
+    # migration that also has to be right about VAT. The account is the
+    # richer one and can grow into the primary; for now it is stamped from
+    # the supplier's category on capture, and stored, so that changing a
+    # supplier's category later never re-posts an expense already declared
+    # in a filed VAT period.
+    account = models.ForeignKey(
+        "ledger.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="expenses",
+        limit_choices_to={"type": "expense"},
+    )
+    # The vehicle this cost is for -- a workshop invoice, tyres, a part
+    # (George, 13 Oct 2026). Optional. A linked expense shows on the
+    # vehicle's page and counts toward its running cost per km. Fuel is NOT
+    # linked here: fill-ups come from the vehicle's own fuel log, and
+    # linking a fuel slip too would count it twice.
+    vehicle = models.ForeignKey(
+        "fleet.Vehicle",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="expenses",
+        help_text="Optional: the vehicle this cost is for (maintenance, repairs, tyres). Not for fuel.",
+    )
     description = models.CharField(max_length=255)
     invoice_number = models.CharField(
         max_length=100, blank=True, help_text="The supplier's own invoice/receipt number, if any.",

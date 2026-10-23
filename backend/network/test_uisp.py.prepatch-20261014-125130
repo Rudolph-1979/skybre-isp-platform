@@ -1,0 +1,121 @@
+"""Network (UISP) read-only integration (14 Oct 2026). The fixtures are trimmed
+copies of Skybre's own UISP answers taken that day."""
+import json
+import os
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+
+from network import uisp
+
+User = get_user_model()
+HERE = os.path.join(os.path.dirname(__file__), "fixtures_uisp")
+
+
+def load(name):
+    with open(os.path.join(HERE, name)) as fh:
+        return json.load(fh)
+
+
+class FakeResponse:
+    def __init__(self, data, status=200):
+        self.status_code = status
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+def fake_get(url, **kwargs):
+    if url.endswith("/devices"):
+        return FakeResponse(load("devices.json"))
+    if url.endswith("/sites"):
+        return FakeResponse(load("sites.json"))
+    if url.endswith("/outages"):
+        return FakeResponse(load("outages.json"))
+    return FakeResponse({}, 404)
+
+
+@override_settings(UISP_URL="https://uisp.test", UISP_TOKEN="t0ken", UISP_VERIFY_TLS=False)
+class UispTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.client.force_authenticate(User.objects.create_user(username="boss", password="x", role="admin"))
+
+    def rows(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get):
+            return {r["name"]: r for r in uisp.devices()}
+
+    def test_fields_match_what_uisp_shows(self):
+        rows = self.rows()
+        orx = rows["ORX-SS"]
+        self.assertEqual(orx["kind"], "ptp")
+        self.assertEqual(orx["link_potential_pct"], 99.9)
+        self.assertEqual(orx["downtime_pct"], 0.5)   # UISP's "Uptime" column: 1%
+        self.assertEqual(orx["ip"], "10.200.6.98")
+        self.assertEqual(rows["BB-SPA"]["link_potential_pct"], 33.5)
+        self.assertIn("low_link", rows["BB-SPA"]["flags"])
+        self.assertIn("busy", rows["BB-SPA"]["flags"])
+        self.assertEqual(rows["OFH_Sect_02"]["kind"], "ap")
+        self.assertEqual(rows["RC Home ST"]["kind"], "ptp")   # sta-ptp: UISP lists it under Point to Point
+        self.assertEqual(rows["WTH Core"]["kind"], "router")
+        self.assertTrue(rows["WTH_SECT_01"]["black_box"])
+        self.assertIsNone(rows["WTH_SECT_01"]["signal_dbm"])
+
+    def test_token_and_tls_setting_are_used(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get) as get:
+            uisp.devices()
+        args, kwargs = get.call_args
+        self.assertEqual(args[0], "https://uisp.test/nms/api/v2.1/devices")
+        self.assertEqual(kwargs["headers"]["x-auth-token"], "t0ken")
+        self.assertFalse(kwargs["verify"])
+
+    def test_answers_are_cached_for_a_minute(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get) as get:
+            uisp.devices()
+            uisp.devices()
+        self.assertEqual(get.call_count, 1)
+
+    def test_api_summary_devices_sites_outages(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get):
+            summary = self.client.get("/api/uisp/summary/").data
+            ptp = self.client.get("/api/uisp/devices/?kind=ptp").data
+            sites = self.client.get("/api/uisp/sites/").data
+            outs = self.client.get("/api/uisp/outages/").data
+        self.assertTrue(summary["connected"])
+        self.assertEqual(summary["devices"], 13)
+        self.assertEqual(summary["devices_online"], 12)
+        self.assertGreaterEqual(summary["ptp_radios"], 6)
+        self.assertTrue(all(r["kind"] == "ptp" for r in ptp["results"]))
+        names = {s["name"]: s for s in sites["results"]}
+        self.assertEqual(names["Winter Hoek"]["parent_id"], names["Fair Weather Heights"]["id"])
+        self.assertEqual(len(outs["items"]), 10)
+        self.assertEqual(outs["total"], 5762)
+
+    @override_settings(UISP_URL="", UISP_TOKEN="")
+    def test_not_configured(self):
+        res = self.client.get("/api/uisp/summary/")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.data["connected"])
+
+    def test_unreachable_and_bad_token(self):
+        import requests
+
+        with mock.patch("network.uisp.requests.get", side_effect=requests.ConnectTimeout("x")):
+            res = self.client.get("/api/uisp/summary/")
+        self.assertEqual(res.status_code, 502)
+        self.assertIn("Couldn't reach UISP", res.data["detail"])
+        cache.clear()
+        with mock.patch("network.uisp.requests.get", return_value=FakeResponse({}, 401)):
+            res = self.client.get("/api/uisp/devices/")
+        self.assertIn("401", res.data["detail"])
+
+    def test_needs_networking_access(self):
+        desk = APIClient()
+        desk.force_authenticate(User.objects.create_user(username="desk", password="x", role="support",
+                                                         allowed_sections=["tickets"]))
+        self.assertEqual(desk.get("/api/uisp/summary/").status_code, 403)

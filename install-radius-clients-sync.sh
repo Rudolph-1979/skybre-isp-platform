@@ -138,6 +138,18 @@ logger -t skybre-radius-clients "rolled back to the previous clients.conf"
 exit 1
 APPLYEOF
 chmod 750 "${APPLY}"
+
+# The heredoc above stays as the fallback for a first install on a clean
+# host. The canonical copy now lives in the repo, because the two had
+# already drifted: the script running on the VPS in September had checks
+# (validate as freerad, restart rather than reload) that this installer
+# knew nothing about, so reading this file gave a false picture of what
+# the host was actually doing during an outage.
+CANONICAL="$(dirname "$0")/deploy/radius/skybre-apply-radius-clients"
+if [ -f "${CANONICAL}" ]; then
+    install -m 750 "${CANONICAL}" "${APPLY}"
+    echo "    installed from ${CANONICAL} (repo copy wins over the inline fallback)"
+fi
 echo "    installed"
 
 log "Installing systemd units"

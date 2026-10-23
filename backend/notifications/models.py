@@ -21,11 +21,24 @@ class EmailTemplate(models.Model):
         STATEMENT = "statement", "Statement"
         INVOICE = "invoice", "Invoice"
         PAYMENT_REMINDER = "payment_reminder", "Payment reminder"
+        # Sent BEFORE the line goes off, naming the date it will. The
+        # payment reminder only says "to avoid any interruption", and the
+        # suspension notice arrives after the fact -- so until this existed
+        # a customer had no email telling them a cut-off was coming, or
+        # when, or what it would take to stop it.
+        SUSPENSION_WARNING = "suspension_warning", "Suspension warning (before cut-off)"
         SUSPENSION = "suspension", "Suspension notification"
         PAYMENT_RECEIVED = "payment_received", "Payment received"
+        # A line back on after payment (12 Oct 2026); sent by
+        # billing.reactivation.notify_service_restored.
+        SERVICE_RESTORED = "service_restored", "Service restored"
         # Goes to a STAFF member, not a customer -- the only one that does.
         # See EmailLog.staff below, and payroll's email-payslip action.
         PAYSLIP = "payslip", "Payslip"
+        # Digital contract signing (6 Oct 2026): the signing link, and the
+        # signed copy afterwards. Sent by contracts.services.
+        CONTRACT = "contract", "Contract for signing"
+        CONTRACT_SIGNED = "contract_signed", "Signed contract (copy)"
 
     key = models.CharField(max_length=30, choices=Key.choices, unique=True)
     name = models.CharField(max_length=100)
@@ -62,7 +75,16 @@ class EmailLog(models.Model):
         null=True, blank=True,
     )
     template_key = models.CharField(max_length=30, choices=EmailTemplate.Key.choices)
+    # The invoice / quote / pro forma this email carried (7 Oct 2026), so a
+    # document can say when it was last sent and to whom. Blank on older
+    # rows and on emails that aren't about one document.
+    invoice = models.ForeignKey(
+        "billing.Invoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="email_logs",
+    )
     recipient_email = models.EmailField()
+    # Copied in on a billing document sent to a customer's billing_email:
+    # their main email. Blank when nothing was copied.
+    cc_email = models.EmailField(blank=True, default="")
     subject = models.CharField(max_length=255)
     status = models.CharField(max_length=10, choices=Status.choices)
     error_message = models.TextField(blank=True)

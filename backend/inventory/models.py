@@ -2,15 +2,61 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
-from django.db import models
+from django.db import models, transaction
 
 from config.uploads import ATTACHMENT_VALIDATORS
+
+
+class SupplierCategory(models.Model):
+    """A grouping of suppliers that share a default expense account.
+
+    The point is the account, not the label. Capturing an invoice from
+    Teraco should already know it is bandwidth; typing that on every
+    invoice is how a month of expenses ends up half-categorised.
+
+    It is only ever a DEFAULT. The account that counts is the one stored
+    on the expense (expenses.Expense.account), for the same reason the
+    VAT rate that counts lives on the receipt line rather than on the
+    supplier: a supplier's category can change, and that must not
+    retroactively re-post invoices already captured and already declared
+    in a VAT period.
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    default_account = models.ForeignKey(
+        "ledger.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="supplier_categories",
+        limit_choices_to={"type": "expense", "is_active": True},
+        help_text="Pre-fills the account when capturing an expense from a supplier in this category.",
+    )
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name_plural = "supplier categories"
+
+    def __str__(self):
+        return self.name
 
 
 class Supplier(models.Model):
     """A vendor Skybre buys network/CPE equipment and consumables from."""
 
     name = models.CharField(max_length=255, unique=True)
+    # SET_NULL, not CASCADE: deleting a category is an act of tidying the
+    # list, and it must not take suppliers with it.
+    category = models.ForeignKey(
+        SupplierCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="suppliers",
+    )
     contact_person = models.CharField(max_length=255, blank=True)
     phone = models.CharField(max_length=50, blank=True)
     email = models.EmailField(blank=True)
@@ -81,6 +127,144 @@ class Supplier(models.Model):
         return self.default_vat_rate_pct
 
 
+class StockSite(models.Model):
+    """Somewhere stock can physically be: a store room, a technician's
+    vehicle, a container at a tower.
+
+    Kept deliberately separate from network.NetworkSite. A tower is not a
+    store room, and NetworkSite carries partner scoping that decides who may
+    *see a device* -- the wrong rule for deciding who may count stock. Where
+    the two do coincide (a store room at a tower), `network_site` links them
+    without merging them, so renaming or re-scoping a tower never moves
+    anyone's stock.
+
+    A vehicle is a site here rather than a model of its own, because
+    everything you want to do with the stock in a bakkie -- count it, move
+    stock into it, move stock out of it, ask what is in it today -- is
+    exactly what you want to do with the stock in a store room. A separate
+    Vehicle model would mean writing every one of those twice and keeping
+    them in step forever.
+    """
+
+    class SiteType(models.TextChoices):
+        WAREHOUSE = "warehouse", "Store room / Warehouse"
+        VEHICLE = "vehicle", "Vehicle"
+        OTHER = "other", "Other"
+
+    name = models.CharField(max_length=150, unique=True)
+    code = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Short code for labels and reports, e.g. JHB-01.",
+    )
+    site_type = models.CharField(
+        max_length=20, choices=SiteType.choices, default=SiteType.WAREHOUSE
+    )
+    address = models.TextField(blank=True)
+    contact_person = models.CharField(max_length=255, blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+
+    # --- Vehicle sites -----------------------------------------------------
+    # A vehicle site points at the real bakkie in Fleet rather than carrying
+    # its own registration and driver. Fleet already owns those, and a second
+    # copy here would drift the first time a vehicle is re-registered or
+    # handed to another technician -- and drift silently, because nothing
+    # would compare the two. Asking the FK also means "who is holding this
+    # stock" is answered by whoever Fleet says drives it, with no second
+    # source of truth to reconcile.
+    #
+    # unique=True: one stock site per vehicle. Two sites for the same bakkie
+    # would split its stock in half with no way to tell which half is real.
+    # Nulls are exempt from unique in Postgres, so every store room can
+    # leave it empty.
+    vehicle = models.OneToOneField(
+        "fleet.Vehicle",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="stock_site",
+        help_text="The vehicle this site is. Required for a vehicle site, empty otherwise.",
+    )
+
+    network_site = models.ForeignKey(
+        "network.NetworkSite",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_sites",
+        help_text="The tower/site this store room sits at, if any. Informational.",
+    )
+
+    # Exactly one site is the default. It is where stock is assumed to be
+    # when nobody said otherwise -- which is what every existing receipt,
+    # issue and movement row will be backfilled to when locations are added
+    # to the ledger. Without one, turning locations on would strand the
+    # entire existing stock holding in "nowhere".
+    is_default = models.BooleanField(
+        default=False,
+        help_text="The site stock lands in when no site is chosen. Only one site can be the default.",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Untick to retire a site. It stays on historic movements but can no longer be chosen.",
+    )
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            # save() already demotes the previous default, so this never
+            # fires in normal use. It exists so a bulk update or a direct
+            # SQL write that creates a second default fails loudly instead
+            # of leaving two, which would make "where did this stock go"
+            # answerable two different ways.
+            models.UniqueConstraint(
+                fields=["is_default"],
+                condition=models.Q(is_default=True),
+                name="inventory_stocksite_single_default",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def holder_name(self):
+        """Who is answerable for the stock here -- the vehicle's driver for
+        a vehicle site, the named contact for anywhere else. Derived, never
+        stored, so reassigning a bakkie in Fleet immediately changes who
+        owns the stock in it."""
+        if self.vehicle_id and self.vehicle.assigned_to_id:
+            user = self.vehicle.assigned_to
+            return user.get_full_name() or user.username
+        return self.contact_person or ""
+
+    def save(self, *args, **kwargs):
+        # Promoting a site to default demotes whichever site held it. Done
+        # in one transaction with the save so there is never a moment with
+        # two defaults or none.
+        if self.is_default:
+            others = StockSite.objects.filter(is_default=True)
+            if self.pk is not None:
+                others = others.exclude(pk=self.pk)
+            with transaction.atomic():
+                others.update(is_default=False)
+                super().save(*args, **kwargs)
+            return
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def default_site(cls):
+        """The default site, or None if nobody has chosen one yet.
+
+        Callers must handle None rather than inventing a site: a platform
+        with no default is a platform where nobody has said where stock
+        lives, and guessing would put real hardware in a made-up room.
+        """
+        return cls.objects.filter(is_default=True, is_active=True).first()
+
+
 class Product(models.Model):
     """A stock catalog entry — either an individually-tracked item
     (routers, ONTs — identified by serial/MAC, useful for warranty/RMA)
@@ -145,6 +329,24 @@ class Product(models.Model):
         if self.tracking_type == self.TrackingType.SERIALIZED:
             return self.serialized_units.filter(status=SerializedUnit.Status.IN_STOCK).count()
         total = self.movements.aggregate(total=models.Sum("quantity"))["total"]
+        return total or 0
+
+    def quantity_at(self, site):
+        """On hand at one stock site (George, 13 Oct 2026: stock by location).
+        The total above is the sum of this over every site -- a transfer is a
+        -n at one site and a +n at another, so it nets to nothing."""
+        if site is None:
+            # No locations set up at all: the one pool of stock.
+            return self.quantity_on_hand
+        site_id = getattr(site, "pk", site)
+        # Rows with no site predate locations and belong to the default.
+        default = StockSite.objects.filter(is_default=True).values_list("pk", flat=True).first()
+        where = models.Q(site_id=site_id)
+        if site_id == default:
+            where |= models.Q(site__isnull=True)
+        if self.tracking_type == self.TrackingType.SERIALIZED:
+            return self.serialized_units.filter(where, status=SerializedUnit.Status.IN_STOCK).count()
+        total = self.movements.filter(where).aggregate(total=models.Sum("quantity"))["total"]
         return total or 0
 
     # --- cost, for working out what the margin actually is ---------------
@@ -213,6 +415,37 @@ class Product(models.Model):
         return ((self.sell_price - cost) / self.sell_price * Decimal("100")).quantize(Decimal("0.1"))
 
 
+class ProductBarcode(models.Model):
+    """A barcode that finds a Product when scanned (Conecto stock scanner,
+    12 Oct 2026). Its own table rather than a column on Product: the same
+    router arrives from two suppliers with two different barcodes, and a
+    single field would make linking the second one erase the first.
+
+    `barcode` is unique across all products -- one code must always mean
+    one item, or a scan answers with whichever row came first. Linked
+    automatically when stock is received in the app against a barcode
+    Vexar didn't know yet (source "conecto").
+    """
+
+    class Source(models.TextChoices):
+        STAFF = "staff", "Added here"
+        CONECTO = "conecto", "Linked from the Conecto scanner"
+
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="barcodes")
+    barcode = models.CharField(max_length=64, unique=True)
+    source = models.CharField(max_length=10, choices=Source.choices, default=Source.STAFF)
+    added_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "pk"]
+
+    def __str__(self):
+        return f"{self.barcode} -> {self.product.name}"
+
+
 class SerializedUnit(models.Model):
     """One physical, individually-identified unit of a serialized Product
     (e.g. a single router). MAC address is stored alongside the serial
@@ -230,6 +463,12 @@ class SerializedUnit(models.Model):
         max_length=17, blank=True, help_text="e.g. AA:BB:CC:DD:EE:FF — routers/ONTs only."
     )
     status = models.CharField(max_length=25, choices=Status.choices, default=Status.IN_STOCK)
+    # Where the unit is while in stock -- moved by a transfer, kept as the
+    # last place it was once issued (13 Oct 2026).
+    site = models.ForeignKey(
+        "StockSite", on_delete=models.PROTECT, null=True, blank=True, related_name="serialized_units",
+        help_text="The stock site this unit is at.",
+    )
     received_via_line = models.ForeignKey(
         "StockReceiptLine",
         on_delete=models.SET_NULL,
@@ -251,6 +490,11 @@ class StockReceipt(models.Model):
     """Stock checked in against a real supplier invoice."""
 
     supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name="receipts")
+    # The warehouse/location the delivery was booked into (13 Oct 2026).
+    site = models.ForeignKey(
+        "StockSite", on_delete=models.PROTECT, null=True, blank=True, related_name="receipts",
+        help_text="The warehouse or location this delivery was received into.",
+    )
     invoice_number = models.CharField(max_length=100)
     invoice_date = models.DateField()
     attachment = models.FileField(
@@ -278,6 +522,13 @@ class StockReceipt(models.Model):
             "Tick if the unit costs below were typed exactly as they appear on a "
             "VAT-inclusive supplier invoice. Leave unticked for VAT-exclusive prices."
         ),
+    )
+
+    # Conecto's id for a receipt booked from the stock scanner (12 Oct
+    # 2026): their resend key, so a dropped connection never books the same
+    # stock twice. Null for every receipt captured here.
+    conecto_receipt_id = models.CharField(
+        max_length=100, null=True, blank=True, unique=True, editable=False,
     )
 
     class Meta:
@@ -480,6 +731,21 @@ class StockIssue(models.Model):
         blank=True,
         related_name="stock_issues_created",
     )
+    # Locations (George, 13 Oct 2026): stock leaves `from_site`. With a
+    # `to_site` it is a TRANSFER to another warehouse/vehicle and stays in
+    # stock there; without one it goes out to the technician/job.
+    from_site = models.ForeignKey(
+        "StockSite", on_delete=models.PROTECT, null=True, blank=True, related_name="issues_out",
+        help_text="Where the stock was taken from.",
+    )
+    to_site = models.ForeignKey(
+        "StockSite", on_delete=models.PROTECT, null=True, blank=True, related_name="issues_in",
+        help_text="Set for a transfer: the warehouse or location it went to.",
+    )
+
+    @property
+    def is_transfer(self):
+        return self.to_site_id is not None
 
     class Meta:
         ordering = ["-issued_at"]
@@ -515,10 +781,16 @@ class StockMovement(models.Model):
         RECEIPT = "receipt", "Receipt"
         ISSUE = "issue", "Issue"
         ADJUSTMENT = "adjustment", "Adjustment"
+        TRANSFER = "transfer", "Transfer"
 
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="movements")
     movement_type = models.CharField(max_length=20, choices=MovementType.choices)
     quantity = models.IntegerField(help_text="Positive for stock in, negative for stock out.")
+    # The site this +/- happened at; on-hand per site is the SUM per site.
+    site = models.ForeignKey(
+        "StockSite", on_delete=models.PROTECT, null=True, blank=True, related_name="movements",
+        help_text="The stock site this movement happened at.",
+    )
     receipt_line = models.ForeignKey(
         StockReceiptLine, on_delete=models.SET_NULL, null=True, blank=True, related_name="movements"
     )

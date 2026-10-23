@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from network import mikrotik
+from customers.scoping import partner_condition
 from network.models import Device
 from . import pingcheck
 from .models import RadiusNasClient, RadAcct, OvpnSettings, OvpnClientConnection, SpeedWindow
@@ -15,6 +16,9 @@ from .serializers import (
     RadiusNasClientSerializer, RadAcctSerializer, OvpnSettingsSerializer, OvpnClientConnectionSerializer,
     SpeedWindowSerializer,
 )
+from .clients_conf import clients_conf_state
+from .models import RadiusNasClientAudit
+from .serializers import RadiusNasClientAuditSerializer
 from accounts.permissions import (
     IsAdmin, IsStaffMember, section_permission, user_can_access_section,
 )
@@ -162,6 +166,43 @@ class RadiusNasClientViewSet(viewsets.ModelViewSet):
     queryset = RadiusNasClient.objects.all()
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasNetworkingAccess]
 
+    # The audit trail can only answer "who changed this" if the request
+    # user reaches the model layer, so every write path stamps it --
+    # including destroy, where the row's own changed_by holds the last
+    # person to SAVE it and would name the wrong person entirely.
+    def perform_create(self, serializer):
+        serializer.save(changed_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(changed_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        instance._changed_by = self.request.user
+        instance.delete()
+
+    @action(detail=False, methods=["get"], url_path="clients-conf-state")
+    def clients_conf_state_view(self, request):
+        """Whether what this screen shows is what FreeRADIUS is running.
+
+        They can disagree, and when they do nothing else says so. The
+        list on this page comes from the database; FreeRADIUS reads a
+        file on the host that a watcher installs only after validating
+        it. Every step between the two can fail quietly, and on
+        2026-09-20 one did, for ten hours, while every screen in the
+        platform looked normal.
+        """
+        return Response(clients_conf_state())
+
+    @action(detail=False, methods=["get"], url_path="audit")
+    def audit(self, request):
+        """Recent changes to NAS clients, newest first.
+
+        Capped rather than paginated: this is read while something is
+        broken, and the useful answer is always near the top.
+        """
+        entries = RadiusNasClientAudit.objects.select_related("changed_by")[:200]
+        return Response(RadiusNasClientAuditSerializer(entries, many=True).data)
+
     @action(detail=True, methods=["post"], url_path="push-to-router")
     def push_to_router(self, request, pk=None):
         """Pushes this NAS client's RADIUS config (server address + secret)
@@ -225,11 +266,84 @@ class RadAcctViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasNetworkingAccess]
     filterset_fields = ["username"]
 
+    # "Connected" has to mean the same thing here as it does everywhere
+    # else. This view used to test acctstoptime IS NULL and nothing more,
+    # which is not the same question: a CPE that loses power never sends an
+    # Accounting-Stop, so its row stays open for ever and this page kept
+    # reporting it as Online. On 2026-09-14 it was showing three sessions as
+    # connected whose last heartbeat was 46 and 75 HOURS old -- two of them
+    # frozen at the exact minute a VLAN fault took accounting down.
+    #
+    # Meanwhile find_live_session() and the Customers page's Connection
+    # column both applied the 900-second heartbeat rule. Two definitions of
+    # online in one platform, disagreeing on screen, which is precisely what
+    # radiusauth/offline.py's docstring says must not happen.
+    #
+    # So the rule is imported, not retyped. THREE states now, because
+    # "stopped reporting" is its own fact and a useful one -- those are the
+    # lines that dropped without telling anybody, which is exactly who
+    # support should be phoning:
+    #
+    #   state=online  open, and heard from inside the window
+    #   state=stale   open, and silent for longer than that
+    #   (neither)     everything, history included
+    #
+    # active_only=true is kept as an alias for state=online so an old
+    # bookmark or a cached frontend doesn't start returning history.
+    def _open_and_fresh(self):
+        from django.db.models import Q
+
+        from .usage import LIVE_SESSION_STALE_SECONDS
+
+        cutoff = timezone.now() - timezone.timedelta(seconds=LIVE_SESSION_STALE_SECONDS)
+        # A session with no interim yet is judged on its start time -- it is
+        # genuinely new, not silent, and excluding it would blank out every
+        # session for the first five minutes of its life.
+        return Q(acctupdatetime__gte=cutoff) | Q(acctupdatetime__isnull=True, acctstarttime__gte=cutoff)
+
+    # Whose sessions these are.
+    #
+    # radacct is not a list of this platform's services. It is a list of
+    # whatever the NASes sent us, and on 2026-09-15 that turned out to be
+    # 48 of 55 open sessions belonging to Grunder Co customers who live on
+    # SPLYNX -- same company, same routers, different platform. Their CPE
+    # attaches to the PPPoE server whose service-name is "Skybre", which
+    # makes their Called-Station-Id match our /radius entry, which sits
+    # first in the router's list -- so RouterOS hands us their accounting
+    # even though we reject their logins.
+    #
+    # They are our customers; they are not our sessions. Splynx
+    # authenticates and bills them, so Splynx is where their usage has to
+    # be counted, and this page must not present them as lines it manages.
+    #
+    # The rule for "ours" is imported, not retyped -- see
+    # radiusauth/ownership.py. It got written twice at first, here and in
+    # the prune command, and the two disagreed about a service whose RADIUS
+    # login had been switched off: this page called it another ISP's while
+    # the pruner protected it. One definition, one module.
+    #
+    # Deliberately NOT a silent filter. "foreign" is a first-class option,
+    # because those sessions are the evidence of a router misconfiguration
+    # and hiding them entirely would mean the next occurrence goes unseen.
+    #   owner=ours     (default) sessions this platform authenticates
+    #   owner=foreign  sessions on our NASes authenticated elsewhere
+    #   owner=all      everything, as this view behaved before
     def get_queryset(self):
+        from .ownership import not_ours_q, ours_q
+
         qs = RadAcct.objects.all()
-        active_only = self.request.query_params.get("active_only")
-        if active_only == "true":
-            qs = qs.filter(acctstoptime__isnull=True)
+        owner = (self.request.query_params.get("owner") or "ours").strip().lower()
+        if owner == "ours":
+            qs = qs.filter(ours_q())
+        elif owner == "foreign":
+            qs = qs.filter(not_ours_q())
+        state = (self.request.query_params.get("state") or "").strip().lower()
+        if self.request.query_params.get("active_only") == "true" and not state:
+            state = "online"
+        if state == "online":
+            qs = qs.filter(acctstoptime__isnull=True).filter(self._open_and_fresh())
+        elif state == "stale":
+            qs = qs.filter(acctstoptime__isnull=True).exclude(self._open_and_fresh())
         realm = self.request.query_params.get("realm")
         if realm:
             nas_ips = RadiusNasClient.objects.filter(realm=realm).values_list("ip_address", flat=True)
@@ -311,12 +425,11 @@ class CustomerUsageView(APIView):
             # does it: allowed_partners is an ArrayField of ids, NOT a
             # relation, so there is no manager to call values_list on.
             # Empty means unrestricted; Admin always sees everything;
-            # restricted staff still see customers with no partner at all,
-            # since direct customers aren't owned by any reseller.
+            # direct customers only when "Direct" is ticked (customers.scoping).
             qs = Customer.objects.all()
-            allowed = getattr(user, "allowed_partners", None) or []
-            if allowed and user.role != user.Role.ADMIN:
-                qs = qs.filter(models.Q(partner_id__in=allowed) | models.Q(partner__isnull=True))
+            condition = partner_condition(user)
+            if condition is not None:
+                qs = qs.filter(condition)
         else:
             # A customer may only ever read their own usage. Anything else
             # is a 404 rather than a 403, so this can't be used to discover
@@ -366,6 +479,40 @@ class CustomerUsageView(APIView):
         return Response(
             customer_usage(customer, year=year, month=month, period=period, anchor=anchor)
         )
+
+
+class CustomerSpeedView(APIView):
+    """GET /customers/<pk>/speed/?range=day|week|month|year&line=<username>
+
+    The Splynx-style speed graph (radiusauth.speed): average download /
+    upload speed per interval, Maximum / Average / Last, and the plan speed
+    to compare against. Staff only, with the Customers section, scoped to
+    the partners they may see -- the same rule as the usage view.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+
+    def get(self, request, pk):
+        from customers.models import Customer
+        from .speed import RANGES, customer_speed
+
+        user = request.user
+        if not user_can_access_section(user, "customers"):
+            return Response({"detail": "You don't have access to the 'customers' section."}, status=403)
+        qs = Customer.objects.all()
+        condition = partner_condition(user)
+        if condition is not None:
+            qs = qs.filter(condition)
+        try:
+            customer = qs.get(pk=pk)
+        except (Customer.DoesNotExist, ValueError):
+            return Response({"detail": "Not found."}, status=404)
+
+        range_key = request.query_params.get("range") or "day"
+        if range_key not in RANGES:
+            return Response({"detail": f"range must be one of {', '.join(RANGES)}."}, status=400)
+        line = request.query_params.get("line") or None
+        return Response(customer_speed(customer, range_key, line=line))
 
 
 class PublicUsageView(APIView):
@@ -426,6 +573,8 @@ class PublicUsageView(APIView):
             # The RADIUS username is a credential half; don't echo it back
             # on an unauthenticated page.
             session.pop("username", None)
+        for session in data.get("last_sessions", []):
+            session.pop("username", None)
         return Response(data)
 
 
@@ -439,38 +588,124 @@ class UsageReportView(APIView):
 
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request):
+    def _report(self, request, limit):
+        """(report, error_response). Shared with the CSV download below, so
+        the export cannot drift from the table it is an export OF -- the
+        partner scoping most of all. An aggregate is still a list of names,
+        and a download is the easiest place for a scoping rule to be
+        forgotten."""
         from customers.models import Customer
         from .usage import PERIODS, parse_anchor, usage_report
 
         user = request.user
         if not getattr(user, "is_staff_member", False):
-            return Response({"detail": "Not found."}, status=404)
+            return None, Response({"detail": "Not found."}, status=404)
         if not user_can_access_section(user, "customers"):
-            return Response(
+            return None, Response(
                 {"detail": "You don't have access to the 'customers' section."}, status=403
             )
 
         period = request.query_params.get("period", "month")
         if period not in PERIODS:
-            return Response({"detail": f"period must be one of {', '.join(PERIODS)}."}, status=400)
+            return None, Response(
+                {"detail": f"period must be one of {', '.join(PERIODS)}."}, status=400
+            )
         try:
             anchor = parse_anchor(request.query_params.get("date"))
         except ValueError:
-            return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
+            return None, Response({"detail": "date must be YYYY-MM-DD."}, status=400)
 
         customers = Customer.objects.all()
-        allowed = getattr(user, "allowed_partners", None) or []
-        if allowed and user.role != user.Role.ADMIN:
-            customers = customers.filter(
-                models.Q(partner_id__in=allowed) | models.Q(partner__isnull=True)
-            )
+        condition = partner_condition(user)
+        if condition is not None:
+            customers = customers.filter(condition)
 
+        return usage_report(
+            list(customers),
+            period=period,
+            anchor=anchor,
+            limit=limit,
+            ordering=request.query_params.get("ordering"),
+        ), None
+
+    def get(self, request):
         try:
             limit = int(request.query_params.get("limit", 200))
         except ValueError:
             limit = 200
-        return Response(usage_report(list(customers), period=period, anchor=anchor, limit=limit))
+        report, error = self._report(request, limit)
+        return error or Response(report)
+
+
+class UsageReportExportView(UsageReportView):
+    """The same report as a CSV download.
+
+    NO LIMIT, on purpose. The table caps at 200 rows because a browser table
+    of 1,500 names helps nobody; a spreadsheet of 1,500 names is exactly what
+    somebody sorting out a month of traffic wants. An export that silently
+    stopped at the same 200 would be worse than no export -- the file looks
+    complete, and the customers missing from it are missing without saying so.
+
+    Bytes AND gigabytes in every row: the bytes are what you sum and filter
+    on, the gigabytes are what you read. Printing only the pretty "226 GB"
+    would hand finance a column that cannot be added up.
+    """
+
+    def get(self, request):
+        import csv
+        import io
+
+        from django.http import HttpResponse
+
+        report, error = self._report(request, limit=None)
+        if error is not None:
+            return error
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow([
+            "Customer reference", "Customer", "Download (bytes)", "Upload (bytes)",
+            "Total (bytes)", "Download (GB)", "Upload (GB)", "Total (GB)",
+            "Cap (GB)", "Cap used (%)",
+        ])
+        for row in report["results"]:
+            writer.writerow([
+                row["customer_ref"], row["full_name"],
+                row["download_bytes"], row["upload_bytes"], row["total_bytes"],
+                _gb(row["download_bytes"]), _gb(row["upload_bytes"]), _gb(row["total_bytes"]),
+                _gb(row["cap_bytes"]) if row["cap_bytes"] else "",
+                row["cap_used_pct"] if row["cap_used_pct"] is not None else "",
+            ])
+
+        response = HttpResponse(buffer.getvalue(), content_type="text/csv")
+        # The period is in the FILENAME, not in a banner row above the header.
+        # A preamble line is the usual way to stamp a report, and it is also
+        # what stops Excel and pandas reading the file as a table.
+        response["Content-Disposition"] = 'attachment; filename="%s"' % _usage_filename(report)
+        return response
+
+
+def _gb(value):
+    """Bytes as gigabytes to two places. GiB, matching the 1024^3 the cap is
+    computed with, so this column and the Cap column mean the same 'GB'."""
+    return round((value or 0) / 1024 ** 3, 2)
+
+
+def _usage_filename(report):
+    """usage_week_2026-09-14_to_2026-09-20.csv
+
+    The report's `end` is EXCLUSIVE -- a week ending Monday the 21st covers
+    up to Sunday the 20th. Naming the file after the exclusive end would put
+    a date in it that the file contains no data for, and somebody would
+    reasonably read two consecutive weeks as overlapping.
+    """
+    import datetime
+
+    start = report["start"]
+    last_day = report["end"] - datetime.timedelta(days=1)
+    return "usage_%s_%s_to_%s.csv" % (
+        report["period"], str(start)[:10], str(last_day)[:10],
+    )
 
 
 class CustomerLiveRateView(APIView):
@@ -501,9 +736,9 @@ class CustomerLiveRateView(APIView):
                     {"detail": "You don't have access to the 'customers' section."}, status=403
                 )
             qs = Customer.objects.all()
-            allowed = getattr(user, "allowed_partners", None) or []
-            if allowed and user.role != user.Role.ADMIN:
-                qs = qs.filter(models.Q(partner_id__in=allowed) | models.Q(partner__isnull=True))
+            condition = partner_condition(user)
+            if condition is not None:
+                qs = qs.filter(condition)
         else:
             # A signed-in customer may watch their OWN line and nothing else.
             # 404 rather than 403 on anything else, so this can't be used to
@@ -569,11 +804,9 @@ class OfflineCustomersView(APIView):
         hours = max(1, min(hours, 168))
 
         customers = Customer.objects.all()
-        allowed = getattr(user, "allowed_partners", None) or []
-        if allowed and user.role != user.Role.ADMIN:
-            customers = customers.filter(
-                models.Q(partner_id__in=allowed) | models.Q(partner__isnull=True)
-            )
+        condition = partner_condition(user)
+        if condition is not None:
+            customers = customers.filter(condition)
 
         results = recently_offline(list(customers), hours=hours)
         return Response({"hours": hours, "count": len(results), "results": results})
@@ -611,13 +844,37 @@ class ServiceSpeedNowView(APIView):
 
     def get(self, request, pk):
         from billing.models import Service
+        from customers.scoping import scope_by_customer
 
         from .speeds import describe, effective_speeds, plan_speeds
 
-        service = (
-            Service.objects.select_related("tariff", "connection_rule").filter(pk=pk).first()
+        # Scoped to the caller's partners, not just fetched by id. Before
+        # this, a reseller-restricted staff member with Customers access
+        # could type any service id into the URL and read a competitor's
+        # plan, the speed that line is running at this second, whether it
+        # is shaped, and how many GB it has used this month -- the exact
+        # facts the Customers page is careful not to show them. Service
+        # ids are sequential, so "any id" means the whole book.
+        #
+        # Every other customer-linked endpoint in this file already
+        # filters on allowed_partners (CustomerUsageView,
+        # CustomerLiveRateView, UsageReportView, OfflineCustomersView).
+        # This view was added afterwards and resolved the Service straight
+        # from the pk.
+        #
+        # allow_null=False because Service.customer is a non-null FK --
+        # there is no ownerless service to keep visible, unlike a
+        # scheduling Job with no customer.
+        services = scope_by_customer(
+            Service.objects.select_related("tariff", "connection_rule"),
+            request.user,
+            allow_null=False,
         )
+        service = services.filter(pk=pk).first()
         if service is None:
+            # 404 rather than 403 on another partner's service, so this
+            # can't be used to map out which service ids exist -- the same
+            # convention CustomerUsageView already follows.
             return Response({"detail": "Not found."}, status=404)
         effective = effective_speeds(service)
         plan_up, plan_down = plan_speeds(service)

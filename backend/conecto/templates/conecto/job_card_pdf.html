@@ -1,0 +1,36 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block brand %}{% include "contracts/_brand.html" %}{% endblock %}
+{% block content %}
+  <div class="doc-title">Job card</div>
+  <table class="meta-table" style="width:300pt;">
+    <tr><td class="meta-label" style="width:100pt;">Reference</td><td>{{ card.reference }}</td></tr>
+    <tr><td class="meta-label">Conecto card</td><td style="font-size:8pt;">{{ card.conecto_job_card_id }}</td></tr>
+    <tr><td class="meta-label">Received</td><td>{{ card.received_at|date:"d/m/Y H:i" }}</td></tr>
+  </table>
+
+  {% for heading, rows in sections %}
+    <div class="addr-label" style="margin-top:10px;">{{ heading }}</div>
+    <table class="items" style="width:478pt; margin-top:2px;">
+      <tbody>
+        {% for label, value in rows %}
+        <tr>
+          <td style="width:140pt; padding:3px 6px; font-size:9pt; color:#555555;">{{ label }}</td>
+          <td style="width:338pt; padding:3px 6px; font-size:9pt;">{{ value|linebreaksbr }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+
+  <div class="addr-label" style="margin-top:12px;">Client sign-off</div>
+  {% if signature_src %}
+    <img src="{{ signature_src }}" style="height:55pt; margin-top:4px;">
+  {% elif card.signature_url %}
+    <p style="font-size:8.5pt; color:#b91c1c;">Signature not copied yet{% if card.signature_error %} ({{ card.signature_error }}){% endif %}.</p>
+  {% endif %}
+  <div style="font-size:9pt;">
+    {% if card.client_signed_name %}Signed by <b>{{ card.client_signed_name }}</b>{% endif %}
+    {% if card.client_unavailable_reason %}Client not available to sign: {{ card.client_unavailable_reason }}{% endif %}
+    {% if not card.client_signed_name and not card.client_unavailable_reason and not signature_src %}Not signed.{% endif %}
+  </div>
+{% endblock %}

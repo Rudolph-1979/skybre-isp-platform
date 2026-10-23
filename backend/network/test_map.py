@@ -1,0 +1,112 @@
+"""Networking -> Map (#173): address search and the serviceability check."""
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+
+from network import geo
+from network.test_uisp import fake_get as uisp_get
+
+User = get_user_model()
+
+
+class FakeResponse:
+    def __init__(self, data, status=200):
+        self.status_code = status
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+NOMINATIM = [
+    {"display_name": "Fisher Street, Kroonstad, Free State, South Africa", "lat": "-27.6501234", "lon": "27.2345678", "type": "residential"},
+    {"display_name": "broken"},
+]
+
+
+@override_settings(UISP_URL="https://uisp.test", UISP_TOKEN="t0ken", UISP_VERIFY_TLS=False)
+class MapTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.client.force_authenticate(User.objects.create_user(username="boss", password="x", role="admin"))
+
+    def test_geocode_south_africa_cached_and_polite(self):
+        with mock.patch("network.geo.requests.get", return_value=FakeResponse(NOMINATIM)) as get, \
+                mock.patch("network.geo.time.sleep"):
+            res = self.client.get("/api/map/geocode/?q=34 Fisher Street Kroonstad")
+            again = self.client.get("/api/map/geocode/?q=34  fisher street  kroonstad")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["results"], [{"label": NOMINATIM[0]["display_name"], "lat": -27.650123, "lng": 27.234568, "kind": "residential"}])
+        self.assertEqual(again.data, res.data)
+        self.assertEqual(get.call_count, 1)                     # second answer from the cache
+        kwargs = get.call_args.kwargs
+        self.assertEqual(kwargs["params"]["countrycodes"], "za")
+        self.assertIn("SkybrePlatform", kwargs["headers"]["User-Agent"])
+
+    def test_geocode_short_and_down(self):
+        self.assertEqual(self.client.get("/api/map/geocode/?q=ab").status_code, 400)
+        import requests
+        with mock.patch("network.geo.requests.get", side_effect=requests.ConnectTimeout("x")):
+            res = self.client.get("/api/map/geocode/?q=Kroonstad")
+        self.assertEqual(res.status_code, 502)
+
+    def test_serviceability_nearest_towers(self):
+        # A point a little north-east of the first fixture site that has
+        # coordinates.
+        with mock.patch("network.uisp.requests.get", side_effect=uisp_get):
+            all_sites = geo.uisp.sites()
+            parents = {s["parent_id"] for s in all_sites}
+            here = next(s for s in all_sites if s["name"] == "Winter Hoek")
+            lat, lng = here["latitude"] + 0.001, here["longitude"] + 0.001
+            res = self.client.get(f"/api/map/serviceability/?lat={lat}&lng={lng}")
+        self.assertEqual(res.status_code, 200)
+        data = res.data
+        self.assertFalse(data["coverage"]["loaded"])
+        self.assertIsNone(data["coverage"]["covered"])
+        near = data["nearest"]
+        self.assertEqual(near[0]["name"], here["name"])
+        self.assertAlmostEqual(near[0]["distance_km"], 0.15, delta=0.03)   # ~110 m N + ~100 m E
+        self.assertEqual(near[0]["compass"], "NE")
+        self.assertEqual([t["distance_km"] for t in near], sorted(t["distance_km"] for t in near))
+        self.assertLessEqual(len(near), 5)
+        # stand-alone client sites are not towers
+        loose = [s["name"] for s in all_sites if not s["parent_id"] and s["id"] not in parents]
+        self.assertFalse(set(loose) & {t["name"] for t in near})
+        # the MikroTik sector at Winter Hoek (WTH_SECT_01) counts as a sector
+        names = {a["name"] for a in near[0]["access_points"]}
+        self.assertTrue(any("sect" in n.lower() for n in names), names)
+
+    def test_bad_point(self):
+        self.assertEqual(self.client.get("/api/map/serviceability/?lat=x&lng=1").status_code, 400)
+        self.assertEqual(self.client.get("/api/map/serviceability/?lat=95&lng=1").status_code, 400)
+
+    def test_needs_networking(self):
+        desk = APIClient()
+        desk.force_authenticate(User.objects.create_user(username="desk", password="x", role="support", allowed_sections=["tickets"]))
+        self.assertEqual(desk.get("/api/map/serviceability/?lat=-27&lng=27").status_code, 403)
+
+
+class MapConfigTests(TestCase):
+    """Mapbox public token for the Satellite switch (#180)."""
+
+    @override_settings(MAPBOX_TOKEN="pk.test")
+    def test_token_for_networking_and_scheduling_only(self):
+        boss = APIClient()
+        boss.force_authenticate(User.objects.create_user(username="b", password="x", role="admin"))
+        self.assertEqual(boss.get("/api/map/config/").data, {"mapbox_token": "pk.test"})
+        disp = APIClient()
+        disp.force_authenticate(User.objects.create_user(username="d", password="x", role="support", allowed_sections=["scheduling"]))
+        self.assertEqual(disp.get("/api/map/config/").status_code, 200)
+        desk = APIClient()
+        desk.force_authenticate(User.objects.create_user(username="t", password="x", role="support", allowed_sections=["tickets"]))
+        self.assertEqual(desk.get("/api/map/config/").status_code, 403)
+
+    @override_settings(MAPBOX_TOKEN="")
+    def test_no_token(self):
+        boss = APIClient()
+        boss.force_authenticate(User.objects.create_user(username="b", password="x", role="admin"))
+        self.assertEqual(boss.get("/api/map/config/").data, {"mapbox_token": ""})

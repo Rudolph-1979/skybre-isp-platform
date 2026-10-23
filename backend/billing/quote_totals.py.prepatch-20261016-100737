@@ -1,0 +1,115 @@
+"""Money that happens once, and money that happens every month.
+
+WHY THIS EXISTS
+
+A quote for a R3 500 router plus a R899-a-month service printed a single
+total. Adding a once-off charge to a monthly one produces a figure that is
+true of nothing: the customer is not paying it once, and they are not
+paying it monthly. It is the sort of number that gets argued about on the
+phone after the first invoice arrives.
+
+So a quote reports two figures, each labelled, and this module works out
+which lines belong to which.
+
+WHAT DECIDES WHICH A LINE IS
+
+`InvoiceItem.billing_kind` when it is set, and the line's type when it is
+not. A tariff-plan line becomes a real Service on acceptance -- see
+Invoice.activate_tariff_services -- and a Service is what the recurring
+engine bills every month, so a tariff line is recurring by nature. A stock
+item is a thing that is handed over once. A custom line could be either,
+which is exactly why the explicit field exists.
+
+Deriving the default rather than back-filling a column is deliberate: no
+data migration, no existing row carrying a guess someone made once, and a
+tariff line added next year is classified correctly without anybody
+remembering a flag.
+
+WHY THE TWO TOTALS ARE NOT ADDED UP ANYWHERE
+
+Because they cannot honestly be. Each is rounded to cents in its own
+right, the way Invoice.recalc_totals rounds the document, so the two are
+each correct. Their sum is not a quantity the customer owes -- and where
+rounding makes it differ by a cent from the document's stored total, a
+blended figure printed beside them would be a visible contradiction on a
+document with our name on it. The caller shows both and no blend.
+
+Read-only. Nothing here writes or recomputes what the customer is charged.
+"""
+from decimal import ROUND_HALF_UP, Decimal
+
+CENTS = Decimal("0.01")
+ZERO = Decimal("0.00")
+
+ONCE_OFF = "once_off"
+RECURRING = "recurring"
+
+
+def to_cents(value):
+    """ROUND_HALF_UP, matching Invoice.recalc_totals.
+
+    Not Python's default half-even: the stored totals were rounded by
+    Postgres to numeric(12,2), and a figure on a quote that rounds
+    differently from the invoice it becomes is a cent nobody can explain.
+    """
+    return Decimal(value).quantize(CENTS, rounding=ROUND_HALF_UP)
+
+
+def kind_of(item):
+    """Which pile this line belongs in."""
+    from .models import InvoiceItem
+
+    explicit = (getattr(item, "billing_kind", "") or "").strip()
+    if explicit in (ONCE_OFF, RECURRING):
+        return explicit
+    return (
+        RECURRING
+        if item.item_type == InvoiceItem.ItemType.TARIFF
+        else ONCE_OFF
+    )
+
+
+def _group(items):
+    """Subtotal, tax and inclusive total for one pile of lines.
+
+    Each component is rounded once over the whole pile and the inclusive
+    figure is derived from the two, for the reason Invoice.recalc_totals
+    spells out at length: rounding three numbers independently lets a
+    document print an exclusive amount and a VAT amount that do not add up
+    to the total beside them.
+    """
+    subtotal = to_cents(
+        sum((i.quantity * i.unit_price for i in items), start=Decimal("0"))
+    )
+    tax = to_cents(
+        sum(
+            (i.quantity * i.unit_price * (i.tax_rate_pct / 100) for i in items),
+            start=Decimal("0"),
+        )
+    )
+    return {
+        "count": len(items),
+        "excl": subtotal,
+        "tax": tax,
+        "incl": subtotal + tax,
+    }
+
+
+def split_totals(invoice):
+    """The two piles, or None when there is nothing to split.
+
+    Returns None unless the document actually carries BOTH kinds. A quote
+    that is all equipment, or all service, already has one honest total and
+    does not need a second way of saying it -- and changing every quote to
+    a split layout to serve the mixed ones would be a worse document for
+    the common case.
+    """
+    items = list(invoice.items.all())
+    once_off = [i for i in items if kind_of(i) == ONCE_OFF]
+    recurring = [i for i in items if kind_of(i) == RECURRING]
+    if not once_off or not recurring:
+        return None
+    return {
+        "once_off": _group(once_off),
+        "recurring": _group(recurring),
+    }

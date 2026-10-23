@@ -1,0 +1,44 @@
+import { Link } from "react-router-dom";
+import { PageHeader } from "../../components/PageHeader";
+
+/**
+ * Administration (Rudolph, 9 Oct 2026). For now a list of reports; new ones
+ * go in REPORTS below and as a child of Administration in AdminLayout's NAV.
+ */
+const REPORTS = [
+  {
+    to: "/admin/administration/clients-per-partner",
+    title: "Clients per partner",
+    description: "Clients, live services and monthly value for each partner, and Direct.",
+  },
+  {
+    to: "/admin/administration/clients-per-tariff",
+    title: "Clients per tariff",
+    description: "Clients, live services and monthly value for each tariff.",
+  },
+  {
+    to: "/admin/administration/revenue",
+    title: "Revenue",
+    description: "MRR and ARPU over time, top payers, daily payments, invoicing and payments per period.",
+  },
+];
+
+export function AdministrationPage() {
+  return (
+    <div>
+      <PageHeader title="Administration" subtitle="Reports" />
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {REPORTS.map((r) => (
+          <Link
+            key={r.to}
+            to={r.to}
+            className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4 shadow-sm transition-colors hover:bg-[var(--tint-hover)]"
+          >
+            <p className="font-medium text-[var(--text-primary)]">{r.title}</p>
+            <p className="mt-1 text-sm text-[var(--text-secondary)]">{r.description}</p>
+          </Link>
+        ))}
+      </div>
+    </div>
+  );
+}

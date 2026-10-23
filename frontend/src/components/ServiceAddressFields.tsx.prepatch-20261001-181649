@@ -1,0 +1,100 @@
+import { FormField, inputClass } from "./Modal";
+import type { Service } from "../types";
+
+// Where a line is installed (Rudolph, 1 Oct: "some clients have one account
+// but 3 different services at different addresses"). Shared by the New/Edit
+// service forms on the Services page and on a client's own page, the same way
+// ServiceShapingFields is. Default: the client's main address.
+
+export type ServiceAddressValues = {
+  use_customer_address: boolean;
+  site_address: string;
+  site_complex_or_area: string;
+  site_city: string;
+  site_zip_code: string;
+};
+
+export const emptyServiceAddressValues: ServiceAddressValues = {
+  use_customer_address: true, site_address: "", site_complex_or_area: "", site_city: "", site_zip_code: "",
+};
+
+export function serviceAddressValuesFrom(service: Service): ServiceAddressValues {
+  return {
+    use_customer_address: service.use_customer_address ?? true,
+    site_address: service.site_address ?? "",
+    site_complex_or_area: service.site_complex_or_area ?? "",
+    site_city: service.site_city ?? "",
+    site_zip_code: service.site_zip_code ?? "",
+  };
+}
+
+export function serviceAddressPayload(values: ServiceAddressValues): Record<string, unknown> {
+  return { ...values };
+}
+
+export function ServiceAddressFields({
+  values,
+  onChange,
+  mainAddress,
+}: {
+  values: ServiceAddressValues;
+  onChange: (patch: Partial<ServiceAddressValues>) => void;
+  // The client's main address as one line, when known -- shown beside the
+  // "same as" option so nobody has to go and look it up.
+  mainAddress?: string;
+}) {
+  return (
+    <div className="mt-4 border-t border-[var(--border-hairline)] pt-4">
+      <p className="mb-2 text-sm font-semibold text-[var(--text-primary)]">Service address</p>
+      <label className="mb-1 flex items-center gap-2 text-sm">
+        <input
+          type="radio"
+          checked={values.use_customer_address}
+          onChange={() => onChange({ use_customer_address: true })}
+        />
+        Same as the client's main address
+      </label>
+      {mainAddress && <p className="mb-2 ml-6 text-xs text-[var(--text-muted)]">{mainAddress}</p>}
+      <label className="mb-3 flex items-center gap-2 text-sm">
+        <input
+          type="radio"
+          checked={!values.use_customer_address}
+          onChange={() => onChange({ use_customer_address: false })}
+        />
+        A separate address for this service
+      </label>
+      {!values.use_customer_address && (
+        <>
+          <FormField label="Street address (number and name)">
+            <input
+              className={inputClass}
+              required
+              value={values.site_address}
+              onChange={(e) => onChange({ site_address: e.target.value })}
+            />
+          </FormField>
+          <FormField label="Complex or residential area">
+            <input
+              className={inputClass}
+              placeholder="e.g. 9A Cabanas Flats"
+              value={values.site_complex_or_area}
+              onChange={(e) => onChange({ site_complex_or_area: e.target.value })}
+            />
+          </FormField>
+          <div className="grid grid-cols-2 gap-3">
+            <FormField label="City">
+              <input className={inputClass} value={values.site_city} onChange={(e) => onChange({ site_city: e.target.value })} />
+            </FormField>
+            <FormField label="Zip code">
+              <input
+                className={inputClass}
+                value={values.site_zip_code}
+                onChange={(e) => onChange({ site_zip_code: e.target.value })}
+              />
+            </FormField>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

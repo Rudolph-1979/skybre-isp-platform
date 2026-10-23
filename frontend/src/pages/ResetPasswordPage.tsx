@@ -72,7 +72,7 @@ export function ResetPasswordPage() {
                 onChange={(e) => setPassword(e.target.value)}
                 autoFocus
                 required
-                minLength={6}
+                minLength={10}
               />
             </label>
             <label className="mb-4 block text-sm">
@@ -83,7 +83,7 @@ export function ResetPasswordPage() {
                 value={confirm}
                 onChange={(e) => setConfirm(e.target.value)}
                 required
-                minLength={6}
+                minLength={10}
               />
             </label>
             {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}

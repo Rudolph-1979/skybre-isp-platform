@@ -13,6 +13,7 @@ import type {
   NetworkSite, Partner, OvpnClientConnection, OvpnClientConnectionPingStatus,
 } from "../../types";
 import { POOL_CATEGORY_LABELS, NETWORK_TYPE_LABELS } from "../../types";
+import { formatIsoDateTime } from "../../utils/billingTerms";
 
 type Tab = "devices" | "sites" | "ip-pools" | "vpn-clients" | "live-sessions";
 
@@ -1697,13 +1698,42 @@ function formatDuration(seconds: number | null) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+// Seconds without a word from the NAS before a session stops counting as
+// connected. Mirrors radiusauth/usage.py LIVE_SESSION_STALE_SECONDS -- the
+// backend decides, this is only for wording the hint text.
+const SESSION_STALE_SECONDS = 900;
+
+function sessionAge(seconds: number | null | undefined): string {
+  if (seconds == null) return "never";
+  if (seconds < 60) return `${seconds}s ago`;
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
-  const [activeOnly, setActiveOnly] = useState(true);
+  // "" = everything including history. Three states rather than two: a
+  // session that stopped reporting is neither connected nor ended, and
+  // lumping it in with either one is what made this page claim three
+  // customers were online whose last heartbeat was two days old.
+  const [sessionState, setSessionState] = useState<"online" | "stale" | "">("online");
+  // Whose sessions to show. This page used to show every row in radacct,
+  // which is not the same as every line this platform manages: on
+  // 2026-09-15 it was listing 48 Grunder Co customers who live on SPLYNX
+  // -- same company, same routers, different platform -- because their CPE
+  // attaches to the "Skybre" PPPoE service and their accounting therefore
+  // lands on us. They are our customers, but they are not our sessions.
+  // The Splynx ones stay one click away rather than hidden, because they
+  // are the evidence of the RADIUS problem and burying them would mean
+  // nobody sees it recur.
+  const [owner, setOwner] = useState<"ours" | "foreign" | "all">("ours");
   const [realmFilter, setRealmFilter] = useState("");
   const { items: nasClients } = useApiList<RadiusNasClient>("/radius-nas-clients/?page_size=200");
   const realms = Array.from(new Set(nasClients.map((c) => c.realm).filter((r): r is string => !!r))).sort();
   const { items, loading, refetch } = useApiList<RadAcctSession>(
-    `/radius-sessions/?page_size=100${activeOnly ? "&active_only=true" : ""}${realmFilter ? `&realm=${encodeURIComponent(realmFilter)}` : ""}`
+    `/radius-sessions/?page_size=100&owner=${owner}${sessionState ? `&state=${sessionState}` : ""}${realmFilter ? `&realm=${encodeURIComponent(realmFilter)}` : ""}`
   );
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("radius-sessions", ["username"]);
 
@@ -1717,9 +1747,23 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
     <div>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <select className={filterSelectClass} value={activeOnly ? "active" : "all"} onChange={(e) => setActiveOnly(e.target.value === "active")}>
-            <option value="active">Currently connected only</option>
-            <option value="all">All sessions (history)</option>
+          <select
+            className={filterSelectClass}
+            value={sessionState}
+            onChange={(e) => setSessionState(e.target.value as "online" | "stale" | "")}
+          >
+            <option value="online">Currently connected only</option>
+            <option value="stale">Stopped reporting</option>
+            <option value="">All sessions (history)</option>
+          </select>
+          <select
+            className={filterSelectClass}
+            value={owner}
+            onChange={(e) => setOwner(e.target.value as "ours" | "foreign" | "all")}
+          >
+            <option value="ours">Managed here</option>
+            <option value="foreign">Managed elsewhere (Splynx)</option>
+            <option value="all">Every session on our NASes</option>
           </select>
           {realms.length > 0 && (
             <select className={filterSelectClass} value={realmFilter} onChange={(e) => setRealmFilter(e.target.value)}>
@@ -1735,6 +1779,21 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
         </div>
         <ColumnToggle columns={SESSION_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["username"]} />
       </div>
+
+      {/* Explained on the page rather than left to be rediscovered. Anyone
+          who switches to "Managed elsewhere" and finds a full table needs
+          to know these are real Grunder Co lines running on Splynx, and
+          that seeing them here means our RADIUS server is answering for
+          usernames it doesn't know. */}
+      {owner === "foreign" && (
+        <p className="mb-4 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] px-3 py-2 text-sm text-[var(--text-secondary)]">
+          Our customers, on our routers, but authenticated and billed by Splynx — no service on this
+          platform matches them. We reject their logins and still receive their accounting, because
+          RouterOS sends it to the first matching <code>/radius</code> entry rather than to whichever
+          server accepted the session. An empty table here is the healthy state: it means we are
+          staying out of Splynx's way.
+        </p>
+      )}
 
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
@@ -1759,7 +1818,7 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
                 {isVisible("realm") && <TD>{s.realm ?? "—"}</TD>}
                 {isVisible("framedipaddress") && <TD>{s.framedipaddress ?? "—"}</TD>}
                 {isVisible("callingstationid") && <TD>{s.callingstationid ?? "—"}</TD>}
-                {isVisible("acctstarttime") && <TD>{s.acctstarttime ? new Date(s.acctstarttime).toLocaleString() : "—"}</TD>}
+                {isVisible("acctstarttime") && <TD>{s.acctstarttime ? formatIsoDateTime(s.acctstarttime) : "—"}</TD>}
                 {isVisible("duration") && <TD>{formatDuration(s.duration_seconds ?? s.acctsessiontime)}</TD>}
                 {isVisible("traffic") && (
                   <TD className="tabular-nums">
@@ -1778,9 +1837,38 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
                 )}
                 {isVisible("status") && (
                   <TD>
-                    {s.is_active ? (
-                      <StatusBadge status="online" />
-                    ) : (
+                    {/* The age sits next to the state on purpose. A green
+                        pill on its own cannot be checked; a green pill
+                        beside "2d ago" is obviously wrong, which is how
+                        the stale-session bug was spotted at all. */}
+                    {s.connection_state === "online" && (
+                      <span className="whitespace-nowrap">
+                        <StatusBadge status="online" />
+                        <span className="ml-2 text-xs text-[var(--text-muted)]">
+                          {sessionAge(s.heartbeat_age_seconds)}
+                        </span>
+                      </span>
+                    )}
+                    {s.connection_state === "stale" && (
+                      <span
+                        className="whitespace-nowrap"
+                        title={
+                          "This session is still open in the accounting table but the router has not " +
+                          `reported on it for over ${Math.round(SESSION_STALE_SECONDS / 60)} minutes. ` +
+                          "Usually a CPE that lost power — it never sends an Accounting-Stop, so the row " +
+                          "stays open. Treat it as offline."
+                        }
+                      >
+                        <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--tint-hover)] px-2 py-0.5 text-xs text-[var(--text-primary)]">
+                          <span className="h-1.5 w-1.5 rounded-full bg-[var(--status-warning,#f59e0b)]" aria-hidden="true" />
+                          Stopped reporting
+                        </span>
+                        <span className="ml-2 text-xs text-[var(--text-muted)]">
+                          {sessionAge(s.heartbeat_age_seconds)}
+                        </span>
+                      </span>
+                    )}
+                    {s.connection_state !== "online" && s.connection_state !== "stale" && (
                       <span className="text-[var(--text-muted)]">Ended{s.acctterminatecause ? ` (${s.acctterminatecause})` : ""}</span>
                     )}
                   </TD>
@@ -1790,7 +1878,13 @@ function LiveSessionsTab({ onRegisterNewAction }: { onRegisterNewAction: (action
             {items.length === 0 && (
               <TR>
                 <TD className="text-[var(--text-muted)]">
-                  {activeOnly ? "No customers currently connected." : "No session history yet."}
+                  {owner === "foreign"
+                    ? "Nothing here — every session on our NASes belongs to a service this platform manages."
+                    : sessionState === "online"
+                      ? "No customers currently connected."
+                      : sessionState === "stale"
+                        ? "No sessions have stopped reporting — every open session is live."
+                        : "No session history yet."}
                 </TD>
               </TR>
             )}

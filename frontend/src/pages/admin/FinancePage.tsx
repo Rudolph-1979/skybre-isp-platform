@@ -4,23 +4,34 @@ import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { Pager } from "../../components/Pager";
 import { SearchableSelect } from "../../components/SearchableSelect";
 import { Table, THead, TH, SortableTH, TR, TD } from "../../components/Table";
-import { StatusBadge } from "../../components/StatusBadge";
+import { StatusBadge, InvoiceStatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
+import { MultiSelect } from "../../components/MultiSelect";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { apiErrorMessage } from "../../utils/apiError";
+import { QUOTE_VALID_DAYS, defaultInvoiceDueDate, defaultQuoteValidUntil, localIsoDate } from "../../utils/quoteDefaults";
+import { formatIsoDate, formatIsoDateTime } from "../../utils/billingTerms";
+import { dmy, proRata } from "../../utils/proRata";
+import { PaymentAllocationsModal } from "../../components/PaymentAllocationsModal";
+import { ReversePaymentModal } from "../../components/ReversePaymentModal";
+import { SendInvoiceButton } from "../../components/SendInvoiceButton";
 import type {
-  Invoice, Customer, Product, Tariff, InvoiceItemType, Payment, CreditRequest, InvoiceDeletionRequest,
+  Invoice, Customer, Product, Tariff, OnceOffItem, RecurringCharge, InvoiceItemType, Payment, CreditRequest, InvoiceDeletionRequest,
   Partner, RecurringBillingCounts, RecurringBillingRun, SuspensionSettingsConfig,
 } from "../../types";
+// Own module, not types/index.ts — see types/finance.ts for why.
+import type { FinanceDashboardData, FinancePeriodFigures, FinancePeriod } from "../../types/finance";
 
 // Bank Feeds moved to the Accountant page (2026-08-19) -- see
 // AccountantPage.tsx's BankFeedsTab and friends. Confirming a bank
 // transaction there now creates either a Payment (credit) or an Expense
 // (debit), both of which feed the VAT Returns report, so it made more
 // sense to live alongside VAT Returns/Expenses than here.
-type Tab = "invoices" | "payments" | "credits" | "recurring-billing";
+type Tab = "dashboard" | "quotes" | "proformas" | "invoices" | "payments" | "credits" | "recurring-billing";
 
 // Unlike the single-button NewAction used elsewhere (Networking, Staff),
 // Invoices needs to register two buttons at once ("+ New quote" and
@@ -29,23 +40,43 @@ type Tab = "invoices" | "payments" | "credits" | "recurring-billing";
 type ActionButton = { label: string; onClick: () => void; variant?: "primary" | "secondary" };
 type NewAction = ActionButton[] | null;
 
+const PAGE_SIZE = 50;
+
 export function FinancePage() {
   const { user } = useAuth();
   // Seeded from the URL so a dashboard tile lands on the right tab with the
   // right filter already applied, instead of dropping you on Invoices/All and
   // leaving you to redo the click you just made.
   const [searchParams] = useSearchParams();
-  const [tab, setTab] = useState<Tab>(() => {
+  const tabFromUrl = (): Tab => {
     const wanted = searchParams.get("tab");
-    return (["invoices", "payments", "credits", "recurring-billing"] as Tab[]).includes(wanted as Tab)
+    // Quotes / Pro formas / Invoices are tabs of their own (8 Oct 2026).
+    // Older links say tab=invoices&doc=quote, or only doc=...; send those to
+    // the matching tab.
+    const doc = searchParams.get("doc");
+    const docTab: Tab | null = doc === "quote" ? "quotes" : doc === "proforma" ? "proformas" : doc === "invoice" ? "invoices" : null;
+    if (docTab && (!wanted || wanted === "invoices")) return docTab;
+    return (["dashboard", "quotes", "proformas", "invoices", "payments", "credits", "recurring-billing"] as Tab[]).includes(
+      wanted as Tab
+    )
       ? (wanted as Tab)
-      : "invoices";
-  });
+      : "dashboard";
+  };
+  const [tab, setTab] = useState<Tab>(tabFromUrl);
+  // A link to another Finance tab from inside this page (e.g. the Dashboard
+  // tab's "Open unpaid invoices") changes only the query string, so follow it.
+  useEffect(() => {
+    setTab(tabFromUrl());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
   const [newAction, setNewAction] = useState<NewAction>(null);
 
   const canSeeCredits = user?.role === "admin" || user?.role === "accounts" || user?.role === "management";
 
   const TABS: { key: Tab; label: string }[] = [
+    { key: "dashboard", label: "Dashboard" },
+    { key: "quotes", label: "Quotes" },
+    { key: "proformas", label: "Pro formas" },
     { key: "invoices", label: "Invoices" },
     { key: "payments", label: "Payments" },
     ...(canSeeCredits ? [{ key: "credits" as Tab, label: "Credits" }] : []),
@@ -84,10 +115,300 @@ export function FinancePage() {
           </button>
         ))}
       </div>
-      {tab === "invoices" && <InvoicesTab onRegisterNewAction={setNewAction} />}
+      {tab === "dashboard" && <DashboardTab onRegisterNewAction={setNewAction} />}
+      {/* One list, three tabs: keyed so switching resets its filters. */}
+      {tab === "quotes" && <InvoicesTab key="quote" docType="quote" onRegisterNewAction={setNewAction} />}
+      {tab === "proformas" && <InvoicesTab key="proforma" docType="proforma" onRegisterNewAction={setNewAction} />}
+      {tab === "invoices" && <InvoicesTab key="invoice" docType="invoice" onRegisterNewAction={setNewAction} />}
       {tab === "payments" && <PaymentsTab onRegisterNewAction={setNewAction} />}
       {tab === "credits" && canSeeCredits && <CreditsTab onRegisterNewAction={setNewAction} />}
       {tab === "recurring-billing" && <RecurringBillingTab onRegisterNewAction={setNewAction} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+//
+// The finance view Skybre is replacing Splynx's with, so the panels are laid
+// out to be readable side by side with it during the changeover.
+//
+// Two panels differ from Splynx on purpose, and say so on screen rather than
+// quietly reporting a different number under the same heading:
+//
+//   * Next month. Splynx projects from a debit/credit transactions ledger.
+//     There isn't one here, so the forecast comes from active services at
+//     their tariff price — the same rule billing/recurring.py actually bills
+//     on, which means the forecast and the invoices it predicts can't
+//     disagree. Excludes VAT, because tariff prices do.
+//   * No Locations filter. Splynx has a location per customer; this platform
+//     doesn't. Partner scoping is the same.
+
+const PERIOD_TABS: { value: FinancePeriod; label: string; heading: string }[] = [
+  { value: "month", label: "Month", heading: "This month" },
+  { value: "year", label: "Year", heading: "This year" },
+  { value: "lifetime", label: "Lifetime", heading: "All time" },
+];
+
+function rand(value: string | number | null | undefined) {
+  if (value === null || value === undefined) return "R0.00";
+  // Parsed only at the moment of display. The API sends decimals as strings
+  // precisely so nothing rounds them in transit.
+  const n = typeof value === "number" ? value : parseFloat(value);
+  if (Number.isNaN(n)) return "—";
+  return `R${n.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function StatTile({
+  label,
+  count,
+  amount,
+  note,
+}: {
+  label: string;
+  count: number;
+  amount: string;
+  // Shown only when it tells you something the headline can't — currently
+  // when part-payments make "billed" and "still owed" differ.
+  note?: string;
+}) {
+  return (
+    <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-sm text-[var(--text-muted)]">{label}</span>
+        <span className="text-lg font-semibold tabular-nums text-[var(--text-primary)]">{count}</span>
+      </div>
+      <div className="mt-1 text-xl font-semibold tabular-nums text-[var(--series-1)]">{rand(amount)}</div>
+      {note && <div className="mt-1 text-xs text-[var(--text-muted)]">{note}</div>}
+    </div>
+  );
+}
+
+// `amount` is optional so a count-only row (customers billed, paying
+// customers) doesn't have to pass a fake "0" that renders as R0.00 beside a
+// real figure and reads like a bug.
+function PeriodRow({ label, count, amount }: { label: string; count?: number; amount?: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 border-b border-[var(--border-hairline)] py-2 last:border-0">
+      <span className="text-sm text-[var(--text-secondary)]">{label}</span>
+      <span className="tabular-nums text-sm">
+        {count !== undefined && (
+          <span className={amount === undefined ? "font-medium text-[var(--text-primary)]" : "mr-2 text-[var(--text-muted)]"}>
+            {count}
+          </span>
+        )}
+        {amount !== undefined && <span className="font-medium text-[var(--text-primary)]">{rand(amount)}</span>}
+      </span>
+    </div>
+  );
+}
+
+function PeriodPanel({ title, figures }: { title: string; figures: FinancePeriodFigures }) {
+  return (
+    <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+      <h3 className="mb-2 font-medium text-[var(--text-primary)]">{title}</h3>
+      <PeriodRow label="Payments" count={figures.payments.count} amount={figures.payments.amount} />
+      <PeriodRow label="Paid invoices" count={figures.paid_invoices.count} amount={figures.paid_invoices.amount} />
+      {/* BILLED here, not outstanding — this panel adds up to Total income,
+          and a row showing "still owed" would make the arithmetic on screen
+          look wrong. The outstanding figure gets its own row underneath
+          whenever part-payments make the two differ, so the distinction is
+          visible rather than buried. The tile at the top of the page shows
+          outstanding, because there the question is what can still be
+          collected. */}
+      <PeriodRow
+        label="Unpaid invoices"
+        count={figures.unpaid_invoices.count}
+        amount={figures.unpaid_invoices.invoiced}
+      />
+      {figures.unpaid_invoices.invoiced !== figures.unpaid_invoices.amount && (
+        <PeriodRow label="— of which still owed" amount={figures.unpaid_invoices.amount} />
+      )}
+      <PeriodRow label="Credits" count={figures.credit_notes.count} amount={figures.credit_notes.amount} />
+      <PeriodRow label="Paid pro formas" count={figures.paid_proformas.count} amount={figures.paid_proformas.amount} />
+      <PeriodRow label="Unpaid pro formas" count={figures.unpaid_proformas.count} amount={figures.unpaid_proformas.amount} />
+      <div className="mt-2 flex items-baseline justify-between gap-3 rounded-md bg-[var(--surface-2)] px-3 py-2">
+        <span
+          className="text-sm font-medium text-[var(--text-primary)]"
+          title="Invoiced revenue net of credits: paid + unpaid − approved credits. Accrual, not cash — the Payments row above is the cash view."
+        >
+          Total income
+        </span>
+        <span className="tabular-nums font-semibold text-[var(--text-primary)]">{rand(figures.total_income)}</span>
+      </div>
+    </div>
+  );
+}
+
+function DashboardTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  // Empty = every partner, matching the backend. Stored as ids so the
+  // query string is built from the same values the checkboxes carry.
+  const [partnerIds, setPartnerIds] = useState<number[]>([]);
+  // A primitive for the effect to depend on. Depending on the array itself
+  // works only for as long as nothing upstream hands this component a fresh
+  // array on every render, and that is not a property worth betting a
+  // request loop on.
+  const partnerKey = partnerIds.join(",");
+  // Which window the six tiles cover. The Last/This/Next month panels below
+  // are always months, so this deliberately does not touch them.
+  const [period, setPeriod] = useState<FinancePeriod>("month");
+  const { items: partners } = useApiList<Partner>("/partners/?page_size=200&ordering=name");
+  const [data, setData] = useState<FinanceDashboardData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    onRegisterNewAction(null);
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    api
+      .get<FinanceDashboardData>(
+        `/finance-dashboard/?period=${period}${partnerIds.length ? `&partner=${partnerIds.join(",")}` : ""}`
+      )
+      .then((res) => {
+        // Guarded because a slow first request can land after a second one
+        // fired by changing the partner filter, which would otherwise show
+        // the wrong partner's numbers under the right partner's name.
+        if (!cancelled) setData(res.data);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(apiErrorMessage(err, "Couldn't load the finance dashboard."));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [partnerKey, period]);
+
+  if (loading && !data) return <p className="text-[var(--text-muted)]">Loading…</p>;
+  if (error) return <p className="rounded-md bg-[#fbeaea] px-3 py-2 text-sm text-[#b32e2e]">{error}</p>;
+  if (!data) return null;
+
+  const { tiles, last_month, current_month, next_month, overdue, recurring } = data;
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <MultiSelect
+          options={partners.map((p) => ({ value: p.id, label: p.name }))}
+          selected={partnerIds}
+          onChange={(next) => setPartnerIds(next as number[])}
+          allLabel="All partners"
+          nounPlural="partners"
+        />
+        <div className="flex gap-1 rounded-md border border-[var(--border-hairline)] p-0.5">
+          {PERIOD_TABS.map((p) => (
+            <button
+              key={p.value}
+              type="button"
+              onClick={() => setPeriod(p.value)}
+              className={`rounded px-3 py-1 text-sm ${
+                period === p.value
+                  ? "bg-[var(--series-1)] text-white"
+                  : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              }`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <span className="text-xs text-[var(--text-muted)]">
+          As at {formatIsoDate(data.as_of)}
+        </span>
+      </div>
+
+      <h3 className="mb-2 text-sm font-medium text-[var(--text-secondary)]">
+        {PERIOD_TABS.find((p) => p.value === data.period)?.heading ?? "This month"}
+      </h3>
+      <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        <StatTile label="Payments" count={tiles.payments.count} amount={tiles.payments.amount} />
+        <StatTile label="Paid invoices" count={tiles.paid_invoices.count} amount={tiles.paid_invoices.amount} />
+        <StatTile
+          label="Unpaid invoices"
+          count={tiles.unpaid_invoices.count}
+          amount={tiles.unpaid_invoices.amount}
+          note={
+            tiles.unpaid_invoices.invoiced !== tiles.unpaid_invoices.amount
+              ? `${rand(tiles.unpaid_invoices.invoiced)} billed, part-paid`
+              : undefined
+          }
+        />
+        <StatTile label="Credits" count={tiles.credit_notes.count} amount={tiles.credit_notes.amount} />
+        <StatTile label="Paid pro formas" count={tiles.paid_proformas.count} amount={tiles.paid_proformas.amount} />
+        <StatTile label="Unpaid pro formas" count={tiles.unpaid_proformas.count} amount={tiles.unpaid_proformas.amount} />
+      </div>
+
+      <div className="mb-4 grid gap-3 lg:grid-cols-3">
+        <PeriodPanel title="Last month" figures={last_month} />
+        <PeriodPanel title="This month" figures={current_month} />
+
+        <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+          <h3 className="mb-2 font-medium text-[var(--text-primary)]">Next month</h3>
+          <PeriodRow label="Active services to bill" count={next_month.services} amount={next_month.planned_income} />
+          <PeriodRow label="Customers billed" count={next_month.customers} />
+          <div className="mt-2 flex items-baseline justify-between gap-3 rounded-md bg-[var(--surface-2)] px-3 py-2">
+            <span className="text-sm font-medium text-[var(--text-primary)]">Planned income</span>
+            <span className="tabular-nums font-semibold text-[var(--text-primary)]">
+              {rand(next_month.planned_income)}
+            </span>
+          </div>
+          {/* Said plainly rather than left as a number that looks like the
+              others but isn't built the same way. */}
+          <p className="mt-2 text-xs text-[var(--text-muted)]">
+            Projected from active services at their tariff price — the same rule the recurring billing run
+            charges on. Excludes VAT.
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+          <h3 className="mb-2 font-medium text-[var(--text-primary)]">Overdue invoices</h3>
+          {overdue.buckets.map((b) => (
+            <PeriodRow key={b.label} label={b.label} count={b.count} amount={b.amount} />
+          ))}
+          <div className="mt-2 flex items-baseline justify-between gap-3 rounded-md bg-[var(--surface-2)] px-3 py-2">
+            <span className="text-sm font-medium text-[var(--text-primary)]">Total</span>
+            <span className="tabular-nums font-semibold text-[var(--text-primary)]">
+              <span className="mr-2 font-normal text-[var(--text-muted)]">{overdue.total.count}</span>
+              {rand(overdue.total.amount)}
+            </span>
+          </div>
+          {/* The buckets here are EXCLUSIVE (30-60 does not include 0-30) so
+              they sum to the total. The Invoices tab's quick filters are
+              CUMULATIVE (0-60 includes 0-30) because that is how a "show me
+              everything up to" button reads. Both come from the same rule in
+              billing/overdue.py; the link goes to the tab rather than to a
+              preset so it can't imply the two are the same shape. */}
+          <Link
+            to="/admin/finance?tab=invoices&status=unpaid"
+            className="mt-3 inline-block text-sm text-[var(--series-1)] hover:underline"
+          >
+            Open unpaid invoices →
+          </Link>
+        </div>
+
+        <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
+          <h3 className="mb-2 font-medium text-[var(--text-primary)]">Recurring revenue</h3>
+          <PeriodRow label="Monthly recurring revenue" amount={recurring.mrr} />
+          <PeriodRow label="Average revenue per user" amount={recurring.arpu} />
+          <PeriodRow label="Paying customers" count={recurring.paying_customers} />
+          <p className="mt-2 text-xs text-[var(--text-muted)]">
+            MRR is the sum of active services at their tariff price, excluding VAT. ARPU divides it by
+            customers holding at least one active service — not by every customer, since one with no
+            service pays nothing and would drag the average down for no reason.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
@@ -103,12 +424,68 @@ const INVOICE_COLUMNS: ColumnDef[] = [
   { key: "total", label: "Total" },
   { key: "paid", label: "Paid" },
   { key: "status", label: "Status" },
+  { key: "sent", label: "Sent" },
 ];
+
+// Line types billed monthly, which can be invoiced for a part month.
+const PRO_RATA_TYPES: InvoiceItemType[] = ["tariff", "recurring_charge", "custom"];
+
+/** "Pro rata from <date>": the line's price is the MONTHLY price; this
+ * shows what the part month comes to (sent when the document is created). */
+function ProRataField({
+  item,
+  onChange,
+}: {
+  item: { proRata: boolean; proFrom: string; unit_price: string; quantity: string };
+  onChange: (patch: { proRata?: boolean; proFrom?: string }) => void;
+}) {
+  const pr = item.proRata ? proRata(item.proFrom, parseFloat(item.unit_price) || 0) : null;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[var(--text-secondary)]">
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={item.proRata}
+          onChange={(e) =>
+            onChange({ proRata: e.target.checked, proFrom: item.proFrom || localIsoDate() })
+          }
+        />
+        Pro rata
+      </label>
+      {item.proRata && (
+        <>
+          <span>from</span>
+          <input
+            type="date"
+            className={inputClass}
+            style={{ maxWidth: 170 }}
+            value={item.proFrom}
+            onChange={(e) => onChange({ proFrom: e.target.value })}
+          />
+          <span className="text-xs text-[var(--text-muted)]">
+            {!item.proFrom
+              ? "Choose the start date."
+              : pr
+                ? `R ${pr.amount.toFixed(2)} excl. VAT each: ${pr.days} of ${pr.monthDays} days to ${dmy(pr.to)}, of the monthly price above.`
+                : "Starts on the 1st — a full month, no pro rata."}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
 
 interface LineItem {
   itemType: InvoiceItemType;
   product: string;
   tariff: string;
+  onceOff: string;
+  recurring: string;
+  // Pro rata (7 Oct 2026): bill this monthly line only from `proFrom` to
+  // month end. unit_price stays the MONTHLY price as picked/typed; the
+  // pro-rata price is worked out when the document is created.
+  proRata: boolean;
+  proFrom: string;
   description: string;
   quantity: string;
   unit_price: string;
@@ -121,6 +498,10 @@ const BLANK_LINE_ITEM: LineItem = {
   itemType: "custom",
   product: "",
   tariff: "",
+  onceOff: "",
+  recurring: "",
+  proRata: false,
+  proFrom: "",
   description: "",
   quantity: "1",
   unit_price: "",
@@ -135,18 +516,11 @@ const BLANK_LINE_ITEM: LineItem = {
 // "show me exactly the cancelled ones". All three compose.
 type DocTypeMode = "" | "quote" | "proforma" | "invoice";
 
-const DOC_TYPE_TABS: { mode: DocTypeMode; label: string }[] = [
-  { mode: "", label: "All documents" },
-  { mode: "quote", label: "Quotes" },
-  { mode: "proforma", label: "Pro formas" },
-  { mode: "invoice", label: "Invoices" },
-];
-
 const DOC_TYPE_NOUN: Record<DocTypeMode, string> = {
   "": "quotes, pro formas, and invoices",
   quote: "quotes only",
   proforma: "pro formas only",
-  invoice: "invoices only — quotes and pro formas excluded",
+  invoice: "invoices only",
 };
 
 type DateFilterMode = "all" | "30" | "60" | "90" | "custom";
@@ -263,7 +637,13 @@ function PendingInvoiceDeletionRequestsPanel() {
   );
 }
 
-function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+function InvoicesTab({
+  onRegisterNewAction,
+  docType,
+}: {
+  onRegisterNewAction: (action: NewAction) => void;
+  docType: DocTypeMode;
+}) {
   const { user } = useAuth();
   const canDecideDeletion = user?.role === "admin" || user?.role === "management";
   const [ordering, setOrdering] = useState("-date_created");
@@ -272,12 +652,6 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [customTo, setCustomTo] = useState("");
   const [searchParams] = useSearchParams();
   const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") ?? "");
-  const [docType, setDocType] = useState<DocTypeMode>(() => {
-    const wanted = searchParams.get("doc");
-    return (["quote", "proforma", "invoice"] as DocTypeMode[]).includes(wanted as DocTypeMode)
-      ? (wanted as DocTypeMode)
-      : "";
-  });
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("invoices", ["number"]);
 
   // Quotes and pro formas can never be "overdue" -- nothing is owed on them
@@ -292,11 +666,58 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
     if (customTo) dateParams += `&date_created_to=${customTo}`;
   }
 
+  // Paginated. This was a flat page_size=100 with no pager anywhere,
+  // beside a header printing the true `count` -- so filtering to "0-90
+  // days overdue" showed "340 documents" above a table of 100 rows and
+  // the other 240 overdue invoices were unreachable from the UI.
+  // Collections was working a truncated list with nothing to say so.
+  const [page, setPage] = useState(1);
+  const listQuery = `${dateParams}${statusFilter ? `&status=${statusFilter}` : ""}${
+    docType ? `&document_type=${docType}` : ""
+  }`;
+  // Any filter or sort change goes back to page one; staying on page 7 of
+  // a result set that now has two pages shows an empty table.
+  useEffect(() => {
+    setPage(1);
+  }, [listQuery, ordering]);
   const { items, count, loading, refetch } = useApiList<Invoice>(
-    `/invoices/?page_size=100&ordering=${ordering}${dateParams}${
-      statusFilter ? `&status=${statusFilter}` : ""
-    }${docType ? `&document_type=${docType}` : ""}`
+    `/invoices/?page_size=${PAGE_SIZE}&page=${page}&ordering=${ordering}${listQuery}`
   );
+
+  // Export what the FILTERS are showing, not the page you can see.
+  //
+  // Reuses `listQuery` verbatim -- the same string the table above is
+  // built from -- so the file and the screen cannot drift apart. It
+  // deliberately does NOT send page/page_size: the whole point is the
+  // other pages. The server re-runs the same filter_queryset and streams
+  // the result (billing.views.InvoiceViewSet.export_csv).
+  //
+  // Fetched through axios rather than a plain link because the endpoint
+  // needs the bearer token, and an <a href> carries no Authorization
+  // header -- it would download a 401 as a file called invoices.csv.
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+
+  async function exportInvoicesCsv() {
+    setExporting(true);
+    setExportError("");
+    try {
+      const res = await api.get(`/invoices/export-csv/?ordering=${ordering}${listQuery}`, {
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(new Blob([res.data], { type: "text/csv" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `invoices_${new Date().toISOString().slice(0, 10)}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(apiErrorMessage(err, "Couldn't export those documents."));
+    } finally {
+      setExporting(false);
+    }
+  }
+  const [createError, setCreateError] = useState("");
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   function toggleSort(field: string) {
@@ -311,15 +732,25 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [modalKind, setModalKind] = useState<"quote" | "invoice">("quote");
   const [saving, setSaving] = useState(false);
   const [customer, setCustomer] = useState("");
-  const [dateDue, setDateDue] = useState(new Date().toISOString().slice(0, 10));
+  // The form opens as a quote by default (modalKind above), so start on
+  // the quote default; each "+ New ..." button resets it on open.
+  const [dateDue, setDateDue] = useState(() => defaultQuoteValidUntil());
   const [lineItems, setLineItems] = useState<LineItem[]>([{ ...BLANK_LINE_ITEM }]);
+  const [clientComment, setClientComment] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
   const [tariffs, setTariffs] = useState<Tariff[]>([]);
+  const [onceOffItems, setOnceOffItems] = useState<OnceOffItem[]>([]);
+  // Configs -> Tariffs -> Recurring Charges (IP rental, domain rental...).
+  const [recurringCharges, setRecurringCharges] = useState<RecurringCharge[]>([]);
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
     api.get<{ results: Product[] }>("/products/?page_size=200&ordering=name").then((res) => setProducts(res.data.results));
     api.get<{ results: Tariff[] }>("/tariffs/?page_size=200&ordering=name&is_active=true").then((res) => setTariffs(res.data.results));
+    api.get<{ results: OnceOffItem[] }>("/once-off-items/?page_size=200&is_active=true").then((res) => setOnceOffItems(res.data.results));
+    api
+      .get<{ results: RecurringCharge[] }>("/recurring-charges/?page_size=200&is_active=true&ordering=name")
+      .then((res) => setRecurringCharges(res.data.results));
   }, []);
 
   useEffect(() => {
@@ -329,6 +760,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
         variant: "secondary",
         onClick: () => {
           setModalKind("quote");
+          setDateDue(defaultQuoteValidUntil());
           setShowModal(true);
         },
       },
@@ -336,6 +768,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
         label: "+ New invoice",
         onClick: () => {
           setModalKind("invoice");
+          setDateDue(defaultInvoiceDueDate());
           setShowModal(true);
         },
       },
@@ -353,6 +786,10 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       itemType,
       product: "",
       tariff: "",
+      onceOff: "",
+      recurring: "",
+      proRata: false,
+      proFrom: "",
       description: "",
       unit_price: "",
       tax_rate_pct: "15",
@@ -379,6 +816,26 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
     });
   }
 
+  function selectOnceOff(idx: number, itemId: string) {
+    const o = onceOffItems.find((x) => String(x.id) === itemId);
+    updateItem(idx, {
+      onceOff: itemId,
+      description: o ? o.name : "",
+      unit_price: o ? o.price : "",
+      tax_rate_pct: o ? o.tax_rate_pct : "15",
+    });
+  }
+
+  function selectRecurring(idx: number, chargeId: string) {
+    const r = recurringCharges.find((x) => String(x.id) === chargeId);
+    updateItem(idx, {
+      recurring: chargeId,
+      description: r ? r.name : "",
+      unit_price: r ? r.price : "",
+      tax_rate_pct: r ? r.tax_rate_pct : "15",
+    });
+  }
+
   function selectTariff(idx: number, tariffId: string) {
     const t = tariffs.find((tr) => String(tr.id) === tariffId);
     updateItem(idx, {
@@ -392,26 +849,49 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setSaving(true);
+    setCreateError("");
     try {
       await api.post("/invoices/", {
         customer,
         date_due: dateDue,
+        note: clientComment.trim(),
         status: modalKind === "quote" ? "quote" : "unpaid",
-        items: lineItems.map((it) => ({
+        items: lineItems.map((it) => {
+          const pr = it.proRata && PRO_RATA_TYPES.includes(it.itemType)
+            ? proRata(it.proFrom, parseFloat(it.unit_price) || 0)
+            : null;
+          return {
           item_type: it.itemType,
           product: it.itemType === "product" ? Number(it.product) : undefined,
           tariff: it.itemType === "tariff" ? Number(it.tariff) : undefined,
-          description: it.description,
+          once_off_item: it.itemType === "once_off_item" ? Number(it.onceOff) : undefined,
+          recurring_charge: it.itemType === "recurring_charge" ? Number(it.recurring) : undefined,
+          description: pr
+            ? `${it.description} — pro rata ${dmy(pr.from)} to ${dmy(pr.to)} (${pr.days} of ${pr.monthDays} days)`.slice(0, 255)
+            : it.description,
           quantity: it.quantity,
-          unit_price: it.unit_price,
+          unit_price: pr ? pr.amount.toFixed(2) : it.unit_price,
+          // Pro rata (16 Oct 2026): keep the full monthly price too, so the
+          // quote's "Monthly thereafter" is the real monthly figure, and a
+          // pro-rata custom line counts as monthly, not once-off.
+          monthly_price: pr ? it.unit_price : undefined,
+          billing_kind: pr && it.itemType === "custom" ? "recurring" : undefined,
           tax_rate_pct: it.tax_rate_pct,
-          period_start: it.itemType === "tariff" ? it.period_start : undefined,
-          period_end: it.itemType === "tariff" ? it.period_end : undefined,
-        })),
+          period_start: it.itemType === "tariff" ? (pr ? pr.from : it.period_start) : undefined,
+          period_end: it.itemType === "tariff" ? (pr ? pr.to : it.period_end) : undefined,
+          };
+        }),
       });
       setShowModal(false);
       setLineItems([{ ...BLANK_LINE_ITEM }]);
+      setClientComment("");
       refetch();
+    } catch (err) {
+      // Reachable without trying anything unusual: the Qty field is
+      // neither required nor min-constrained, so clearing it 400s on
+      // items[].quantity -- and clicking "Create invoice" then did
+      // nothing at all, forever, with no message and the modal still open.
+      setCreateError(apiErrorMessage(err, "Could not create this document."));
     } finally {
       setSaving(false);
     }
@@ -424,39 +904,6 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
         {count} document{count === 1 ? "" : "s"} matching current filter ({DOC_TYPE_NOUN[docType]})
       </p>
-
-      {/* Document type first, on its own row: it's the question people ask
-          most ("show me the quotes"), and it was previously buried in a
-          status dropdown below the overdue buttons. */}
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        {DOC_TYPE_TABS.map((tab) => (
-          <button
-            key={tab.mode || "all"}
-            type="button"
-            onClick={() => {
-              setDocType(tab.mode);
-              // An overdue preset would guarantee an empty list for a quote
-              // or pro forma, so drop back to All when switching to one.
-              if ((tab.mode === "quote" || tab.mode === "proforma") &&
-                  ["30", "60", "90"].includes(dateFilterMode)) {
-                setDateFilterMode("all");
-              }
-              // An exact-status filter left over from a previous look would
-              // fight this one -- status=paid with Quotes selected returns
-              // nothing, and it isn't obvious why. Clearing it keeps the
-              // buttons honest; the dropdown is still there to narrow again.
-              setStatusFilter("");
-            }}
-            className={
-              docType === tab.mode
-                ? "rounded-md bg-[var(--series-1)] px-3 py-1.5 text-sm font-medium text-white"
-                : "rounded-md border border-[var(--baseline)] px-3 py-1.5 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--tint-hover)]"
-            }
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         {DATE_FILTER_TABS.filter(
@@ -494,10 +941,23 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
             Clear status
           </button>
         )}
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          {/* Count in the label so it is obvious this is the whole filtered
+              set and not the page on screen. */}
+          <button
+            type="button"
+            className={btnSecondary}
+            disabled={exporting || count === 0}
+            onClick={exportInvoicesCsv}
+            title="Downloads every document matching the filters above — all pages — with amounts excluding VAT, the VAT, and the inclusive total."
+          >
+            {exporting ? "Exporting…" : `Export CSV${count ? ` (${count})` : ""}`}
+          </button>
           <ColumnToggle columns={INVOICE_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["number"]} />
         </div>
       </div>
+
+      {exportError && <p className="mb-3 text-sm text-[var(--status-critical)]">{exportError}</p>}
 
       {dateFilterMode === "custom" && (
         <div className="mb-4 flex flex-wrap items-end gap-3">
@@ -535,6 +995,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
+        <>
         <Table>
           <THead>
             <tr>
@@ -544,6 +1005,8 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               {isVisible("total") && <SortableTH field="total" ordering={ordering} onSort={toggleSort}>Total</SortableTH>}
               {isVisible("paid") && <SortableTH field="paid_amount" ordering={ordering} onSort={toggleSort}>Paid</SortableTH>}
               {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
+              {/* Send / Resend by email (7 Oct 2026). */}
+              {isVisible("sent") && <TH>Sent</TH>}
             </tr>
           </THead>
           <tbody>
@@ -555,10 +1018,18 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                   </Link>
                 </TD>
                 {isVisible("customer") && <TD>{inv.customer_name}</TD>}
-                {isVisible("due_date") && <TD>{inv.date_due}</TD>}
+                {isVisible("due_date") && <TD>{formatIsoDate(inv.date_due)}</TD>}
                 {isVisible("total") && <TD className="tabular-nums">R {parseFloat(inv.total).toFixed(2)}</TD>}
                 {isVisible("paid") && <TD className="tabular-nums">R {parseFloat(inv.paid_amount).toFixed(2)}</TD>}
-                {isVisible("status") && <TD><StatusBadge status={inv.status} /></TD>}
+                {isVisible("status") && <TD><InvoiceStatusBadge invoice={inv} /></TD>}
+                {isVisible("sent") && (
+                  <TD className="whitespace-nowrap text-xs">
+                    <span className="mr-3 text-[var(--text-muted)]">
+                      {inv.last_emailed_at ? formatIsoDate(inv.last_emailed_at.slice(0, 10)) : "—"}
+                    </span>
+                    <SendInvoiceButton invoice={inv} onSent={refetch} />
+                  </TD>
+                )}
               </TR>
             ))}
             {/* An empty list should say WHY it's empty. "No documents" while
@@ -577,11 +1048,21 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
             )}
           </tbody>
         </Table>
+        <Pager page={page} pageSize={PAGE_SIZE} count={count} shown={items.length} onPageChange={setPage} label="documents" />
+        </>
       )}
 
       {showModal && (
-        <Modal title={modalKind === "quote" ? "New quote" : "New invoice"} onClose={() => setShowModal(false)}>
+        <Modal
+          title={modalKind === "quote" ? "New quote" : "New invoice"}
+          onClose={() => { setShowModal(false); setCreateError(""); }}
+        >
           <form onSubmit={handleSubmit}>
+            {createError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {createError}
+              </p>
+            )}
             <FormField label="Customer">
 <SearchableSelect
                 options={customers.map((c) => ({
@@ -597,7 +1078,10 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 required
               />
             </FormField>
-            <FormField label={modalKind === "quote" ? "Valid until" : "Due date"}>
+            <FormField
+              label={modalKind === "quote" ? "Valid until" : "Due date"}
+              hint={modalKind === "quote" ? `Defaults to ${QUOTE_VALID_DAYS} days from today.` : undefined}
+            >
               <input type="date" className={inputClass} required value={dateDue} onChange={(e) => setDateDue(e.target.value)} />
             </FormField>
 
@@ -606,19 +1090,23 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 recurring plan and the hardware it needs together -- which is
                 what a real installation quote looks like. */}
             <p className="mb-2 text-xs text-[var(--text-muted)]">
-              Mix freely: a <strong>Tariff plan</strong> line for the recurring subscription, <strong>Stock item</strong>
+              Mix freely: a <strong>Tariff plan</strong> line for the recurring subscription, <strong>Recurring charge</strong>
+              {" "}lines for IP rental and the like (Configs → Tariffs → Recurring Charges), <strong>Once-off item</strong>
+              {" "}lines for installation and the like (Configs → Tariffs → Once-off Items), <strong>Stock item</strong>
               {" "}lines for the hardware, <strong>Custom</strong> for anything else — all on the same document. Stock
               items price themselves from their resell price (Inventory → Products).
             </p>
             {lineItems.map((item, idx) => (
               <div key={idx} className="mb-3 rounded-md border border-[var(--border-hairline)] p-3">
-                <div className="mb-2 grid grid-cols-[130px_1fr] gap-2">
+                <div className="mb-2 grid grid-cols-[150px_1fr] gap-2">
                   <select
                     className={inputClass}
                     value={item.itemType}
                     onChange={(e) => setItemType(idx, e.target.value as InvoiceItemType)}
                   >
                     <option value="custom">Custom</option>
+                    <option value="once_off_item">Once-off item</option>
+                    <option value="recurring_charge">Recurring charge</option>
                     <option value="product">Stock item</option>
                     <option value="tariff">Tariff plan</option>
                   </select>
@@ -637,6 +1125,36 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                           {p.sku ? ` (${p.sku})` : ""}
                           {p.sell_price ? ` — R ${parseFloat(p.sell_price).toFixed(2)}` : " — no resell price set"}
                         </option>
+                      ))}
+                    </select>
+                  ) : item.itemType === "once_off_item" ? (
+                    <select
+                      className={inputClass}
+                      required
+                      value={item.onceOff}
+                      onChange={(e) => selectOnceOff(idx, e.target.value)}
+                    >
+                      <option value="">
+                        {onceOffItems.length ? "Select once-off item…" : "No once-off items yet — add them under Configs → Tariffs"}
+                      </option>
+                      {onceOffItems.map((o) => (
+                        <option key={o.id} value={o.id}>{o.name} — R {parseFloat(o.price).toFixed(2)}</option>
+                      ))}
+                    </select>
+                  ) : item.itemType === "recurring_charge" ? (
+                    <select
+                      className={inputClass}
+                      required
+                      value={item.recurring}
+                      onChange={(e) => selectRecurring(idx, e.target.value)}
+                    >
+                      <option value="">
+                        {recurringCharges.length
+                          ? "Select recurring charge…"
+                          : "No recurring charges yet — add them under Configs → Tariffs"}
+                      </option>
+                      {recurringCharges.map((r) => (
+                        <option key={r.id} value={r.id}>{r.name} — R {parseFloat(r.price).toFixed(2)}/month</option>
                       ))}
                     </select>
                   ) : item.itemType === "tariff" ? (
@@ -682,7 +1200,7 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                   />
                   <input
                     className={inputClass}
-                    placeholder="Price"
+                    placeholder={item.proRata ? "Monthly price" : "Price"}
                     type="number"
                     step="0.01"
                     required
@@ -691,7 +1209,11 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                   />
                 </div>
 
-                {item.itemType === "tariff" && (
+                {PRO_RATA_TYPES.includes(item.itemType) && (
+                  <ProRataField item={item} onChange={(patch) => updateItem(idx, patch)} />
+                )}
+
+                {item.itemType === "tariff" && !(item.proRata && proRata(item.proFrom, 1)) && (
                   <div className="mt-2 grid grid-cols-2 gap-2">
                     <FormField label="From">
                       <input
@@ -723,6 +1245,20 @@ function InvoicesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               + Add line item
             </button>
 
+            {/* Comments for the client (George, 14 Oct 2026) -- printed on the
+                quote/invoice PDF under "Comments", and carried over when a
+                quote is converted. */}
+            <FormField label="Comments for the client (optional — shown on the document)">
+              <textarea
+                className={inputClass}
+                rows={3}
+                maxLength={2000}
+                placeholder="e.g. Installation within 5 working days of acceptance. Price valid for 7 days."
+                value={clientComment}
+                onChange={(e) => setClientComment(e.target.value)}
+              />
+            </FormField>
+
             <div className="mt-4 flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>
               <button type="submit" disabled={saving} className={btnPrimary}>
@@ -747,13 +1283,20 @@ const PAYMENT_COLUMNS: ColumnDef[] = [
   { key: "amount", label: "Amount" },
   { key: "method", label: "Method" },
   { key: "received_by", label: "Received by" },
+  { key: "allocated", label: "Allocated" },
 ];
 
 function PaymentsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const [ordering, setOrdering] = useState("-date");
   const [methodFilter, setMethodFilter] = useState("");
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("payments", ["date"]);
-  const { items, count, loading } = useApiList<Payment>(
+  const [allocating, setAllocating] = useState<Payment | null>(null);
+  const [reversing, setReversing] = useState<Payment | null>(null);
+  const { user } = useAuth();
+  // Mirrors the backend gate (IsAccountsOrManagement) -- hiding the button
+  // is cosmetic, the API refuses everyone else regardless.
+  const canReverse = user?.role === "admin" || user?.role === "accounts" || user?.role === "management";
+  const { items, count, loading, refetch } = useApiList<Payment>(
     `/payments/?page_size=100&ordering=${ordering}${methodFilter ? `&method=${methodFilter}` : ""}`
   );
 
@@ -801,21 +1344,78 @@ function PaymentsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               {isVisible("amount") && <SortableTH field="amount" ordering={ordering} onSort={toggleSort}>Amount</SortableTH>}
               {isVisible("method") && <SortableTH field="method" ordering={ordering} onSort={toggleSort}>Method</SortableTH>}
               {isVisible("received_by") && <SortableTH field="received_by__username" ordering={ordering} onSort={toggleSort}>Received by</SortableTH>}
+              {isVisible("allocated") && <TH>Allocated</TH>}
+              <TH>&nbsp;</TH>
             </tr>
           </THead>
           <tbody>
             {items.map((p) => (
               <TR key={p.id}>
-                <TD>{new Date(p.date).toLocaleString()}</TD>
+                <TD>{formatIsoDateTime(p.date)}</TD>
                 {isVisible("customer") && <TD>{p.customer_name}</TD>}
                 {isVisible("invoice") && <TD>{p.invoice ?? "—"}</TD>}
                 {isVisible("amount") && <TD className="tabular-nums">R {parseFloat(p.amount).toFixed(2)}</TD>}
                 {isVisible("method") && <TD className="capitalize">{p.method.replace("_", " ")}</TD>}
                 {isVisible("received_by") && <TD>{p.received_by_name ?? "—"}</TD>}
+                {isVisible("allocated") && (
+                  <TD className="tabular-nums">
+                    {p.invoice ? (
+                      /* Credited to that invoice directly, with no allocation
+                         row -- see PaymentSerializer. Showing R 0.00 here
+                         would read as unallocated money, which it is not. */
+                      <span className="text-[var(--text-muted)]">on invoice</span>
+                    ) : (
+                      <>
+                        R {parseFloat(p.allocated_amount ?? "0").toFixed(2)}
+                        {parseFloat(p.unallocated_amount ?? "0") > 0 && (
+                          <span className="ml-1 text-xs text-[var(--text-muted)]">
+                            (R {parseFloat(p.unallocated_amount ?? "0").toFixed(2)} credit)
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </TD>
+                )}
+                <TD>
+                  <div className="flex flex-wrap gap-2">
+                    {!p.invoice && (
+                      <button type="button" className={btnSecondary} onClick={() => setAllocating(p)}>
+                        Allocate
+                      </button>
+                    )}
+                    {canReverse && (
+                      <button type="button" className={btnSecondary} onClick={() => setReversing(p)}>
+                        Reverse
+                      </button>
+                    )}
+                  </div>
+                </TD>
               </TR>
             ))}
           </tbody>
         </Table>
+      )}
+
+      {allocating && (
+        <PaymentAllocationsModal
+          paymentId={allocating.id}
+          customerId={allocating.customer}
+          paymentAmount={allocating.amount}
+          onClose={() => setAllocating(null)}
+          onSaved={refetch}
+        />
+      )}
+
+      {reversing && (
+        <ReversePaymentModal
+          paymentId={reversing.id}
+          customerName={reversing.customer_name}
+          amount={reversing.amount}
+          date={formatIsoDateTime(reversing.date)}
+          onInvoice={reversing.invoice ? String(reversing.invoice) : null}
+          onClose={() => setReversing(null)}
+          onReversed={refetch}
+        />
       )}
     </div>
   );
@@ -827,7 +1427,7 @@ function PaymentsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
 // convention that Admin overrides every senior-role gate).
 // ---------------------------------------------------------------------------
 
-const EMPTY_CREDIT = { customer: "", amount: "", reason: "" };
+const EMPTY_CREDIT = { customer: "", amount: "", reason: "", invoice: "" };
 
 function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const { user } = useAuth();
@@ -849,11 +1449,38 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState<number | null>(null);
   const [rejecting, setRejecting] = useState<CreditRequest | null>(null);
+  // Approved credit being re-allocated to specific invoices.
+  const [allocatingCredit, setAllocatingCredit] = useState<CreditRequest | null>(null);
   const [decisionNote, setDecisionNote] = useState("");
+  // This customer's invoices that still have money outstanding, for the
+  // optional "Apply to invoice" picker below -- see CreditRequest.invoice.
+  // Re-fetched whenever the selected customer changes; empty (and the
+  // picker hidden) until one is picked.
+  const [customerInvoices, setCustomerInvoices] = useState<Invoice[]>([]);
 
   useEffect(() => {
-    api.get<{ results: Customer[] }>("/customers/?page_size=1000&ordering=full_name").then((res) => setCustomers(res.data.results));
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
   }, []);
+
+  useEffect(() => {
+    if (!form.customer) {
+      setCustomerInvoices([]);
+      return;
+    }
+    // Unpaid/overdue with something still outstanding -- the same set
+    // CreditRequestSerializer.validate will actually accept (a draft
+    // isn't issued, a cancelled invoice isn't owed, a paid one has
+    // nothing left to credit).
+    api
+      .get<{ results: Invoice[] }>(`/invoices/?customer=${form.customer}&page_size=200&ordering=date_due`)
+      .then((res) =>
+        setCustomerInvoices(
+          res.data.results.filter(
+            (inv) => (inv.status === "unpaid" || inv.status === "overdue") && parseFloat(inv.balance_due) > 0
+          )
+        )
+      );
+  }, [form.customer]);
 
   useEffect(() => {
     if (!canSubmit) {
@@ -883,6 +1510,7 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
         customer: Number(form.customer),
         amount: form.amount,
         reason: form.reason,
+        invoice: form.invoice ? Number(form.invoice) : null,
       });
       setShowModal(false);
       refetch();
@@ -929,6 +1557,8 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       setRejecting(null);
       setDecisionNote("");
       refetch();
+    } catch (err) {
+      setError(apiErrorMessage(err, "Could not reject this credit request."));
     } finally {
       setBusyId(null);
     }
@@ -981,6 +1611,8 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
               <TH>Amount</TH>
               <TH>Reason</TH>
               <TH>Status</TH>
+              <TH>Credit note</TH>
+              <TH>Applied to</TH>
               <TH>Requested by</TH>
               <TH>Decided by</TH>
               <TH></TH>
@@ -996,6 +1628,35 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                   <StatusBadge status={c.status} />
                   {c.status === "rejected" && c.decision_note && (
                     <div className="mt-1 text-xs text-[var(--text-muted)]">{c.decision_note}</div>
+                  )}
+                </TD>
+                <TD>
+                  {c.credit_note && c.credit_note_number ? (
+                    <Link to={`/admin/finance/invoices/${c.credit_note}`} className="text-[var(--series-1)] hover:underline">
+                      {c.credit_note_number}
+                    </Link>
+                  ) : (
+                    "—"
+                  )}
+                </TD>
+                <TD>
+                  {/* What it actually settles (allocations), falling back to
+                      the invoice it was raised against for older credits. */}
+                  {(c.allocations_detail ?? []).length > 0 ? (
+                    (c.allocations_detail ?? []).map((a) => (
+                      <span key={a.invoice} className="block">
+                        <Link to={`/admin/finance/invoices/${a.invoice}`} className="text-[var(--series-1)] hover:underline">
+                          {a.invoice_number}
+                        </Link>
+                        <span className="text-xs text-[var(--text-muted)]"> R{Number(a.amount).toFixed(2)}</span>
+                      </span>
+                    ))
+                  ) : c.invoice && c.invoice_number ? (
+                    <Link to={`/admin/finance/invoices/${c.invoice}`} className="text-[var(--series-1)] hover:underline">
+                      {c.invoice_number}
+                    </Link>
+                  ) : (
+                    "—"
                   )}
                 </TD>
                 <TD>{c.requested_by_name || "—"}</TD>
@@ -1030,6 +1691,14 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                       Withdraw
                     </button>
                   )}
+                  {c.status === "approved" && c.allocation_tracked && (canSubmit || canDecide) && (
+                    <button
+                      className="text-xs text-[var(--series-1)] hover:underline"
+                      onClick={() => setAllocatingCredit(c)}
+                    >
+                      Allocate
+                    </button>
+                  )}
                 </TD>
               </TR>
             ))}
@@ -1054,11 +1723,30 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                   searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
                 }))}
                 value={form.customer}
-                onChange={(v) => setForm({ ...form, customer: v })}
+                onChange={(v) => setForm({ ...form, customer: v, invoice: "" })}
                 placeholder="Select customer…"
                 hint="Search by name or payment reference."
                 required
               />
+            </FormField>
+            <FormField label="Apply to invoice (optional)">
+              <select
+                className={filterSelectClass}
+                value={form.invoice}
+                disabled={!form.customer}
+                onChange={(e) => setForm({ ...form, invoice: e.target.value })}
+              >
+                <option value="">General credit (not linked to an invoice)</option>
+                {customerInvoices.map((inv) => (
+                  <option key={inv.id} value={inv.id}>
+                    {inv.number} — R {parseFloat(inv.balance_due).toFixed(2)} outstanding
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-[var(--text-muted)]">
+                Picking an invoice settles that invoice itself (fully or partially) once this is
+                approved, not just the customer's balance -- so it stops reading as still owed.
+              </p>
             </FormField>
             <FormField label="Amount (R)">
               <input
@@ -1093,6 +1781,16 @@ function CreditsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
         </Modal>
       )}
 
+      {allocatingCredit && (
+        <PaymentAllocationsModal
+          kind="credit"
+          paymentId={allocatingCredit.id}
+          customerId={allocatingCredit.customer}
+          paymentAmount={allocatingCredit.amount}
+          onClose={() => setAllocatingCredit(null)}
+          onSaved={refetch}
+        />
+      )}
       {rejecting && (
         <Modal title="Reject credit request" onClose={() => setRejecting(null)}>
           <form onSubmit={handleReject}>
@@ -1146,6 +1844,40 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
   const [previewing, setPreviewing] = useState(false);
   const [previewError, setPreviewError] = useState("");
 
+  // The saved Preview that would authorise a Run. The gate is enforced
+  // server-side in billing/views.py's run action -- this is only the half
+  // that stops the button being pressed in the first place.
+  type PreviewSnapshot = {
+    id: number;
+    run_date: string;
+    partner_ids: number[];
+    fingerprint: string;
+    counts: RecurringBillingCounts;
+    grand_total: string;
+    created_at: string;
+    generated_by_name: string | null;
+    approved_at: string | null;
+    approved_by_name: string | null;
+    is_approved: boolean;
+    is_spent: boolean;
+    download_url: string;
+  };
+  const [snapshot, setSnapshot] = useState<PreviewSnapshot | null>(null);
+  const [pendingPreviews, setPendingPreviews] = useState<PreviewSnapshot[]>([]);
+  const [approving, setApproving] = useState(false);
+  // Which snapshot+format is currently being fetched, as `${id}:${output}` --
+  // lets each of the three export buttons on a row show its own "…" without
+  // a separate boolean per format, while all three still disable together.
+  const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
+  const [mismatch, setMismatch] = useState("");
+  // Which preview is one click away from being deleted. Delete is
+  // irreversible and sits beside Approve, so it asks first rather than
+  // acting on the click that might have been aimed at the button next to
+  // it. Holding an id (not a boolean) means only the row being confirmed
+  // changes -- the rest of the queue keeps its normal buttons.
+  const [confirmingDelete, setConfirmingDelete] = useState<number | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState("");
   const [confirmingRun, setConfirmingRun] = useState(false);
@@ -1172,11 +1904,22 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
     setPreviewError("");
     setPreviewCounts(null);
     try {
-      const res = await api.post<{ counts: RecurringBillingCounts }>("/recurring-billing/preview/", {
+      const res = await api.post<{
+        counts: RecurringBillingCounts;
+        snapshot: PreviewSnapshot;
+        mismatch?: { engine: RecurringBillingCounts; preview: RecurringBillingCounts };
+      }>("/recurring-billing/preview/", {
         date: runDate,
         partners: partnerPayload(),
       });
       setPreviewCounts(res.data.counts);
+      setSnapshot(res.data.snapshot);
+      setMismatch(
+        res.data.mismatch
+          ? "The projection and the engine disagree about this run — do not approve it, and report it."
+          : "",
+      );
+      refetchPendingPreviews();
     } catch (err) {
       const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
       setPreviewError(detail || "Could not generate a preview for this date.");
@@ -1185,14 +1928,192 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
     }
   }
 
+  async function refetchPendingPreviews() {
+    try {
+      const res = await api.get<PreviewSnapshot[]>("/recurring-billing/previews/", {
+        params: { pending: 1 },
+      });
+      setPendingPreviews(res.data);
+    } catch {
+      setPendingPreviews([]);
+    }
+  }
+
+  // Arming Run has to survive a reload and a hand-off between two people.
+  //
+  // `snapshot` -- the only thing that ungreys Run -- used to be set solely
+  // by the Preview call in THIS browser tab. So the reviewer who opens the
+  // approval queue, approves a preview somebody else generated and then
+  // goes to run it found the button still disabled, with nothing on screen
+  // saying why; the same happened to whoever reloaded the page after
+  // approving. That is exactly the hand-off the queue exists for, so the
+  // approval has to be readable from the server, not only from memory.
+  //
+  // The server re-checks the fingerprint on Run regardless, so adopting a
+  // snapshot here can only ever arm a button, never authorise a run.
+  async function refetchArmedPreview() {
+    try {
+      const res = await api.get<PreviewSnapshot[]>("/recurring-billing/previews/", {
+        params: { date: runDate },
+      });
+      const wanted = [...partnerPayload()].sort((a, b) => a - b).join(",");
+      const match = res.data.find(
+        (p) =>
+          p.is_approved &&
+          !p.is_spent &&
+          [...p.partner_ids].sort((a, b) => a - b).join(",") === wanted,
+      );
+      setSnapshot((current) => {
+        if (match && (!current || !current.is_approved || current.run_date !== runDate)) {
+          return match;
+        }
+        // A snapshot left over from a date the operator has since changed
+        // would sit there looking ready while the server refuses it. Drop
+        // it rather than show Run as armed for numbers it will reject.
+        if (!match && current && current.run_date !== runDate) return null;
+        return current;
+      });
+    } catch {
+      // Leave whatever this tab already has -- a failed lookup is not
+      // evidence that an approval went away.
+    }
+  }
+
+  // Approving from the queue arms the form for THAT preview: its date and
+  // its partner scope, not whatever the boxes happened to be left on. The
+  // alternative is approving one thing and running another, which the
+  // server refuses anyway -- as a 409 the operator then has to decode.
+  function adoptPreview(target: PreviewSnapshot) {
+    setRunDate(target.run_date);
+    if (target.partner_ids.length) {
+      setPartnersRestricted(true);
+      setCheckedPartners(new Set(target.partner_ids));
+    } else {
+      setPartnersRestricted(false);
+      setCheckedPartners(new Set());
+    }
+    setSnapshot(target);
+    setPreviewCounts(target.counts);
+  }
+
+  const scopeKey = partnersRestricted
+    ? Array.from(checkedPartners).sort((a, b) => a - b).join(",")
+    : "";
+
+  useEffect(() => {
+    refetchPendingPreviews();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    refetchArmedPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runDate, scopeKey]);
+
+  // The export endpoint is authenticated, so it cannot be a plain <a href>:
+  // the JWT lives in localStorage and only axios attaches it. Fetch the
+  // reviewed bundle as a blob and hand the browser an object URL instead.
+  // (The query param is ?output=, not ?format= -- see billing/views.py's
+  // export action docstring for why ?format= would 404 against DRF's own
+  // content negotiation.) HTML opens inline in a new tab, matching the
+  // backend's Content-Disposition: inline for that format; zip and xlsx
+  // download as files.
+  async function handleExportPreview(target: PreviewSnapshot, output: "zip" | "html" | "xlsx") {
+    const key = `${target.id}:${output}`;
+    setDownloadingKey(key);
+    setPreviewError("");
+    try {
+      const res = await api.get(`/recurring-billing/${target.id}/export/`, {
+        params: { output },
+        responseType: "blob",
+      });
+      const blobUrl = URL.createObjectURL(res.data as Blob);
+      if (output === "html") {
+        window.open(blobUrl, "_blank");
+        // Not revoked immediately -- the new tab still needs to load it.
+        // The browser reclaims it once that tab is closed or navigated away.
+      } else {
+        const link = document.createElement("a");
+        link.href = blobUrl;
+        link.download = `finance_${target.run_date.replace(/-/g, "")}${target.fingerprint}.${output}`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(blobUrl);
+      }
+    } catch {
+      setPreviewError(
+        output === "html"
+          ? "Could not open the preview as HTML."
+          : output === "xlsx"
+            ? "Could not download the preview as Excel."
+            : "Could not download the preview bundle.",
+      );
+    } finally {
+      setDownloadingKey(null);
+    }
+  }
+
+  async function handleApprovePreview(target: PreviewSnapshot) {
+    setApproving(true);
+    setRunError("");
+    try {
+      const res = await api.post<PreviewSnapshot>(`/recurring-billing/${target.id}/approve/`);
+      adoptPreview(res.data);
+      refetchPendingPreviews();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setRunError(detail || "Could not approve this preview.");
+    } finally {
+      setApproving(false);
+    }
+  }
+
+  async function handleDeletePreview(target: PreviewSnapshot) {
+    setDeleting(true);
+    setPreviewError("");
+    try {
+      await api.delete(`/recurring-billing/${target.id}/`);
+      // If the one just deleted is the preview this tab generated, drop it
+      // from the panel above too -- otherwise Run would still look armed
+      // against a snapshot the server no longer has.
+      if (snapshot && snapshot.id === target.id) {
+        setSnapshot(null);
+        setPreviewCounts(null);
+        setConfirmingRun(false);
+      }
+      setConfirmingDelete(null);
+      refetchPendingPreviews();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      // The 409s are the interesting ones: somebody approved it between
+      // this list loading and the click. Show what the server said rather
+      // than a generic failure, because the answer is "reload and look".
+      setPreviewError(detail || "Could not delete this preview.");
+      setConfirmingDelete(null);
+      refetchPendingPreviews();
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  // A date still to come: Run becomes "Issue early" -- invoices only,
+  // dated that date (billing.recurring._run_early).
+  const isEarly = runDate > localIsoDate();
+
   async function handleRun() {
     setRunning(true);
     setRunError("");
     try {
-      await api.post<RecurringBillingRun>("/recurring-billing/run/", { date: runDate, partners: partnerPayload() });
+      await api.post<RecurringBillingRun>(isEarly ? "/recurring-billing/run-early/" : "/recurring-billing/run/", {
+        date: runDate,
+        partners: partnerPayload(),
+      });
       setPreviewCounts(null);
       setConfirmingRun(false);
       refetchRuns();
+      setSnapshot(null);
+      refetchPendingPreviews();
     } catch (err) {
       const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
       setRunError(detail || "Could not run recurring billing for this date.");
@@ -1221,9 +2142,12 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
         </p>
       )}
       <p className="mb-4 max-w-2xl text-sm text-[var(--text-secondary)]">
-        Preview shows what would happen for a given date without writing anything. Run actually creates the
-        invoices/pro formas, sends reminder and billing emails, applies auto-suspensions, and logs a row below —
-        staff trigger each cycle manually for now; nothing runs unattended yet.
+        Preview projects the cycle without writing anything and saves it as a downloadable CSV bundle —
+        one sheet per customer total, one per line item, plus the reminders and suspensions it would apply.
+        Check that bundle, Approve it, and only then can Run create the invoices/pro formas, send the emails
+        and log a row below. Run refuses if nothing is approved for that date, or if a tariff, service or
+        customer changed after approval. The run also happens by itself every day at 15:00 (reminders,
+        warnings and suspensions every day; invoices only on a billing date with an approved preview).
       </p>
 
       <div className="mb-6 max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5">
@@ -1234,9 +2158,83 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
           <button type="button" className={btnSecondary} disabled={previewing} onClick={handlePreview}>
             {previewing ? "Loading…" : "Preview"}
           </button>
+          {snapshot && (
+            <>
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={downloadingKey?.startsWith(`${snapshot.id}:`)}
+                onClick={() => handleExportPreview(snapshot, "zip")}
+              >
+                {downloadingKey === `${snapshot.id}:zip` ? "Preparing…" : "Download CSV zip"}
+              </button>
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={downloadingKey?.startsWith(`${snapshot.id}:`)}
+                onClick={() => handleExportPreview(snapshot, "xlsx")}
+              >
+                {downloadingKey === `${snapshot.id}:xlsx` ? "Preparing…" : "Download Excel"}
+              </button>
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={downloadingKey?.startsWith(`${snapshot.id}:`)}
+                onClick={() => handleExportPreview(snapshot, "html")}
+              >
+                {downloadingKey === `${snapshot.id}:html` ? "Opening…" : "View as HTML"}
+              </button>
+              {!snapshot.is_approved && (
+                <>
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    disabled={approving}
+                    onClick={() => handleApprovePreview(snapshot)}
+                  >
+                    {approving ? "Approving…" : "Approve"}
+                  </button>
+                  {confirmingDelete === snapshot.id ? (
+                    <>
+                      <button
+                        type="button"
+                        className={btnSecondary}
+                        onClick={() => setConfirmingDelete(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className={btnSecondary}
+                        disabled={deleting}
+                        onClick={() => handleDeletePreview(snapshot)}
+                      >
+                        {deleting ? "Deleting…" : "Confirm delete"}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className={btnSecondary}
+                      title="Discard this preview — it has not been approved, so nothing was billed from it."
+                      onClick={() => setConfirmingDelete(snapshot.id)}
+                    >
+                      Delete
+                    </button>
+                  )}
+                </>
+              )}
+            </>
+          )}
           {!confirmingRun ? (
-            <button type="button" className={btnPrimary} onClick={() => setConfirmingRun(true)}>
-              Run…
+            <button
+              type="button"
+              className={btnPrimary}
+              disabled={!snapshot?.is_approved}
+              title={snapshot?.is_approved ? "" : "Preview this date and get the preview approved first"}
+              onClick={() => setConfirmingRun(true)}
+            >
+              {isEarly ? "Issue early…" : "Run…"}
             </button>
           ) : (
             <>
@@ -1244,7 +2242,7 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
                 Cancel
               </button>
               <button type="button" className={btnPrimary} disabled={running} onClick={handleRun}>
-                {running ? "Running…" : "Confirm run"}
+                {running ? "Running…" : isEarly ? `Confirm — issue invoices dated ${formatIsoDate(runDate)}` : "Confirm run"}
               </button>
             </>
           )}
@@ -1274,13 +2272,122 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
 
         {previewError && <p className="mb-2 text-sm text-[var(--status-critical)]">{previewError}</p>}
         {runError && <p className="mb-2 text-sm text-[var(--status-critical)]">{runError}</p>}
+        {isEarly && (
+          <p className="mb-2 max-w-2xl text-sm text-[var(--text-secondary)]">
+            {formatIsoDate(runDate)} is still to come. <strong>Issue early</strong> creates only the invoices,
+            dated {formatIsoDate(runDate)}, emails them and adds them to balances now — like Splynx. Services are
+            billed as they will be on {formatIsoDate(runDate)}: booked plan changes, partner moves, new services
+            starting and services ending by then are billed that way. Reminders, cut-off warnings and suspensions are not
+            run; the daily 15:00 job does those on their own days, counted from the due date. Allowed up to 14
+            days before the date, and only after the preview for that date is approved.
+          </p>
+        )}
 
         {previewCounts && (
           <div className="grid grid-cols-2 gap-3 rounded-md border border-[var(--border-hairline)] bg-[var(--tint-subtle)] p-4 text-sm sm:grid-cols-4">
             <div><p className="text-[var(--text-muted)]">Invoices</p><p className="text-lg font-semibold">{previewCounts.invoices_created}</p></div>
             <div><p className="text-[var(--text-muted)]">Pro formas</p><p className="text-lg font-semibold">{previewCounts.proforma_invoices_created}</p></div>
             <div><p className="text-[var(--text-muted)]">Reminders</p><p className="text-lg font-semibold">{previewCounts.reminders_sent}</p></div>
+            {/* Beside the suspensions, because the pair is the thing to
+                read: how many are being warned versus how many are being
+                cut off in this same run. */}
+            <div><p className="text-[var(--text-muted)]">Suspension warnings</p><p className="text-lg font-semibold">{previewCounts.suspension_warnings_sent}</p></div>
             <div><p className="text-[var(--text-muted)]">Suspensions</p><p className="text-lg font-semibold">{previewCounts.suspensions_applied}</p></div>
+          </div>
+        )}
+
+        {mismatch && <p className="mb-2 text-sm text-[var(--status-critical)]">{mismatch}</p>}
+
+        {snapshot && (
+          <div className="mt-3 rounded-md border border-[var(--border-hairline)] p-3 text-sm">
+            <p>
+              Preview <span className="font-mono">{snapshot.fingerprint}</span> · {formatIsoDate(snapshot.run_date)} ·{" "}
+              {snapshot.partner_ids.length ? `${snapshot.partner_ids.length} partner(s)` : "all partners"} · R
+              {snapshot.grand_total} to invoice
+            </p>
+            <p className="text-[var(--text-muted)]">
+              {snapshot.is_approved
+                ? `Approved by ${snapshot.approved_by_name ?? "—"} — Run is unlocked for these exact numbers.`
+                : "Not approved yet. Download the bundle, check it, then Approve — Run stays locked until then."}
+            </p>
+          </div>
+        )}
+
+        {pendingPreviews.filter((p) => !snapshot || p.id !== snapshot.id).length > 0 && (
+          <div className="mt-3 rounded-md border border-[var(--border-hairline)] p-3 text-sm">
+            <p className="mb-2 font-semibold">Previews awaiting approval</p>
+            {pendingPreviews
+              .filter((p) => !snapshot || p.id !== snapshot.id)
+              .map((p) => (
+                <div key={p.id} className="mb-1 flex flex-wrap items-center gap-2">
+                  <span className="font-mono">{p.fingerprint}</span>
+                  <span>{formatIsoDate(p.run_date)}</span>
+                  <span className="text-[var(--text-muted)]">
+                    R{p.grand_total} · {p.counts.invoices_created} invoices · by {p.generated_by_name ?? "—"}
+                  </span>
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    disabled={downloadingKey?.startsWith(`${p.id}:`)}
+                    onClick={() => handleExportPreview(p, "zip")}
+                  >
+                    {downloadingKey === `${p.id}:zip` ? "Preparing…" : "CSV"}
+                  </button>
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    disabled={downloadingKey?.startsWith(`${p.id}:`)}
+                    onClick={() => handleExportPreview(p, "xlsx")}
+                  >
+                    {downloadingKey === `${p.id}:xlsx` ? "Preparing…" : "Excel"}
+                  </button>
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    disabled={downloadingKey?.startsWith(`${p.id}:`)}
+                    onClick={() => handleExportPreview(p, "html")}
+                  >
+                    {downloadingKey === `${p.id}:html` ? "Opening…" : "HTML"}
+                  </button>
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    disabled={approving}
+                    onClick={() => handleApprovePreview(p)}
+                  >
+                    Approve
+                  </button>
+                  {confirmingDelete === p.id ? (
+                    <>
+                      <span className="text-[var(--text-muted)]">Delete this preview?</span>
+                      <button
+                        type="button"
+                        className={btnSecondary}
+                        onClick={() => setConfirmingDelete(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className={btnSecondary}
+                        disabled={deleting}
+                        onClick={() => handleDeletePreview(p)}
+                      >
+                        {deleting ? "Deleting…" : "Confirm delete"}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className={btnSecondary}
+                      title="Discard this preview — it has not been approved, so nothing was billed from it."
+                      onClick={() => setConfirmingDelete(p.id)}
+                    >
+                      Delete
+                    </button>
+                  )}
+                </div>
+              ))}
           </div>
         )}
       </div>
@@ -1298,6 +2405,7 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
               <TH>Invoices</TH>
               <TH>Pro formas</TH>
               <TH>Reminders</TH>
+              <TH>Warnings</TH>
               <TH>Suspensions</TH>
               <TH>Triggered by</TH>
               <TH>Run at</TH>
@@ -1306,10 +2414,31 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
           <tbody>
             {runs.map((r) => (
               <TR key={r.id}>
-                <TD>{r.run_date}</TD>
+                <TD>{formatIsoDate(r.run_date)}</TD>
                 <TD>{r.partner_names}</TD>
                 <TD>
-                  <StatusBadge status={r.status === "processed" ? "active" : "failed"} />
+                  {/* "in progress" is its own state, not a shade of failed. A run
+                      is created in it and only leaves it when it reaches the end,
+                      so a row still showing it long after the fact is a run that
+                      was interrupted -- and the counts beside it are what it got
+                      through, not what it set out to do. Rendering that as
+                      "failed" would say the opposite of what happened: the work
+                      it counted is real and must not be repeated. */}
+                  <StatusBadge
+                    status={
+                      r.status === "processed"
+                        ? "active"
+                        : r.status === "in_progress"
+                          ? "pending"
+                          : "failed"
+                    }
+                  />
+                  {r.status === "in_progress" && (
+                    <span className="ml-2 text-xs text-[var(--text-muted)]">
+                      Started but never finished — the counts are what it completed.
+                      Check these customers before running this date again.
+                    </span>
+                  )}
                   {r.status === "failed" && r.status_message && (
                     <span className="ml-2 text-xs text-[var(--text-muted)]">{r.status_message}</span>
                   )}
@@ -1317,9 +2446,10 @@ function RecurringBillingTab({ onRegisterNewAction }: { onRegisterNewAction: (ac
                 <TD>{r.invoices_created_count}</TD>
                 <TD>{r.proforma_invoices_created_count}</TD>
                 <TD>{r.reminders_sent_count}</TD>
+                <TD>{r.suspension_warnings_sent_count}</TD>
                 <TD>{r.suspensions_applied_count}</TD>
                 <TD>{r.triggered_by_name ?? "—"}</TD>
-                <TD>{new Date(r.created_at).toLocaleString()}</TD>
+                <TD>{formatIsoDateTime(r.created_at)}</TD>
               </TR>
             ))}
             {runs.length === 0 && <TR><TD className="text-[var(--text-muted)]">No recurring-billing runs logged yet.</TD></TR>}

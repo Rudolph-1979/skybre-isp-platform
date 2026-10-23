@@ -115,3 +115,24 @@ def unmark_customer_deleting(pk):
 
 def customer_is_being_deleted(pk):
     return pk in _deleting_customer_pks.get()
+
+
+# Why something is being deleted, for the "deleted" row its post_delete
+# writes. A field diff can say what was removed but never why, and for a
+# reversed payment the why is the whole point -- "confirmed to the wrong
+# customer" is what the next person reading the History tab needs.
+_delete_detail: ContextVar = ContextVar("audit_delete_detail", default="")
+
+
+@contextmanager
+def deletion_detail(text):
+    """Attach `text` to every "deleted" audit row written inside the block."""
+    token = _delete_detail.set(text or "")
+    try:
+        yield
+    finally:
+        _delete_detail.reset(token)
+
+
+def current_delete_detail():
+    return _delete_detail.get()

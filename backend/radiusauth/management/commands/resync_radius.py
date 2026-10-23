@@ -65,7 +65,14 @@ class Command(BaseCommand):
                 stale += 1
 
             if commit:
-                sync_service_radius(service)
+                # push_to_session=False, deliberately. This command exists to
+                # rewrite rows that have drifted -- which is exactly the case
+                # where the answer changes, so pushing would disconnect every
+                # service it repairs, in one pass, across the whole book. The
+                # same reasoning as allow_disconnect_fallback=False on the
+                # scheduled speed run: the blast radius is everybody and the
+                # thing being delivered can wait for their next reconnect.
+                sync_service_radius(service, push_to_session=False)
                 after = self._rate_limit(service.radius_username)
             else:
                 after = "(dry run)"

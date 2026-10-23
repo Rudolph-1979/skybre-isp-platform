@@ -1,0 +1,352 @@
+from django.utils import timezone
+from rest_framework import serializers
+from .models import Customer, CustomerDeletionRequest, CustomerTask, Partner
+
+
+class PartnerSerializer(serializers.ModelSerializer):
+    customer_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Partner
+        fields = [
+            "id", "name", "contact_person", "email", "phone",
+            "commission_rate", "notes", "is_active", "created_at", "customer_count",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def get_customer_count(self, obj):
+        return obj.customers.count()
+
+    def validate_name(self, value):
+        value = value.strip()
+        qs = Partner.objects.filter(name__iexact=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("A partner with this name already exists.")
+        return value
+
+
+class CustomerSerializer(serializers.ModelSerializer):
+    assigned_staff_name = serializers.CharField(source="assigned_staff.username", read_only=True, default=None)
+    partner_name = serializers.CharField(source="partner.name", read_only=True, default=None)
+    # A move to another partner booked for a date (package #20).
+    pending_partner_name = serializers.CharField(source="pending_partner.name", read_only=True, default=None)
+    # The no-login usage link to send this customer. Read-only: it changes
+    # only through the regenerate-usage-link action, so an ordinary save
+    # can't alter it by accident and silently break a link the customer has
+    # already bookmarked.
+    usage_token = serializers.UUIDField(read_only=True)
+    # The customer's payment reference, now writable (it used to be read-only)
+    # so a customer migrated from another system can keep the reference they
+    # already put on their EFTs -- which is what bank-feed matching looks for.
+    #
+    # Optional: leave it out or send it blank and the model generates the next
+    # CUS-######. On an UPDATE, blank means "leave it alone" rather than
+    # "clear it", so a PATCH that doesn't care about the reference can't wipe
+    # one the customer is actively using.
+    customer_id = serializers.CharField(
+        required=False, allow_blank=True, max_length=20, label="Payment reference"
+    )
+    # Every public address this customer's services are currently handing out.
+    #
+    # A list rather than one value, because a customer can hold more than one
+    # line and choosing which of them to show would be arbitrary. The question
+    # this column exists to answer -- "who is 102.23.154.3?" -- needs all of
+    # them or it silently misses the second line.
+    #
+    # Cheap only because CustomerViewSet.get_queryset prefetches the services
+    # and their pool addresses; see the note there before using this anywhere
+    # that doesn't.
+    public_ips = serializers.SerializerMethodField()
+    # Is this customer's line up right now, and when was it last seen?
+    #
+    # THREE-valued on purpose. True = a session is open and still reporting.
+    # False = they have an active RADIUS line and it has gone quiet. None =
+    # no active RADIUS line here at all, which is most of the book on
+    # somebody else's fibre. Reporting those as "Offline" would paint the
+    # column red forever and teach staff to ignore it.
+    #
+    # Both read out of a map the VIEW builds once per page
+    # (radiusauth.offline.connection_state). They deliberately do NOT fall
+    # back to computing per row -- that would be three queries per customer,
+    # and the note above public_ips exists because this page has already
+    # been down that road once. A serializer used without the map returns
+    # None rather than quietly going to the database fifty times.
+    online = serializers.SerializerMethodField()
+    last_seen_at = serializers.SerializerMethodField()
+    # How many of this customer's lines are Suspended right now, and how
+    # many of those the billing run suspended for non-payment. Display only
+    # (customers/suspension.py): billing suspends SERVICES and leaves
+    # Customer.status alone, so without these a customer whose only line is
+    # off reads "Active". Same rules as `online`: read from a map the view
+    # builds once per page, None when there is no map, 0 when the customer
+    # is not in it.
+    suspended_lines = serializers.SerializerMethodField()
+    suspended_for_nonpayment_lines = serializers.SerializerMethodField()
+    # Paid up / Unpaid / Partially Paid / Overdue / In credit, for the
+    # Customers list (customers.payment_status). Read from the annotation
+    # CustomerViewSet.get_queryset adds; queried only when serialised
+    # without it.
+    payment_status = serializers.SerializerMethodField()
+    payment_status_label = serializers.SerializerMethodField()
+    # The client's partner first, then any other partner one of its lines
+    # is with (billing.Service.partner). Reads the services
+    # CustomerViewSet already prefetches for public_ips.
+    partner_names = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Customer
+        fields = [
+            "id", "customer_id", "customer_type", "category", "full_name", "company_name",
+            "email", "billing_email", "phone",
+            "contact_person", "contact_person_phone", "contact_person_email",
+            "secondary_contact_name", "secondary_contact_phone",
+            "address", "complex_or_area", "city", "zip_code", "latitude", "longitude", "id_number", "vat_number",
+            "status", "account_type", "account_type_reason",
+            "balance", "public_ips", "online", "last_seen_at",
+            "suspended_lines", "suspended_for_nonpayment_lines",
+            "payment_status", "payment_status_label", "partner_names",
+            "live_bandwidth_public",
+            "live_bandwidth_last_viewed_at",
+            "assigned_staff", "assigned_staff_name", "partner", "partner_name",
+            "pending_partner", "pending_partner_name", "pending_partner_date",
+            "notes", "signup_date", "created_at", "updated_at", "user", "usage_token",
+        ]
+        read_only_fields = [
+            "id", "created_at", "updated_at", "usage_token", "live_bandwidth_last_viewed_at",
+            "online", "last_seen_at", "suspended_lines", "suspended_for_nonpayment_lines",
+        ]
+
+    def _connection(self, obj):
+        """This customer's entry in the page-wide map, or None."""
+        state = self.context.get("connection_map")
+        if not state:
+            return None
+        return state.get(obj.pk)
+
+    def get_online(self, obj):
+        entry = self._connection(obj)
+        return None if entry is None else entry["online"]
+
+    def get_last_seen_at(self, obj):
+        entry = self._connection(obj)
+        return None if entry is None else entry["last_seen"]
+
+    def _suspension(self, obj, key):
+        state = self.context.get("suspension_map")
+        if state is None:
+            return None
+        entry = state.get(obj.pk)
+        return 0 if entry is None else entry[key]
+
+    def get_suspended_lines(self, obj):
+        return self._suspension(obj, "suspended")
+
+    def get_suspended_for_nonpayment_lines(self, obj):
+        return self._suspension(obj, "nonpayment")
+
+    def _payment_status(self, obj):
+        if not hasattr(obj, "_payment_status_cache"):
+            from .payment_status import payment_status
+            obj._payment_status_cache = payment_status(obj)
+        return obj._payment_status_cache
+
+    def get_partner_names(self, obj):
+        names = [obj.partner.name] if obj.partner_id else []
+        for service in obj.services.all():
+            if service.status == "terminated" or service.partner_id is None:
+                continue
+            name = service.partner.name
+            if name not in names:
+                names.append(name)
+        return names
+
+    def get_payment_status(self, obj):
+        return self._payment_status(obj)
+
+    def get_payment_status_label(self, obj):
+        from .payment_status import LABELS
+        return LABELS[self._payment_status(obj)]
+
+    def get_public_ips(self, obj):
+        # dict.fromkeys rather than set(): two services on the same manual
+        # static IP is a misconfiguration, but the column should show it once,
+        # in the order the services are listed, not in a random one.
+        addresses = (service.public_ip for service in obj.services.all())
+        return list(dict.fromkeys(a for a in addresses if a))
+
+    def validate(self, attrs):
+        """A partner move booked for a date needs both halves, a different
+        partner, and a date after today -- for today, change the Partner
+        field itself. Checked only when the booking is being set or
+        changed. (package #20)"""
+        attrs = super().validate(attrs)
+        # Main-address coordinates: a pair, within range (5 Oct 2026).
+        if "latitude" in attrs or "longitude" in attrs:
+            lat = attrs.get("latitude", getattr(self.instance, "latitude", None))
+            lng = attrs.get("longitude", getattr(self.instance, "longitude", None))
+            if (lat is None) != (lng is None):
+                raise serializers.ValidationError({"latitude": "Enter both latitude and longitude, or neither."})
+            if lat is not None and not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                raise serializers.ValidationError({"latitude": "Those coordinates are out of range."})
+        self._check_partner_access(attrs)
+        # A sponsor or a deal says why (6 Oct 2026); Paying needs no reason
+        # and drops any old one so it can't linger after a deal ends.
+        if "account_type" in attrs or "account_type_reason" in attrs:
+            kind = attrs.get("account_type", getattr(self.instance, "account_type", Customer.AccountType.PAYING))
+            reason = (attrs.get("account_type_reason", getattr(self.instance, "account_type_reason", "")) or "").strip()
+            if kind == Customer.AccountType.PAYING:
+                attrs["account_type_reason"] = ""
+            elif not reason:
+                label = Customer.AccountType(kind).label.lower()
+                raise serializers.ValidationError(
+                    {"account_type_reason": f"Say why this client is a {label}."}
+                )
+            else:
+                attrs["account_type_reason"] = reason
+        if "pending_partner" not in attrs and "pending_partner_date" not in attrs:
+            return attrs
+        inst = self.instance
+        new_partner = attrs.get("pending_partner", getattr(inst, "pending_partner", None))
+        when = attrs.get("pending_partner_date", getattr(inst, "pending_partner_date", None))
+        if new_partner and not when:
+            raise serializers.ValidationError({"pending_partner_date": "Give the date of the move."})
+        if when and not new_partner:
+            raise serializers.ValidationError({"pending_partner": "Choose the partner to move to."})
+        if new_partner and when:
+            current = attrs.get("partner", getattr(inst, "partner", None))
+            if current is not None and current.pk == new_partner.pk:
+                raise serializers.ValidationError(
+                    {"pending_partner": "The customer is already on that partner."}
+                )
+            unchanged = inst is not None and inst.pending_partner_date == when
+            if not unchanged and when <= timezone.localdate():
+                raise serializers.ValidationError(
+                    {"pending_partner_date": "Pick a date after today. To move them today, change the Partner field itself."}
+                )
+        return attrs
+
+    def _check_partner_access(self, attrs):
+        """A partner-restricted staff member may only put a customer under a
+        partner they can see -- and "Direct" only when that is ticked for
+        them. Otherwise the customer they just saved would vanish from their
+        own list (customers.scoping)."""
+        from .scoping import may_assign_partner
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or not getattr(user, "is_staff_member", False):
+            return
+        if self.instance is not None and "partner" not in attrs:
+            return
+        partner = attrs.get("partner")
+        # Unchanged is fine: a client can be visible to someone through one
+        # of its lines' partners (billing.Service.partner) while its own
+        # partner is one they don't have.
+        if self.instance is not None and (partner.pk if partner else None) == self.instance.partner_id:
+            return
+        if not may_assign_partner(user, partner.pk if partner else None):
+            raise serializers.ValidationError({
+                "partner": "Choose one of your partners." if partner is None
+                else f"You don't have access to {partner.name}.",
+            })
+        pending = attrs.get("pending_partner")
+        if pending is not None and not may_assign_partner(user, pending.pk):
+            raise serializers.ValidationError({"pending_partner": f"You don't have access to {pending.name}."})
+
+    def validate_customer_id(self, value):
+        """Normalise to trimmed upper case, and reject a duplicate.
+
+        Upper-casing is not cosmetic. Postgres unique constraints are
+        case-SENSITIVE, so "sky1" and "SKY1" could both exist -- while
+        bankfeeds.matching compares references case-insensitively and would
+        see them as the same reference, making every payment for either
+        customer permanently ambiguous and therefore unmatched. Storing one
+        canonical form makes that impossible.
+        """
+        value = (value or "").strip().upper()
+        if not value:
+            return ""
+        clash = Customer.objects.filter(customer_id__iexact=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(
+                f"Another customer already uses the reference '{value}'. "
+                "References must be unique so bank payments can be matched to one customer."
+            )
+        return value
+
+    def update(self, instance, validated_data):
+        # Blank on update means "unchanged", not "clear it". Clearing would
+        # make save() mint a brand-new CUS-###### and quietly orphan every
+        # future EFT the customer sends with their old reference.
+        if "customer_id" in validated_data and not validated_data["customer_id"]:
+            validated_data.pop("customer_id")
+        return super().update(instance, validated_data)
+
+
+class CustomerDeletionRequestSerializer(serializers.ModelSerializer):
+    # Falls back to the snapshotted display fields once `customer` itself
+    # has been deleted (after approval) -- see the model's docstring.
+    customer_name = serializers.SerializerMethodField()
+    requested_by_name = serializers.CharField(source="requested_by.username", read_only=True, default=None)
+    decided_by_name = serializers.CharField(source="decided_by.username", read_only=True, default=None)
+
+    class Meta:
+        model = CustomerDeletionRequest
+        fields = [
+            "id", "customer", "customer_name", "reason", "status",
+            "requested_by", "requested_by_name", "decided_by", "decided_by_name",
+            "decision_note", "decided_at", "created_at",
+        ]
+        read_only_fields = [
+            "id", "status", "requested_by", "decided_by", "decision_note", "decided_at", "created_at",
+        ]
+
+    def get_customer_name(self, obj):
+        if obj.customer:
+            return obj.customer.full_name
+        return obj.customer_display_name or obj.customer_display_id or None
+
+    def validate_reason(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("A reason is required to request a customer's deletion.")
+        return value
+
+    def validate_customer(self, value):
+        if value.deletion_requests.filter(status=CustomerDeletionRequest.Status.PENDING).exists():
+            raise serializers.ValidationError("There's already a pending deletion request for this customer.")
+        return value
+
+
+class CustomerTaskSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.full_name", read_only=True)
+    assigned_to_name = serializers.CharField(source="assigned_to.username", read_only=True, default=None)
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True, default=None)
+    # Computed server-side rather than in the browser: "overdue" depends on
+    # today's date in OUR timezone, and a customer's laptop set to another
+    # one would otherwise disagree with the same list on the next desk.
+    is_overdue = serializers.BooleanField(read_only=True)
+    is_outstanding = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = CustomerTask
+        fields = [
+            "id", "customer", "customer_name", "title", "description",
+            "status", "priority", "due_date",
+            "assigned_to", "assigned_to_name", "created_by", "created_by_name",
+            "is_overdue", "is_outstanding",
+            "completed_at", "created_at", "updated_at",
+        ]
+        # created_by is stamped from the request (see the viewset), not
+        # accepted from the client -- otherwise anyone could file a task
+        # under someone else's name.
+        read_only_fields = ["id", "created_by", "completed_at", "created_at", "updated_at"]
+
+    def validate_title(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Give the task a title — it's what shows in the list.")
+        return value

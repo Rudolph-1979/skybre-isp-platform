@@ -1,0 +1,48 @@
+"""Networking -> Map API (#173, #174).
+
+GET /api/map/config/                        the Google Maps browser key (Networking or Scheduling)
+GET /api/map/serviceability/?lat=&lng=      nearest towers + coverage (KMZ later) (Networking)
+"""
+from django.conf import settings
+from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.permissions import IsStaffMember, user_can_access_section
+
+from . import geo, uisp
+from .uisp_api import PERMS
+
+
+class NetworkingOrScheduling(permissions.BasePermission):
+    """The Map replaced Scheduling -> Technician positions (#174), so staff
+    with either section open it: Networking sees towers and the check,
+    Scheduling the technicians."""
+    message = "You need the Networking or Scheduling section."
+
+    def has_permission(self, request, view):
+        return any(user_can_access_section(request.user, s) for s in ("networking", "scheduling"))
+
+
+class MapConfigView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, NetworkingOrScheduling]
+
+    def get(self, request):
+        return Response({"google_maps_key": getattr(settings, "GOOGLE_MAPS_API_KEY", "") or ""})
+
+
+class MapServiceabilityView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        try:
+            lat = float(request.query_params.get("lat", ""))
+            lng = float(request.query_params.get("lng", ""))
+        except ValueError:
+            return Response({"detail": "lat and lng are required numbers."}, status=400)
+        try:
+            return Response(geo.check_point(lat, lng))
+        except geo.GeoError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        except uisp.UispError as exc:
+            return Response({"detail": str(exc)}, status=502)

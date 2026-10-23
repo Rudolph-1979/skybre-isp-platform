@@ -22,8 +22,11 @@ class HighAlertTests(TestCase):
         self.quiet = Customer.objects.create(full_name="Quiet Quinn", email="q@x.com")
 
         today = datetime.date.today()
+        # Three separate days of one month: the rule counts days, not
+        # tickets (13 Oct 2026). From the 1st so they share a month.
+        first = today.replace(day=1)
         for i in range(3):
-            self._ticket(self.noisy, today)
+            self._ticket(self.noisy, first + datetime.timedelta(days=i))
         self._ticket(self.quiet, today)
 
     def _ticket(self, customer, on):
@@ -86,3 +89,22 @@ class HighAlertTests(TestCase):
         force_authenticate(request, user=scoped)
         data = CustomerViewSet.as_view({"get": "list"})(request).data
         self.assertEqual([r["full_name"] for r in data["results"]], [])
+
+    def test_several_tickets_on_one_day_count_once(self):
+        """A double-tapped Log ticket button is one day, not a breach."""
+        tapper = Customer.objects.create(full_name="Double Tap", email="d@x.com")
+        today = datetime.date.today()
+        for _ in range(5):
+            self._ticket(tapper, today)
+        names = [r["full_name"] for r in self._filtered_list()["results"]]
+        self.assertNotIn("Double Tap", names)
+
+    def test_total_tickets_still_counts_every_ticket(self):
+        """Three days with an extra ticket on one: flagged on 3 days, 4 tickets."""
+        busy = Customer.objects.create(full_name="Busy Bea", email="b@x.com")
+        first = datetime.date.today().replace(day=1)
+        for i in (0, 1, 2, 2):
+            self._ticket(busy, first + datetime.timedelta(days=i))
+        row = next(r for r in self._tile()["results"] if r["full_name"] == "Busy Bea")
+        self.assertEqual(row["peak_count"], 3)
+        self.assertEqual(row["total_tickets"], 4)

@@ -1,0 +1,139 @@
+"""The balance an emailed invoice quotes must include that invoice.
+
+Every recurring invoice email offers a {{ balance }} placeholder, and the
+default templates use it -- it is the "your account is now R X" line the
+customer reads to decide what to pay.
+
+It was the balance from BEFORE the invoice was debited. Invoice
+.apply_balance_debit updates the customer row with an F() expression, on
+purpose (the balance is the field two concurrent finance actions race
+on), which leaves the in-memory Customer holding the value it was read
+with. That same stale instance is what gets handed to the mailer, and
+notifications.services.build_context reads customer.balance off it.
+
+So a customer with a clean account got an invoice for R575 quoting a
+balance of R0.00, and a customer already R575 down got their second
+invoice quoting R575 instead of R1,150 -- always exactly one invoice
+behind, for every customer, on every run. The number is wrong in the
+direction that tells them to pay less than they owe.
+
+Fixed in _send_after_commit rather than at the call site, because the
+send happens after the transaction commits: that is both the moment the
+true value exists in the database and the one place every billing email
+goes through.
+"""
+import datetime
+from decimal import Decimal
+from unittest import mock
+
+from django.test import TestCase
+from django.utils import timezone
+
+from billing.models import CustomerBillingConfig, Invoice, Service, Tariff
+from billing.recurring import run_recurring_billing
+from customers.models import Customer
+
+
+class InvoiceEmailBalanceTests(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240,
+        )
+
+    def _billable(self, name, opening_balance=Decimal("0.00")):
+        customer = Customer.objects.create(
+            full_name=name, email=f"{name.split()[0].lower()}@example.com",
+            status=Customer.Status.ACTIVE, balance=opening_balance,
+        )
+        Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90),
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.next_billing_date = self.today
+        config.save()
+        return customer
+
+    def _balances_at_send_time(self):
+        """What customer.balance reads as at the moment the mailer is called.
+
+        Not what it reads afterwards -- the whole defect is that the
+        object handed to the mailer is stale, so the assertion has to be
+        made on that object, at that moment.
+        """
+        seen = {}
+
+        def record(template_key, customer, **kwargs):
+            seen[(template_key, customer.pk)] = customer.balance
+
+        return seen, mock.patch("billing.recurring.send_customer_email", side_effect=record)
+
+    def test_the_invoice_email_quotes_the_balance_including_that_invoice(self):
+        customer = self._billable("Anna Able")
+
+        seen, patcher = self._balances_at_send_time()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        invoice = Invoice.objects.get(customer=customer)
+        self.assertEqual(invoice.total, Decimal("575.00"))
+        self.assertEqual(
+            seen[("invoice", customer.pk)], Decimal("575.00"),
+            "the emailed balance is missing the invoice the email is about",
+        )
+
+    def test_a_customer_already_in_arrears_gets_the_running_total(self):
+        customer = self._billable("Boris Bright", opening_balance=Decimal("575.00"))
+
+        seen, patcher = self._balances_at_send_time()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(
+            seen[("invoice", customer.pk)], Decimal("1150.00"),
+            "the emailed balance is one invoice behind",
+        )
+
+    def test_it_matches_what_the_database_says_once_the_run_is_over(self):
+        """The email and the portal must not disagree about the same number."""
+        customer = self._billable("Carol Clear")
+
+        seen, patcher = self._balances_at_send_time()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        customer.refresh_from_db()
+        self.assertEqual(seen[("invoice", customer.pk)], customer.balance)
+
+    def test_a_credit_balance_is_still_reported_honestly(self):
+        """Refreshing must not be mistaken for recomputing: a customer in
+        credit stays in credit, they are just one invoice less so."""
+        customer = self._billable("Dora Dunn", opening_balance=Decimal("-1000.00"))
+
+        seen, patcher = self._balances_at_send_time()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(seen[("invoice", customer.pk)], Decimal("-425.00"))
+
+    def test_a_customer_deleted_between_commit_and_send_does_not_break_the_run(self):
+        """The refresh reads the database, so the row has to be allowed to
+        be gone. Losing the email is acceptable; raising out of an
+        on_commit callback, after the invoice has committed, is not."""
+        customer = self._billable("Eve Early")
+
+        sent = []
+
+        def record(template_key, cust, **kwargs):
+            sent.append(template_key)
+
+        with mock.patch("billing.recurring.send_customer_email", side_effect=record):
+            with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                run_recurring_billing(self.today, commit=True)
+                Customer.objects.filter(pk=customer.pk).delete()
+
+        self.assertTrue(callbacks, "the run should have queued a send")
+        self.assertEqual(Invoice.objects.count(), 0, "the invoice went with the customer")

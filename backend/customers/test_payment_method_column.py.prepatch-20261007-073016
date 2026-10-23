@@ -1,0 +1,36 @@
+"""Customers list Payment method column (Rudolph, 7 Oct 2026: "Add me a
+column for Payment method left of balance")."""
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from billing.models import CustomerBillingConfig, PaymentMethod
+from customers.models import Customer
+
+
+class PaymentMethodColumnTests(TestCase):
+    def setUp(self):
+        admin = User.objects.create_user(username="boss", password="x", role="admin")
+        self.api = APIClient()
+        self.api.force_authenticate(admin)
+        eft = PaymentMethod.objects.create(name="EFT 1st")
+        debit = PaymentMethod.objects.create(name="Debit order 15th")
+        for name, method in (("Anna", debit), ("Ben", eft), ("Cara", None)):
+            customer = Customer.objects.create(full_name=name)
+            if method is not None:
+                config = CustomerBillingConfig.for_customer(customer)
+                config.payment_method = method
+                config.save()
+
+    def rows(self, ordering="full_name"):
+        res = self.api.get(f"/api/customers/?ordering={ordering}&page_size=50")
+        self.assertEqual(res.status_code, 200)
+        return [(c["full_name"], c["payment_method_name"]) for c in res.data["results"]]
+
+    def test_listed_and_sortable(self):
+        self.assertEqual(self.rows(), [("Anna", "Debit order 15th"), ("Ben", "EFT 1st"), ("Cara", "")])
+        self.assertEqual([n for n, _ in self.rows("payment_method_name")][:2], ["Anna", "Ben"])
+
+    def test_detail_too(self):
+        anna = Customer.objects.get(full_name="Anna")
+        self.assertEqual(self.api.get(f"/api/customers/{anna.pk}/").data["payment_method_name"], "Debit order 15th")

@@ -16,6 +16,7 @@ from customers.models import Customer, Partner
 from radiusauth.models import RadAcct
 from radiusauth.offline import recently_offline
 from radiusauth.views import OfflineCustomersView
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -153,7 +154,7 @@ class OfflineListTests(TestCase):
         customer.partner = theirs
         customer.save()
         self._session("dan", 8, 3)
-        scoped = User.objects.create_user(username="reseller", password="x", role="support")
+        scoped = User.objects.create_user(username="reseller", password="x", role="support", allowed_sections=ALL_SECTIONS)
         scoped.allowed_partners = [mine.id]
         scoped.save()
         self.assertEqual(self._get(scoped).data["count"], 0)

@@ -1,0 +1,21 @@
+psql: warning: extra command-line argument "id," ignored
+psql: warning: extra command-line argument "timestamp," ignored
+psql: warning: extra command-line argument "actor_id," ignored
+psql: warning: extra command-line argument "action," ignored
+psql: warning: extra command-line argument "object_type," ignored
+psql: warning: extra command-line argument "object_id" ignored
+psql: warning: extra command-line argument "FROM" ignored
+psql: warning: extra command-line argument "audit_auditevent" ignored
+psql: warning: extra command-line argument "WHERE" ignored
+psql: warning: extra command-line argument "timestamp" ignored
+psql: warning: extra command-line argument "2026-09-12" ignored
+psql: warning: extra command-line argument "16:00'" ignored
+psql: warning: extra command-line argument "ORDER" ignored
+psql: warning: extra command-line argument "BY" ignored
+psql: warning: extra command-line argument "id" ignored
+psql: warning: extra command-line argument "DESC" ignored
+psql: warning: extra command-line argument "LIMIT" ignored
+psql: warning: extra command-line argument "20" ignored
+--
+(1 row)
+

@@ -1,0 +1,46 @@
+"""The quoted plan is priced at the tariff, not at an estimate typed on the
+lead earlier (Rudolph, 9 Oct 2026: a quote showed "Skybre Wireless 4 Mbps
+(monthly) R 0.00")."""
+from decimal import Decimal
+
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from billing.models import Tariff
+from sales.models import Lead
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class QuotePlanPriceTests(TestCase):
+    def setUp(self):
+        self.api = APIClient()
+        self.api.force_authenticate(User.objects.create_user(username="boss", password="x", role="admin"))
+        self.tariff = Tariff.objects.create(name="Skybre Wireless 4 Mbps", price=Decimal("150.00"),
+                                            tax_rate_pct=Decimal("15"))
+        self.lead = Lead.objects.create(full_name="Lucky Moeletsi", coverage_method="electronic",
+                                        coverage_result="pass", status="coverage",
+                                        estimated_monthly_value=Decimal("0.00"))
+
+    def body(self):
+        return {"tariff": self.tariff.pk, "items": [{"label": "Rental Install", "amount": "391.30"}]}
+
+    def test_preview_and_saved_quote_use_the_tariff_price(self):
+        preview = self.api.post(f"/api/leads/{self.lead.pk}/quote-preview/", self.body(), format="json")
+        self.assertEqual(preview.status_code, 200)
+        res = self.api.post(f"/api/leads/{self.lead.pk}/quote/", self.body(), format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        totals = res.data["lead"]["quote_totals"]
+        self.assertEqual(totals["plan"]["excl"], "150.00")
+        self.assertEqual(totals["monthly"]["incl"], "172.50")
+        self.lead.refresh_from_db()
+        self.assertIsNone(self.lead.estimated_monthly_value)
+        self.assertEqual(self.lead.plan_value, Decimal("150.00"))
+
+    def test_free_month_is_a_discount_not_a_zero_price(self):
+        body = {**self.body(), "discount": {"monthly": {"type": "percentage", "value": "100", "months": 1}}}
+        res = self.api.post(f"/api/leads/{self.lead.pk}/quote/", body, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        totals = res.data["lead"]["quote_totals"]
+        self.assertEqual(totals["plan_gross"]["excl"], "150.00")
+        self.assertEqual(totals["plan"]["excl"], "0.00")

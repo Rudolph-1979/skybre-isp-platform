@@ -1,0 +1,111 @@
+/**
+ * Helpers for the customer Billing tab's cycle fields.
+ *
+ * Two things the form used to get wrong, both decided with Rudolph on
+ * 2026-09-23:
+ *
+ * 1. PICKING A PAYMENT METHOD FILLS ITS TERMS IN. The Payment Methods screen
+ *    has always said that selecting a method on a customer "copies these
+ *    onto them", but the customer form only stored the method's name. Now
+ *    choosing a method copies its terms into the form, where staff can see
+ *    them before saving. Nothing is saved until they press Save.
+ *
+ * 2. A CHANGED BILLING DAY APPLIES FROM THE NEXT CYCLE, AND THE FORM SAYS
+ *    SO. Once the recurring engine has a next_billing_date for a customer,
+ *    that date alone decides when they are next billed (billing.recurring
+ *    ._invoice_due); billing_day, the anniversary switch and the payment
+ *    period only shape the date AFTER it (._generate_document re-derives it
+ *    when it advances the cycle). next_billing_date is read-only through
+ *    the API, so a saved change cannot move it. The engine is deliberately
+ *    left alone -- moving the date on save risks a doubled or skipped
+ *    cycle -- and the form now tells the truth instead.
+ */
+import type { PaymentMethod, RecurringPaymentPeriod } from "../types";
+import type { RecurringBillingFormState } from "../pages/admin/ConfigsPage";
+
+const str = (v: number | null | undefined) => (v == null ? "" : String(v));
+
+/** The form with `method`'s terms copied in. A term the method does not
+ *  carry (undefined in the API response) leaves the form's value alone. */
+export function applyPaymentMethodTerms(
+  form: RecurringBillingFormState,
+  method: PaymentMethod,
+): RecurringBillingFormState {
+  const next: RecurringBillingFormState = { ...form, payment_method: String(method.id) };
+  if (method.payment_period !== undefined) next.payment_period = method.payment_period;
+  if (method.billing_day !== undefined) next.billing_day = str(method.billing_day);
+  if (method.use_date_of_customer_creation !== undefined) {
+    next.use_date_of_customer_creation = method.use_date_of_customer_creation;
+  }
+  if (method.payment_due_days !== undefined) next.payment_due_days = str(method.payment_due_days);
+  if (method.blocking_period_days !== undefined) next.blocking_period_days = str(method.blocking_period_days);
+  if (method.deactivation_period_days !== undefined) {
+    next.deactivation_period_days = str(method.deactivation_period_days);
+  }
+  if (method.minimum_balance !== undefined) next.minimum_balance = method.minimum_balance;
+  if (method.auto_create_invoices !== undefined) next.auto_create_invoices = method.auto_create_invoices;
+  if (method.send_billing_notifications !== undefined) {
+    next.send_billing_notifications = method.send_billing_notifications;
+  }
+  if (method.auto_proforma_enabled !== undefined) next.auto_proforma_enabled = method.auto_proforma_enabled;
+  if (method.proforma_day !== undefined) next.proforma_day = str(method.proforma_day);
+  if (method.proforma_payment_period !== undefined) next.proforma_payment_period = method.proforma_payment_period;
+  if (method.create_proforma_for !== undefined) next.create_proforma_for = method.create_proforma_for;
+  if (method.reminder_enabled !== undefined) next.reminder_enabled = method.reminder_enabled;
+  if (method.reminder_1_day !== undefined) next.reminder_1_day = str(method.reminder_1_day);
+  if (method.reminder_2_day !== undefined) next.reminder_2_day = str(method.reminder_2_day);
+  if (method.reminder_3_day !== undefined) next.reminder_3_day = str(method.reminder_3_day);
+  return next;
+}
+
+/** "2026-10-01" -> "01/10/2026" without going through Date (a date-only
+ *  string parsed by Date is UTC midnight, which is a timezone trap). */
+export function formatIsoDate(iso: string): string {
+  const [y, m, d] = iso.slice(0, 10).split("-");
+  return y && m && d ? `${d}/${m}/${y}` : iso;
+}
+
+/** Day of the month the customer was created, in Skybre's timezone -- the
+ *  day the engine bills on when "anniversary" is ticked
+ *  (billing.recurring._billing_due_day uses timezone.localtime). */
+export function anniversaryDay(createdAt: string | null | undefined): number | null {
+  if (!createdAt) return null;
+  const parsed = new Date(createdAt);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const day = new Intl.DateTimeFormat("en-ZA", { timeZone: "Africa/Johannesburg", day: "numeric" }).format(parsed);
+  const n = Number(day);
+  return Number.isFinite(n) ? n : null;
+}
+
+export interface SavedCycle {
+  billing_day: number;
+  use_date_of_customer_creation: boolean;
+  payment_period: RecurringPaymentPeriod;
+  next_billing_date: string | null;
+}
+
+/** One line for under the billing-day field saying when the customer will
+ *  actually be billed, and when a change made here takes effect. */
+export function billingCycleHint(
+  saved: SavedCycle | null,
+  form: Pick<RecurringBillingFormState, "billing_day" | "use_date_of_customer_creation" | "payment_period">,
+  anniversary: number | null,
+): string {
+  const day = form.use_date_of_customer_creation
+    ? anniversary != null
+      ? `day ${anniversary} of the month (the customer's creation anniversary; earlier in months that are too short)`
+      : "the customer's creation anniversary"
+    : `day ${form.billing_day || "1"} of the month`;
+
+  if (saved?.next_billing_date) {
+    const when = formatIsoDate(saved.next_billing_date);
+    const changed =
+      form.billing_day !== String(saved.billing_day) ||
+      form.use_date_of_customer_creation !== saved.use_date_of_customer_creation ||
+      form.payment_period !== saved.payment_period;
+    return changed
+      ? `The next bill stays on ${when}. This change applies from the cycle after that bill (${day}).`
+      : `Next bill: ${when}. A change here applies from the cycle after that bill, not before it.`;
+  }
+  return `Not billed by the recurring engine yet, so this applies straight away: the first bill falls on ${day}, once that day's billing run is approved.`;
+}

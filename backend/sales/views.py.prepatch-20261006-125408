@@ -1,0 +1,339 @@
+from django.db.models import Count, Q, Sum
+from django.http import HttpResponse
+from django.utils import timezone
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.permissions import IsStaffMember, section_permission
+
+from .models import Lead, LeadNote
+from .serializers import LeadNoteSerializer, LeadSerializer
+
+HasSalesAccess = section_permission("sales")
+
+
+def scope_to_partners(qs, user):
+    """Same reseller-visibility rule the customer list uses.
+
+    A rep restricted to one reseller's customers must not see another
+    reseller's pipeline. Leads with no partner are direct enquiries and
+    follow the same "Direct" tick as no-partner customers (customers.scoping).
+    """
+    from customers.scoping import partner_condition
+
+    condition = partner_condition(user, services=False)
+    return qs if condition is None else qs.filter(condition)
+
+
+class LeadViewSet(viewsets.ModelViewSet):
+    serializer_class = LeadSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSalesAccess]
+    filterset_fields = ["status", "source", "partner", "assigned_to", "lost_reason"]
+    search_fields = [
+        "full_name", "company_name", "email", "phone",
+        "address", "city", "source_detail", "notes",
+    ]
+    ordering_fields = ["created_at", "next_follow_up", "full_name", "status"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = Lead.objects.select_related(
+            "partner", "assigned_to", "interested_tariff", "customer",
+            "coverage_partner", "coverage_checked_by", "scan_job", "install_job",
+        ).prefetch_related("scan_job__assigned_technicians", "install_job__assigned_technicians")
+        qs = scope_to_partners(qs, self.request.user)
+        params = self.request.query_params
+
+        if params.get("open") == "true":
+            qs = qs.filter(status__in=Lead.OPEN_STATUSES)
+
+        if params.get("due") == "true":
+            # Overdue counts as due. A rep needs one list; splitting
+            # "today" from "late" makes the late one the one that stops
+            # getting opened.
+            qs = qs.filter(
+                status__in=Lead.OPEN_STATUSES,
+                next_follow_up__isnull=False,
+                next_follow_up__lte=timezone.localdate(),
+            )
+
+        if params.get("mine") == "true":
+            qs = qs.filter(assigned_to=self.request.user)
+
+        return qs
+
+    def perform_create(self, serializer):
+        # An unassigned lead is one nobody is chasing. Default it to
+        # whoever entered it -- they can hand it on, but it never starts
+        # life belonging to no one.
+        lead = serializer.save(
+            assigned_to=serializer.validated_data.get("assigned_to") or self.request.user
+        )
+        LeadNote.objects.create(
+            lead=lead,
+            author=self.request.user,
+            kind=LeadNote.Kind.SYSTEM,
+            body=f"Lead created — {lead.get_source_display()}.",
+        )
+
+    def perform_update(self, serializer):
+        before = serializer.instance.status
+        lead = serializer.save()
+        if lead.status != before:
+            LeadNote.objects.create(
+                lead=lead,
+                author=self.request.user,
+                kind=LeadNote.Kind.SYSTEM,
+                body=(
+                    f"Stage: {Lead.Status(before).label} → {lead.get_status_display()}"
+                    + (f" ({lead.get_lost_reason_display()})" if lead.lost_reason else "")
+                ),
+            )
+
+    @action(detail=True, methods=["post"])
+    def convert(self, request, pk=None):
+        """Turn this lead into a customer.
+
+        Idempotent -- a second call returns the customer already linked
+        rather than creating another. Two people clicking Convert within
+        a few seconds of each other is an ordinary Tuesday, and a
+        duplicate customer is expensive to unpick afterwards.
+        """
+        lead = self.get_object()
+        already = bool(lead.customer_id)
+        customer = lead.convert_to_customer(actor=request.user)
+        return Response(
+            {
+                "customer_id": customer.pk,
+                "customer_reference": customer.customer_id,
+                "already_converted": already,
+                "lead": LeadSerializer(lead).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    # --- the flow Rudolph drew (6 Oct 2026); see sales/workflow.py ---------
+
+    def _flow(self, request, fn):
+        from .workflow import FlowError
+
+        try:
+            extra = fn() or {}
+        except FlowError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        lead = self.get_queryset().get(pk=self.kwargs["pk"])
+        return Response({**extra, "lead": LeadSerializer(lead).data})
+
+    @staticmethod
+    def _get(model, value, what):
+        from .workflow import FlowError
+
+        if value in (None, "", 0, "0"):
+            return None
+        try:
+            return model.objects.get(pk=value)
+        except (model.DoesNotExist, ValueError, TypeError):
+            raise FlowError(f"That {what} doesn't exist.")
+
+    @action(detail=True, methods=["post"])
+    def coverage(self, request, pk=None):
+        """Coverage check: method electronic/scan/fibre, and the result once
+        known. A Scan LOS with no result books a Site Visit job."""
+        from django.contrib.auth import get_user_model
+        from django.utils.dateparse import parse_datetime
+
+        from customers.models import Partner
+
+        from .workflow import FlowError, record_coverage
+
+        lead = self.get_object()
+        d = request.data
+
+        def run():
+            start = None
+            if d.get("scan_start"):
+                start = parse_datetime(str(d["scan_start"]))
+                if start is None:
+                    raise FlowError("The scan time isn't a valid date and time.")
+                if timezone.is_naive(start):
+                    start = timezone.make_aware(start)
+            record_coverage(
+                lead, request.user,
+                method=str(d.get("method", "")),
+                result=str(d.get("result", "") or ""),
+                tower=str(d.get("tower", "") or "")[:100],
+                sector=str(d.get("sector", "") or "")[:100],
+                signal=str(d.get("signal", "") or "")[:50],
+                notes=str(d.get("notes", "") or ""),
+                partner=self._get(Partner, d.get("coverage_partner"), "fibre partner"),
+                scan_start=start,
+                scan_technician=self._get(get_user_model(), d.get("scan_technician"), "technician"),
+            )
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["post"])
+    def quote(self, request, pk=None):
+        """Prepare the quote (plan + once-off items) and optionally email it."""
+        from billing.models import Tariff
+
+        from .quote import email_quote
+        from .workflow import DEFAULT_QUOTE_DAYS, FlowError, prepare_quote
+
+        lead = self.get_object()
+        d = request.data
+
+        def run():
+            items = d.get("items") or []
+            if not isinstance(items, list):
+                raise FlowError("Once-off items must be a list.")
+            try:
+                days = int(d.get("valid_days") or DEFAULT_QUOTE_DAYS)
+            except (TypeError, ValueError):
+                raise FlowError("Valid for how many days?")
+            prepare_quote(lead, request.user, self._get(Tariff, d.get("tariff"), "plan"), items, days)
+            if d.get("send_email") in (True, "true", "1", 1):
+                return {"emailed_to": email_quote(lead, request.user)}
+            return {}
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["post"], url_path="quote-email")
+    def quote_email(self, request, pk=None):
+        from .quote import email_quote
+        from .workflow import FlowError
+
+        lead = self.get_object()
+
+        def run():
+            if not lead.quote_sent_at:
+                raise FlowError("There's no quote yet.")
+            return {"emailed_to": email_quote(lead, request.user)}
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["get"], url_path="quote-pdf")
+    def quote_pdf(self, request, pk=None):
+        from .quote import render_quote_pdf
+        from .workflow import quote_number
+
+        lead = self.get_object()
+        if not lead.quote_sent_at:
+            return Response({"detail": "There's no quote yet."}, status=status.HTTP_404_NOT_FOUND)
+        response = HttpResponse(render_quote_pdf(lead), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{quote_number(lead)}.pdf"'
+        return response
+
+    @action(detail=True, methods=["post"])
+    def accept(self, request, pk=None):
+        """Quote accepted: client created, installation job in the job pool."""
+        from .workflow import accept
+
+        lead = self.get_object()
+
+        def run():
+            customer, job = accept(lead, request.user)
+            return {
+                "customer_id": customer.pk,
+                "customer_reference": customer.customer_id,
+                "install_job_id": job.pk if job else None,
+            }
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        """Lost, at whatever step -- always with a reason."""
+        from .workflow import FlowError, reject
+
+        lead = self.get_object()
+        d = request.data
+
+        def run():
+            reason = str(d.get("reason") or Lead.LostReason.QUOTE_REJECTED)
+            if reason not in Lead.LostReason.values:
+                raise FlowError("Choose why it was lost.")
+            reject(lead, request.user, reason=reason, note=str(d.get("note", "") or "").strip())
+
+        return self._flow(request, run)
+
+    @action(detail=True, methods=["get", "post"], url_path="notes")
+    def notes_action(self, request, pk=None):
+        lead = self.get_object()
+        if request.method == "GET":
+            return Response(
+                LeadNoteSerializer(lead.lead_notes.select_related("author"), many=True).data
+            )
+        serializer = LeadNoteSerializer(data={**request.data, "lead": lead.pk})
+        serializer.is_valid(raise_exception=True)
+        note = serializer.save(lead=lead, author=request.user)
+        # Logging a call or an email usually means the next one has been
+        # agreed. Offered as an optional field on the note rather than a
+        # separate save, so it happens in the same keystroke or not at all.
+        follow_up = request.data.get("next_follow_up")
+        if follow_up:
+            lead.next_follow_up = follow_up
+            lead.save(update_fields=["next_follow_up", "updated_at"])
+        return Response(LeadNoteSerializer(note).data, status=status.HTTP_201_CREATED)
+
+
+class PipelineSummaryView(APIView):
+    """Counts and value per stage, plus what is due today.
+
+    One request rather than one per stage: the stage strip is the first
+    thing on the page and six sequential round trips is how a fast screen
+    becomes a slow one.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSalesAccess]
+
+    def get(self, request):
+        qs = scope_to_partners(Lead.objects.all(), request.user)
+        if request.query_params.get("mine") == "true":
+            qs = qs.filter(assigned_to=request.user)
+
+        rows = {
+            row["status"]: row
+            for row in qs.values("status").annotate(
+                count=Count("id"),
+                value=Sum("estimated_monthly_value"),
+            )
+        }
+
+        # Sum() above only covers the explicit override. The rest of the
+        # pipeline's value comes from each lead's tariff, so the fallback
+        # is applied in Python -- correct beats one query here, and the
+        # row count is a pipeline, not a ledger.
+        stages = []
+        for choice in Lead.Status:
+            leads = [lead for lead in qs.select_related("interested_tariff") if lead.status == choice.value]
+            stages.append(
+                {
+                    "status": choice.value,
+                    "label": choice.label,
+                    "count": rows.get(choice.value, {}).get("count", 0),
+                    "value": sum((lead.value for lead in leads), start=0),
+                    "is_open": choice.value in Lead.OPEN_STATUSES,
+                }
+            )
+
+        today = timezone.localdate()
+        open_qs = qs.filter(status__in=Lead.OPEN_STATUSES)
+        due = open_qs.filter(next_follow_up__isnull=False, next_follow_up__lte=today)
+
+        return Response(
+            {
+                "stages": stages,
+                "open_count": open_qs.count(),
+                "open_value": sum(
+                    (lead.value for lead in open_qs.select_related("interested_tariff")), start=0
+                ),
+                "due_count": due.count(),
+                # Leads nobody has scheduled anything for. Not overdue --
+                # invisible, which is worse, because an overdue list at
+                # least admits they exist.
+                "unscheduled_count": open_qs.filter(next_follow_up__isnull=True).count(),
+            }
+        )

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { Modal, btnPrimary } from "./Modal";
+import { jobAssignee } from "../utils/scheduling";
 import type { Job, Shift } from "../types";
 
 // One day, laid out against the hours, so it is obvious at a glance when
@@ -105,17 +106,20 @@ export function DayScheduleModal({
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const items = useMemo<PlacedItem[]>(() => {
-    const jobItems: Item[] = jobs.map((j) => ({
-      key: `job-${j.id}`,
-      kind: "job",
-      label: j.title,
-      sublabel: j.customer_name ?? j.assigned_to_name ?? "standalone",
-      colour: jobColour(j),
-      start: new Date(j.start),
-      end: new Date(j.end),
-      cancelled: j.status === "cancelled",
-      onClick: () => onEditJob(j),
-    }));
+    // A pool job (no start/end) has no place on an hourly grid.
+    const jobItems: Item[] = jobs
+      .filter((j) => j.start && j.end)
+      .map((j) => ({
+        key: `job-${j.id}`,
+        kind: "job",
+        label: j.title,
+        sublabel: j.customer_name ?? (j.technicians.length > 0 ? jobAssignee(j) : null) ?? "standalone",
+        colour: jobColour(j),
+        start: new Date(j.start as string),
+        end: new Date(j.end as string),
+        cancelled: j.status === "cancelled",
+        onClick: () => onEditJob(j),
+      }));
     const shiftItems: Item[] = shifts.map((s) => ({
       key: `shift-${s.id}`,
       kind: "shift",

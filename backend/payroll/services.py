@@ -1,6 +1,8 @@
 import datetime
 from decimal import Decimal
 
+from django.db.models import Q
+
 from accounts.models import User
 from .models import AttendanceRecord, PayrollRunLine, PayrollSettings, StaffProfile, days_in_month
 
@@ -53,6 +55,73 @@ def salary_for_period(monthly_salary, period_start, period_end):
     return total
 
 
+def monthly_cycles_in(period_start, period_end):
+    """How many monthly PAY CYCLES a run covers -- not calendar months.
+
+    26 Aug -> 25 Sep is ONE cycle even though it touches two calendar
+    months; 1 Jul -> 31 Aug is two. Counted as the number of whole months
+    between the two dates, plus one more when the end day has reached the
+    day the cycle starts on.
+
+    Deliberately NOT done by stepping a month at a time from the start
+    date. That was the first attempt and it drifts: stepping from 31
+    January clamps to 28 February, and every later step then anchors on
+    the 28th, so a 31 Jan -> 28 Feb run -- one month's pay -- counted two
+    cycles and charged two UIF ceilings. Over-deducting from the employee
+    is exactly the harm this function was written to stop, so the
+    arithmetic here is done in one shot from the original dates and cannot
+    accumulate that error.
+
+    A run whose start and end are both on a month end (31 Jan -> 31 Mar)
+    lands on a cycle boundary and counts the day the next cycle opens.
+    That is the arithmetic being honest about an odd period rather than a
+    bug, but it is the one shape worth a second opinion from whoever owns
+    payroll -- as is the even spread in uif_for_period below.
+    """
+    if period_end < period_start:
+        return 1
+    months = (period_end.year - period_start.year) * 12 + (
+        period_end.month - period_start.month
+    )
+    if period_end.day >= period_start.day:
+        months += 1
+    return max(months, 1)
+
+
+def uif_for_period(settings_obj, remuneration, period_start, period_end):
+    """(employee, employer) UIF for a run's period, capped once per PAY CYCLE.
+
+    UIF is 1% from the employee and 1% matched by the employer, on
+    remuneration up to a ceiling for each month of pay. PayrollSettings.uif_for
+    applies exactly one ceiling, and nothing constrains a run to one cycle --
+    the only validation is period_end >= period_start -- so a two-month
+    catch-up run squeezed two months of pay under a single month's cap:
+    R177.12 off the employee instead of R354.24, with the employer's own
+    contribution short by the same amount on the EMP201.
+
+    So the remuneration is spread evenly over the cycles the run covers and
+    each cycle is capped on its own. An ordinary one-cycle run -- which is
+    nearly all of them, straddling month-end or not -- gets exactly one
+    ceiling and is therefore unchanged to the cent from the original code.
+
+    NOTE FOR WHOEVER OWNS PAYROLL: the even spread is an assumption. If a
+    catch-up run covers two months in which the person earned very
+    differently (nothing in one, everything in the other), the honest answer
+    is two separate runs, one per month, which this platform already
+    supports. This function only makes the multi-cycle case better than
+    charging one ceiling for all of it; it does not make it exact.
+    """
+    cycles = monthly_cycles_in(period_start, period_end)
+    share = (remuneration / Decimal(cycles)).quantize(Decimal("0.01"))
+    employee = Decimal("0.00")
+    employer = Decimal("0.00")
+    for _ in range(cycles):
+        cycle_employee, cycle_employer = settings_obj.uif_for(share)
+        employee += cycle_employee
+        employer += cycle_employer
+    return employee, employer
+
+
 # Fields a person types in that this function must NOT destroy. Everything
 # else on a line is derived from attendance and can be safely recomputed.
 _MANUAL_LINE_FIELDS = (
@@ -85,9 +154,32 @@ def generate_payroll_run_lines(run):
     }
     run.lines.all().delete()
 
+    # Who gets a line: everyone currently on the payroll, plus anyone who
+    # already had one on this run. That second half is the leaver. Someone
+    # deactivated between a draft being generated and it being recalculated
+    # has almost always just left, and that line is their final pay -- but
+    # rebuilding from the active staff alone dropped it, along with the PAYE
+    # somebody had typed against it, and the run came back one person shorter
+    # with nothing said about it. The page redraws itself from the response,
+    # and the bank CSV and the payslip PDFs are all driven off these lines, so
+    # the first sign of it was someone not being paid. Recalculate must never
+    # be the thing that quietly decides not to pay somebody.
+    #
+    # It still won't ADD anyone who left before the period: they have no line
+    # on this run, so they aren't in `preserved`, so they aren't matched here.
+    # The staff_profile guard is what the old is_active filter gave us for
+    # free -- the loop below reads staff.staff_profile, and a line can outlive
+    # the profile it was generated from.
     staff_qs = (
-        User.objects.filter(role__in=["admin", "support", "sales", "technician", "management", "accounts"], is_active=True)
-        .filter(staff_profile__is_active=True)
+        User.objects.filter(staff_profile__isnull=False)
+        .filter(
+            Q(
+                role__in=["admin", "support", "sales", "technician", "management", "accounts"],
+                is_active=True,
+                staff_profile__is_active=True,
+            )
+            | Q(pk__in=list(preserved))
+        )
         .select_related("staff_profile")
     )
 
@@ -125,7 +217,13 @@ def generate_payroll_run_lines(run):
         # Remuneration includes any additional amount (a bonus is remuneration
         # for UIF purposes), which is why this happens after the carry-over.
         remuneration = gross_pay + carried.get("additional_amount", Decimal("0"))
-        uif_employee, uif_employer = settings_obj.uif_for(remuneration)
+        # Per month, not per run: uif_for caps at one month's ceiling, so a
+        # two-month catch-up run used to charge UIF on one month of it while
+        # paying two months' salary. SDL has no ceiling, so 1% of the whole
+        # period is right as it stands.
+        uif_employee, uif_employer = uif_for_period(
+            settings_obj, remuneration, run.period_start, run.period_end
+        )
         sdl = settings_obj.sdl_for(remuneration)
 
         lines.append(
@@ -161,7 +259,13 @@ def recalculate_statutory(line):
     """
     settings_obj = PayrollSettings.load()
     remuneration = line.gross_pay + line.additional_amount
-    line.uif_employee, line.uif_employer = settings_obj.uif_for(remuneration)
+    # Capped per month, exactly as generation does it -- otherwise typing a
+    # bonus into a line on a multi-month run quietly put the single-month cap
+    # back on a run that had been generated correctly.
+    run = line.payroll_run
+    line.uif_employee, line.uif_employer = uif_for_period(
+        settings_obj, remuneration, run.period_start, run.period_end
+    )
     line.sdl = settings_obj.sdl_for(remuneration)
     line.save(update_fields=["uif_employee", "uif_employer", "sdl"])
     return line

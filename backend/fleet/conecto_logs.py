@@ -1,0 +1,224 @@
+"""Trips and fuel slips technicians capture in the Conecto app (7 Oct 2026).
+
+Conecto posts one trip or one fill-up per call and retries anything we have
+not accepted every 30 minutes, so each is keyed on Conecto's own id: a
+repeat returns the row already made. The vehicle is ours (vexar_vehicle_id)
+or, when the technician typed it, found by registration.
+"""
+import datetime
+from decimal import Decimal, InvalidOperation
+
+from django.contrib.auth import get_user_model
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
+
+from .models import FuelLog, OdometerReading, TripLog, Vehicle
+
+
+class LogError(ValueError):
+    """Shown to Conecto as the 4xx detail. `status` is 400 or 404."""
+
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def _reg(text):
+    return "".join(ch for ch in str(text or "").upper() if ch.isalnum())
+
+
+def find_vehicle(vexar_vehicle_id, registration):
+    if str(vexar_vehicle_id or "").strip().isdigit():
+        vehicle = Vehicle.objects.filter(pk=int(str(vexar_vehicle_id).strip())).first()
+        if vehicle is not None:
+            return vehicle
+    wanted = _reg(registration)
+    if wanted:
+        for vehicle in Vehicle.objects.all().only("id", "registration_number"):
+            if _reg(vehicle.registration_number) == wanted:
+                return Vehicle.objects.get(pk=vehicle.pk)
+    raise LogError(
+        f"No vehicle {registration or vexar_vehicle_id!r} on our side. It will go through once "
+        "the vehicle is added (or the registration corrected).",
+        status=404,
+    )
+
+
+def find_staff(staff_code, technician_code):
+    User = get_user_model()
+    if staff_code:
+        user = User.objects.filter(staff_code__iexact=str(staff_code).strip()).first()
+        if user is not None:
+            return user
+    if technician_code:
+        from conecto.models import ConectoTechnician
+
+        link = ConectoTechnician.objects.select_related("user").filter(
+            technician_code=str(technician_code).strip()
+        ).first()
+        if link is not None:
+            return link.user
+    return None
+
+
+def _number(data, key, required=True, kind=Decimal):
+    value = data.get(key)
+    if value in (None, ""):
+        if required:
+            raise LogError(f"{key} is required.")
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise LogError(f"{key} must be a number.")
+    if number < 0:
+        raise LogError(f"{key} can't be negative.")
+    return int(number) if kind is int else number
+
+
+def _moment(data, key, required=True):
+    value = data.get(key)
+    if not value:
+        if required:
+            raise LogError(f"{key} is required.")
+        return None
+    moment = parse_datetime(str(value))
+    if moment is None:
+        raise LogError(f"{key} must be an ISO 8601 date and time.")
+    if timezone.is_naive(moment):
+        moment = timezone.make_aware(moment)
+    return moment
+
+
+def _url(value):
+    value = str(value or "").strip()
+    return value[:1000] if value.startswith(("http://", "https://")) else ""
+
+
+def add_reading(vehicle, km, at, user, note, source=""):
+    """Put a reading into the vehicle's odometer history -- only where it
+    fits (no lower than the reading before it in time, no higher than the
+    one after, nothing else at the same instant). Returns True if it went in
+    or was already there."""
+    readings = vehicle.odometer_readings.all()
+    if readings.filter(recorded_at=at, reading_km=km).exists():
+        return True
+    if readings.filter(recorded_at=at).exists():
+        return False
+    earlier = readings.filter(recorded_at__lt=at).order_by("-recorded_at", "-id").first()
+    if earlier and km < earlier.reading_km:
+        return False
+    later = readings.filter(recorded_at__gt=at).order_by("recorded_at", "id").first()
+    if later and km > later.reading_km:
+        return False
+    OdometerReading.objects.create(vehicle=vehicle, reading_km=km, recorded_at=at, recorded_by=user, notes=note[:255], source=source)
+    return True
+
+
+def record_trip(data):
+    """Returns (trip, created)."""
+    trip_id = str(data.get("conecto_trip_id") or "").strip()[:64]
+    if not trip_id:
+        raise LogError("conecto_trip_id is required.")
+    existing = TripLog.objects.filter(conecto_trip_id=trip_id).first()
+    if existing is not None:
+        return existing, False
+
+    vehicle = find_vehicle(data.get("vexar_vehicle_id"), data.get("vehicle_registration"))
+    start = _number(data, "start_odometer", kind=int)
+    end = _number(data, "end_odometer", kind=int)
+    if end < start:
+        raise LogError("end_odometer is lower than start_odometer.")
+    km = _number(data, "km_driven", required=False, kind=int)
+    started_at = _moment(data, "started_at")
+    ended_at = _moment(data, "ended_at")
+    user = find_staff(data.get("staff_code"), data.get("technician_code"))
+    name = str(data.get("technician_name") or "").strip()[:150] or (user.get_full_name() if user else "")
+
+    try:
+        with transaction.atomic():
+            trip = TripLog.objects.create(
+                vehicle=vehicle, driver=user, driver_name=name, conecto_trip_id=trip_id,
+                start_odometer=start, end_odometer=end,
+                km_driven=km if km is not None else end - start,
+                started_at=started_at, ended_at=ended_at,
+                start_photo_url=_url(data.get("start_photo_url")),
+                end_photo_url=_url(data.get("end_photo_url")),
+                notes=str(data.get("notes") or "").strip(),
+            )
+            note = f"Trip logged in Conecto by {name}" if name else "Trip logged in Conecto"
+            fits_start = add_reading(vehicle, start, started_at, user, note)
+            fits_end = add_reading(vehicle, end, ended_at, user, note)
+            trip.odometer_recorded = fits_start and fits_end
+            trip.save(update_fields=["odometer_recorded"])
+    except IntegrityError:
+        # The same trip arriving twice at once: the other request won.
+        return TripLog.objects.get(conecto_trip_id=trip_id), False
+    return trip, True
+
+
+def record_fuel(data):
+    """Returns (fuel_log, created)."""
+    fuel_id = str(data.get("conecto_fuel_id") or "").strip()[:64]
+    if not fuel_id:
+        raise LogError("conecto_fuel_id is required.")
+    existing = FuelLog.objects.filter(conecto_fuel_id=fuel_id).first()
+    if existing is not None:
+        return existing, False
+
+    vehicle = find_vehicle(data.get("vexar_vehicle_id"), data.get("vehicle_registration"))
+    filled_at = parse_date(str(data.get("filled_at") or ""))
+    if filled_at is None:
+        raise LogError("filled_at must be YYYY-MM-DD.")
+    litres = _number(data, "litres")
+    if not litres:
+        raise LogError("litres must be more than 0.")
+    odometer = _number(data, "odometer", kind=int)
+    total = _number(data, "total_amount", required=False)
+    user = find_staff(data.get("staff_code"), data.get("technician_code"))
+    name = str(data.get("technician_name") or "").strip()[:150] or (user.get_full_name() if user else "")
+    station = str(data.get("station") or "").strip()[:120]
+    recorded_at = _moment(data, "recorded_at", required=False)
+
+    extras = {
+        key: data.get(key)
+        for key in ("price_per_litre", "currency", "fuel_type", "ai_extracted", "edited_by_technician",
+                    "technician_name", "technician_code", "staff_code", "recorded_at")
+        if data.get(key) not in (None, "")
+    }
+    try:
+        with transaction.atomic():
+            log = FuelLog.objects.create(
+                vehicle=vehicle, filled_at=filled_at, litres=litres.quantize(Decimal("0.01")),
+                cost=total.quantize(Decimal("0.01")) if total is not None else None,
+                odometer_km=odometer,
+                notes=" · ".join(b for b in (f"Conecto: {name}" if name else "Conecto", station) if b)[:255],
+                logged_by=user, source=FuelLog.Source.CONECTO, conecto_fuel_id=fuel_id,
+                station=station, slip_url=_url(data.get("slip_url")),
+                amount_mismatch=bool(data.get("amount_mismatch")), conecto_data=extras,
+            )
+            at = recorded_at or timezone.make_aware(
+                datetime.datetime.combine(filled_at, datetime.time(12, 0)), timezone.get_current_timezone()
+            )
+            add_reading(vehicle, odometer, at, user, f"Fuel slip in Conecto{f' by {name}' if name else ''}")
+    except IntegrityError:
+        return FuelLog.objects.get(conecto_fuel_id=fuel_id), False
+    return log, True
+
+
+def vehicle_list(user=None):
+    rows = []
+    for vehicle in Vehicle.objects.filter(is_active=True).prefetch_related("odometer_readings"):
+        rows.append({
+            "vehicle_id": str(vehicle.pk),
+            "registration": vehicle.registration_number,
+            "make": vehicle.make,
+            "model": vehicle.model,
+            "name": f"{vehicle.make} {vehicle.model}".strip(),
+            "current_odometer": vehicle.current_odometer_km,
+            "is_active": vehicle.is_active,
+            "assigned_to_you": bool(user is not None and vehicle.assigned_to_id == user.pk),
+        })
+    rows.sort(key=lambda r: (not r["assigned_to_you"], r["registration"]))
+    return rows

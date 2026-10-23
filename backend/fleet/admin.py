@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import FuelLog, OdometerReading, ServiceRecord, Vehicle
+from .models import FuelLog, OdometerReading, ServiceRecord, TyreRotation, Vehicle
 
 
 class OdometerReadingInline(admin.TabularInline):
@@ -10,6 +10,11 @@ class OdometerReadingInline(admin.TabularInline):
 
 class ServiceRecordInline(admin.TabularInline):
     model = ServiceRecord
+    extra = 0
+
+
+class TyreRotationInline(admin.TabularInline):
+    model = TyreRotation
     extra = 0
 
 
@@ -23,4 +28,4 @@ class VehicleAdmin(admin.ModelAdmin):
     list_display = ("registration_number", "make", "model", "year", "fuel_type", "assigned_to", "is_active")
     list_filter = ("is_active", "make", "fuel_type")
     search_fields = ("make", "model", "registration_number")
-    inlines = [OdometerReadingInline, ServiceRecordInline, FuelLogInline]
+    inlines = [OdometerReadingInline, ServiceRecordInline, TyreRotationInline, FuelLogInline]

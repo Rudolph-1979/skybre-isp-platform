@@ -1,0 +1,270 @@
+"""Administration -> Revenue charts (9 Oct 2026)."""
+import datetime
+from decimal import Decimal
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from billing.models import Invoice, Payment, PaymentAllocation, Service, Tariff
+from customers.models import Customer, Partner, RevenueSnapshot
+from customers.scoping import DIRECT
+
+User = get_user_model()
+ALL_SECTIONS = list(User.Section.values)
+
+
+def at(day, hour=10):
+    return timezone.make_aware(datetime.datetime.combine(day, datetime.time(hour, 0)))
+
+
+class RevenueFixture(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.vuma = Partner.objects.create(name="Vumatel")
+        self.t149 = Tariff.objects.create(name="W 4", price=Decimal("149.00"), tax_rate_pct=Decimal("15"))
+        self.t400 = Tariff.objects.create(name="F 10", price=Decimal("400.00"), tax_rate_pct=Decimal("15"))
+        self.anna = Customer.objects.create(full_name="Anna", status="active")
+        self.ben = Customer.objects.create(full_name="Ben", status="active", partner=self.vuma)
+        long_ago = self.today - datetime.timedelta(days=400)
+        # Anna: direct line since long ago + a Vumatel line that started 10 days ago.
+        Service.objects.create(customer=self.anna, tariff=self.t149, status="active", start_date=long_ago)
+        Service.objects.create(customer=self.anna, tariff=self.t400, status="active", partner=self.vuma,
+                               start_date=self.today - datetime.timedelta(days=10))
+        # Ben: Vumatel line, active since long ago.
+        Service.objects.create(customer=self.ben, tariff=self.t149, status="active", start_date=long_ago)
+        # A line that ended 5 days ago counts in the past only.
+        Service.objects.create(customer=self.ben, tariff=self.t400, status="terminated", start_date=long_ago,
+                               end_date=self.today - datetime.timedelta(days=5))
+        self.api = APIClient()
+        self.staff = User.objects.create_user(username="staff", password="pw-for-tests-123", role="support",
+                                              allowed_sections=ALL_SECTIONS)
+
+    def _get(self, url, user=None):
+        self.api.force_authenticate(user or self.staff)
+        res = self.api.get(url)
+        self.assertEqual(res.status_code, 200, getattr(res, "data", res))
+        return res.data
+
+
+class MrrTests(RevenueFixture):
+    def test_today_is_live_and_saved(self):
+        data = self._get("/api/reports/revenue/mrr/?period=daily")
+        last = data["points"][-1]
+        self.assertEqual(last["date"], self.today.isoformat())
+        self.assertFalse(last["estimated"])
+        self.assertEqual(last["mrr"], "698.00")          # 149 + 400 + 149
+        self.assertEqual(last["clients"], 2)
+        self.assertEqual(last["arpu"], "349.00")
+        self.assertEqual(RevenueSnapshot.objects.filter(date=self.today).count(), 2)   # direct + Vumatel
+
+    def test_past_days_are_estimated_from_start_and_end_dates(self):
+        data = self._get("/api/reports/revenue/mrr/?period=daily")
+        by_date = {p["date"]: p for p in data["points"]}
+        d20 = (self.today - datetime.timedelta(days=20)).isoformat()
+        d7 = (self.today - datetime.timedelta(days=7)).isoformat()
+        self.assertTrue(by_date[d20]["estimated"])
+        self.assertEqual(by_date[d20]["mrr"], "698.00")  # 149 + 149 + 400 (the line that ended later; no new line yet)
+        self.assertEqual(by_date[d7]["mrr"], "1098.00")  # 149 + 400 new + 149 + 400 (ended line still running)
+        d3 = (self.today - datetime.timedelta(days=3)).isoformat()
+        self.assertEqual(by_date[d3]["mrr"], "698.00")   # ended line gone, Vumatel 400 there
+
+    def test_a_snapshot_day_is_exact(self):
+        day = self.today - datetime.timedelta(days=2)
+        RevenueSnapshot.objects.create(date=day, partner_key=DIRECT, mrr=Decimal("1000.00"), services=4,
+                                       client_ids=[self.anna.pk])
+        data = self._get("/api/reports/revenue/mrr/?period=daily")
+        point = next(p for p in data["points"] if p["date"] == day.isoformat())
+        self.assertFalse(point["estimated"])
+        self.assertEqual(point["mrr"], "1000.00")
+        self.assertEqual(point["arpu"], "1000.00")
+
+    def test_partner_filter_counts_lines(self):
+        data = self._get(f"/api/reports/revenue/mrr/?period=daily&partner={self.vuma.pk}")
+        last = data["points"][-1]
+        self.assertEqual(last["mrr"], "549.00")          # Anna's 400 Vumatel line + Ben's 149
+        self.assertEqual(last["clients"], 2)
+        data = self._get("/api/reports/revenue/mrr/?period=daily&partner=direct")
+        self.assertEqual(data["points"][-1]["mrr"], "149.00")
+
+    def test_periods(self):
+        for period, n in (("weekly", 26), ("monthly", 18), ("yearly", 5)):
+            data = self._get(f"/api/reports/revenue/mrr/?period={period}")
+            self.assertEqual(len(data["points"]), n)
+            self.assertEqual(data["points"][-1]["date"], self.today.isoformat())
+        self.api.force_authenticate(self.staff)
+        self.assertEqual(self.api.get("/api/reports/revenue/mrr/?period=hourly").status_code, 400)
+
+
+class PaymentChartTests(RevenueFixture):
+    def _pay(self, customer, amount, day, method="bank_transfer", invoice=None):
+        p = Payment.objects.create(customer=customer, amount=Decimal(amount), method=method, invoice=invoice)
+        Payment.objects.filter(pk=p.pk).update(date=at(day))
+        return p
+
+    def test_top_payers_and_others(self):
+        first = self.today.replace(day=1)
+        self._pay(self.anna, "500", first)
+        self._pay(self.anna, "100", first)
+        self._pay(self.ben, "300", first)
+        data = self._get("/api/reports/revenue/top-payers/?month=this")
+        self.assertEqual([(r["name"], r["amount"]) for r in data["rows"]], [("Anna", "600.00"), ("Ben", "300.00")])
+        self.assertEqual(data["total"], "900.00")
+        data = self._get("/api/reports/revenue/top-payers/?month=this&partner=direct")
+        # Anna has a direct line, Ben doesn't.
+        self.assertEqual([r["name"] for r in data["rows"]], ["Anna"])
+
+    def test_top_payers_folds_the_rest_into_others(self):
+        first = self.today.replace(day=1)
+        for i in range(12):
+            c = Customer.objects.create(full_name=f"C{i:02d}", status="active")
+            self._pay(c, str(100 + i), first)
+        data = self._get("/api/reports/revenue/top-payers/?month=this")
+        self.assertEqual(len(data["rows"]), 10)
+        self.assertEqual(data["others"]["payers"], 2)
+        self.assertEqual(data["others"]["amount"], "201.00")    # 100 + 101
+
+    def test_daily_payments_last_month(self):
+        last_month_day = self.today.replace(day=1) - datetime.timedelta(days=1)
+        self._pay(self.ben, "250", last_month_day.replace(day=3))
+        self._pay(self.ben, "50", last_month_day.replace(day=3))
+        data = self._get("/api/reports/revenue/daily-payments/?month=last")
+        self.assertEqual(len(data["days"]), last_month_day.day)
+        day3 = data["days"][2]
+        self.assertEqual((day3["amount"], day3["payments"]), ("300.00", 2))
+        self.assertEqual(data["total"], "300.00")
+
+    def test_payments_by_method(self):
+        first = self.today.replace(day=1)
+        self._pay(self.anna, "100", first, method="cash")
+        self._pay(self.ben, "200", first, method="bank_transfer")
+        data = self._get("/api/reports/revenue/payments/?period=month")
+        self.assertEqual(len(data["rows"]), 12)
+        now = data["rows"][-1]
+        self.assertEqual((now["cash"], now["bank_transfer"], now["total"]), ("100.00", "200.00", "300.00"))
+        self.assertEqual(len(self._get("/api/reports/revenue/payments/?period=quarter")["rows"]), 8)
+        self.assertEqual(len(self._get("/api/reports/revenue/payments/?period=year")["rows"]), 5)
+
+    def test_invoicing_paid_unpaid_on_time_late_unknown(self):
+        first = self.today.replace(day=1)
+        due = first + datetime.timedelta(days=7)
+
+        def inv(customer, total, paid, status):
+            i = Invoice.objects.create(customer=customer, status=status, date_due=due, date_issued=first,
+                                       total=Decimal(total), paid_amount=Decimal(paid))
+            return i
+
+        on_time = inv(self.anna, "200", "200", "paid")
+        late = inv(self.ben, "300", "300", "paid")
+        inv(self.anna, "100", "100", "paid")                     # imported as paid, no record of when
+        inv(self.ben, "50", "0", "unpaid")
+        p1 = self._pay(self.anna, "200", first + datetime.timedelta(days=2))
+        PaymentAllocation.objects.create(payment=p1, invoice=on_time, amount=Decimal("200"))
+        self._pay(self.ben, "300", due + datetime.timedelta(days=3), invoice=late)
+        cn = inv(self.anna, "999", "0", "unpaid")
+        Invoice.objects.filter(pk=cn.pk).update(number="CN-000099")   # credit notes are left out
+        data = self._get("/api/reports/revenue/invoicing/?period=month")
+        now = data["rows"][-1]
+        self.assertEqual(now["invoices"], 4)
+        self.assertEqual(now["invoiced"], "650.00")
+        self.assertEqual((now["paid"], now["unpaid"]), ("600.00", "50.00"))
+        self.assertEqual((now["on_time"], now["late"], now["paid_unknown"]), ("200.00", "300.00", "100.00"))
+
+
+class AccessTests(RevenueFixture):
+    def test_needs_administration(self):
+        user = User.objects.create_user(username="desk", password="pw-for-tests-123", role="support",
+                                        allowed_sections=[s for s in ALL_SECTIONS if s != "administration"])
+        self.api.force_authenticate(user)
+        self.assertEqual(self.api.get("/api/reports/revenue/mrr/").status_code, 403)
+        self.api.force_authenticate(self.staff)
+        self.assertEqual(self.api.get("/api/reports/revenue/nonsense/").status_code, 404)
+
+    def test_restricted_user_gets_only_their_partners(self):
+        user = User.objects.create_user(username="vuma", password="pw-for-tests-123", role="support",
+                                        allowed_sections=ALL_SECTIONS, allowed_partners=[self.vuma.pk])
+        data = self._get("/api/reports/revenue/partners/", user)
+        self.assertEqual([p["name"] for p in data["partners"]], ["Vumatel"])
+        self.api.force_authenticate(user)
+        self.assertEqual(self.api.get("/api/reports/revenue/mrr/?partner=direct").status_code, 400)
+        data = self._get("/api/reports/revenue/mrr/?period=daily", user)
+        self.assertEqual(data["points"][-1]["mrr"], "549.00")
+
+    def test_snapshot_command(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("snapshot_revenue", stdout=out)
+        self.assertIn("MRR R698.00", out.getvalue())
+        self.assertEqual(RevenueSnapshot.objects.filter(date=self.today).count(), 2)
+        call_command("snapshot_revenue", stdout=StringIO())      # idempotent for the day
+        self.assertEqual(RevenueSnapshot.objects.filter(date=self.today).count(), 2)
+
+
+class OutstandingByMethodTests(RevenueFixture):
+    """Outstanding & overdue per payment method (12 Oct 2026)."""
+
+    def setUp(self):
+        super().setUp()
+        from billing.models import CustomerBillingConfig, PaymentMethod
+
+        self.eft1 = PaymentMethod.objects.create(name="EFT 1st")
+        CustomerBillingConfig.objects.create(customer=self.anna, payment_method=self.eft1)
+        past = self.today - datetime.timedelta(days=10)
+        future = self.today + datetime.timedelta(days=5)
+
+        def inv(customer, total, paid, due, status="unpaid"):
+            return Invoice.objects.create(customer=customer, status=status, date_due=due, date_issued=past,
+                                          total=Decimal(total), paid_amount=Decimal(paid))
+
+        inv(self.anna, "300", "100", past)          # 200 owed, overdue
+        inv(self.anna, "150", "0", future)          # 150 owed, not yet due
+        inv(self.anna, "500", "500", past, "paid")  # paid: ignored
+        inv(self.ben, "80", "0", past)              # Ben has no billing setup -> No payment method set
+        inv(self.ben, "40", "60", past)             # overpaid: never below 0, left out
+
+    def test_rows_and_total(self):
+        data = self._get("/api/reports/revenue/outstanding/")
+        rows = {r["name"]: r for r in data["rows"]}
+        self.assertEqual(list(rows), ["EFT 1st", "No payment method set"])
+        self.assertEqual((rows["EFT 1st"]["outstanding"], rows["EFT 1st"]["overdue"], rows["EFT 1st"]["clients"]),
+                         ("350.00", "200.00", 1))
+        self.assertEqual((rows["No payment method set"]["outstanding"], rows["No payment method set"]["overdue"]),
+                         ("80.00", "80.00"))
+        self.assertEqual(data["total"], {"clients": 2, "outstanding": "430.00", "overdue": "280.00"})
+
+    def test_partner_filter_and_click_through(self):
+        data = self._get("/api/reports/revenue/outstanding/?partner=direct")
+        self.assertEqual([r["name"] for r in data["rows"]], ["EFT 1st"])       # Ben has no direct line
+        data = self._get(f"/api/reports/revenue/outstanding/?method={self.eft1.pk}")
+        self.assertEqual([(c["full_name"], c["outstanding"], c["overdue"], c["invoices"]) for c in data["results"]],
+                         [("Anna", "350.00", "200.00", 2)])
+        data = self._get("/api/reports/revenue/outstanding/?method=none")
+        self.assertEqual([c["full_name"] for c in data["results"]], ["Ben"])
+        self.api.force_authenticate(self.staff)
+        self.assertEqual(self.api.get("/api/reports/revenue/outstanding/?method=abc").status_code, 400)
+
+    def test_export_csv_and_excel(self):
+        """Export CSV / Excel (14 Oct 2026)."""
+        import io
+
+        from openpyxl import load_workbook
+
+        self.api.force_authenticate(self.staff)
+        res = self.api.get("/api/reports/revenue/outstanding/?filetype=xlsx")
+        self.assertEqual(res.status_code, 200)
+        wb = load_workbook(io.BytesIO(res.content))
+        self.assertEqual(wb.sheetnames, ["By payment method", "Clients"])
+        summary = list(wb["By payment method"].iter_rows(min_row=2, max_row=4, values_only=True))
+        self.assertEqual(summary[0][:5], ("EFT 1st", 1, 350, 150, 200))
+        self.assertEqual(summary[2][0], "Total")
+        clients = list(wb["Clients"].iter_rows(min_row=2, values_only=True))
+        self.assertEqual([(c[0], c[1], c[3]) for c in clients], [("EFT 1st", "Anna", 2), ("No payment method set", "Ben", 1)])
+        res = self.api.get("/api/reports/revenue/outstanding/?filetype=csv&partner=direct")
+        self.assertEqual(res.status_code, 200)
+        text = res.content.decode("utf-8-sig")
+        self.assertIn("EFT 1st,1,350.00,150.00,200.00,57.1", text)
+        self.assertNotIn("Ben", text)

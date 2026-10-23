@@ -1,0 +1,98 @@
+"""Customers list Extension column next to Payment status (#194, Rudolph
+19 Oct 2026: "Add next to payment status Extension Requested or not")."""
+from datetime import timedelta
+
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from billing.models import CustomerBillingConfig, SuspensionExtensionRequest
+from customers.models import Customer
+
+
+class ExtensionColumnTests(TestCase):
+    def setUp(self):
+        admin = User.objects.create_user(username="boss", password="x", role="admin")
+        self.api = APIClient()
+        self.api.force_authenticate(admin)
+        today = timezone.localdate()
+        self.friday = today + timedelta(days=4)
+        self.anna = Customer.objects.create(full_name="Anna")  # pending request
+        SuspensionExtensionRequest.objects.create(customer=self.anna, extend_until=self.friday, reason="Pays Friday")
+        ben = Customer.objects.create(full_name="Ben")  # approved, in force
+        config = CustomerBillingConfig.for_customer(ben)
+        config.suspension_extended_until = today + timedelta(days=2)
+        config.save()
+        cara = Customer.objects.create(full_name="Cara")  # approved but expired + an old rejected request
+        config = CustomerBillingConfig.for_customer(cara)
+        config.suspension_extended_until = today - timedelta(days=1)
+        config.save()
+        SuspensionExtensionRequest.objects.create(customer=cara, extend_until=today, reason="x", status="rejected")
+        Customer.objects.create(full_name="Dirk")  # nothing at all
+        self.today = today
+
+    def test_listed(self):
+        res = self.api.get("/api/customers/?ordering=full_name&page_size=50")
+        self.assertEqual(res.status_code, 200)
+        rows = [(c["full_name"], c["extension_status"], c["extension_until"]) for c in res.data["results"]]
+        self.assertEqual(rows, [
+            ("Anna", "requested", self.friday.isoformat()),
+            ("Ben", "extended", (self.today + timedelta(days=2)).isoformat()),
+            ("Cara", "", None),
+            ("Dirk", "", None),
+        ])
+
+    def test_detail_too(self):
+        data = self.api.get(f"/api/customers/{self.anna.pk}/").data
+        self.assertEqual((data["extension_status"], data["extension_until"]), ("requested", self.friday.isoformat()))
+
+    def test_a_decided_request_stops_showing_as_requested(self):
+        SuspensionExtensionRequest.objects.filter(customer=self.anna).update(status="rejected")
+        data = self.api.get(f"/api/customers/{self.anna.pk}/").data
+        self.assertEqual(data["extension_status"], "")
+
+    def test_click_shows_the_reason(self):
+        # #195: the badge opens the request behind it.
+        data = self.api.get(f"/api/customers/{self.anna.pk}/extension/").data
+        self.assertEqual(data["status"], "requested")
+        self.assertEqual(data["pending"]["reason"], "Pays Friday")
+        self.assertEqual(data["pending"]["extend_until"], self.friday)
+        self.assertIsNone(data["approved"])
+
+    def test_click_on_an_approved_extension(self):
+        ben = Customer.objects.get(full_name="Ben")
+        until = self.today + timedelta(days=2)
+        boss = User.objects.get(username="boss")
+        SuspensionExtensionRequest.objects.create(
+            customer=ben, extend_until=until, reason="Salary on the 25th", status="approved",
+            requested_by=boss, decided_by=boss, decision_note="OK once", decided_at=timezone.now(),
+        )
+        data = self.api.get(f"/api/customers/{ben.pk}/extension/").data
+        self.assertEqual((data["status"], data["extended_until"]), ("extended", until))
+        self.assertEqual(data["approved"]["reason"], "Salary on the 25th")
+        self.assertEqual((data["approved"]["decided_by"], data["approved"]["decision_note"]), ("boss", "OK once"))
+        cara = Customer.objects.get(full_name="Cara")  # expired: nothing to show
+        data = self.api.get(f"/api/customers/{cara.pk}/extension/").data
+        self.assertEqual((data["status"], data["approved"], data["pending"]), ("", None, None))
+
+
+class StartDateColumnTests(TestCase):
+    """#199: Start date = signup date, else the day created here; sortable."""
+
+    def setUp(self):
+        import datetime
+
+        admin = User.objects.create_user(username="boss", password="x", role="admin")
+        self.api = APIClient()
+        self.api.force_authenticate(admin)
+        Customer.objects.create(full_name="Migrated", signup_date=datetime.date(2019, 3, 4))
+        self.new = Customer.objects.create(full_name="New here")
+
+    def test_listed_and_sorted(self):
+        res = self.api.get("/api/customers/?ordering=start_date&page_size=50")
+        rows = [(c["full_name"], c["start_date"]) for c in res.data["results"]]
+        self.assertEqual(rows, [("Migrated", "2019-03-04"), ("New here", timezone.localdate(self.new.created_at).isoformat())])
+        res = self.api.get("/api/customers/?ordering=-start_date&page_size=50")
+        self.assertEqual(res.data["results"][0]["full_name"], "New here")
+        self.assertEqual(self.api.get(f"/api/customers/{self.new.pk}/").data["start_date"], rows[1][1])

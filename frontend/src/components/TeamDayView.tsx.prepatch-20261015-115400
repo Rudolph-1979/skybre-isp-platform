@@ -1,0 +1,384 @@
+import { useEffect, useMemo, useState } from "react";
+import type { Job, JobTypeOption, Shift, User } from "../types";
+import { jobFieldStatus } from "../utils/scheduling";
+
+/**
+ * The Scheduling Day view, laid out the way Splynx does it (Rudolph,
+ * 6 Oct 2026): one row per person, time running left to right, so each
+ * technician's day reads across and free time and double bookings are
+ * obvious. Colour belongs to the PERSON (User.calendar_colour), not the job
+ * type -- the type is written on the card instead.
+ *
+ * - "Unassigned" row on top for jobs with a time but nobody on them.
+ * - A job with two technicians shows on both rows, in each one's colour,
+ *   with "+Name" on the card.
+ * - Overlaps on one person stack into sub-rows and are outlined red.
+ * - Shifts are a dashed band behind that person's row.
+ * - Click an empty slot to book that person at that time; drop a pool job
+ *   on a row to schedule it for them.
+ */
+
+const ROW_PAD = 6;
+const CARD_H = 44;
+const CARD_GAP = 4;
+const NAME_W = 190;
+const SNAP_MIN = 15;
+const NOW_TICK_MS = 60_000;
+export const UNASSIGNED_COLOUR = "#6b6b6b";
+
+type ScheduledJob = Job & { start: string; end: string };
+
+const FIELD_TAG: Record<string, { label: string; bg: string; fg: string }> = {
+  en_route: { label: "En route", bg: "#6b5410", fg: "#ffe9a8" },
+  checked_in: { label: "On site", bg: "#0f5c3c", fg: "#b6f5d3" },
+  completed: { label: "✓ Done", bg: "rgba(0,0,0,.35)", fg: "#fff" },
+};
+
+function hours(d: Date) {
+  return d.getHours() + d.getMinutes() / 60;
+}
+
+function hhmm(d: Date) {
+  return d.toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
+}
+
+function firstName(name: string | null) {
+  return (name || "").split(" ")[0];
+}
+
+function initials(u: User) {
+  const a = (u.first_name || u.username || "?").trim();
+  const b = (u.last_name || "").trim();
+  return ((a[0] || "?") + (b[0] || a[1] || "")).toUpperCase();
+}
+
+type Placed = { job: ScheduledJob; start: Date; end: Date; lane: number; clash: boolean };
+
+/** Stack a row's jobs into sub-lanes so overlapping ones don't sit on top
+ * of each other, and flag the overlaps (cancelled jobs never clash). */
+function placeRow(jobs: ScheduledJob[], clashCheck: boolean): { placed: Placed[]; lanes: number } {
+  const items = jobs
+    .map((job) => ({ job, start: new Date(job.start), end: new Date(job.end) }))
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
+  const laneEnds: number[] = [];
+  const placed: Placed[] = items.map((it) => {
+    let lane = laneEnds.findIndex((end) => end <= it.start.getTime());
+    if (lane === -1) {
+      lane = laneEnds.length;
+      laneEnds.push(0);
+    }
+    laneEnds[lane] = it.end.getTime();
+    return { ...it, lane, clash: false };
+  });
+  if (clashCheck) {
+    const live = placed.filter((p) => p.job.status !== "cancelled");
+    live.forEach((p) => {
+      p.clash = live.some((o) => o !== p && o.start < p.end && p.start < o.end);
+    });
+  }
+  return { placed, lanes: Math.max(1, laneEnds.length) };
+}
+
+export function TeamDayView({
+  day,
+  jobs,
+  shifts,
+  staff,
+  jobTypes,
+  onNewJob,
+  onEditJob,
+  onEditShift,
+  onDropJob,
+  onChangeColour,
+}: {
+  day: Date;
+  jobs: ScheduledJob[];
+  shifts: Shift[];
+  staff: User[];
+  jobTypes: Map<string, JobTypeOption>;
+  onNewJob: (at: Date, technicianId: number | null) => void;
+  onEditJob: (job: Job) => void;
+  onEditShift: (shift: Shift) => void;
+  onDropJob: (jobId: number, at: Date, technicianId: number | null) => void;
+  onChangeColour: (userId: number, colour: string) => void;
+}) {
+  const [hideEmpty, setHideEmpty] = useState(() => {
+    try {
+      return localStorage.getItem("schedHideEmpty") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("schedHideEmpty", hideEmpty ? "1" : "0");
+    } catch {
+      /* per-viewer convenience only */
+    }
+  }, [hideEmpty]);
+
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), NOW_TICK_MS);
+    return () => clearInterval(t);
+  }, []);
+
+  // 06:00-19:00 by default, widened to whatever the day actually holds.
+  const [startH, endH] = useMemo(() => {
+    let lo = 6;
+    let hi = 19;
+    [...jobs, ...shifts].forEach((x) => {
+      const s = new Date(x.start);
+      const e = new Date(x.end);
+      const sameDay = (d: Date) => d.toDateString() === day.toDateString();
+      if (sameDay(s)) lo = Math.min(lo, Math.floor(hours(s)));
+      hi = sameDay(e) ? Math.max(hi, Math.ceil(hours(e))) : 24;
+    });
+    return [Math.max(0, lo), Math.min(24, hi)];
+  }, [jobs, shifts, day]);
+  const span = endH - startH;
+  const pct = (h: number) => ((Math.min(Math.max(h, startH), endH) - startH) / span) * 100;
+  const hourOf = (d: Date) => (d.toDateString() === day.toDateString() ? hours(d) : d < day ? startH : endH);
+
+  const colourOf = useMemo(() => {
+    const m = new Map<number, string>();
+    staff.forEach((u) => m.set(u.id, u.calendar_colour || UNASSIGNED_COLOUR));
+    return (id: number) => m.get(id) ?? UNASSIGNED_COLOUR;
+  }, [staff]);
+
+  type Row = { key: string; user: User | null; jobs: ScheduledJob[]; shifts: Shift[] };
+  const rows: Row[] = useMemo(() => {
+    const unassigned: Row = { key: "unassigned", user: null, jobs: jobs.filter((j) => j.technicians.length === 0), shifts: [] };
+    const known = new Set(staff.map((u) => u.id));
+    // Anyone on a job but missing from the staff list (deactivated since)
+    // still gets a row, so their jobs don't vanish.
+    const extra: User[] = [];
+    jobs.forEach((j) =>
+      j.technicians.forEach((t) => {
+        if (!known.has(t.id) && !extra.some((e) => e.id === t.id)) {
+          extra.push({ id: t.id, username: t.name ?? "", first_name: t.name ?? "", last_name: "" } as User);
+        }
+      }),
+    );
+    const people = [...staff, ...extra]
+      .map((u) => ({
+        key: `u${u.id}`,
+        user: u,
+        jobs: jobs.filter((j) => j.technicians.some((t) => t.id === u.id)),
+        shifts: shifts.filter((s) => s.staff === u.id),
+      }))
+      .sort((a, b) => (a.user.first_name || a.user.username).localeCompare(b.user.first_name || b.user.username));
+    const visible = hideEmpty ? people.filter((r) => r.jobs.length || r.shifts.length) : people;
+    // No "Unassigned" row as a standing fixture -- the Job pool is where
+    // waiting work lives (Rudolph, 6 Oct 2026). It only appears when a job
+    // has a TIME but nobody on it, so such a job can't vanish from the day.
+    return unassigned.jobs.length ? [unassigned, ...visible] : visible;
+  }, [jobs, shifts, staff, hideEmpty]);
+
+  const isToday = now.toDateString() === day.toDateString();
+  const nowPct = isToday && hours(now) >= startH && hours(now) <= endH ? pct(hours(now)) : null;
+
+  function timeAt(e: React.MouseEvent<HTMLDivElement> | React.DragEvent<HTMLDivElement>) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const minutes = Math.round(((startH + frac * span) * 60) / SNAP_MIN) * SNAP_MIN;
+    const at = new Date(day);
+    at.setHours(0, minutes, 0, 0);
+    return at;
+  }
+
+  const peopleBooked = rows.filter((r) => r.user && r.jobs.length).length;
+  const hourMarks = Array.from({ length: span + 1 }, (_, i) => startH + i);
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-3 py-2 text-xs text-[var(--text-muted)]">
+        <span>
+          {jobs.length} job{jobs.length === 1 ? "" : "s"} · {peopleBooked} {peopleBooked === 1 ? "person" : "people"} booked — click an
+          empty slot to book that person at that time, drop a pool job on a row, or click a colour dot to change it.
+        </span>
+        <label className="flex cursor-pointer items-center gap-1.5">
+          <input type="checkbox" checked={hideEmpty} onChange={(e) => setHideEmpty(e.target.checked)} />
+          Hide people with no jobs
+        </label>
+      </div>
+
+      <div className="overflow-x-auto">
+        <div style={{ minWidth: 980 }}>
+          {/* Hour header */}
+          <div className="flex border-b border-[var(--border-hairline)]">
+            <div style={{ width: NAME_W }} className="shrink-0 border-r border-[var(--border-hairline)]" />
+            <div className="relative h-7 flex-1">
+              {hourMarks.map((h, i) => (
+                <span
+                  key={h}
+                  className="absolute top-1.5 text-[11px] text-[var(--text-muted)]"
+                  style={{
+                    left: `${pct(h)}%`,
+                    transform: i === 0 ? "none" : i === hourMarks.length - 1 ? "translateX(-100%)" : "translateX(-50%)",
+                  }}
+                >
+                  {String(h).padStart(2, "0")}:00
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {rows.map((row) => {
+            const { placed, lanes } = placeRow(row.jobs, row.user !== null);
+            const height = ROW_PAD * 2 + lanes * CARD_H + (lanes - 1) * CARD_GAP;
+            const colour = row.user ? colourOf(row.user.id) : UNASSIGNED_COLOUR;
+            const live = row.jobs.filter((j) => j.status !== "cancelled");
+            const booked = live.reduce((a, j) => a + (new Date(j.end).getTime() - new Date(j.start).getTime()) / 3.6e6, 0);
+            const techId = row.user ? row.user.id : null;
+            return (
+              <div key={row.key} className="flex border-b border-[var(--border-hairline)] last:border-b-0">
+                <div
+                  style={{ width: NAME_W, minHeight: height }}
+                  className="flex shrink-0 items-center gap-2.5 border-r border-[var(--border-hairline)] px-3"
+                >
+                  {row.user ? (
+                    <label
+                      className="relative grid h-7 w-7 shrink-0 cursor-pointer place-items-center rounded-full text-[11px] font-bold text-white"
+                      style={{ background: colour }}
+                      title="Change this person's calendar colour"
+                    >
+                      {initials(row.user)}
+                      <input
+                        type="color"
+                        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                        value={colour}
+                        onChange={(e) => onChangeColour(row.user!.id, e.target.value)}
+                      />
+                    </label>
+                  ) : (
+                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-[#4a4a4a] text-[11px] font-bold text-white">?</span>
+                  )}
+                  <span className="min-w-0">
+                    <span className={`block truncate text-sm font-medium ${row.user ? "text-[var(--text-primary)]" : "text-[#e0a83c]"}`}>
+                      {row.user ? `${row.user.first_name || row.user.username} ${row.user.last_name || ""}`.trim() : "No technician"}
+                    </span>
+                    <span className="block text-[11px] text-[var(--text-muted)]">
+                      {row.user
+                        ? `${live.length} job${live.length === 1 ? "" : "s"} · ${Math.round(booked * 10) / 10}h booked`
+                        : `${live.length} booked, no technician yet`}
+                    </span>
+                  </span>
+                </div>
+
+                <div
+                  className="relative flex-1 cursor-copy hover:bg-[var(--tint-hover)]"
+                  style={{ minHeight: height }}
+                  onClick={(e) => onNewJob(timeAt(e), techId)}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const id = Number(e.dataTransfer.getData("text/plain"));
+                    if (id) onDropJob(id, timeAt(e), techId);
+                  }}
+                >
+                  {hourMarks.map((h) => (
+                    <div key={h} className="absolute bottom-0 top-0 w-px bg-[var(--border-hairline)]" style={{ left: `${pct(h)}%` }} />
+                  ))}
+                  {row.shifts.map((s) => (
+                    <button
+                      key={`s${s.id}`}
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onEditShift(s);
+                      }}
+                      className="absolute rounded-md border border-dashed text-right"
+                      style={{
+                        left: `${pct(hourOf(new Date(s.start)))}%`,
+                        width: `${pct(hourOf(new Date(s.end))) - pct(hourOf(new Date(s.start)))}%`,
+                        top: 3,
+                        bottom: 3,
+                        borderColor: colour,
+                        background: `${colour}14`,
+                        opacity: s.status === "cancelled" ? 0.4 : 1,
+                      }}
+                      title={`${s.staff_name} shift ${hhmm(new Date(s.start))}–${hhmm(new Date(s.end))}${s.role_note ? ` · ${s.role_note}` : ""}`}
+                    >
+                      <span className="absolute bottom-0.5 right-1.5 text-[10px]" style={{ color: colour }}>
+                        Shift {hhmm(new Date(s.start))}–{hhmm(new Date(s.end))}
+                        {s.role_note ? ` · ${s.role_note}` : ""}
+                      </span>
+                    </button>
+                  ))}
+                  {placed.map(({ job, start, end, lane, clash }) => {
+                    const left = pct(hourOf(start));
+                    const width = Math.max(pct(hourOf(end)) - left, 0.8);
+                    const type = jobTypes.get(job.job_type)?.name ?? job.job_type.replace(/_/g, " ");
+                    const mine = row.user ? job.technicians.find((t) => t.id === row.user!.id) : undefined;
+                    const status = mine?.field_status ?? jobFieldStatus(job);
+                    const tag = FIELD_TAG[status];
+                    const crew = row.user
+                      ? job.technicians.filter((t) => t.id !== row.user!.id).map((t) => firstName(t.name))
+                      : [];
+                    const where = job.customer_name || job.location || "";
+                    const cancelled = job.status === "cancelled";
+                    return (
+                      <button
+                        key={`j${job.id}`}
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onEditJob(job);
+                        }}
+                        className="absolute overflow-hidden rounded-md px-2 py-1 text-left text-white"
+                        style={{
+                          left: `calc(${left}% + 2px)`,
+                          width: `calc(${width}% - 4px)`,
+                          top: ROW_PAD + lane * (CARD_H + CARD_GAP),
+                          height: CARD_H,
+                          background: row.user
+                            ? colour
+                            : "repeating-linear-gradient(135deg,#3d3d3d 0 8px,#353535 8px 16px)",
+                          border: row.user ? undefined : "1px dashed #8f8f8f",
+                          opacity: cancelled ? 0.4 : status === "completed" ? 0.6 : 1,
+                          boxShadow: clash ? "0 0 0 2px #fff inset, 0 0 0 3px #e34948" : undefined,
+                          zIndex: 2,
+                        }}
+                        title={[
+                          job.title,
+                          `${hhmm(start)}–${hhmm(end)} · ${type}`,
+                          where,
+                          job.technicians.length ? `With: ${job.technicians.map((t) => t.name).join(", ")}` : "Nobody assigned",
+                          cancelled ? "Cancelled" : tag?.label,
+                          clash ? "Overlaps another job for this person" : "",
+                        ]
+                          .filter(Boolean)
+                          .join("\n")}
+                      >
+                        <span className={`block truncate text-[12px] font-semibold ${cancelled ? "line-through" : ""}`}>{job.title}</span>
+                        <span className="block truncate text-[11px] text-white/85">
+                          {clash && (
+                            <span className="mr-1 rounded px-1 text-[10px] font-bold" style={{ background: "#3a1c1c", color: "#ff9a9a" }}>
+                              Clash
+                            </span>
+                          )}
+                          {tag && !cancelled && (
+                            <span className="mr-1 rounded px-1 text-[10px] font-bold" style={{ background: tag.bg, color: tag.fg }}>
+                              {tag.label}
+                            </span>
+                          )}
+                          {hhmm(start)}–{hhmm(end)} · {type}
+                          {crew.length ? ` · +${crew.join(", ")}` : ""}
+                          {where ? ` · ${where}` : ""}
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {nowPct !== null && (
+                    <div className="pointer-events-none absolute bottom-0 top-0 z-[3] w-0.5 bg-[var(--status-critical)]" style={{ left: `${nowPct}%` }} />
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,11 @@
+{% comment %} Letterhead for contract PDFs. An uploaded logo (Configs -> Billing)
+   wins, at the size invoices use; otherwise the Skybre mark beside the
+   company name. {% endcomment %}
+{% if logo_path %}
+  <img src="{{ logo_path }}" style="width:84.7pt; height:60pt;">
+{% else %}
+  <table style="width:300pt;" cellpadding="0"><tr>
+    <td style="width:48pt; vertical-align:middle;"><img src="{{ brand_icon }}" style="width:42pt; height:42pt;"></td>
+    <td style="vertical-align:middle;"><div class="brand">{{ company.name|default:company_name }}</div><div class="tagline">Internet Service Provider</div></td>
+  </tr></table>
+{% endif %}

@@ -117,23 +117,36 @@ def render_invoice_pdf(invoice, company_name: str) -> bytes:
         Invoice.Status.QUOTE: ("Quotation", "Valid until"),
         Invoice.Status.PROFORMA: ("Pro forma invoice", "Due date"),
     }
-    doc_title, due_label = titles.get(invoice.status, ("Tax invoice", "Due date"))
+    if invoice.total < 0:
+        # A credit note (see CreditRequest.create_credit_note_invoice) is,
+        # in every other respect, an ordinary Invoice at status UNPAID/PAID
+        # -- it has no Status of its own to key `titles` off, so without
+        # this check it fell through to the default below and printed
+        # "Tax invoice" on what is, and needs to read as, a credit note.
+        # Checked ahead of the status lookup, and by total rather than a
+        # CreditRequest link, so a historical Splynx-imported credit note
+        # (which has no CreditRequest at all) gets the same correct title
+        # -- the same convention billing.statements.movements() already
+        # uses to tell a credit note apart from an ordinary invoice.
+        doc_title, due_label = ("Credit note", "Due date")
+    else:
+        doc_title, due_label = titles.get(invoice.status, ("Tax invoice", "Due date"))
 
     # Per-line figures. InvoiceItem stores the ex-VAT unit price and a rate,
     # so the inclusive column is derived here rather than in the template --
     # Django templates can't multiply, and doing it in the view keeps the
     # rounding in one place.
     rows = []
-    total_exclusive = Decimal("0")
-    total_tax = Decimal("0")
     for item in invoice.items.all():
         excl_total = (item.quantity or 0) * (item.unit_price or Decimal("0"))
         rate = item.tax_rate_pct or Decimal("0")
         tax = (excl_total * rate / Decimal("100")).quantize(Decimal("0.01"))
-        total_exclusive += excl_total
-        total_tax += tax
         period = ""
-        if item.period_start and item.period_end:
+        # Not on a QUOTE (decided 2026-09-24): nothing is billed on a quote,
+        # so "(01/10/2026 - 31/10/2026)" reads like a charge for that month.
+        # The dates stay on the line -- accepting the quote starts the
+        # service on period_start -- and pro formas / invoices still print it.
+        if item.period_start and item.period_end and invoice.status != Invoice.Status.QUOTE:
             period = f"{item.period_start:%d/%m/%Y} - {item.period_end:%d/%m/%Y}"
         rows.append({
             "item": item,
@@ -157,19 +170,46 @@ def render_invoice_pdf(invoice, company_name: str) -> bytes:
     ]
 
     customer = invoice.customer
+
+    # ONCE-OFF MONEY AND MONTHLY MONEY, KEPT APART -- ON A QUOTE ONLY.
+    #
+    # A quote is a document about a future commitment, and adding a R3 500
+    # router to a R899-a-month service produces a total the customer is
+    # neither paying once nor paying monthly. A pro forma and a tax invoice
+    # are demands for one specific amount that is due, so their totals are
+    # already the right answer and are deliberately left alone.
+    #
+    # None unless the document carries BOTH kinds: a quote that is all
+    # equipment, or all service, has one honest total already.
+    from billing.quote_totals import split_totals
+
+    kind_split = (
+        split_totals(invoice) if invoice.status == Invoice.Status.QUOTE else None
+    )
     context = {
         "company_name": company["name"],
         "company": company,
         "logo_path": _logo_path(defaults),
         "generated_date": timezone.localdate(),
         "invoice": invoice,
+        # The date the document itself carries. For a converted quote that
+        # is when it became a tax invoice, not when the quote was raised.
+        "document_date": invoice.date_issued or invoice.date_created,
         "customer": customer,
         "customer_display_name": customer.company_name or customer.full_name,
         "doc_title": doc_title,
         "due_label": due_label,
         "rows": rows,
-        "total_exclusive": total_exclusive,
-        "total_tax": total_tax,
+        # The totals come off the invoice, not from re-adding the rows here.
+        # This used to sum each line's tax AFTER rounding it to cents, while
+        # Invoice.recalc_totals rounds the total once -- so the document
+        # printed a "Total exclusive" and a "Total tax" from one calculation
+        # and a "Total" and "Balance due" from another, and on the wrong
+        # numbers they did not add up. Whatever the customer is actually
+        # charged is what the document has to show.
+        "total_exclusive": invoice.subtotal,
+        "total_tax": invoice.tax_total,
+        "kind_split": kind_split,
         "related": related,
         "balance_due": invoice.total - invoice.paid_amount,
     }
@@ -293,9 +333,53 @@ def render_payslip_pdf(lines) -> bytes:
     return _render_pdf("notifications/payslip_pdf.html", {"slips": slips})
 
 
+def render_period_statement_pdf(customer, statement, company_name: str) -> bytes:
+    """A window of account activity, with a running balance.
+
+    `statement` is exactly the dict billing.statements.rolling_statement
+    or period_statement returns -- opening balance, dated movements,
+    closing balance, and the heading the document should carry -- and
+    nothing here recomputes any of it. Two renderings that each did their
+    own arithmetic would eventually disagree, and the one the customer is
+    holding is the one that gets argued about.
+
+    SEPARATE FROM render_statement_pdf, not a replacement for it. That one
+    is the whole account as it stands today, which is a different document
+    answering a different question ("what do I owe?" rather than "what
+    happened in September?"). Both are wanted; neither is the other.
+    """
+    # THE SAME LOGO THE INVOICE PRINTS, from the same place: the uploaded
+    # file on BillingDefaults, resolved to an absolute path because that is
+    # what _link_callback can open. A statement and an invoice arriving in
+    # the same inbox looking like they came from different companies is a
+    # small thing that reads as carelessness.
+    company, defaults = _company_block()
+    context = {
+        # The caller's company_name still drives the text fallback, as in
+        # every other document here. `company` carries the REGISTERED
+        # entity, which is what shows when no logo has been uploaded --
+        # the same choice render_invoice_pdf makes.
+        "company_name": company_name,
+        "company": company,
+        "logo_path": _logo_path(defaults),
+        "generated_date": timezone.localdate(),
+        "customer": customer,
+        "statement": statement,
+    }
+    return _render_pdf("notifications/period_statement_pdf.html", context)
+
+
 def render_statement_pdf(customer, invoices, company_name: str) -> bytes:
+    # The logo and the registered entity, so this document carries the same
+    # header as the invoice and the period statement. Added here rather than
+    # inside _render_pdf: the payslip and the VAT report deliberately keep
+    # the plain wordmark, and a blanket injection would have changed three
+    # documents to fix one.
+    company, defaults = _company_block()
     context = {
         "company_name": company_name,
+        "company": company,
+        "logo_path": _logo_path(defaults),
         "generated_date": timezone.localdate(),
         "statement_date": timezone.localdate(),
         "customer": customer,

@@ -1,5 +1,11 @@
 import django_filters
-from .models import Product, SerializedUnit, StockReceipt, StockIssue
+from .models import Product, SerializedUnit, StockReceipt, StockIssue, StockSite
+
+
+class StockSiteFilter(django_filters.FilterSet):
+    class Meta:
+        model = StockSite
+        fields = ["site_type", "is_active", "vehicle", "network_site"]
 
 
 class ProductFilter(django_filters.FilterSet):
@@ -18,7 +24,7 @@ class SerializedUnitFilter(django_filters.FilterSet):
 
     class Meta:
         model = SerializedUnit
-        fields = ["product", "status", "supplier", "category"]
+        fields = ["product", "status", "supplier", "category", "site"]
 
 
 class StockReceiptFilter(django_filters.FilterSet):
@@ -27,10 +33,19 @@ class StockReceiptFilter(django_filters.FilterSet):
 
     class Meta:
         model = StockReceipt
-        fields = ["supplier", "date_from", "date_to"]
+        fields = ["supplier", "site", "date_from", "date_to"]
 
 
 class StockIssueFilter(django_filters.FilterSet):
+    # Stock that left OR arrived at this location (13 Oct 2026).
+    site = django_filters.NumberFilter(method="filter_site")
+    transfers = django_filters.BooleanFilter(field_name="to_site", lookup_expr="isnull", exclude=True)
+
+    def filter_site(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(Q(from_site_id=value) | Q(to_site_id=value))
+
     class Meta:
         model = StockIssue
-        fields = ["job", "issued_to"]
+        fields = ["job", "issued_to", "site", "transfers"]

@@ -1,0 +1,196 @@
+"""What the History row says after a run that did not finish.
+
+The run row is created up front, deliberately -- so every invoice has a
+run to point at, and so the run is findable even if the work goes wrong.
+But it was created with the model's default status, which is
+"processed", and its counts stayed at zero until the very last line of
+_run_commit.
+
+So a run that did not reach that line -- the container restarted mid-run,
+the deploy went out, somebody hit the box, the process was killed --
+left a row reading "Processed, 0 invoices" sitting on top of invoices
+that had committed, balances that had been debited, and PDFs that were
+already in customers' inboxes. Every one of those is irreversible. The
+one record that says what happened denied all of it, and the obvious
+recovery -- run it again, History says nothing was done -- is exactly
+the thing that would double-bill everybody.
+
+A run now starts as "in progress" and keeps its counts current as each
+customer commits, so an interrupted run is legible as an interrupted
+run: what it got through, and that it did not finish.
+
+The second half of this file is smaller and older: _describe_failures
+named the empty string when the failure was the customer re-read itself
+(there is no customer object to name at that point, so it was handed an
+unsaved one whose customer_id is ""). "1 customer(s) failed and were
+skipped:  (OperationalError)" is a message that tells whoever reads
+History strictly less than the count already did.
+"""
+import datetime
+from decimal import Decimal
+from unittest import mock
+
+from django.db import OperationalError
+from django.test import TestCase
+from django.utils import timezone
+
+from billing.models import (
+    CustomerBillingConfig, Invoice, RecurringBillingRun, Service, Tariff,
+)
+from billing.recurring import _describe_failures, run_recurring_billing
+from customers.models import Customer
+
+
+class RunBookkeepingTestCase(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240,
+        )
+
+    def _billable(self, name):
+        customer = Customer.objects.create(
+            full_name=name, email=f"{name.split()[0].lower()}@example.com",
+            status=Customer.Status.ACTIVE,
+        )
+        Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90),
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.next_billing_date = self.today
+        config.save()
+        return customer
+
+
+class InterruptedRunTests(RunBookkeepingTestCase):
+    def _interrupt_after(self, n_customers):
+        """Kill the run once n customers have been invoiced, the way a
+        container restart would: from outside, between customers, after
+        their transactions have committed."""
+        state = {"seen": 0}
+        real = CustomerBillingConfig.save
+
+        def maybe_stop(config, *args, **kwargs):
+            result = real(config, *args, **kwargs)
+            state["seen"] += 1
+            if state["seen"] > n_customers:
+                raise KeyboardInterrupt("container went away mid-run")
+            return result
+
+        return mock.patch.object(CustomerBillingConfig, "save", maybe_stop)
+
+    def test_an_interrupted_run_does_not_claim_it_processed_nothing(self):
+        for name in ("Anna Able", "Boris Bright", "Carol Clear"):
+            self._billable(name)
+
+        with self._interrupt_after(2):
+            with self.assertRaises(KeyboardInterrupt):
+                run_recurring_billing(self.today, commit=True)
+
+        run = RecurringBillingRun.objects.get()
+        self.assertEqual(
+            run.invoices_created_count, Invoice.objects.count(),
+            "History disagrees with the invoices that actually exist",
+        )
+        self.assertEqual(run.invoices_created_count, 2)
+
+    def test_an_interrupted_run_does_not_read_as_a_clean_one(self):
+        for name in ("Anna Able", "Boris Bright", "Carol Clear"):
+            self._billable(name)
+
+        with self._interrupt_after(2):
+            with self.assertRaises(KeyboardInterrupt):
+                run_recurring_billing(self.today, commit=True)
+
+        run = RecurringBillingRun.objects.get()
+        self.assertEqual(
+            run.status, RecurringBillingRun.Status.IN_PROGRESS,
+            "a run that never finished is filed as one that did",
+        )
+
+    def test_a_run_that_finishes_is_still_marked_processed(self):
+        for name in ("Anna Able", "Boris Bright"):
+            self._billable(name)
+
+        result = run_recurring_billing(self.today, commit=True)
+
+        run = RecurringBillingRun.objects.get(pk=result["run"].pk)
+        self.assertEqual(run.status, RecurringBillingRun.Status.PROCESSED)
+        self.assertEqual(run.invoices_created_count, 2)
+        self.assertEqual(run.status_message, "")
+
+    def test_the_counts_are_not_double_counted_by_the_running_total(self):
+        """The incremental update and the final write must not both land."""
+        for name in ("Anna Able", "Boris Bright", "Carol Clear"):
+            self._billable(name)
+
+        result = run_recurring_billing(self.today, commit=True)
+
+        run = RecurringBillingRun.objects.get(pk=result["run"].pk)
+        self.assertEqual(run.invoices_created_count, 3)
+        self.assertEqual(run.invoices_created_count, Invoice.objects.count())
+
+    def test_a_failed_customer_is_still_excluded_from_the_running_total(self):
+        """The property the counts had before and must keep: they describe
+        work that committed, not work that was attempted."""
+        good = self._billable("Anna Able")
+        victim = self._billable("Boris Bright")
+        real = CustomerBillingConfig.save
+
+        def boom(config, *args, **kwargs):
+            if config.customer_id == victim.pk:
+                raise RuntimeError("connection reset by peer mid-invoice")
+            return real(config, *args, **kwargs)
+
+        with mock.patch.object(CustomerBillingConfig, "save", boom):
+            result = run_recurring_billing(self.today, commit=True)
+
+        run = RecurringBillingRun.objects.get(pk=result["run"].pk)
+        self.assertEqual(run.status, RecurringBillingRun.Status.FAILED)
+        self.assertEqual(run.invoices_created_count, 1)
+        self.assertEqual(Invoice.objects.count(), 1)
+        self.assertEqual(Invoice.objects.get().customer_id, good.pk)
+
+
+class FailureNamingTests(RunBookkeepingTestCase):
+    def test_a_customer_that_could_not_even_be_read_is_still_identified(self):
+        self._billable("Anna Able")
+
+        def boom(*args, **kwargs):
+            raise OperationalError("server closed the connection unexpectedly")
+
+        with mock.patch("billing.recurring.Customer.objects.select_related", side_effect=boom):
+            result = run_recurring_billing(self.today, commit=True)
+
+        run = RecurringBillingRun.objects.get(pk=result["run"].pk)
+        self.assertEqual(run.status, RecurringBillingRun.Status.FAILED)
+        self.assertNotIn(
+            ":  (", run.status_message,
+            f"the failure names nobody: {run.status_message!r}",
+        )
+        self.assertIn("OperationalError", run.status_message)
+
+    def test_it_still_prefers_the_customer_reference_when_there_is_one(self):
+        customer = Customer.objects.create(
+            full_name="Anna Able", email="anna@example.com", status=Customer.Status.ACTIVE,
+        )
+        message = _describe_failures([(customer, RuntimeError("boom"))])
+
+        self.assertIn(customer.customer_id, message)
+        self.assertIn("RuntimeError", message)
+
+    def test_the_message_still_fits_the_column(self):
+        customers = [
+            Customer.objects.create(
+                full_name=f"Customer {i}", email=f"c{i}@example.com",
+                status=Customer.Status.ACTIVE,
+            )
+            for i in range(6)
+        ]
+        message = _describe_failures([(c, RuntimeError("boom")) for c in customers])
+
+        self.assertLessEqual(len(message), 255)
+        self.assertIn("and 3 more", message)

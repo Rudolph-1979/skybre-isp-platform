@@ -1,0 +1,870 @@
+"""Pushing Skybre's changes to Conecto.
+
+Three rules govern everything here.
+
+1. NOTHING PUSHES UNTIL THE TRANSACTION COMMITS. transaction.on_commit,
+   every time. A ticket created inside a request that later rolls back
+   must not have been announced to a subscriber's phone, and a create
+   that pushed from inside the transaction would also be pushing a row
+   Conecto could ask us about before we had finished writing it.
+
+2. AN EVENT THAT ARRIVED FROM CONECTO IS NEVER PUSHED BACK. The webhook
+   receivers wrap their writes in `suppressed()`, a thread-local flag,
+   so a ticket Conecto just told us about does not immediately get sent
+   to Conecto as a new ticket. Without it, the create webhook and the
+   create signal feed each other. ConectoTicket.origin is the durable
+   half of the same guard: even if the flag were somehow missed, a
+   ticket that already has a Conecto id is never created again.
+
+3. ONLY REAL CHANGES PUSH. Ticket rows are saved by a lot of unrelated
+   code -- assignment, comments touching updated_at, the importer. A
+   post_save alone would fire updateTicket on every one of them, which
+   at best wastes calls and at worst overwrites a status a subscriber
+   set moments ago with the identical value re-sent. So pre_save keeps
+   a snapshot of the two fields Conecto actually holds, and post_save
+   pushes only when one of them really moved.
+"""
+import logging
+import threading
+
+from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.db import transaction
+from django.db.models.signals import m2m_changed, post_save, pre_save
+from django.dispatch import receiver
+
+from django.utils import timezone
+
+from customers.models import Customer
+from scheduling.models import Job
+from tickets.models import Ticket
+from tickets.models import TicketComment
+
+from . import client
+from .mapping import priority_to_conecto, status_to_conecto
+from .models import ConectoJob, ConectoTicket
+
+logger = logging.getLogger(__name__)
+
+_local = threading.local()
+
+#: The fields Conecto stores a copy of. A change to anything else is our
+#: business alone and is not worth a call.
+TRACKED = ("status", "priority")
+
+
+class suppressed:
+    """Context manager: don't push anything written in this block.
+
+    Thread-local, and re-entrant by counter rather than a boolean, so a
+    nested use cannot switch pushing back on for the outer one.
+    """
+
+    def __enter__(self):
+        _local.depth = getattr(_local, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        _local.depth = max(0, getattr(_local, "depth", 1) - 1)
+        return False
+
+
+def is_suppressed():
+    return getattr(_local, "depth", 0) > 0
+
+
+# --- tickets --------------------------------------------------------------
+
+
+@receiver(pre_save, sender=Ticket, dispatch_uid="conecto_ticket_snapshot")
+def _snapshot_ticket(sender, instance, **kwargs):
+    """Remember what Conecto currently believes, before the save lands."""
+    if not instance.pk:
+        instance._conecto_before = None
+        return
+    before = (
+        Ticket.objects.filter(pk=instance.pk).values(*TRACKED).first()
+    )
+    instance._conecto_before = before
+
+
+@receiver(post_save, sender=Ticket, dispatch_uid="conecto_ticket_push")
+def _push_ticket(sender, instance, created, **kwargs):
+    if is_suppressed():
+        return
+
+    if instance.is_internal:
+        # An internal ticket already EXISTS in Conecto -- their app is
+        # where the technician raised it. createTicket here would make a
+        # second, client-facing copy of a technician's private note, and
+        # create_ticket reads ticket.customer.customer_id, which is None on
+        # one of these, so it would fail on the way to doing that.
+        #
+        # Belt to the suppressed() braces in the inbound webhook. Either
+        # alone would do; the cost of both failing is a job-feedback note
+        # in a customer's app, and the cost of one being redundant is
+        # nothing.
+        return
+
+    if created:
+        transaction.on_commit(lambda: _create_ticket(instance.pk))
+        return
+
+    before = getattr(instance, "_conecto_before", None)
+    if before is None:
+        return
+    changed = {f: getattr(instance, f) for f in TRACKED if before.get(f) != getattr(instance, f)}
+    if not changed:
+        return
+    transaction.on_commit(lambda: _update_ticket(instance.pk, changed))
+
+
+def _create_ticket(ticket_pk):
+    """Send a newly raised ticket and record the id Conecto gives back.
+
+    Re-read from the database rather than closing over the instance: by
+    the time on_commit runs, the in-memory object may be stale, and the
+    id we are about to store has to attach to the row that actually
+    exists.
+    """
+    ticket = Ticket.objects.select_related("customer").filter(pk=ticket_pk).first()
+    if ticket is None:
+        return
+    if ConectoTicket.objects.filter(ticket_id=ticket_pk).exists():
+        # Already linked -- this came from Conecto, or a previous push
+        # succeeded. Either way it is not a new ticket to them.
+        return
+
+    response = client.create_ticket(ticket)
+    conecto_id = _extract_ticket_id(response)
+    if not conecto_id:
+        # The ConectoCall row already records why. Without an id we cannot
+        # send updates for this ticket, which is exactly what
+        # `conecto_resync` exists to repair.
+        return
+
+    ConectoTicket.objects.get_or_create(
+        ticket=ticket,
+        defaults={
+            "conecto_ticket_id": conecto_id,
+            "origin": ConectoTicket.Origin.SKYBRE,
+        },
+    )
+
+
+def _update_ticket(ticket_pk, changed):
+    link = (
+        ConectoTicket.objects.select_related("ticket")
+        .filter(ticket_id=ticket_pk)
+        .first()
+    )
+    if link is None:
+        # Not a ticket Conecto knows about. Nothing to update, and
+        # creating it now would present an old ticket as new.
+        return
+
+    payload = {}
+    if "status" in changed:
+        payload["status"] = status_to_conecto(changed["status"])
+    if "priority" in changed:
+        payload["priority"] = priority_to_conecto(changed["priority"])
+
+    client.update_ticket(
+        link.conecto_ticket_id,
+        subject_ref=link.ticket.ticket_number,
+        **payload,
+    )
+
+
+@receiver(post_save, sender=TicketComment, dispatch_uid="conecto_comment_push")
+def _push_ticket_comment(sender, instance, created, **kwargs):
+    """Send a staff reply to the client, and nothing else.
+
+    EVERY GUARD HERE EXISTS TO STOP ONE THING REACHING A CUSTOMER'S
+    PHONE.
+
+    Conecto has no internal-note mode: whatever we send appears in the
+    thread the client reads and pushes a notification to them. An
+    internal note is, by definition, the one thing on a ticket that was
+    written on the understanding the customer would never see it --
+    handover context, a credit decision, an opinion about the customer
+    themselves. Sending one is not a bug that can be corrected
+    afterwards; the notification has already arrived.
+
+    So the refusals are deliberately redundant:
+
+      * is_internal, the field that means exactly this;
+      * external_author, set only on comments that CAME FROM the client,
+        which must not be echoed back to them as if we had written them;
+      * is_suppressed(), the thread-local the inbound webhook wraps its
+        writes in, which is the same guard the ticket push uses;
+      * created, because an edit is not a new reply, and pushing on every
+        save would re-send the whole thread each time somebody fixed a
+        typo.
+
+    Any one of these would usually be enough. They are all here because
+    the cost of them all failing at once is a private note on a
+    customer's phone, and the cost of one being redundant is nothing.
+    """
+    if is_suppressed() or not created:
+        return
+    if instance.is_internal or instance.external_author:
+        return
+    transaction.on_commit(lambda: _send_ticket_comment(instance.pk))
+
+
+def _send_ticket_comment(comment_pk):
+    """Re-read and re-check before sending.
+
+    Re-read for the same reason _create_ticket does: on_commit runs after
+    the transaction, and the in-memory object may not be what landed.
+    Re-check is_internal because the gap between save and commit is a
+    window, and this is the one decision worth paying a second query to
+    be sure of.
+    """
+    comment = (
+        TicketComment.objects.select_related("ticket")
+        .filter(pk=comment_pk)
+        .first()
+    )
+    if comment is None or comment.is_internal or comment.external_author:
+        return
+
+    if comment.ticket.is_internal:
+        # THE RULE INVERTS HERE, and it is worth being explicit about why.
+        #
+        # On a CLIENT ticket, addTicketReply reaches the customer's phone,
+        # so the author is a label -- "Support Team" -- because our staff's
+        # names are not the customer's business.
+        #
+        # On an INTERNAL ticket it reaches the technician who asked the
+        # question, and Conecto confirmed on 2026-09-21 that whatever we
+        # send as author_name is what their push notification shows,
+        # verbatim, with no masking. A technician waiting on a stock answer
+        # should see who answered them.
+        return _send_internal_reply(comment)
+
+    link = ConectoTicket.objects.filter(ticket_id=comment.ticket_id).first()
+    if link is None:
+        # Not a ticket Conecto knows about -- raised in Skybre for a
+        # customer who does not use the app, or a push that failed and is
+        # waiting for conecto_resync. Either way there is no thread there
+        # to reply into.
+        return
+
+    client.add_ticket_reply(
+        link.conecto_ticket_id,
+        comment.message,
+        subject_ref=comment.ticket.ticket_number,
+    )
+
+
+def _send_internal_reply(comment):
+    """A staff answer on a technician's job-feedback ticket.
+
+    Looked up in ConectoInternalTicket and nowhere else. Conecto's two
+    kinds of ticket share one id namespace and addTicketReply does not
+    check which kind it is given, so the TABLE is what keeps a reply meant
+    for a technician out of a customer's thread -- an internal id is not in
+    ConectoTicket and a client id is not in here.
+
+    The double-check on is_internal above and the table lookup here are
+    two independent ways of reaching the same conclusion. That is
+    deliberate: the failure mode is not "the wrong person gets no reply",
+    it is "the wrong person gets this reply".
+    """
+    from .models import ConectoInternalTicket
+
+    link = ConectoInternalTicket.objects.filter(ticket_id=comment.ticket_id).first()
+    if link is None:
+        return
+
+    author = ""
+    if comment.author_id is not None:
+        author = (comment.author.get_full_name() or "").strip() or comment.author.username
+
+    client.add_ticket_reply(
+        link.conecto_ticket_id,
+        comment.message,
+        # A real name, unlike the client path. Falls back to something
+        # honest rather than to a person who did not write it.
+        author_name=author or "Skybre office",
+        subject_ref=comment.ticket.ticket_number,
+    )
+
+
+def _extract_ticket_id(response):
+    """Conecto's spec shows the id at the top level; be tolerant of it
+    arriving nested, since a missing id costs us every later update."""
+    if not isinstance(response, dict):
+        return ""
+    for key in ("ticket_id", "ticketId", "id"):
+        value = response.get(key)
+        if value:
+            return str(value)
+    data = response.get("data")
+    if isinstance(data, dict):
+        return _extract_ticket_id(data)
+    return ""
+
+
+# --- customers ------------------------------------------------------------
+#
+# Conecto's app asks a subscriber for their client code and refuses to
+# register them unless it already knows it. So a customer created here
+# who has not been pushed cannot sign up -- the push is what makes the
+# app usable, not a nicety.
+
+
+CUSTOMER_TRACKED = ("customer_id", "full_name", "email", "phone", "city")
+
+
+@receiver(pre_save, sender=Customer, dispatch_uid="conecto_customer_snapshot")
+def _snapshot_customer(sender, instance, **kwargs):
+    if not instance.pk:
+        instance._conecto_before = None
+        return
+    instance._conecto_before = (
+        Customer.objects.filter(pk=instance.pk).values(*CUSTOMER_TRACKED).first()
+    )
+
+
+@receiver(post_save, sender=Customer, dispatch_uid="conecto_customer_push")
+def _push_customer(sender, instance, created, **kwargs):
+    if is_suppressed():
+        return
+
+    if not created:
+        before = getattr(instance, "_conecto_before", None)
+        if before is None:
+            return
+        if all(before.get(f) == getattr(instance, f) for f in CUSTOMER_TRACKED):
+            return
+
+    transaction.on_commit(lambda: _register_customer(instance.pk))
+
+
+def _register_customer(customer_pk):
+    customer = Customer.objects.filter(pk=customer_pk).first()
+    if customer is None or not customer.customer_id:
+        return
+    client.register_client_code(customer)
+
+
+# --- job dispatch ---------------------------------------------------------
+#
+# A job assigned to a technician who has a Conecto code appears on that
+# technician's phone. Reassign it, move it, change the address, and the
+# phone follows -- because a technician's list that does not match the
+# calendar is worse than one that was never pushed at all: somebody drives
+# to yesterday's address believing it is today's.
+#
+# A job can now carry more than one technician (Rudolph, 29 Sep: "allow me
+# to assign to two technicians"), and Conecto has no idea of a job with two
+# people on it -- each technician gets their OWN scheduleJob call and their
+# own ConectoJob row (one per (job, technician), see the model), cancelled
+# independently of the others when they come off the job. _schedule_job
+# below diffs the job's CURRENT technicians against whichever ConectoJob
+# rows already exist for it and reconciles the two, same spirit as the old
+# single-technician version, just for a set instead of one person.
+
+#: Exactly the fields that go over the wire in schedule_job (technician
+#: aside -- that is tracked per row below, not here). The digest of these
+#: is what decides whether a save is worth a push, so anything added to the
+#: payload has to be added here too or it will be sent once and then never
+#: updated.
+JOB_TRACKED = ("start", "location", "description", "customer_id", "ticket_id")
+
+
+def _dispatch_code(user):
+    """The code Conecto can actually route a job to, and which kind it is.
+
+    Returns ("", "") when there is no way to reach this person.
+
+    WHY THE ROLE CHECK IS NOT TIDINESS (confirmed with Conecto 2026-09-21).
+
+    scheduleJob does not check role. It accepts the job, answers success,
+    and stores it. But getting a job onto a phone needs a car-session
+    token, and that is refused to anyone whose role is not `technician` --
+    in their Cloud Function and again in the app itself. So a job assigned
+    to an admin or an office account is created, acknowledged, recorded
+    here as pushed, and then seen by nobody. Forever. With no error
+    anywhere on either side.
+
+    Refusing here is the only place that failure can be made visible, and
+    a 200 from scheduleJob is not evidence that a technician got the work.
+
+    THE TWO KINDS OF CODE.
+
+    `technicianCode` is set by hand, per person, in Conecto's admin
+    screen. `staff_code` is what this platform issues and what Conecto
+    gates registration on. scheduleJob accepted only the first of those
+    until 2026-09-21, when Conecto shipped staff-code support and
+    CONECTO_DISPATCH_BY_STAFF_CODE was turned on here. Both are routable
+    now; a hand-set link still wins, because it is the more specific fact.
+
+    AN INACTIVE LINK IS AN ANSWER, NOT A MISSING ONE.
+
+    ConectoTechnician.is_active is switched off when somebody stops doing
+    field work. Before the staff-code switch that was the end of it --
+    there was no other code to fall back to, so dispatch stopped. With the
+    switch on, falling through to the staff code would quietly undo that
+    decision: every technician has a staff code by construction, so the
+    one deliberate "stop sending this person jobs" control in the system
+    would have started doing nothing at all, without a single error.
+
+    That is why the inactive case returns early instead of falling
+    through. An explicit off beats an implicit fallback. Somebody who
+    should receive jobs again is reactivated, which is the same action
+    that turned it off.
+    """
+    if user is None:
+        return "", ""
+
+    if user.role != user.Role.TECHNICIAN:
+        return "", ""
+
+    link = getattr(user, "conecto_technician", None)
+    if link is not None:
+        if not link.is_active:
+            # Deliberately off. Do NOT fall through to the staff code --
+            # see the docstring. Said out loud because the job will not be
+            # dispatched and somebody has to be able to find out why.
+            logger.warning(
+                "Job not dispatched to %s: their Conecto technician link is "
+                "deactivated. Reactivate it to send them work again.",
+                user.username,
+            )
+            return "", ""
+        if link.technician_code:
+            return link.technician_code, "technician"
+
+    if getattr(settings, "CONECTO_DISPATCH_BY_STAFF_CODE", False):
+        return (user.staff_code or ""), "staff"
+
+    return "", ""
+
+
+def _job_digest(job, technician_code):
+    import hashlib
+    import json
+
+    blob = json.dumps(
+        {
+            "technician_code": technician_code,
+            "start": job.start.isoformat() if job.start else "",
+            "address": client.job_address(job),
+            "notes": job.description or "",
+            "customer": job.customer_id,
+            "ticket": job.ticket_id,
+        },
+        sort_keys=True,
+    )
+    return hashlib.md5(blob.encode()).hexdigest()
+
+
+@receiver(post_save, sender=Job, dispatch_uid="conecto_job_push")
+def _push_job(sender, instance, created, **kwargs):
+    if is_suppressed():
+        return
+    transaction.on_commit(lambda: _schedule_job(instance.pk))
+
+
+@receiver(m2m_changed, sender=Job.assigned_technicians.through, dispatch_uid="conecto_job_technicians_push")
+def _push_job_technicians(sender, instance, action, **kwargs):
+    """The OTHER way a job's technician list changes.
+
+    DRF's ModelSerializer.update() calls instance.save() for the ordinary
+    fields FIRST, then sets a M2M with .set() afterwards -- so by the time
+    the post_save above fires, assigned_technicians still reads as it did
+    before the request, and no second post_save follows once .set() does
+    its own work. Without this, adding or removing a technician (with
+    nothing else on the job changing) would never trigger a push or a
+    cancellation at all.
+
+    Only post_add/post_remove/post_clear carry a settled state worth
+    acting on; pre_* fire before the through-table write has happened.
+    """
+    if action not in ("post_add", "post_remove", "post_clear"):
+        return
+    if is_suppressed():
+        return
+    transaction.on_commit(lambda: _schedule_job(instance.pk))
+
+
+def _schedule_job(job_pk):
+    """Reconcile Conecto's picture of this job with who is on it now.
+
+    Re-read rather than closing over an instance: by the time on_commit
+    runs the in-memory copy may be stale, and this decides what a
+    technician is told to do. One ConectoJob row per (job, technician);
+    a technician no longer on the job has theirs cancelled, one newly on
+    it (or whose own dispatch code changed, or whose copy of the job has
+    gone stale) gets scheduled or re-scheduled, and everyone else already
+    holding an up-to-date copy is left alone -- same digest-guarded
+    "only real changes push" rule the single-technician version always
+    had, just decided per person instead of once for the whole job.
+    """
+    job = (
+        Job.objects.select_related("customer", "ticket")
+        .prefetch_related("assigned_technicians")
+        .filter(pk=job_pk)
+        .first()
+    )
+    if job is None:
+        return
+
+    existing = {link.technician_id: link for link in ConectoJob.objects.filter(job_id=job_pk)}
+    technicians = list(job.assigned_technicians.all())
+    wanted_ids = {u.id for u in technicians}
+
+    # Anyone taken off the job comes off their phone too, or they drive to
+    # work that is no longer theirs to do. This covers both a technician
+    # dropped from a still-live job and (via the loop below) every
+    # remaining one when the whole job is cancelled.
+    for tech_id in list(existing):
+        if tech_id not in wanted_ids:
+            _cancel_job(existing[tech_id], job_pk, "No longer assigned to this technician")
+            del existing[tech_id]
+
+    if job.status == Job.Status.CANCELLED:
+        # Withdraw everybody rather than push anything -- a cancelled job
+        # left on any phone is somebody driving to work that is not
+        # happening.
+        for link in existing.values():
+            _cancel_job(link, job_pk, "Cancelled in Skybre")
+        return
+
+    if not technicians:
+        return  # Unassigned. Ordinary, and not worth a line in the log.
+
+    for user in technicians:
+        code, code_kind = _dispatch_code(user)
+        link = existing.get(user.id)
+
+        if not code:
+            # Say WHICH of these it is. "Not dispatched" covers two quite
+            # different situations and only one of them is ordinary.
+            if user.role != user.Role.TECHNICIAN:
+                # The dangerous one. Conecto would ACCEPT this job and
+                # answer success, and it would reach nobody, because the
+                # car session a phone needs to show it is refused to every
+                # role but technician. Not sending it is the only honest
+                # outcome.
+                logger.warning(
+                    "Job %s is assigned to %s, whose role is %r. Conecto "
+                    "cannot deliver a job to anyone but a technician, so it "
+                    "has NOT been sent to them -- it exists in Skybre only.",
+                    job_pk, user.username, user.role,
+                )
+            else:
+                logger.warning(
+                    "Job %s is assigned to %s, a technician with no code "
+                    "Conecto can route to. It has NOT been sent to them. "
+                    "Either link a technician code, or turn on "
+                    "CONECTO_DISPATCH_BY_STAFF_CODE once Conecto supports "
+                    "staff codes on scheduleJob.",
+                    job_pk, user.username,
+                )
+            if link is not None:
+                _cancel_job(link, job_pk, "No longer routable")
+            continue
+
+        # This person's OWN dispatch code changed (re-linked to a different
+        # Conecto code, or switched between a hand-set code and the staff
+        # code). Conecto has no reassign call for that either -- cancel the
+        # stale copy, then schedule fresh, same as the old single-technician
+        # version did for a full reassignment. Cancel first, deliberately:
+        # if the cancel fails, the new schedule still goes out and the
+        # failure is a recorded call to replay, which is visible; the
+        # reverse order could leave the job on nobody's phone while the
+        # calendar says it is assigned.
+        reassigned = link is not None and link.technician_code and link.technician_code != code
+        if reassigned:
+            _cancel_job(link, job_pk, f"Reassigned to {code}")
+
+        digest = _job_digest(job, code)
+        if link is not None and link.pushed_digest == digest:
+            # Nothing this technician would notice has changed. Jobs get
+            # saved by plenty of code; a push per save is a notification
+            # per save.
+            continue
+
+        response = client.schedule_job(
+            job,
+            technician_code=code if code_kind == "technician" else "",
+            staff_code=code if code_kind == "staff" else "",
+        )
+        if response is None:
+            continue
+
+        conecto_job_id = ""
+        if isinstance(response, dict):
+            for key in ("job_id", "jobId", "conecto_job_id", "id"):
+                if response.get(key):
+                    conecto_job_id = str(response[key])
+                    break
+
+        ConectoJob.objects.update_or_create(
+            job_id=job_pk,
+            technician_id=user.id,
+            defaults={
+                "technician_code": code,
+                # Cleared when this technician's own code has just changed.
+                # last_status described the job on the OLD code, which
+                # _cancel_job above has just withdrawn and marked
+                # "cancelled". Left as it was, a later genuine cancellation
+                # would be skipped as already done -- and this technician
+                # would keep work nobody intends them to do, which is the
+                # exact failure this whole package exists to end.
+                **({"last_status": ""} if reassigned else {}),
+                "pushed_digest": digest,
+                "pushed_at": timezone.now(),
+                **({"conecto_job_id": conecto_job_id} if conecto_job_id else {}),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Staff -> Conecto staff codes
+# ---------------------------------------------------------------------------
+# Conecto will not let a staff member register in the app unless it knows
+# their code and their role. So the code has to reach them when the
+# account is made, the role has to reach them when it changes, and -- the
+# part that matters most -- the revocation has to reach them the moment
+# the account is switched off here.
+#
+# That last one is why is_active is tracked at all. An ex-employee who
+# keeps a field app because somebody forgot to remove them in a second
+# system is not a hypothetical; it is the default outcome of any design
+# where leaving requires two actions in two places.
+
+User = get_user_model()
+
+#: What Conecto holds a copy of. A change to anything else -- a phone
+#: number, a section permission, a password -- is our business alone.
+STAFF_TRACKED = ("role", "is_active", "staff_code")
+
+
+@receiver(pre_save, sender=User, dispatch_uid="conecto_staff_snapshot")
+def _snapshot_staff(sender, instance, **kwargs):
+    if not instance.pk:
+        instance._conecto_staff_before = None
+        return
+    instance._conecto_staff_before = (
+        User.objects.filter(pk=instance.pk).values(*STAFF_TRACKED).first()
+    )
+
+
+@receiver(post_save, sender=User, dispatch_uid="conecto_staff_push")
+def _push_staff(sender, instance, created, **kwargs):
+    if is_suppressed() or not instance.staff_code:
+        return
+
+    before = getattr(instance, "_conecto_staff_before", None)
+    was_staff = bool(before) and before.get("role") != User.Role.CUSTOMER
+
+    # Neither a staff account now nor one a moment ago: nothing Conecto
+    # has ever been told about, so nothing to tell them.
+    if not instance.is_staff_member and not was_staff:
+        return
+
+    # Only real changes push. Staff rows are saved by plenty of unrelated
+    # code -- a login updating last_login, a section permission edit, a
+    # password reset -- and re-sending an unchanged role on each of those
+    # is a call that can only do harm if it lands out of order.
+    if before is not None and all(
+        before.get(field) == getattr(instance, field) for field in STAFF_TRACKED
+    ):
+        return
+
+    # A code that CHANGED has to be revoked before the replacement is
+    # registered, and in that order. Conecto gates registration on the
+    # code, so leaving the old one live means it holds two valid codes for
+    # one person -- and the stale half is the dangerous one, because
+    # nothing in this platform refers to it any more, so nothing here will
+    # ever revoke it again.
+    #
+    # Queued as its own on_commit callback ahead of the registration:
+    # callbacks run in the order they were added, and if the revocation
+    # fails its ConectoCall row is the record that conecto_resync replays
+    # from.
+    old_code = (before or {}).get("staff_code") or ""
+    if old_code and old_code != instance.staff_code:
+        transaction.on_commit(
+            lambda pk=instance.pk, code=old_code: _revoke_staff_code(pk, code)
+        )
+
+    transaction.on_commit(lambda: _send_staff_code(instance.pk))
+
+
+def _send_staff_code(user_pk):
+    """Re-read before sending, for the same reason _create_ticket does:
+    on_commit runs after the transaction and the in-memory object may not
+    be what landed."""
+    user = User.objects.filter(pk=user_pk).first()
+    if user is None or not user.staff_code:
+        return
+    client.register_staff_code(user)
+
+
+def _revoke_staff_code(user_pk, code):
+    """Tell Conecto a code this staff member NO LONGER HAS is invalid.
+
+    Only ever called for a code that has been replaced. Anyone who had
+    already registered in the app on the old code loses access and has to
+    register again with the new one -- which is the cost of letting a code
+    be changed at all, and the reason changing one should be rare.
+    """
+    user = User.objects.filter(pk=user_pk).first()
+    if user is None:
+        return
+    client.register_staff_code(user, code=code, is_active=False)
+
+
+def _cancel_job(link, job_pk, reason):
+    """Withdraw one job, once.
+
+    last_status is what stops a second attempt. Conecto answers 409 for a
+    job already cancelled or completed, and a Job row gets saved by plenty
+    of unrelated code -- without this, every later save of a cancelled job
+    would send another cancellation and record another failure for
+    something that had already worked.
+
+    A failed withdrawal is said out loud rather than swallowed: it means a
+    technician still has work on their phone that nobody intends them to
+    do, and the only way anyone finds out is this line or the ConectoCall
+    row behind it.
+    """
+    if link.last_status in ("cancelled", "completed", "checked_out"):
+        return
+
+    response = client.cancel_job(
+        conecto_job_id=link.conecto_job_id,
+        vexar_job_id=str(job_pk),
+        reason=reason,
+        subject_ref=str(job_pk),
+    )
+    if response is None:
+        logger.warning(
+            "Job %s could NOT be withdrawn from %s -- it is still on their "
+            "phone and they may drive to it. See the Conecto call record and "
+            "replay with conecto_resync.",
+            job_pk, link.technician_code,
+        )
+        return
+
+    ConectoJob.objects.filter(pk=link.pk).update(last_status="cancelled")
+    link.last_status = "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Invoices -> the client's app
+# ---------------------------------------------------------------------------
+#
+# Only ISSUED documents go out. Everything else -- quote, pro forma, draft,
+# cancelled -- is either not a bill yet or no longer one, and a customer's
+# app is the worst possible place to discover the difference.
+
+#: The fields a customer would actually notice. A save that moves none of
+#: them is not worth a call: Invoice rows are written by the reminder job,
+#: the balance flags and the recurring engine, none of which change what the
+#: customer is being asked to pay.
+INVOICE_TRACKED = ("status", "total", "date_due")
+
+
+@receiver(pre_save, sender="billing.Invoice", dispatch_uid="conecto_invoice_snapshot")
+def _snapshot_invoice(sender, instance, **kwargs):
+    from billing.models import Invoice
+
+    if not instance.pk:
+        instance._conecto_invoice_before = None
+        return
+    instance._conecto_invoice_before = (
+        Invoice.objects.filter(pk=instance.pk).values(*INVOICE_TRACKED, "number").first()
+    )
+
+
+@receiver(post_save, sender="billing.Invoice", dispatch_uid="conecto_invoice_push")
+def _push_invoice(sender, instance, created, **kwargs):
+    if is_suppressed():
+        return
+    before = getattr(instance, "_conecto_invoice_before", None)
+    if before is not None and all(
+        before.get(field) == getattr(instance, field) for field in INVOICE_TRACKED
+    ):
+        return
+    transaction.on_commit(lambda: _send_invoice(instance.pk))
+
+
+def _send_invoice(invoice_pk):
+    """Re-read, decide, and record what was sent.
+
+    Re-read for the same reason every other push here does: on_commit runs
+    after the transaction and the in-memory copy may not be what landed.
+    This one decides what a customer sees as money owed.
+    """
+    from billing.models import Invoice
+
+    from .models import ConectoInvoice
+
+    invoice = (
+        Invoice.objects.select_related("customer").filter(pk=invoice_pk).first()
+    )
+    if invoice is None:
+        return
+
+    link = ConectoInvoice.objects.filter(invoice_id=invoice_pk).first()
+
+    if invoice.status not in client.INVOICE_STATUS_TO_CONECTO:
+        if link is not None and link.pushed_status:
+            # We told them about this document and now it is a quote again,
+            # a draft again, or cancelled. Their schema has no word for any
+            # of that, so there is nothing we can send to correct it -- and
+            # the client is looking at a bill that is no longer real.
+            #
+            # Said out loud rather than swallowed, exactly like a failed job
+            # withdrawal: the only way anybody finds out is this line.
+            logger.warning(
+                "Invoice %s was pushed to Conecto as %r and is now %r. Their "
+                "invoice schema has no cancelled/draft state, so the client's "
+                "app still shows the old one. Ask Conecto for a withdrawal "
+                "path, or correct it by hand on their side.",
+                link.pushed_number, link.pushed_status, invoice.status,
+            )
+        return
+
+    digest = _invoice_digest(invoice)
+    if link is not None and link.pushed_digest == digest and link.pushed_number == invoice.number:
+        return
+
+    response = client.push_invoice(invoice)
+    if response is None:
+        # The ConectoCall row records why, and conecto_resync replays it.
+        return
+
+    ConectoInvoice.objects.update_or_create(
+        invoice_id=invoice_pk,
+        defaults={
+            "pushed_number": invoice.number,
+            "pushed_status": invoice.status,
+            "pushed_digest": digest,
+            "pushed_at": timezone.now(),
+        },
+    )
+
+
+def _invoice_digest(invoice):
+    import hashlib
+    import json
+
+    blob = json.dumps(
+        {
+            "number": invoice.number,
+            "status": invoice.status,
+            "total": str(invoice.total or 0),
+            "due": invoice.date_due.isoformat() if invoice.date_due else "",
+        },
+        sort_keys=True,
+    )
+    return hashlib.md5(blob.encode()).hexdigest()

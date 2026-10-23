@@ -146,12 +146,39 @@ tables throughout, which is also what keeps it stable across page breaks.
       <div class="doc-title">{{ doc_title }}</div>
       <table class="meta" style="width:181.3pt; margin-top:3.7pt;">
         <tr><td>Number:</td><td class="v">{{ invoice.number }}</td></tr>
-        <tr><td>Date:</td><td class="v">{{ invoice.date_created|date:"d/m/Y" }}</td></tr>
+        {% comment %} The day it became a tax invoice, falling back to date_created for
+           quotes/pro formas (not issued yet) and for rows raised before
+           date_issued existed. A converted quote used to print the date the
+           QUOTE was raised as its invoice date. {% endcomment %}
+        <tr><td>Date:</td><td class="v">{{ document_date|date:"d/m/Y" }}</td></tr>
         <tr><td>{{ due_label }}:</td><td class="v">{{ invoice.date_due|date:"d/m/Y" }}</td></tr>
+        {% comment %} The summary the eye lands on first. On a mixed quote a single
+           "Total due" is the blended figure the split exists to remove, so
+           the two real commitments go here instead. Every other document
+           keeps the one line it has always had. {% endcomment %}
+        {% if kind_split %}
+        {% if kind_split.once_off.count %}
+        <tr>
+          <td class="due-l">Once-off:</td>
+          <td class="due-v v">R{{ kind_split.once_off.incl|floatformat:2 }}</td>
+        </tr>
+        {% endif %}
+        {% if kind_split.has_pro_rata %}
+        <tr>
+          <td class="due-l">First month:</td>
+          <td class="due-v v">R{{ kind_split.first_month.incl|floatformat:2 }}</td>
+        </tr>
+        {% endif %}
+        <tr>
+          <td class="due-l">Monthly:</td>
+          <td class="due-v v">R{{ kind_split.recurring.incl|floatformat:2 }}</td>
+        </tr>
+        {% else %}
         <tr>
           <td class="due-l">Total due:</td>
           <td class="due-v v">R{{ balance_due|floatformat:2 }}</td>
         </tr>
+        {% endif %}
       </table>
     </td>
   </tr>
@@ -182,10 +209,11 @@ tables throughout, which is also what keeps it stable across page breaks.
     <td style="width:183pt; vertical-align:top; padding:0;">
       <div class="party-name">{{ customer_display_name }}</div>
       {% if customer.address %}<div class="cu-line">{{ customer.address }}</div>{% endif %}
+      {% if customer.complex_or_area %}<div class="cu-line">{{ customer.complex_or_area }}</div>{% endif %}
       {% if customer.city %}<div class="cu-line">{{ customer.city }}</div>{% endif %}
       {% if customer.zip_code %}<div class="cu-line">{{ customer.zip_code }}</div>{% endif %}
-      <div class="cu-line">ID:{% if customer.id_number %} {{ customer.id_number }}{% endif %}</div>
-      <div class="cu-line">VAT ID:{% if customer.vat_number %} {{ customer.vat_number }}{% endif %}</div>
+      {% if customer.id_number %}<div class="cu-line">ID: {{ customer.id_number }}</div>{% endif %}
+      {% if customer.vat_number %}<div class="cu-line">VAT ID: {{ customer.vat_number }}</div>{% endif %}
       {% if customer.customer_id %}
         <div class="reference">Reference #: {{ customer.customer_id }}</div>
       {% endif %}
@@ -227,9 +255,56 @@ tables throughout, which is also what keeps it stable across page breaks.
 {# ---------- totals ---------- #}
 <table style="width:561.6pt; border-collapse:collapse; table-layout:fixed; margin-top:22pt;">
   <tr>
-    <td width="330.9pt" style="width:330.9pt; padding:0;"></td>
+    {% comment %} Comments for the client (George, 14 Oct 2026) -- Invoice.note,
+       typed on the quote/invoice form. Beside the totals, where it's read. {% endcomment %}
+    <td width="330.9pt" style="width:330.9pt; padding:0 14pt 0 0; vertical-align:top;">
+      {% if invoice.note %}
+        <div class="related-h" style="text-align:left;">Comments</div>
+        <div style="margin-top:6pt; font-size:9pt; line-height:1.4;">{{ invoice.note|linebreaksbr }}</div>
+      {% endif %}
+    </td>
     <td width="218.1pt" style="width:218.1pt; padding:0; vertical-align:top;">
+      {% comment %} TWO FIGURES ON A MIXED QUOTE, AND NO BLENDED ONE.
+
+         kind_split is set only for a Quote that carries both once-off and
+         recurring lines (notifications.pdf decides; billing.quote_totals
+         does the arithmetic). Everything else -- a pro forma, a tax
+         invoice, a quote that is all equipment or all service -- falls
+         through to the totals it has always printed.
+
+         The two figures are deliberately NOT added together anywhere on
+         the page. Each is rounded to cents in its own right, so their sum
+         can differ by a cent from the document's stored total, and a
+         blended number beside them would be a contradiction the customer
+         can see. It is also not a quantity anybody owes. {% endcomment %}
       <table class="tot">
+        {% if kind_split %}
+        {% if kind_split.once_off.count %}
+        <tr><td>Once-off exclusive:</td><td class="v">R{{ kind_split.once_off.excl|floatformat:2 }}</td></tr>
+        <tr><td>Once-off tax:</td><td class="v">R{{ kind_split.once_off.tax|floatformat:2 }}</td></tr>
+        <tr>
+          <td class="due-l">Once-off total:</td>
+          <td class="due-v v">R{{ kind_split.once_off.incl|floatformat:2 }}</td>
+        </tr>
+        {% endif %}
+        {% comment %} Pro rata (16 Oct 2026): the monthly lines above carry only the
+           part month, so the first month is its own figure and "Monthly
+           thereafter" is the full monthly price (billing.quote_totals). {% endcomment %}
+        {% if kind_split.has_pro_rata %}
+        <tr><td>First month exclusive:</td><td class="v">R{{ kind_split.first_month.excl|floatformat:2 }}</td></tr>
+        <tr><td>First month tax:</td><td class="v">R{{ kind_split.first_month.tax|floatformat:2 }}</td></tr>
+        <tr>
+          <td class="due-l">First month total:</td>
+          <td class="due-v v">R{{ kind_split.first_month.incl|floatformat:2 }}</td>
+        </tr>
+        {% endif %}
+        <tr><td>Monthly exclusive:</td><td class="v">R{{ kind_split.recurring.excl|floatformat:2 }}</td></tr>
+        <tr><td>Monthly tax:</td><td class="v">R{{ kind_split.recurring.tax|floatformat:2 }}</td></tr>
+        <tr>
+          <td class="due-l">Monthly thereafter:</td>
+          <td class="due-v v">R{{ kind_split.recurring.incl|floatformat:2 }}</td>
+        </tr>
+        {% else %}
         <tr><td>Total exclusive:</td><td class="v">R{{ total_exclusive|floatformat:2 }}</td></tr>
         <tr><td>Total tax:</td><td class="v">R{{ total_tax|floatformat:2 }}</td></tr>
         <tr><td>Total:</td><td class="v">R{{ invoice.total|floatformat:2 }}</td></tr>
@@ -237,6 +312,7 @@ tables throughout, which is also what keeps it stable across page breaks.
           <td class="due-l">Total due:</td>
           <td class="due-v v">R{{ balance_due|floatformat:2 }}</td>
         </tr>
+        {% endif %}
       </table>
     </td>
     <td width="12.6pt" style="width:12.6pt; padding:0;"></td>

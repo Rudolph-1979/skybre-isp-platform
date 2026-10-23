@@ -1,0 +1,157 @@
+"""Dashboard "System status" card (Rudolph, 7 Oct 2026): how the server is
+doing, for admins.
+
+Read from inside the backend container, and that is fine: /proc/loadavg,
+/proc/stat and /proc/meminfo are not namespaced by Docker, so they describe
+the VPS itself, and the container's root filesystem sits on the server's
+disk. Nothing here needs the host to be changed.
+
+The two backup rows are the exception -- the backups are written on the
+host, outside the container. They are read from SYSTEM_BACKUP_DIR (the
+newest database dump in it) and SYSTEM_REMOTE_BACKUP_STAMP (a file the
+backup script touches after a successful off-site copy), both mounted
+read-only into the container. Until that is set up the card says so rather
+than guessing.
+"""
+import datetime
+import glob
+import os
+import shutil
+import time
+
+from django.conf import settings
+from django.utils import timezone
+from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.permissions import IsAdmin
+
+PROC = "/proc"
+#: A backup older than this is shown in red.
+BACKUP_STALE_HOURS = 26
+DUMP_PATTERNS = ("*.sql", "*.sql.gz", "*.dump", "*.backup", "*.gz", "*.zst", "*.bz2", "*.xz")
+
+
+def _read(path):
+    with open(path) as fh:
+        return fh.read()
+
+
+def _cpu_times():
+    """(idle incl. iowait, iowait, total) jiffies from the first line of /proc/stat."""
+    first = _read(os.path.join(PROC, "stat")).splitlines()[0].split()
+    values = [int(v) for v in first[1:]]
+    # user nice system idle iowait irq softirq steal [guest guest_nice]
+    # guest/guest_nice are already counted inside user/nice.
+    values = values[:8]
+    idle, iowait = values[3], values[4]
+    return idle + iowait, iowait, sum(values)
+
+
+def cpu_usage(sample_seconds=0.25):
+    """(cpu busy %, iowait %) over a short sample."""
+    a_idle, a_wait, a_total = _cpu_times()
+    time.sleep(sample_seconds)
+    b_idle, b_wait, b_total = _cpu_times()
+    total = b_total - a_total
+    if total <= 0:
+        return 0.0, 0.0
+    busy = 100.0 * (total - (b_idle - a_idle)) / total
+    wait = 100.0 * (b_wait - a_wait) / total
+    return round(busy, 1), round(wait, 1)
+
+
+def memory():
+    info = {}
+    for line in _read(os.path.join(PROC, "meminfo")).splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts:
+            info[key] = int(parts[0]) * 1024  # kB -> bytes
+    total = info.get("MemTotal", 0)
+    available = info.get("MemAvailable", info.get("MemFree", 0))
+    swap_total = info.get("SwapTotal", 0)
+    swap_free = info.get("SwapFree", 0)
+    return {
+        "mem_total": total, "mem_available": available,
+        "swap_total": swap_total, "swap_free": swap_free,
+    }
+
+
+def load_average():
+    return [float(v) for v in _read(os.path.join(PROC, "loadavg")).split()[:3]]
+
+
+def _newest(paths):
+    best = None
+    for path in paths:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if os.path.isfile(path) and (best is None or stat.st_mtime > best[1].st_mtime):
+            best = (path, stat)
+    return best
+
+
+def _age(mtime, now):
+    hours = (now - mtime) / 3600.0
+    return {
+        "at": datetime.datetime.fromtimestamp(mtime, tz=timezone.get_current_timezone()).isoformat(),
+        "hours": round(hours, 1),
+        "ok": hours <= BACKUP_STALE_HOURS,
+    }
+
+
+def backups(now=None):
+    now = now or time.time()
+    folder = getattr(settings, "SYSTEM_BACKUP_DIR", "") or ""
+    stamp = getattr(settings, "SYSTEM_REMOTE_BACKUP_STAMP", "") or ""
+    db = None
+    if folder and os.path.isdir(folder):
+        files = []
+        for pattern in DUMP_PATTERNS:
+            files += glob.glob(os.path.join(folder, "**", pattern), recursive=True)
+        newest = _newest(set(files))
+        if newest:
+            db = {**_age(newest[1].st_mtime, now), "size": newest[1].st_size, "file": os.path.basename(newest[0])}
+    remote = None
+    if stamp and os.path.isfile(stamp):
+        remote = _age(os.stat(stamp).st_mtime, now)
+    return {
+        "db_backup": db,
+        "db_backup_configured": bool(folder and os.path.isdir(folder)),
+        "remote_backup": remote,
+        "remote_backup_configured": bool(stamp and os.path.exists(stamp)),
+    }
+
+
+def snapshot(sample_seconds=0.25):
+    cpu, iowait = cpu_usage(sample_seconds)
+    mem = memory()
+    disk = shutil.disk_usage(getattr(settings, "SYSTEM_DISK_PATH", "/") or "/")
+    return {
+        "checked_at": timezone.now().isoformat(),
+        "cpu_cores": os.cpu_count() or 0,
+        "load": load_average(),
+        "cpu_pct": cpu,
+        "iowait_pct": iowait,
+        **mem,
+        "disk_total": disk.total,
+        "disk_free": disk.free,
+        **backups(),
+    }
+
+
+class SystemStatusView(APIView):
+    """GET /api/system-status/ -- admins only."""
+
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        try:
+            return Response(snapshot())
+        except OSError as exc:
+            # Not Linux, or /proc unreadable: say so instead of a 500.
+            return Response({"detail": f"Server figures aren't readable here: {exc}"}, status=503)

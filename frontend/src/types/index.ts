@@ -38,7 +38,8 @@ export type Section =
   | "vehicles"
   | "bulk_email"
   | "configs"
-  | "accountant";
+  | "accountant"
+  | "administration";
 
 export const SECTION_LABELS: Record<Section, string> = {
   scheduling: "Scheduling",
@@ -60,10 +61,64 @@ export const SECTION_LABELS: Record<Section, string> = {
   bulk_email: "Bulk Email",
   configs: "Configs",
   accountant: "Accountant",
+  // Administration -> Reports (9 Oct 2026).
+  administration: "Administration",
 };
+
+// Administration -> Reports: clients per partner / per tariff (9 Oct 2026).
+export interface ClientsReportRow {
+  key: string;
+  name: string;
+  clients: number;
+  services: number;
+  active_services: number;
+  monthly_incl: string;  // incl. VAT (13 Oct 2026)
+  // Cost and markup (13 Oct 2026): over active + suspended lines whose
+  // tariff has a cost; null when none has. uncosted_lines = lines left out.
+  monthly_cost?: string | null;
+  gross_profit?: string | null;
+  markup_pct?: string | null;
+  margin_pct?: string | null;
+  uncosted_lines?: number;
+  // Clients per tariff rows only: the tariff's own price and cost per line.
+  unit_price?: string | null;
+  unit_cost?: string | null;
+  unit_markup_pct?: string | null;
+  // Only with ?clients=1 (the CSV export, 13 Oct 2026).
+  client_list?: ClientsReportClient[];
+}
+
+export interface ClientsReport {
+  statuses: string[];
+  // Clients per tariff only: the tariffs picked (empty = all) and every
+  // tariff on offer in the picker (9 Oct 2026).
+  tariffs?: string[];
+  options?: { key: string; name: string }[];
+  // Clients per tariff: the partners picked and the partner picker (13 Oct 2026).
+  partners?: string[];
+  partner_options?: { key: string; name: string }[];
+  rows: ClientsReportRow[];
+  total: Omit<ClientsReportRow, "key" | "name">;
+}
+
+export interface ClientsReportClient {
+  id: number;
+  customer_ref: string;
+  full_name: string;
+  status: string;
+  services: { id: number; tariff: string; status: string }[];
+  monthly_incl: string;  // incl. VAT (13 Oct 2026)
+  monthly_cost?: string | null;
+  // Discount live today on the active lines, rand per month (13 Oct 2026).
+  discount?: string | null;
+  discount_detail?: string;
+  monthly_after_discount?: string;
+}
 
 export interface User {
   id: number;
+  // Scheduling calendar colour -- their own or the automatic one (6 Oct 2026).
+  calendar_colour?: string;
   username: string;
   email: string;
   first_name: string;
@@ -78,15 +133,26 @@ export interface User {
   // check entirely on the backend regardless of its contents.
   allowed_sections: Section[];
   // Reseller-partner visibility restriction, set by Management/Admin under
-  // Staff -> Partners. Empty = unrestricted (sees every partner's
-  // customers, plus direct/no-partner ones). Read-only from this type --
-  // only ever written via /staff-permissions/.
+  // Configs -> Permissions or Users. Empty = unrestricted (every partner's
+  // customers, plus direct/no-partner ones). 0 = direct customers; a
+  // restricted user without it does not see them. Read-only from this type.
   allowed_partners: number[];
   // This staff member's own personal narrowing of the above -- which of
   // their *allowed* partners they currently want shown by default on the
   // Customers page. Empty = show all of whichever partners they're
   // allowed to see. Self-service: PATCH /me/ with { visible_partners }.
   visible_partners: number[];
+  // Whether this staff member can decide (accept/reject) a ticket
+  // escalated to NOC -- a capability on top of their existing role, not a
+  // separate account type. Read-only here (see UserSerializer): only ever
+  // granted via StaffAccountsSerializer, Admin-only, same as role.
+  is_noc: boolean;
+  // This person's own dashboard tile order (15 Oct 2026). Self-service:
+  // PATCH /me/ with { dashboard_layout: { order: [...] } }. {} = default.
+  dashboard_layout?: { order?: string[] };
+  // Which foldable panels this person keeps open, per page (#193):
+  // { vehicle: ["odometer", ...] }. PATCH /me/ { panel_state: { page: [...] } }.
+  panel_state?: Record<string, string[]>;
 }
 
 // Mirrors the backend's accounts.serializers.StaffPermissionsSerializer --
@@ -126,12 +192,28 @@ export interface Partner {
 export interface StaffAccountEntry {
   id: number;
   username: string;
+  // What the Conecto app checks before letting this person register.
+  // Nullable because customers share this model and have none, and
+  // because accounts created before staff codes existed were backfilled
+  // rather than invented.
+  staff_code: string | null;
   first_name: string;
   last_name: string;
   email: string;
   phone: string;
   role: Role;
   is_active: boolean;
+  // Admin-editable here (see StaffAccountsSerializer) -- the actual grant
+  // of the NOC capability. Not tied to a role: per Rudolph's design call,
+  // NOC is "overlapping/same staff, different capability", so any staff
+  // account can carry it, typically Support.
+  is_noc: boolean;
+  // Calendar colour: "" = automatic; display_colour is what is shown.
+  calendar_colour?: string;
+  display_colour?: string;
+  // Partner access, editable on Edit user too (5 Oct 2026). Empty = every
+  // partner; 0 = direct customers (components/PartnerAccessFields).
+  allowed_partners?: number[];
 }
 
 export interface Paginated<T> {
@@ -153,20 +235,96 @@ export interface Customer {
   customer_type: "individual" | "company";
   category: "residential" | "business";
   full_name: string;
+  // Business lines: who on the business side to deal with -- the owner or
+  // manager, distinct from the account holder the row otherwise describes.
+  contact_person: string;
+  contact_person_phone: string;
+  contact_person_email: string;
+  // Residential lines: a second contact on standby, so there is another
+  // number to reach when the primary one is not answering.
+  secondary_contact_name: string;
+  secondary_contact_phone: string;
   company_name: string;
   email: string;
+  // Billing documents go here with `email` in CC. "" = main email.
+  billing_email: string;
   phone: string;
   address: string;
+  // Complex, estate or residential area. Printed between the street line and
+  // the city on a tax invoice.
+  complex_or_area: string;
   city: string;
   zip_code: string;
+  // GPS for the main address (farms with no street). Both or neither.
+  latitude: string | null;
+  longitude: string | null;
   // Printed on the customer's side of a tax invoice. Both optional — a
   // residential customer usually has neither, and the invoice prints the
   // labels with nothing after them rather than hiding the rows, which is
   // what the document they're replacing did.
   id_number: string;
   vat_number: string;
-  status: "new" | "active" | "suspended" | "bad_debt" | "inactive";
+  status: "new" | "active" | "online" | "suspended" | "bad_debt" | "inactive";
+  // Paying / Sponsor / Deal with its reason (6 Oct 2026) -- a label, not a
+  // billing rule; the reason is required unless Paying.
+  // A ClientAccountType key (paying, sponsor, deal, staff, or one staff add).
+  account_type?: string;
+  account_type_reason?: string;
   balance: string;
+  // When they actually became a customer, which is NOT created_at.
+  // created_at is auto_now_add — the moment this row was written — so for
+  // anyone migrated from another system it says "the day of the import",
+  // and the dashboard growth chart becomes one spike with no history behind
+  // it. null falls back to created_at.
+  signup_date: string | null;
+  // Whether this customer's line is reporting to RADIUS right now, and when
+  // it was last seen. Read-only, derived per request from accounting data.
+  //
+  // THREE-valued, which is the whole point: true = a session is open and
+  // reporting, false = they have an active RADIUS line that has gone quiet,
+  // null = no RADIUS line on this platform at all (a customer on somebody
+  // else's fibre). Collapsing the third case into "offline" would mark most
+  // of the book red and make the column worthless.
+  //
+  // Optional because only the list and detail endpoints populate them — a
+  // POST/PATCH response leaves them undefined rather than paying three
+  // queries to answer a question nobody asked.
+  online?: boolean | null;
+  // ISO timestamp of the most recent accounting activity across all of their
+  // lines — an interim update, a session start, or a clean stop. null when no
+  // session has ever been recorded for them.
+  last_seen_at?: string | null;
+  // Lines down while the client is Online on another (8 Oct 2026).
+  offline_lines?: number | null;
+  // Lines Suspended right now, and how many of those the billing run
+  // suspended for non-payment. Billing suspends the service and leaves
+  // `status` alone, so these are how the list shows it. Same rules as
+  // `online`: list and detail only; null/undefined elsewhere.
+  suspended_lines?: number | null;
+  suspended_for_nonpayment_lines?: number | null;
+  // Customers list Payment status (customers.payment_status on the backend).
+  payment_status?: "overdue_partial" | "overdue" | "partial" | "unpaid" | "paid" | "credit";
+  payment_status_label?: string;
+  // How the client pays (21 Oct 2026, billing.payer_rating): last 12
+  // invoices, on time = on or before the due date. Staff only.
+  payer_rating?: {
+    code: "early" | "on_time" | "late" | "chronic" | "new";
+    label: string;
+    detail: string;
+    counted: number;
+    early: number;
+    on_time: number;
+    late: number;
+    avg_late: number;
+  } | null;
+  // Suspension extension (#194): "requested" = waiting for Management,
+  // "extended" = approved and in force today, "" = neither.
+  extension_status?: "requested" | "extended" | "";
+  extension_until?: string | null;
+  // Signup date, or the day the customer was created here (#199).
+  start_date?: string | null;
+  // Payment method on the client's billing config (Customers list column).
+  payment_method_name?: string;
   // Every public address this customer's non-terminated services are handing
   // out. Read-only, derived from the services — a list because a customer can
   // hold more than one line, and empty for a customer with no PPPoE service.
@@ -179,7 +337,16 @@ export interface Customer {
   assigned_staff_name: string | null;
   partner: number | null;
   partner_name: string | null;
+  // The client's partner first, then any other partner one of its lines is
+  // with (Service.partner).
+  partner_names?: string[];
+  // A move to another partner booked for a date (package #20).
+  pending_partner?: number | null;
+  pending_partner_name?: string | null;
+  pending_partner_date?: string | null;
   notes: string;
+  // Free-typed router / PtP / CPE details (20 Oct 2026). Staff only.
+  equipment_details?: string;
   created_at: string;
   updated_at: string;
   user: number | null;
@@ -220,6 +387,16 @@ export interface CustomerUsage {
   total_bytes: number;
   sessions: number;
   live_sessions: CustomerUsageLiveSession[];
+  // When each line last came up / went down (15 Oct 2026). "silent" = an
+  // open session not heard from for 15 min: probably dropped without a Stop.
+  last_sessions?: {
+    username?: string;
+    state: "up" | "down" | "silent" | null;
+    up_at: string | null;
+    down_at: string | null;
+    down_cause: string;
+    heard_at: string | null;
+  }[];
   // Present only when ?period= was asked for. The month-to-date fields above
   // come from RADIUS accounting and cover history from before per-hour
   // accumulation started, so they are kept rather than replaced.
@@ -292,6 +469,13 @@ export interface UsageReport {
   start: string;
   end: string;
   measuring_since: string | null;
+  // The ordering the server applied, echoed back. "-total_bytes" by default.
+  ordering: string;
+  // How many customers had usage in this period, BEFORE the row limit. The
+  // table shows the heaviest `limit` of these; the CSV export has all of
+  // them. Surfaced when the two differ, so a capped table cannot read as the
+  // whole picture.
+  total_rows: number;
   results: UsageReportRow[];
 }
 
@@ -316,13 +500,86 @@ export interface Tariff {
   fup_threshold_gb: number | null;
   fup_speed_pct: number;
   tax_rate_pct: string;
+  // What one line costs a month, excl. VAT (13 Oct 2026). null = not known.
+  cost_price: string | null;
   is_active: boolean;
   description: string;
+  // Which partner sells this plan. null = available to EVERY partner — the
+  // same "empty means unrestricted" convention as allowed_partners and
+  // visible_partners. A customer is tagged to a partner when created, and
+  // from then on only that partner's plans (plus these shared ones) are
+  // offered for their services.
+  partner: number | null;
+  partner_name: string | null;
   // Read-only, annotated in SQL by TariffViewSet. How many services sit on
   // this plan — shown when editing, because the price and the speed both
   // reach every one of them.
   service_count: number;
   active_service_count: number;
+}
+
+// The catalog of standard recurring charges -- IP Rental, domain, email,
+// web hosting. Lives on the "Recurring Charges" tab of Configs -> Tariffs.
+// Given to a CLIENT (not a service) as a CustomerRecurringCharge below,
+// since some clients take only a domain or hosting (Rudolph, 1 Oct).
+// The list of standard once-off charges picked as invoice/quote lines
+// (Installation, Relocation, 6 m pole...) -- 6 Oct 2026. Price excl. VAT.
+export interface OnceOffItem {
+  id: number;
+  name: string;
+  price: string;
+  tax_rate_pct: string;
+  description: string;
+  is_active: boolean;
+  // How many invoice/quote lines have used it.
+  used_count: number;
+  created_at: string;
+}
+
+export interface RecurringCharge {
+  id: number;
+  name: string;
+  price: string;
+  tax_rate_pct: string;
+  // Unticking takes it off the list staff can newly opt a service onto.
+  // A service already carrying it keeps being billed for it -- remove it
+  // from the service instead to stop billing there.
+  is_active: boolean;
+  description: string;
+  partner: number | null;
+  partner_name: string | null;
+  // Read-only, annotated in SQL. How many clients currently carry this
+  // charge -- shown before anyone deletes or reprices it.
+  client_count: number;
+  created_at: string;
+}
+
+// One recurring charge a client is billed for every cycle, from
+// start_date until end_date (the first day it is NOT billed; null = until
+// stopped). Price/tax are the catalog's live figures, excl. VAT.
+export interface CustomerRecurringCharge {
+  id: number;
+  customer: number;
+  charge: number;
+  charge_name: string;
+  price: string;
+  tax_rate_pct: string;
+  quantity: number;
+  start_date: string;
+  end_date: string | null;
+  note: string;
+  created_at: string;
+  // Custom pricing (13 Oct 2026): amounts excl. VAT, for the whole line.
+  discount_type: "none" | "percentage" | "amount" | "surcharge";
+  discount_value: string;
+  discount_starts_on: string | null;
+  discount_ends_on: string | null;
+  discount_reason: string;
+  price_incl_vat?: string;
+  net_price_incl_vat?: string;
+  discount_now_incl_vat?: string;
+  surcharge_now_incl_vat?: string;
+  discount_active?: boolean;
 }
 
 export type ServiceConnectionType = "ovpn" | "pppoe";
@@ -345,6 +602,12 @@ export interface Service {
   customer_name: string;
   tariff: number;
   tariff_name: string;
+  // The line's OWN partner (several partners on one client, 5 Oct 2026);
+  // null = same as the client's. partner_name / effective_partner are what
+  // the line is actually with: its own, else the client's.
+  partner: number | null;
+  partner_name: string | null;
+  effective_partner?: number | null;
   // A tariff change booked for a future date. Both are set together or
   // neither is -- the API rejects half of one, since a tariff with no date
   // would never apply and a date with no tariff looks scheduled but isn't.
@@ -353,7 +616,19 @@ export interface Service {
   pending_tariff_price: string | null;
   pending_tariff_date: string | null;
   price: string;
-  status: "active" | "suspended" | "terminated" | "pending";
+  // The tariff's cost per month, excl. VAT (13 Oct 2026). null = not set.
+  cost?: string | null;
+  // Price and cost with VAT at the tariff's rate (13 Oct 2026).
+  price_incl_vat?: string | null;
+  cost_incl_vat?: string | null;
+  // Billed today incl. VAT after the line's discount, and that discount
+  // incl. VAT (13 Oct 2026).
+  net_price_incl_vat?: string | null;
+  discount_now_incl_vat?: string | null;
+  // "Rand amount up" special pricing live today, incl. VAT (13 Oct 2026).
+  surcharge_now_incl_vat?: string | null;
+  // "paused" (#211): set and cleared only by Pause / Resume.
+  status: "active" | "suspended" | "terminated" | "pending" | "paused";
   device: number | null;
   // Where the client PHYSICALLY connects -- the AP/sector, OLT or switch.
   // Deliberately not the same as `device` above, which is the NAS the line
@@ -365,6 +640,38 @@ export interface Service {
   access_device_type: string | null;
   access_site_name: string | null;
   access_detail: string;
+  // Where this line is installed: the client's main address, or its own.
+  use_customer_address: boolean;
+  site_address: string;
+  site_complex_or_area: string;
+  site_city: string;
+  site_zip_code: string;
+  // GPS for a separate address; both or neither. Strings (Decimal).
+  site_latitude: string | null;
+  site_longitude: string | null;
+  // Read-only: the installation address as one line, whichever it is.
+  site_address_display: string;
+  // A reduction on this line's plan price. Reaches the invoice as its own
+  // negative line at the tariff's tax rate, so VAT is charged on the reduced
+  // amount -- which is what SARS expects of a discount.
+  //
+  // Only Management/Admin can SET these; the API rejects the change from
+  // anyone else. Everyone can read them, so staff can see why an invoice
+  // doesn't match the plan price instead of guessing.
+  discount_type: "none" | "percentage" | "amount" | "surcharge";
+  discount_value: string;
+  // Both optional. null start = applies immediately; null end = runs until
+  // somebody removes it. The end date is checked on the day the invoice is
+  // RAISED, so end a discount the day before the next billing date, not on it.
+  discount_starts_on: string | null;
+  discount_ends_on: string | null;
+  discount_reason: string;
+  // Read-only, worked out server-side for today. The raw fields above can't
+  // answer "is this customer actually being discounted right now?" without
+  // re-deriving it from a type, a value and two dates on every screen that
+  // asks -- a discount not yet started looks identical to a live one.
+  discount_active: boolean;
+  discount_amount_now: string;
   // Fair-use overrides for this one line. null = use the tariff's, so a
   // plan's policy stays in one place and an exception doesn't need a new
   // plan invented for one customer. 0 is a real threshold meaning "shape
@@ -398,6 +705,48 @@ export interface Service {
     detail: string;
     at: string;
   } | null;
+  // True while the billing run has this line suspended for non-payment.
+  // Read-only.
+  suspended_for_nonpayment?: boolean;
+  // Is this line up right now (radacct)? null = no RADIUS login here, or
+  // not Active -- nothing to report.
+  online?: boolean | null;
+  last_seen_at?: string | null;
+  // Pending service that switches itself to Active on this date (package #20).
+  activate_on?: string | null;
+  // The service this one takes over from -- carries over its PPPoE login
+  // and IP at cutover (package #22).
+  replaces?: number | null;
+  replaces_tariff_name?: string | null;
+  replaces_end_date?: string | null;
+  // The booked cancellation, if any (#203). end_date = first day without
+  // service, as on the service.
+  cancellation?: {
+    id: number;
+    kind: "notice" | "cannot_service";
+    kind_label: string;
+    notice_date: string | null;
+    end_date: string;
+    reason: string;
+    replacement_service: number | null;
+    replacement_name: string;
+    created_by_name: string;
+    created_at: string;
+    credit_requests: { id: number; amount: string; status: string; invoice_number: string | null }[];
+  } | null;
+  // The current pause, or one booked for later (#211). resume_on = the
+  // first day back (null = until resumed by hand). A client's own view has
+  // only id / status / pause_from / resume_on.
+  pause?: {
+    id: number;
+    status: "scheduled" | "active";
+    pause_from: string;
+    resume_on: string | null;
+    reason?: string;
+    created_by_name?: string;
+    created_at?: string;
+    credit_requests?: { id: number; amount: string; status: string; invoice_number: string | null }[];
+  } | null;
 }
 
 // Response shape of GET /services/{id}/live-bandwidth/ -- see
@@ -407,7 +756,7 @@ export interface ServiceLiveBandwidth {
   upload_mbps: number;
 }
 
-export type InvoiceItemType = "custom" | "product" | "tariff";
+export type InvoiceItemType = "custom" | "product" | "tariff" | "recurring_charge" | "once_off_item";
 
 export interface InvoiceItem {
   id: number;
@@ -418,9 +767,16 @@ export interface InvoiceItem {
   product_name: string | null;
   tariff: number | null;
   tariff_name: string | null;
+  recurring_charge: number | null;
+  recurring_charge_name: string | null;
+  once_off_item?: number | null;
+  once_off_item_name?: string | null;
   description: string;
   quantity: string;
   unit_price: string;
+  // Full monthly price of a pro-rata line (16 Oct 2026); null otherwise.
+  monthly_price?: string | null;
+  billing_kind?: "" | "once_off" | "recurring";
   tax_rate_pct: string;
   // Only meaningful for item_type "tariff" -- the contract/service period
   // quoted. Set on the item once activated into a real Service, see
@@ -440,11 +796,27 @@ export interface Invoice {
   status: InvoiceStatus;
   date_created: string;
   date_due: string;
+  // Stamped automatically the first time this becomes a real tax invoice
+  // (see billing.Invoice.save()); null for a Quote/Pro Forma that hasn't
+  // converted yet. Used to sort the customer's combined Statement by the
+  // date each document actually counts from -- the same field
+  // billing.statements.movements() sorts by -- not date_due.
+  date_issued: string | null;
   subtotal: string;
   tax_total: string;
   total: string;
   paid_amount: string;
   balance_due: string;
+  // Still owed and past date_due -- computed server-side (see billing/
+  // models.py's Invoice.is_overdue) because `status` is never actually
+  // flipped to "overdue" on a real invoice, and because "today" needs to
+  // be OUR timezone, not whatever the browser's clock is set to. See
+  // StatusBadge.tsx's InvoiceStatusBadge, the only thing that reads this.
+  is_overdue: boolean;
+  // When it was last emailed to the client, and to whom (null = never, or
+  // before 7 Oct 2026 when this started being recorded).
+  last_emailed_at?: string | null;
+  last_emailed_to?: string;
   note: string;
   items: InvoiceItem[];
   // Whether the "Convert to pro forma" / "Convert to invoice" actions are
@@ -465,9 +837,16 @@ export interface Payment {
   note: string;
   received_by: number | null;
   received_by_name: string | null;
+  // Read-only. How much of this payment is pinned to invoices and how
+  // much sits as account credit -- see PaymentSerializer. A payment
+  // recorded against one invoice credited it directly without an
+  // allocation row, so it reads as fully unallocated.
+  allocated_amount?: string;
+  unallocated_amount?: string;
+  allocation_count?: number;
 }
 
-export type CreditStatus = "pending" | "approved" | "rejected";
+export type CreditStatus = "pending" | "approved" | "rejected" | "reversed";
 
 export interface CreditRequest {
   id: number;
@@ -483,6 +862,24 @@ export interface CreditRequest {
   decision_note: string;
   decided_at: string | null;
   created_at: string;
+  // The visible line item this credit created on approval (see
+  // billing.CreditRequest.create_credit_note_invoice). Null for anything
+  // decided before that existed and not yet backfilled.
+  credit_note: number | null;
+  credit_note_number: string | null;
+  // The specific invoice this credit is FOR, if any -- optional. Set, it
+  // also settles (fully or partially) that invoice's own paid_amount/
+  // status on approval, not just the customer's balance. See
+  // billing.CreditRequest.invoice's own comment: this is the CN-00002 /
+  // TXN92206 fix -- a credit note that moved only the balance and never
+  // the invoice it was raised for.
+  invoice: number | null;
+  invoice_number: string | null;
+  // False for credits approved before 5 Oct 2026 -- what they settled was
+  // never recorded, so they can't be re-allocated.
+  allocation_tracked: boolean;
+  // Which invoices this credit settles, and how much of it on each.
+  allocations_detail: { invoice: number; invoice_number: string; amount: string }[];
 }
 
 export type InvoiceDeletionStatus = "pending" | "approved" | "rejected";
@@ -507,6 +904,27 @@ export interface InvoiceDeletionRequest {
   created_at: string;
 }
 
+export type SuspensionExtensionStatus = "pending" | "approved" | "rejected";
+
+// Mirrors billing.models.SuspensionExtensionRequest -- pausing suspension
+// AND the reminder/warning chasers for one customer through a date,
+// Management-approved, not a permanent change to their billing terms.
+export interface SuspensionExtensionRequest {
+  id: number;
+  customer: number;
+  customer_name: string | null;
+  extend_until: string;
+  reason: string;
+  status: SuspensionExtensionStatus;
+  requested_by: number | null;
+  requested_by_name: string | null;
+  decided_by: number | null;
+  decided_by_name: string | null;
+  decision_note: string;
+  decided_at: string | null;
+  created_at: string;
+}
+
 // Mirrors billing.models.PaymentMethod -- a named payment convention (e.g.
 // "EFT 1st", "Cash") tagged onto a customer's billing config for
 // reference; doesn't drive any automated timing on its own.
@@ -514,6 +932,45 @@ export interface PaymentMethod {
   id: number;
   name: string;
   is_active: boolean;
+  // How many customers currently have this method on their billing config.
+  // Read-only; it is what the "apply to existing" confirmation counts.
+  customer_count?: number;
+  // The terms this method hands a customer when it is selected on them.
+  // A copy, not a link -- editing these changes nobody already on the
+  // method until "Apply to existing customers" is pressed.
+  payment_period?: RecurringPaymentPeriod;
+  billing_day?: number;
+  use_date_of_customer_creation?: boolean;
+  payment_due_days?: number | null;
+  blocking_period_days?: number | null;
+  deactivation_period_days?: number | null;
+  minimum_balance?: string;
+  auto_create_invoices?: boolean;
+  send_billing_notifications?: boolean;
+  auto_proforma_enabled?: boolean;
+  proforma_day?: number | null;
+  proforma_payment_period?: RecurringPaymentPeriod | "";
+  create_proforma_for?: ProformaTarget;
+  reminder_enabled?: boolean;
+  reminder_1_day?: number | null;
+  reminder_2_day?: number | null;
+  reminder_3_day?: number | null;
+}
+
+/** One customer the "apply to existing" preview says would newly block. */
+export interface PaymentMethodBlockPreviewRow {
+  customer_id: number;
+  customer: string;
+  reference: string;
+  services: number;
+}
+
+export interface PaymentMethodApplyResult {
+  committed: boolean;
+  customers: number;
+  newly_blocked: PaymentMethodBlockPreviewRow[];
+  /** Whether auto-suspension is on at all -- if not, nothing above happens. */
+  auto_suspend_enabled: boolean;
 }
 
 export type RecurringPaymentPeriod = "monthly" | "quarterly" | "biannually" | "annually";
@@ -582,6 +1039,9 @@ export interface CustomerBillingConfig extends RecurringBillingFields {
   billing_zip: string;
   billing_city: string;
   next_billing_date: string | null;
+  // Read-only -- set only by approving a SuspensionExtensionRequest. Pauses
+  // suspension AND reminder/warning emails through this date (inclusive).
+  suspension_extended_until: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -602,10 +1062,19 @@ export interface ReminderSettingsConfig {
 // only actually suspends anyone if this is also on.
 export interface SuspensionSettingsConfig {
   auto_suspend_enabled: boolean;
+  // The warning email before the cut-off, and its notice period. Separate
+  // from the master switch above and usable while that is off: warning
+  // people is not the destructive half of auto-suspension.
+  warning_enabled: boolean;
+  warning_days: number;
   updated_at: string;
 }
 
-export type RecurringBillingRunStatus = "processed" | "failed";
+// "in_progress" is the state a run is CREATED in, and it only leaves it
+// when the run reaches the end -- so a row still showing it is a run that
+// was interrupted, and its counts are what it actually completed before
+// it stopped. See RecurringBillingRun.Status in billing/models.py.
+export type RecurringBillingRunStatus = "in_progress" | "processed" | "failed";
 
 // Mirrors GET /api/recurring-billing-runs/ -- one row per committed Run
 // (never a Preview) of the recurring-billing engine.
@@ -620,6 +1089,7 @@ export interface RecurringBillingRun {
   invoices_created_count: number;
   proforma_invoices_created_count: number;
   reminders_sent_count: number;
+  suspension_warnings_sent_count: number;
   suspensions_applied_count: number;
   triggered_by: number | null;
   triggered_by_name: string | null;
@@ -632,6 +1102,7 @@ export interface RecurringBillingCounts {
   invoices_created: number;
   proforma_invoices_created: number;
   reminders_sent: number;
+  suspension_warnings_sent: number;
   suspensions_applied: number;
 }
 
@@ -668,7 +1139,9 @@ export interface Device {
   vendor: string;
   model_name: string;
   status: "online" | "offline" | "unknown";
-  snmp_community: string;
+  // Write-only on the API, same as api_password: the community is a
+  // credential and is never echoed back, so only the boolean is readable.
+  snmp_community_set: boolean;
   snmp_version: string;
   latest_reading: MonitoringReading | null;
   api_enabled: boolean;
@@ -862,6 +1335,20 @@ export interface OvpnClientConnectionPingStatus {
 }
 
 export interface RadAcctSession {
+  // What this session actually is, decided server-side on the same
+  // 900-second heartbeat rule the Customers page and find_live_session use.
+  //
+  // THREE states, because `is_active` below only means "no stop time
+  // recorded" and that is not the same as connected: a CPE that loses power
+  // never sends an Accounting-Stop, so its row reads active for ever.
+  //   online  open, and heard from inside the window
+  //   stale   open, but silent for longer — dropped without telling us
+  //   ended   a real Accounting-Stop arrived
+  connection_state: "online" | "stale" | "ended";
+  // Seconds since the NAS last reported on this session; null if it never
+  // has. Shown next to the state on purpose — a green pill on its own can't
+  // be checked, one beside "2d ago" is self-evidently wrong.
+  heartbeat_age_seconds: number | null;
   // Real elapsed time. acctsessiontime only moves on an interim update, so on
   // a 5-minute interim a live session reports 0 for its first five minutes.
   duration_seconds: number | null;
@@ -898,11 +1385,34 @@ export interface TicketComment {
   created_at: string;
 }
 
+// Mirrors the backend's tickets.serializers.TicketEscalationSerializer.
+// Every field is read-only through the API -- written only by
+// TicketViewSet's escalate/decide_escalation actions, never posted
+// directly (see that serializer's Meta for why).
+export interface TicketEscalation {
+  id: number;
+  ticket: number;
+  escalated_by: number | null;
+  escalated_by_name: string | null;
+  reason: string;
+  escalated_at: string;
+  decision: "pending" | "accepted" | "rejected";
+  decided_by: number | null;
+  decided_by_name: string | null;
+  decided_at: string | null;
+  decision_note: string;
+}
+
 export interface Ticket {
   id: number;
   ticket_number: string;
-  customer: number;
-  customer_name: string;
+  // Null on an internal job-feedback ticket, which by construction has no
+  // customer at all -- that absence is what keeps it out of the portal.
+  customer: number | null;
+  customer_name: string | null;
+  // Raised by a technician from a job in the Conecto app. Staff and admins
+  // only; a customer can never be served one.
+  is_internal: boolean;
   subject: string;
   description: string;
   department: "support" | "billing" | "sales" | "abuse";
@@ -910,9 +1420,86 @@ export interface Ticket {
   priority: "low" | "medium" | "high" | "urgent";
   assigned_to: number | null;
   assigned_to_name: string | null;
+  // Who opened it. Null on tickets raised before the field existed, and
+  // on anything created by a process rather than a person.
+  created_by: number | null;
+  created_by_name: string | null;
   created_at: string;
   updated_at: string;
   comments: TicketComment[];
+  // Set by POST /tickets/:id/accept/ -- the support member who took
+  // ownership. Distinct from assigned_to, which can be reassigned without
+  // that being an "acceptance"; this is the fact the KPI report counts.
+  accepted_by: number | null;
+  accepted_by_name: string | null;
+  accepted_at: string | null;
+  // Stamped/cleared automatically by the view when status crosses into or
+  // out of resolved/closed -- never sent by the client.
+  resolved_at: string | null;
+  // Full escalation history, most recent first (see TicketEscalation.Meta).
+  escalations: TicketEscalation[];
+  // The one escalation still awaiting a decision, or null if none --
+  // what the UI needs to decide which buttons to show without re-deriving
+  // it from `escalations` on every render.
+  pending_escalation: TicketEscalation | null;
+  // Set the first time this ticket is reopened after being Resolved/
+  // Closed -- never cleared again, even once it's re-resolved. Means
+  // this ticket permanently stopped counting toward the yearly KPI
+  // report's resolved counts (see TicketViewSet.kpi_report).
+  disqualified_from_kpi: boolean;
+}
+
+// Mirrors the backend's TicketViewSet.status_counts action
+// (GET /tickets/status-counts/) -- the tile row above the ticket list.
+// Scoped exactly like the list itself, so a tile's number and the list you
+// get by clicking it (which sets only the status filter, or for
+// `escalated`, only the escalated filter) always agree.
+export interface TicketStatusCounts {
+  open: number;
+  pending: number;
+  resolved: number;
+  closed: number;
+  escalated: number;
+}
+
+// Mirrors the backend's TicketViewSet.kpi_report action
+// (GET /tickets/kpi-report/?year=). Management/Admin only.
+export interface TicketKpiRow {
+  user_id: number;
+  username: string;
+  tickets_accepted: number;
+  // Only tickets accepted by this user, resolved/closed in `year`, and
+  // NEVER escalated at all -- an escalation NOC later rejected still
+  // doesn't count as a clean resolution, per how this was defined. A
+  // ticket that was ever reopened (Ticket.disqualified_from_kpi) never
+  // counts here again either, even once it's re-resolved.
+  tickets_resolved_without_escalation: number;
+  // Average hours between accepted_at and resolved_at across the
+  // resolved-without-escalation tickets above. Null with none resolved
+  // yet -- there's nothing to average.
+  avg_resolution_hours: number | null;
+  // volume / average resolution time (Rudolph, 26 Sep). Null with
+  // nothing resolved yet -- 0 would read as "worst", not "no data".
+  score: number | null;
+}
+
+// The NOC side of the same report. NOC doesn't "accept" a ticket the way
+// support does -- it accepts the ESCALATION -- so `escalations_accepted`
+// is the NOC parallel to `tickets_accepted` above, and `tickets_resolved`
+// credits whichever NOC member currently owns the ticket (assigned_to).
+export interface TicketKpiNocRow {
+  user_id: number;
+  username: string;
+  escalations_accepted: number;
+  tickets_resolved: number;
+  avg_resolution_hours: number | null;
+  score: number | null;
+}
+
+export interface TicketKpiReport {
+  year: number;
+  results: TicketKpiRow[];
+  noc_results: TicketKpiNocRow[];
 }
 
 export interface CustomerTask {
@@ -938,23 +1525,109 @@ export interface CustomerTask {
   updated_at: string;
 }
 
+export interface JobTechnician {
+  id: number;
+  name: string | null;
+  // What THIS technician's phone says, which is not the same as the job's
+  // own `status` below: that one is what the office set, this one is what
+  // happened. A string rather than a union because an unrecognised value
+  // from Conecto is shown as itself rather than rounded to something
+  // familiar. Two technicians on the same job can be at different stages
+  // at once (one en route, one already checked in), which is why this
+  // lives per technician rather than once on the job.
+  field_status: string;
+}
+
+// Scheduling -> Job types (scheduling.JobType). `key` is what Job.job_type
+// stores and never changes; name and colour can.
+export interface JobTypeOption {
+  id: number;
+  key: string;
+  name: string;
+  colour: string;
+  is_active: boolean;
+  sort_order: number;
+  job_count: number;
+}
+
 export interface Job {
   id: number;
   customer: number | null;
   customer_name: string | null;
   ticket: number | null;
   ticket_number: string | null;
-  assigned_to: number | null;
-  assigned_to_name: string | null;
-  job_type: "installation" | "repair" | "maintenance" | "site_visit" | "office_task" | "other";
+  // The client's quote this job carries out (8 Oct 2026).
+  quote?: number | null;
+  quote_number?: string | null;
+  quote_total?: string | null;
+  quote_status?: string | null;
+  // Write side: the ids to assign. A job can carry more than one
+  // technician (Rudolph, 29 Sep: "allow me to assign to two technicians"),
+  // no cap -- was a single nullable `assigned_to` until then.
+  assigned_technicians: number[];
+  // Read side: one entry per assigned technician, in a stable (name)
+  // order, each with their own name and field_status -- see JobTechnician.
+  technicians: JobTechnician[];
+  // A JobTypeOption.key -- staff add their own under Scheduling -> Job types.
+  job_type: string;
   title: string;
   description: string;
   status: "scheduled" | "in_progress" | "completed" | "cancelled";
-  start: string;
-  end: string;
+  // Both null (never one without the other -- JobSerializer.validate
+  // enforces that) means this job is in the pool: it exists but has not
+  // been given a time yet (Rudolph, 30 Sep: "create a Job pool where jobs
+  // land before scheduled").
+  start: string | null;
+  end: string | null;
   location: string;
   created_at: string;
   updated_at: string;
+  // Set = in the Deleted jobs pool (6 Oct 2026); restorable until purged.
+  deleted_at?: string | null;
+  deleted_by_name?: string | null;
+  // Sent back to the pool by a technician's Return or the daily sweep
+  // (6 Oct 2026), and why.
+  returned_at?: string | null;
+  return_reason?: string;
+  return_count?: number;
+  // Urgent tag (15 Oct 2026): red outline on the calendar and pool.
+  urgent?: boolean;
+}
+
+// Weekly support rotations (#184, 16 Oct 2026) -- scheduling/rotation.py.
+export interface SupportPerson {
+  id: number;
+  name: string;
+  full_name: string;
+  colour: string;
+  phone: string;
+  // Set when this person stands in for someone that week.
+  override_id?: number;
+  instead_of?: string;
+  kind?: "cover" | "swap";
+  reason?: string;
+}
+
+export interface SupportRotation {
+  id: number;
+  name: string;
+  people_per_week: number;
+  handover_weekday: number;
+  handover_time: string;
+  first_week_start: string;
+  is_active: boolean;
+  sort_order: number;
+  members: SupportPerson[];
+}
+
+export interface SupportWeek {
+  rotation: number;
+  rotation_name: string;
+  week_start: string;
+  week_end: string;
+  starts_at: string;
+  ends_at: string;
+  people: SupportPerson[];
 }
 
 export interface Shift {
@@ -969,9 +1642,89 @@ export interface Shift {
   created_at: string;
 }
 
+// Somewhere stock can physically be: a store room, a technician's bakkie,
+// a container at a tower. Deliberately separate from NetworkSite — a tower
+// is not a store room, and NetworkSite's partner scoping decides who may
+// see a device, which is the wrong rule for who may count stock.
+export type StockSiteType = "warehouse" | "vehicle" | "other";
+
+export interface StockSite {
+  id: number;
+  name: string;
+  code: string;
+  site_type: StockSiteType;
+  site_type_display: string;
+  address: string;
+  contact_person: string;
+  phone: string;
+  // A vehicle site points at the real bakkie in Fleet rather than keeping
+  // its own registration and driver — one source of truth, so re-registering
+  // a vehicle or reassigning it never leaves stock records stale. Required
+  // for a vehicle site, null for everything else.
+  vehicle: number | null;
+  vehicle_label: string | null;
+  vehicle_registration: string | null;
+  // The vehicle's driver for a vehicle site, the named contact otherwise.
+  // Derived on the server, never stored.
+  holder_name: string;
+  network_site: number | null;
+  network_site_name: string | null;
+  // Exactly one site is the default — where stock is assumed to be when
+  // nobody said otherwise. Promoting a site demotes the previous one.
+  is_default: boolean;
+  is_active: boolean;
+  notes: string;
+  created_at: string;
+}
+
+/** One line of the chart of accounts.
+ *
+ * `system_key` marks an account the platform itself depends on -- the VAT
+ * control account is "the account VAT goes to", not "account 2100", so it
+ * can be renamed and renumbered to match an accountant's own chart but
+ * never deleted. See backend ledger/models.py. */
+export type AccountType = "asset" | "liability" | "equity" | "income" | "expense";
+
+export interface Account {
+  id: number;
+  code: string;
+  name: string;
+  type: AccountType;
+  type_display: string;
+  description: string;
+  system_key: string;
+  is_system: boolean;
+  is_active: boolean;
+  in_use_count: number;
+  created_at: string;
+}
+
+/** A group of suppliers sharing a default expense account. The account is
+ * the point; the label is how you pick it. It only ever PRE-FILLS -- the
+ * account that counts is stored on the expense itself, so re-categorising
+ * a supplier never re-posts invoices already captured and possibly
+ * already declared in a filed VAT period. */
+export interface SupplierCategory {
+  id: number;
+  name: string;
+  default_account: number | null;
+  default_account_code: string | null;
+  default_account_name: string | null;
+  notes: string;
+  is_active: boolean;
+  supplier_count: number;
+  created_at: string;
+}
+
 export interface Supplier {
   id: number;
   name: string;
+  category: number | null;
+  category_name: string | null;
+  // Read through from the category, so the Expenses form can show which
+  // account a supplier will pre-fill without fetching the category list.
+  default_account: number | null;
+  default_account_name: string | null;
   contact_person: string;
   phone: string;
   email: string;
@@ -1023,6 +1776,14 @@ export const EXPENSE_CATEGORY_LABELS: Record<ExpenseCategory, string> = {
 // null) on the way out -- same shape as StockReceipt's attachment.
 export interface Expense {
   id: number;
+  // The chart account, stamped once when the expense was captured. Null
+  // for expenses whose supplier had no category at the time.
+  account: number | null;
+  account_code: string | null;
+  account_name: string | null;
+  // The vehicle this cost is for (13 Oct 2026). Never fuel -- see fleet.
+  vehicle: number | null;
+  vehicle_label: string | null;
   supplier: number | null;
   supplier_name: string;
   supplier_display_name: string;
@@ -1129,6 +1890,8 @@ export interface Product {
   margin_pct: string | null;
   quantity_on_hand: number;
   is_low_stock: boolean;
+  // On hand per stock site (13 Oct 2026), only sites holding some.
+  stock_by_site?: { site: number | null; site_name: string; quantity: number }[];
   created_at: string;
 }
 
@@ -1142,6 +1905,9 @@ export interface SerializedUnit {
   serial_number: string;
   mac_address: string;
   status: "in_stock" | "issued" | "faulty" | "returned_to_supplier";
+  // Where it is (or was last, once issued) -- 13 Oct 2026.
+  site?: number | null;
+  site_name?: string | null;
   notes: string;
   created_at: string;
   // Where the unit came from, read through the receipt line it arrived on.
@@ -1182,6 +1948,9 @@ export interface StockReceipt {
   supplier: number;
   supplier_name: string;
   supplier_is_vat_registered: boolean;
+  // The warehouse/location it was received into (13 Oct 2026).
+  site?: number | null;
+  site_name?: string | null;
   invoice_number: string;
   invoice_date: string;
   // Which convention the unit costs on this receipt were typed in.
@@ -1218,13 +1987,21 @@ export interface StockIssue {
   customer_name: string | null;
   issued_to: number | null;
   issued_to_name: string | null;
+  // Locations (13 Oct 2026): taken from `from_site`; with a `to_site` it is
+  // a transfer to another warehouse/vehicle and stays in stock.
+  from_site?: number | null;
+  from_site_name?: string | null;
+  to_site?: number | null;
+  to_site_name?: string | null;
+  is_transfer?: boolean;
   issued_at: string;
   notes: string;
   lines: StockIssueLine[];
 }
 
 export type EmailTemplateKey =
-  | "welcome" | "quote" | "proforma" | "statement" | "invoice" | "payment_reminder" | "suspension" | "payment_received";
+  | "welcome" | "quote" | "proforma" | "statement" | "invoice" | "payment_reminder" | "suspension" | "payment_received"
+  | "contract" | "contract_signed" | "suspension_warning" | "service_restored";
 
 export interface EmailTemplate {
   id: number;
@@ -1270,6 +2047,8 @@ export interface EmailLog {
   template_key: EmailTemplateKey;
   template_name: string;
   recipient_email: string;
+  // The client's main email, when a billing document went to their billing email.
+  cc_email: string;
   subject: string;
   status: "sent" | "failed";
   error_message: string;
@@ -1291,6 +2070,11 @@ export interface StaffProfile {
   employee_number: string;
   id_number: string;
   license_number: string;
+  // The driver's licence card. Null means nobody has captured it -- which
+  // for office staff who never drive is the correct, permanent state.
+  license_expiry: string | null;
+  license_days_left: number | null;
+  license_status: RenewalStatus;
   pay_type: PayType;
   monthly_salary: string | null;
   hourly_rate: string | null;
@@ -1418,6 +2202,17 @@ export interface PayrollRun {
 // overrides the km-derived states -- a bakkie booked in today is still
 // past its due mark, but "Overdue" reads as nobody having dealt with it.
 export type ServiceStatus = "ok" | "due_soon" | "overdue" | "in_service";
+
+// No "in_service" state here, unlike ServiceStatus: being at the workshop
+// for a service doesn't mean this visit includes a tyre rotation, so a
+// rotation genuinely overdue stays "overdue" regardless. See
+// Vehicle.tyre_rotation_status.
+export type TyreRotationStatus = "ok" | "due_soon" | "overdue";
+
+/** What state a licence is in. `unknown` is NOT a flavour of `ok` -- it
+ * means nobody has captured a date, which is a different job from
+ * renewing one. See backend fleet/renewals.py. */
+export type RenewalStatus = "expired" | "due_soon" | "unknown" | "ok";
 export type FuelType = "petrol" | "diesel";
 
 export interface Vehicle {
@@ -1439,12 +2234,73 @@ export interface Vehicle {
   next_service_due_km: number;
   km_until_due: number;
   service_status: ServiceStatus;
+  // Same shape as the four service fields above, its own schedule -- see
+  // TyreRotationStatus and fleet.Vehicle.tyre_rotation_status.
+  tyre_rotation_interval_km: number;
+  last_tyre_rotation_date: string | null;
+  last_tyre_rotation_km: number;
+  next_tyre_rotation_due_km: number;
+  km_until_tyre_rotation_due: number;
+  tyre_rotation_status: TyreRotationStatus;
+  // The annual licence disc. Null means nobody has captured it.
+  licence_expiry: string | null;
+  licence_days_left: number | null;
+  licence_status: RenewalStatus;
   // Date it went into the workshop. Set = currently in for a service;
   // cleared automatically when the service is logged.
   in_service_since: string | null;
   days_in_service: number | null;
   total_litres_used: string;
   average_km_per_litre: number | null;
+  fuel_summary: VehicleFuelSummary;
+  maintenance_summary: VehicleMaintenanceSummary;
+  maintenance_invoices: VehicleMaintenanceInvoice[];
+  // Webfleet (#186): tracker object number, and the OptiDrive driving
+  // score averaged over the last 30 days (0..1, null without Webfleet).
+  webfleet_objectno?: string;
+  optidrive_30d?: number | null;
+}
+
+/** What the vehicle has cost in fuel, and how much of the record is
+ * missing. The missing counts travel WITH the money on purpose: a spend
+ * figure built from half the fill-ups is not wrong so much as unlabelled,
+ * and the page has to be able to say so. See fleet.Vehicle.fuel_summary. */
+export interface VehicleFuelSummary {
+  month: string;
+  year: string;
+  lifetime: string;
+  average_rand_per_litre: string | null;
+  // Null while ANY fill-up lacks a cost: distance comes from all of them
+  // and the money from only some, so the figure would read low and look
+  // entirely reasonable.
+  rand_per_km: string | null;
+  missing_cost_count: number;
+  month_missing_cost_count: number;
+}
+
+/** Expenses linked to a vehicle, excl. VAT (13 Oct 2026). Per-km figures
+ * use the fuel record's distance; see fleet.Vehicle.maintenance_summary. */
+export interface VehicleMaintenanceSummary {
+  month: string;
+  year: string;
+  lifetime: string;
+  count: number;
+  rand_per_km: string | null;
+  running_rand_per_km: string | null;
+  outside_window_count: number;
+}
+
+export interface VehicleMaintenanceInvoice {
+  id: number;
+  date: string;
+  supplier: string;
+  description: string;
+  invoice_number: string;
+  amount_excl_vat: string;
+  amount_incl_vat: string;
+  attachment: string | null;
+  service_record: number | null;
+  service_date: string | null;
 }
 
 export interface OdometerReading {
@@ -1455,6 +2311,12 @@ export interface OdometerReading {
   recorded_by: number | null;
   recorded_by_name: string | null;
   notes: string;
+  source?: string;
+  /** Km and place where the Webfleet trip this reading ends started / stopped (#191/#192). */
+  trip_start_km?: number | null;
+  trip_start_place?: string;
+  trip_end_km?: number | null;
+  trip_end_place?: string;
   created_at: string;
 }
 
@@ -1467,6 +2329,22 @@ export interface ServiceRecord {
   logged_by: number | null;
   logged_by_name: string | null;
   created_at: string;
+  // Its workshop invoice, if one was linked (13 Oct 2026).
+  expense: number | null;
+  expense_amount_excl_vat: string | null;
+  expense_label: string | null;
+}
+
+// Same shape as ServiceRecord, its own schedule -- see fleet.TyreRotation.
+export interface TyreRotation {
+  id: number;
+  vehicle: number;
+  rotation_date: string;
+  odometer_km: number;
+  notes: string;
+  logged_by: number | null;
+  logged_by_name: string | null;
+  created_at: string;
 }
 
 export interface FuelLog {
@@ -1474,10 +2352,43 @@ export interface FuelLog {
   vehicle: number;
   filled_at: string;
   litres: string;
+  // The total on the slip, VAT included. Null on every fill-up logged
+  // before this field existed, and on any where the figure genuinely isn't
+  // known -- nothing that totals money treats a null as zero.
+  cost: string | null;
+  // Derived from cost / litres by the API, never stored.
+  price_per_litre: string | null;
   odometer_km: number;
   notes: string;
   logged_by: number | null;
   logged_by_name: string | null;
+  created_at: string;
+  // Fuel slips captured in the Conecto app (7 Oct 2026).
+  source?: "staff" | "conecto" | "fleetcard";
+  station?: string;
+  slip_url?: string;
+  amount_mismatch?: boolean;
+}
+
+// A trip a technician logged in the Conecto app (7 Oct 2026).
+export interface TripLog {
+  id: number;
+  vehicle: number;
+  driver: number | null;
+  driver_name: string;
+  start_odometer: number;
+  end_odometer: number;
+  km_driven: number;
+  // Where a Webfleet trip started and stopped (#191); "" for Conecto trips.
+  start_place?: string;
+  end_place?: string;
+  started_at: string;
+  ended_at: string;
+  start_photo_url: string;
+  end_photo_url: string;
+  notes: string;
+  // False when the readings contradicted the odometer history and were not added to it.
+  odometer_recorded: boolean;
   created_at: string;
 }
 
@@ -1531,8 +2442,13 @@ export interface UpcomingBlock {
   name: string;
   // The earliest date a billing run would suspend this customer's services.
   block_date: string;
-  // 0 means tomorrow (the headline figure), 1 the day after, and so on.
+  // 0 means the next billing run (today's if it hasn't run yet, else
+  // tomorrow's) -- the headline figure; 1 the day after, and so on.
   days_until: number;
+  // Counted from today: 0 today, 1 tomorrow (20 Oct 2026).
+  days_from_today: number;
+  // The date is an approved extension's agreed cut-off date.
+  extension_date: boolean;
   balance: string;
   oldest_invoice_due: string;
   invoices_owing: number;
@@ -1542,6 +2458,10 @@ export interface UpcomingBlock {
 
 export interface UpcomingBlocks {
   from_date: string;
+  // Today's run hasn't happened yet, so the list starts today.
+  next_run_is_today?: boolean;
+  // Time of day the billing run suspends, e.g. "15:00".
+  run_time?: string;
   horizon_days: number;
   // The platform-wide master switch (Configs → Billing → Auto-suspension).
   // The list is deliberately NOT filtered by this — when it's off these
@@ -1567,9 +2487,18 @@ export interface DashboardSummary {
   leads_follow_up_due: number;
   leads_open: number;
   customers_cancelled_recently: number;
+  // Customers with a line suspended for non-payment / for any reason.
+  customers_suspended_nonpayment: number;
+  customers_with_suspended_lines: number;
   services_active: number;
+  services_online: number;
+  // Active lines not up right now, and their clients (8 Oct 2026).
+  services_offline?: number;
+  services_offline_customers?: number;
   revenue_this_month: number;
   outstanding_balance: number;
+  // Clients whose balance is in debit -- the ones outstanding_balance sums.
+  customers_owing: number;
   invoices_unpaid: number;
   invoices_overdue: number;
   devices_total: number;
@@ -1593,6 +2522,36 @@ export interface BankAccount {
   api_base_url: string;
   api_client_id: string;
   api_client_secret_set: boolean;
+  // FNB Integration Channel connection (#185). Tokens never reach the
+  // browser -- only whether the account is connected.
+  api_token_url: string;
+  api_authorize_url: string;
+  api_scope: string;
+  api_client_auth: "post" | "basic" | "jwt";
+  api_grant: "authorization_code" | "client_credentials";
+  api_account_id: string;
+  connection_status: "csv_only" | "not_connected" | "connected" | "reconnect";
+  api_connected_at: string | null;
+  api_connected_by_name: string | null;
+  api_needs_reconnect: boolean;
+  api_token_expires_at: string | null;
+  // Set only when FNB_REDIRECT_URI is fixed in backend/.env; otherwise the
+  // page uses its own address + /bank-feeds/fnb-callback.
+  fnb_redirect_uri: string;
+  // What FNB itself reported on the last sync.
+  bank_balance: string | null;
+  bank_balance_at: string | null;
+  // The balance the platform works out: opening balance plus every
+  // transaction on the feed since. Null until an opening date is set.
+  opening_balance: string;
+  opening_balance_date: string | null;
+  current_balance: string | null;
+  // What internet banking last said, and by how much the two differ.
+  // A non-zero variance means a transaction is missing or duplicated --
+  // it is the useful number on this row, not an error to hide.
+  confirmed_balance: string | null;
+  confirmed_balance_at: string | null;
+  balance_variance: string | null;
   last_synced_at: string | null;
   last_sync_status: "success" | "failed" | "";
   last_sync_message: string;
@@ -1615,7 +2574,12 @@ export interface BankTransaction {
   external_id: string;
   date: string;
   description: string;
+  // FNB's payment reference (API lines only, #185).
+  reference: string;
   amount: string;
+  // The same line already on file from the other source (CSV vs FNB API).
+  duplicate_of: number | null;
+  duplicate_of_source: BankTransactionSource | null;
   status: BankTransactionStatus;
   matched_customer: number | null;
   matched_customer_name: string | null;
@@ -1655,6 +2619,8 @@ export interface BankStatementImportRow {
   external_id: string | null;
   errors: string[];
   already_imported: boolean;
+  // Already on file from the FNB API -- imported as a duplicate (#185).
+  already_from_api?: boolean;
 }
 
 export interface BankStatementImportPreview {
@@ -1662,12 +2628,14 @@ export interface BankStatementImportPreview {
   valid_count: number;
   invalid_count: number;
   already_imported_count: number;
+  already_from_api_count?: number;
   rows: BankStatementImportRow[];
 }
 
 export interface BankStatementImportResult {
   created: number;
   duplicates_skipped: number;
+  already_from_api?: number;
   matched: number;
   invalid_skipped: number;
   skipped: { row: number; errors: string[] }[];
@@ -1717,18 +2685,58 @@ export interface CustomerSession {
 
 // --- Sales / leads ---------------------------------------------------------
 
-export type LeadStatus = "new" | "contacted" | "qualified" | "quoted" | "won" | "lost";
+// Rudolph's flow (6 Oct 2026): New -> Qualified -> Coverage check ->
+// Quoted -> Accepted ("won") / Lost. "contacted" is gone.
+export type LeadStatus = "new" | "qualified" | "coverage" | "quoted" | "won" | "lost";
 
 // Pipeline order, used for the stage strip. Won and Lost are included so
 // the strip shows where deals ended up, not only where they're stuck.
 export const LEAD_STAGES: LeadStatus[] = [
   "new",
-  "contacted",
   "qualified",
+  "coverage",
   "quoted",
   "won",
   "lost",
 ];
+
+export type CoverageMethod = "electronic" | "scan" | "fibre";
+export type CoverageResult = "pass" | "fail" | "fibre_confirmed" | "fibre_unavailable";
+
+export interface LeadJobInfo {
+  id: number;
+  title: string;
+  status: string;
+  start: string | null;
+  end: string | null;
+  deleted: boolean;
+  technicians: string[];
+}
+
+export interface QuoteItem {
+  label: string;
+  amount: string;
+  // On a quoted recurring charge: its Configs -> Tariffs -> Recurring Charges id.
+  recurring_charge?: number;
+}
+
+// Discounts on a sales quote (7 Oct 2026). Monthly comes off the plan price.
+export interface QuoteDiscountSpec {
+  type: "percentage" | "amount";
+  value: string;
+  months?: number;
+}
+export interface QuoteDiscount {
+  monthly?: QuoteDiscountSpec;
+  once_off?: QuoteDiscountSpec;
+  reason?: string;
+}
+
+export interface QuoteSplit {
+  excl: string;
+  vat: string;
+  incl: string;
+}
 
 export interface Lead {
   id: number;
@@ -1757,6 +2765,54 @@ export interface Lead {
   status_display: string;
   lost_reason: string;
   lost_reason_display: string;
+  lost_at_stage: string;
+  lost_at_stage_display: string;
+  latitude: string | null;
+  longitude: string | null;
+  coverage_method: CoverageMethod | "";
+  coverage_method_display: string;
+  coverage_result: CoverageResult | "";
+  coverage_result_display: string;
+  coverage_tower: string;
+  coverage_sector: string;
+  coverage_signal: string;
+  coverage_notes: string;
+  coverage_partner: number | null;
+  coverage_partner_name: string;
+  coverage_checked_at: string | null;
+  coverage_checked_by_name: string;
+  scan_job: number | null;
+  scan: LeadJobInfo | null;
+  quote_items: QuoteItem[];
+  // Monthly extras on top of the plan (IP rental...), excl. VAT.
+  quote_recurring: QuoteItem[];
+  // Service start: the quote charges pro rata from here to month end.
+  quote_start_date: string | null;
+  quote_discount: QuoteDiscount;
+  quote_valid_until: string | null;
+  quote_sent_at: string | null;
+  quote_number: string;
+  // monthly = plan + recurring charges; plan = the plan alone.
+  quote_totals: {
+    monthly: QuoteSplit;
+    plan?: QuoteSplit;
+    once_off: QuoteSplit;
+    pro_rata?: QuoteSplit;
+    pro_rata_period?: { from: string; to: string; days: number; month_days: number } | null;
+    plan_gross?: QuoteSplit;
+    once_off_gross?: QuoteSplit;
+    discount?: {
+      monthly: QuoteSplit;
+      once_off: QuoteSplit;
+      months: number | null;
+      reason: string;
+      monthly_after: QuoteSplit | null;
+    };
+    rate_pct: string;
+  };
+  install_job: number | null;
+  install: LeadJobInfo | null;
+  next_action: { text: string; detail: string; late: boolean };
   next_follow_up: string | null;
   // Due today OR overdue, and still open. Overdue is not a separate state
   // on purpose — see the backend model.
@@ -1844,3 +2900,140 @@ export interface ServiceSpeedNow {
 }
 
 export const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/** One row on the Renewals tab: either a vehicle's licence disc or a
+ * driver's licence card. Both come from ONE endpoint
+ * (`GET /vehicles/renewals/`) because they are read as one list -- and
+ * because the dashboard tile counts `counts.action_needed` off exactly
+ * the rows the tab shows, so the two can never disagree. */
+export interface LicenceRenewal {
+  kind: "vehicle_disc" | "driver_licence";
+  key: string;
+  vehicle_id: number | null;
+  staff_profile_id: number | null;
+  title: string;
+  subtitle: string;
+  holder: string;
+  document: string;
+  expiry: string | null;
+  days_left: number | null;
+  status: RenewalStatus;
+  // Each document carries its OWN notice window -- 30 days for a disc, 60
+  // for a driver's card, because a card means a testing-centre booking.
+  // It travels with the row so the screen can say which window it means.
+  notice_days: number;
+  term_years: number;
+}
+
+export interface LicenceRenewals {
+  as_of: string;
+  vehicle_notice_days: number;
+  counts: {
+    expired: number;
+    due_soon: number;
+    unknown: number;
+    ok: number;
+    action_needed: number;
+  };
+  results: LicenceRenewal[];
+}
+
+
+export interface TechnicianPosition {
+  code: string;
+  name: string;
+  status: string;
+  // Null for a technician whose phone has reported nothing. They are still
+  // in the list, because "we do not know where this person is" and
+  // "nothing to report" are different sentences.
+  lat: number | null;
+  lng: number | null;
+  occurred_at: string | null;
+  minutes_ago: number | null;
+  // "ping"   — a periodic GPS report, sent once a minute while en route.
+  // "status" — the place a status change was reported from, which may be
+  //            hours old and is usually the customer's own address.
+  // ""       — nothing has been reported at all.
+  //
+  // The pin looks the same either way, so this is what lets the screen
+  // avoid making the stronger claim than it has earned.
+  source: "ping" | "status" | "";
+  // Decided by the server, not by arithmetic in the browser: a tab left
+  // open must not keep calling an old pin live.
+  live: boolean;
+  job_id: number | null;
+  job_title: string;
+  customer_name: string;
+  // Recent pings, oldest first, ready to draw as a polyline.
+  trail: [number, number][];
+}
+
+// --- Digital contract signing (6 Oct 2026) ---------------------------------
+
+export type ContractStatus = "draft" | "sent" | "viewed" | "signed" | "cancelled";
+
+export interface ContractEvent {
+  id: number;
+  kind: string;
+  kind_display: string;
+  at: string;
+  user_name: string;
+  ip: string | null;
+  user_agent: string;
+  detail: string;
+}
+
+export interface Contract {
+  id: number;
+  reference: string;
+  customer: number;
+  customer_name: string;
+  customer_code: string;
+  kind: "template" | "upload";
+  kind_display: string;
+  template: number | null;
+  template_name: string;
+  lead: number | null;
+  title: string;
+  status: ContractStatus;
+  status_display: string;
+  is_expired: boolean;
+  document_filename: string;
+  document_sha256: string;
+  sent_to: string;
+  sent_at: string | null;
+  expires_at: string | null;
+  viewed_at: string | null;
+  signed_at: string | null;
+  signer_name: string;
+  signer_id_number: string;
+  signer_ip: string | null;
+  signer_user_agent: string;
+  signed_in_person: boolean;
+  witnessed_by_name: string;
+  signed_sha256: string;
+  has_signed_pdf: boolean;
+  created_by_name: string;
+  created_at: string;
+  events?: ContractEvent[];
+  warning?: string;
+}
+
+export interface ContractTemplate {
+  id: number;
+  name: string;
+  title: string;
+  body_html: string;
+  is_active: boolean;
+  contract_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ContractSettingsConfig {
+  default_template: number | null;
+  default_template_name: string;
+  auto_send_new_client: boolean;
+  auto_send_lead_accepted: boolean;
+  link_valid_days: number;
+}

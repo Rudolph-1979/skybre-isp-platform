@@ -1,0 +1,251 @@
+/**
+ * Which invoices a payment settles — read, and changed.
+ *
+ * WHY THIS EXISTS
+ *
+ * Payments auto-allocate on the way in, oldest due first. That is right
+ * almost always and wrong in the case that matters: a customer disputing
+ * an old invoice who pays the current one. FIFO puts their money on the
+ * disputed one and the invoice they actually paid still reads unpaid.
+ *
+ * The API has supported re-mapping all along, and the bank-feed confirm
+ * flow uses it. Nothing else did — so a payment captured any other way,
+ * or one you want to correct a week later, had no route in. This is that
+ * route.
+ *
+ * NOTHING HERE MOVES THE BALANCE. The balance moved once, when the
+ * payment was recorded; allocation only distributes money it has already
+ * accounted for. `replace: true` clears the existing lines and writes
+ * these, which is why the totals below are checked before Save is
+ * offered — an over-allocation is refused by the server, and finding
+ * that out after pressing Save is a worse way to learn it.
+ */
+import { useEffect, useState } from "react";
+import { api } from "../api/client";
+import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "./Modal";
+import { apiErrorMessage } from "../utils/apiError";
+
+type OpenInvoice = {
+  id: number;
+  number: string;
+  status: string;
+  date_due: string;
+  total: string;
+  paid_amount: string;
+  balance_due: string;
+};
+
+type Allocation = {
+  id: number;
+  invoice: number;
+  invoice_number: string;
+  amount: string;
+};
+
+type Summary = {
+  payment: number;
+  amount: string;
+  allocated: string;
+  unallocated: string;
+  allocations: Allocation[];
+};
+
+const money = (value: string | number) => Number(value || 0).toFixed(2);
+
+export function PaymentAllocationsModal({
+  paymentId,
+  customerId,
+  paymentAmount,
+  onClose,
+  onSaved,
+}: {
+  paymentId: number;
+  customerId: number;
+  paymentAmount: string;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [invoices, setInvoices] = useState<OpenInvoice[]>([]);
+  // Keyed by invoice id. A blank string means "no allocation", which is
+  // different from "0.00" only in how it reads; both are dropped on save.
+  const [amounts, setAmounts] = useState<Record<number, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [current, open] = await Promise.all([
+          api.get<Summary>(`/payments/${paymentId}/allocations/`),
+          api.get<{ invoices: OpenInvoice[] }>(`/payments/open-invoices/?customer=${customerId}`),
+        ]);
+        if (cancelled) return;
+        setSummary(current.data);
+        // An invoice this payment already settled in full is no longer
+        // "open", so it would not come back from open-invoices -- but it
+        // has to be listed, or saving would silently drop its allocation.
+        const allocated = current.data.allocations;
+        const known = new Set(open.data.invoices.map((i) => i.id));
+        const extra: OpenInvoice[] = allocated
+          .filter((a) => !known.has(a.invoice))
+          .map((a) => ({
+            id: a.invoice,
+            number: a.invoice_number,
+            status: "paid",
+            date_due: "",
+            total: a.amount,
+            paid_amount: a.amount,
+            balance_due: "0.00",
+          }));
+        setInvoices([...open.data.invoices, ...extra]);
+        const seeded: Record<number, string> = {};
+        allocated.forEach((a) => {
+          seeded[a.invoice] = money(a.amount);
+        });
+        setAmounts(seeded);
+      } catch (err) {
+        if (!cancelled) setError(apiErrorMessage(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [paymentId, customerId]);
+
+  const entered = Object.values(amounts).reduce((sum, v) => sum + Number(v || 0), 0);
+  const total = Number(paymentAmount || 0);
+  const remaining = total - entered;
+  const overAllocated = remaining < -0.004;
+
+  function setAmount(invoiceId: number, value: string) {
+    setAmounts((prev) => ({ ...prev, [invoiceId]: value }));
+  }
+
+  /** Oldest due first with whatever is unallocated — the same rule the
+   *  automatic path uses, offered here so "put it back how it was" is one
+   *  click rather than arithmetic. */
+  function fillOldestFirst() {
+    let left = total;
+    const next: Record<number, string> = {};
+    [...invoices]
+      .sort((a, b) => (a.date_due || "").localeCompare(b.date_due || "") || a.id - b.id)
+      .forEach((inv) => {
+        const owed = Number(inv.balance_due || 0) + Number(amounts[inv.id] || 0);
+        const take = Math.min(left, owed);
+        if (take > 0) {
+          next[inv.id] = take.toFixed(2);
+          left -= take;
+        }
+      });
+    setAmounts(next);
+  }
+
+  async function save() {
+    setSaving(true);
+    setError("");
+    try {
+      const lines = Object.entries(amounts)
+        .map(([invoice, amount]) => ({ invoice: Number(invoice), amount }))
+        .filter((line) => line.amount && Number(line.amount) > 0);
+      // replace:true even when the list is empty -- that is how a payment
+      // is put back to pure account credit, and DELETE would need a
+      // second code path to say the same thing.
+      await api.post(`/payments/${paymentId}/allocations/`, { replace: true, allocations: lines });
+      onSaved();
+      onClose();
+    } catch (err) {
+      setError(apiErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal title="Allocate payment" onClose={onClose}>
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <div className="space-y-4">
+          <div className="rounded-md bg-[var(--tint-hover)] p-3 text-sm">
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">Payment</span>
+              <span className="tabular-nums">R {money(paymentAmount)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-muted)]">Allocated</span>
+              <span className="tabular-nums">R {entered.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between font-medium">
+              <span>{remaining < 0 ? "Over-allocated by" : "Left as account credit"}</span>
+              <span className="tabular-nums">R {Math.abs(remaining).toFixed(2)}</span>
+            </div>
+          </div>
+
+          {invoices.length === 0 ? (
+            <p className="text-[var(--text-muted)]">
+              This customer has no invoices with anything outstanding. The payment stays as
+              account credit.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {invoices.map((inv) => (
+                <FormField key={inv.id} label={`${inv.number} — due ${inv.date_due || "—"}`}>
+                  <div className="flex items-center gap-2">
+                    <input
+                      className={inputClass}
+                      inputMode="decimal"
+                      placeholder="0.00"
+                      value={amounts[inv.id] ?? ""}
+                      onChange={(e) => setAmount(inv.id, e.target.value)}
+                    />
+                    <span className="whitespace-nowrap text-xs text-[var(--text-muted)]">
+                      owing R {money(inv.balance_due)}
+                    </span>
+                  </div>
+                </FormField>
+              ))}
+            </div>
+          )}
+
+          {overAllocated && (
+            <p className="text-sm text-[var(--status-critical)]">
+              More has been allocated than the payment is worth. The server refuses this, so
+              adjust before saving.
+            </p>
+          )}
+          {error && <p className="text-sm text-[var(--status-critical)]">{error}</p>}
+
+          <div className="flex flex-wrap justify-end gap-2">
+            <button type="button" className={btnSecondary} onClick={fillOldestFirst}>
+              Oldest first
+            </button>
+            <button type="button" className={btnSecondary} onClick={() => setAmounts({})}>
+              Clear all
+            </button>
+            <button
+              type="button"
+              className={btnPrimary}
+              disabled={saving || overAllocated}
+              onClick={save}
+            >
+              {saving ? "Saving…" : "Save allocation"}
+            </button>
+          </div>
+
+          {summary && summary.allocations.length > 0 && (
+            <p className="text-xs text-[var(--text-muted)]">
+              Currently allocated across {summary.allocations.length} invoice(s). Saving
+              replaces that entirely. The customer's balance is not affected — allocation only
+              says which invoices this money settles.
+            </p>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}

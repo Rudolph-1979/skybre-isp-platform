@@ -1,0 +1,785 @@
+"""Projects a recurring-billing run into reviewable rows, and writes them as
+the Splynx-shaped CSV bundle that finance signs off before anyone presses Run.
+
+Why this exists as its own module rather than extra return values on
+run_recurring_billing: a Preview has to answer "what exactly will each
+customer be charged, line by line" while writing nothing at all, and the
+engine's commit=False path deliberately only counts. Rather than teach the
+engine to build throwaway Invoice/InvoiceItem instances (which invites
+someone saving them by accident), the projection below rebuilds the same
+rows in memory from the same inputs.
+
+The invariant that matters: every line here is constructed exactly the way
+billing.recurring._generate_document constructs the real InvoiceItem --
+same description string, same unit price, same tax rate, same one-line-per-
+ACTIVE-service rule. If that function changes, this one changes with it, and
+test_preview_export.py asserts the two agree by committing a real run and
+diffing it against the projection.
+
+Version tolerance: the reminder engine differs between the pre- and
+post-audit trees (the fixed one orders candidates, excludes this run's own
+invoices, requires a positive balance and dedupes on
+Invoice.last_reminder_run_date; the older one takes the first matching
+invoice in database order and dedupes on an EmailLog row for today). This
+module feature-detects `last_reminder_run_date` and mirrors whichever engine
+it is actually running against, so a Preview never promises behaviour the
+installed engine does not have.
+"""
+
+import csv
+import hashlib
+import html
+import io
+import json
+import zipfile
+from datetime import timedelta
+from decimal import Decimal, ROUND_HALF_UP
+
+from django.db.models import F
+from django.utils import timezone
+
+from customers.models import Customer
+from notifications.models import EmailLog, EmailTemplate
+from .invoice_lines import customer_invoice_lines, document_totals
+from .models import Invoice, ReminderSettings, Service, SuspensionSettings
+from .recurring import (
+    _add_period, _invoice_due, _process_suspension_warning, blocking_candidate_services,
+    suspension_block_date,
+)
+
+TWO_PLACES = Decimal("0.01")
+
+
+def _has_field(model, name) -> bool:
+    """Whether this tree's model carries a field -- how this module stays
+    honest on both the pre- and post-audit engines without a version flag
+    to read."""
+    return any(f.name == name for f in model._meta.get_fields())
+
+
+# --------------------------------------------------------------------------
+# formatting -- mirrors the sample export column-for-column
+# --------------------------------------------------------------------------
+
+def _money(value) -> str:
+    """R435.85 -- no thousands separator, always two places, matching the
+    sample export (R1055.70, not R1,055.70)."""
+    return "R%s" % Decimal(value).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+
+def _pct(value) -> str:
+    """15% / 7.5% -- trailing zeros trimmed, because a tax column full of
+    '15.00%' reads like a different number to the people checking it."""
+    d = Decimal(value).normalize()
+    text = format(d, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "%s%%" % text
+
+
+def _qty(value) -> str:
+    d = Decimal(value).normalize()
+    text = format(d, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _d(date_value) -> str:
+    return date_value.strftime("%d/%m/%Y") if date_value else ""
+
+
+def _period(start, end) -> str:
+    return "%s-%s" % (_d(start), _d(end))
+
+
+def _line_total(quantity, unit_price, tax_rate_pct) -> Decimal:
+    """The same arithmetic as InvoiceItem.line_total, rounded once at the
+    end -- so a projected total and the invoice that follows it agree to the
+    cent instead of drifting by rounding order."""
+    gross = Decimal(quantity) * Decimal(unit_price) * (1 + Decimal(tax_rate_pct) / 100)
+    return gross.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+
+class _SplynxDialect(csv.Dialect):
+    """Semicolon-delimited, CRLF, minimal quoting. The sample also quotes any
+    value containing a space, which no csv quoting constant does, so
+    _write_csv adds that rule on top -- see the comment there."""
+
+    delimiter = ";"
+    quotechar = '"'
+    doublequote = True
+    skipinitialspace = False
+    lineterminator = "\r\n"
+    quoting = csv.QUOTE_MINIMAL
+
+
+def _needs_quotes(text: str) -> bool:
+    return any(ch in text for ch in (' ', ';', '"', '\r', '\n'))
+
+
+def _write_csv(header, rows) -> str:
+    """Hand-rolled rather than csv.writer, only because of the space rule:
+    the reference export writes "Hennenman Car Wash" quoted and active bare,
+    and finance's spreadsheets are set up against that shape."""
+    out = io.StringIO(newline="")
+    for record in [header] + list(rows):
+        cells = []
+        for value in record:
+            text = "" if value is None else str(value)
+            if _needs_quotes(text):
+                text = '"%s"' % text.replace('"', '""')
+            cells.append(text)
+        out.write(";".join(cells))
+        out.write("\r\n")
+    return out.getvalue()
+
+
+# --------------------------------------------------------------------------
+# projection
+# --------------------------------------------------------------------------
+
+def _customer_cells(customer):
+    """The four identifying columns every sheet starts with. 'Customer login'
+    is the payment reference (CUS-000123) -- the value that appears on the
+    customer's EFT and that bank-feed matching keys on, which is what makes
+    it the useful one to eyeball next to a total."""
+    return [
+        customer.pk,
+        customer.customer_id or "",
+        customer.full_name or "",
+        customer.status,
+    ]
+
+
+def _period_bounds(run_date, payment_period):
+    """run_date .. one payment period later, minus a day. The engine does not
+    store a period on recurring line items today, so this is derived rather
+    than read -- stated here because it is the one column in the export that
+    is a decision rather than a fact."""
+    end = _add_period(run_date, payment_period) - timedelta(days=1)
+    return run_date, end
+
+
+def _project_invoice(customer, config, run_date):
+    """None when this customer would produce no document, else the projected
+    document. Mirrors _generate_document's ordering and its early return on
+    no ACTIVE services."""
+    # As they will be ON run_date -- the same function the engine bills from
+    # (invoice_lines.customer_invoice_lines): plans plus customer charges.
+    billed_lines = customer_invoice_lines(customer, run_date)
+    if not billed_lines:
+        return None
+
+    doc_type = "proforma" if config.auto_proforma_enabled else "invoice"
+    period_start, period_end = _period_bounds(run_date, config.payment_period)
+    # The lines come from the same module the engine builds its InvoiceItems
+    # from, so this projection cannot drift from what would actually be
+    # billed. It used to build its own -- tariff price, no discount line --
+    # so a customer on a 100% discount was projected at full price and
+    # invoiced at zero, and the approval fingerprint, which is taken over
+    # exactly these lines, could not see the difference.
+    lines = [
+        {
+            "service_id": line["service"].pk if line["service"] is not None else "",
+            "type": line["type"],
+            "description": line["description"],
+            "period_start": period_start,
+            "period_end": period_end,
+            "quantity": line["quantity"],
+            "unit": "",
+            "unit_price": line["unit_price"],
+            "tax_rate_pct": line["tax_rate_pct"],
+            "total": _line_total(line["quantity"], line["unit_price"], line["tax_rate_pct"]),
+        }
+        for line in billed_lines
+    ]
+    # The document total is NOT the sum of the per-line totals above. Those
+    # are rounded per line for display; the invoice rounds subtotal and VAT
+    # once each and adds them, and on a discounted customer the two orders
+    # differ by a cent. document_totals is the invoice's arithmetic.
+    subtotal, tax, total = document_totals(
+        (line["quantity"], line["unit_price"], line["tax_rate_pct"]) for line in lines
+    )
+    return {
+        "doc_type": doc_type,
+        "date_due": run_date + timedelta(days=config.payment_due_days or 0),
+        "lines": lines,
+        "subtotal": subtotal,
+        "tax_total": tax,
+        "total": total,
+    }
+
+
+def _reminder_slots(config, reminder_settings):
+    return (
+        (config.reminder_1_day, reminder_settings.reminder_1_enabled),
+        (config.reminder_2_day, reminder_settings.reminder_2_enabled),
+        (config.reminder_3_day, getattr(reminder_settings, "reminder_3_enabled", True)),
+    )
+
+
+def _project_reminder(customer, config, reminder_settings, run_date):
+    """Which unpaid invoice would trigger a payment reminder, or None.
+
+    Mirrors _process_reminders on the three axes it decides:
+
+      WHO   -- nothing owed, nothing to chase (balance <= 0), because the
+               balance is the entire content of the email.
+      WHICH -- oldest due first, invoices their own payments already cover
+               left out. `run` is None here exactly as in the engine's own
+               preview path, so this run's invoices are not excluded -- at
+               preview time they do not exist yet, which is why the
+               projection and the committed run still agree.
+      HOW OFTEN -- already reminded for this run_date is a no-op, and
+               deliberately not "try the next invoice instead".
+
+    On a tree that predates those fixes there is no
+    Invoice.last_reminder_run_date and the engine dedupes on an EmailLog row
+    for the calendar day instead; that branch is kept so a Preview never
+    promises behaviour the installed engine does not have.
+    """
+    if not config.reminder_enabled:
+        return None
+
+    fixed_engine = hasattr(Invoice, "last_reminder_run_date")
+    if fixed_engine and customer.balance <= 0:
+        return None
+
+    offsets = {
+        day_value
+        for day_value, enabled in _reminder_slots(config, reminder_settings)
+        if day_value is not None and enabled
+    }
+    if not offsets:
+        return None
+
+    candidates = customer.invoices.filter(
+        status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE]
+    )
+    # Both guarded: paid_amount arrived with the same audit pass as
+    # last_reminder_run_date, so an older tree has neither.
+    if _has_field(Invoice, "paid_amount"):
+        candidates = candidates.exclude(paid_amount__gte=F("total"))
+    if fixed_engine:
+        candidates = candidates.order_by("date_due", "pk")
+
+    # The engine's catch-up (12 Oct 2026): nothing owed ever reminded about
+    # and the oldest invoice's first reminder day already gone by -> that
+    # invoice is reminded today. Only when no exact-day match exists.
+    catch_up = None
+    if fixed_engine and not any(inv.date_due and (inv.date_due - run_date).days in offsets for inv in candidates):
+        ordered = list(candidates.order_by("date_due", "pk"))
+        if ordered and not any(inv.last_reminder_run_date for inv in ordered):
+            if (ordered[0].date_due - run_date).days < max(offsets):
+                catch_up = ordered[0].pk
+
+    for invoice in candidates:
+        days_until_due = (invoice.date_due - run_date).days
+        if days_until_due not in offsets and invoice.pk != catch_up:
+            continue
+        if fixed_engine:
+            if invoice.last_reminder_run_date == run_date:
+                return None
+        else:
+            already_today = EmailLog.objects.filter(
+                customer=customer,
+                template_key=EmailTemplate.Key.PAYMENT_REMINDER,
+                created_at__date=timezone.localdate(),
+            ).exists()
+            if already_today:
+                return None
+        return {
+            "invoice_number": invoice.number,
+            "date_due": invoice.date_due,
+            "invoice_total": Decimal(invoice.total),
+            "days_until_due": days_until_due,
+            "balance": Decimal(customer.balance),
+        }
+    return None
+
+
+def _project_suspension(customer, config, suspension_settings, run_date):
+    """The services a run would suspend. Honours the platform-wide master
+    switch first, exactly as _process_blocking does, so a preview taken with
+    auto-suspension off never lists anyone."""
+    if not suspension_settings.auto_suspend_enabled:
+        return []
+    services = blocking_candidate_services(customer, config, run_date)
+    return [
+        {
+            "service_id": svc.pk,
+            "tariff": svc.tariff.name if svc.tariff_id else "",
+            "connection_type": getattr(svc, "connection_type", "") or "",
+            "status": svc.status,
+        }
+        for svc in services
+    ]
+
+
+def project_run(run_date, partner_ids=None):
+    """Everything a committed run dated run_date would do, as plain data.
+
+    Reads only. The customer queryset and the partner filter are the same
+    ones run_recurring_billing uses, so a customer missing from this
+    projection is a customer the run will not touch.
+    """
+    customers_qs = (
+        Customer.objects.filter(billing_config__billing_enabled=True)
+        .select_related("billing_config")
+        .order_by("pk")
+    )
+    if partner_ids:
+        customers_qs = customers_qs.filter(partner_id__in=partner_ids)
+
+    reminder_settings = ReminderSettings.load()
+    suspension_settings = SuspensionSettings.load()
+
+    documents, reminders, suspensions, warnings = [], [], [], []
+    for customer in customers_qs:
+        config = customer.billing_config
+
+        if _invoice_due(customer, config, run_date):
+            projected = _project_invoice(customer, config, run_date)
+            if projected:
+                projected["customer"] = customer
+                documents.append(projected)
+
+        reminder = _project_reminder(customer, config, reminder_settings, run_date)
+        if reminder:
+            reminder["customer"] = customer
+            reminders.append(reminder)
+
+        services = _project_suspension(customer, config, suspension_settings, run_date)
+        if services:
+            suspensions.append({"customer": customer, "services": services})
+
+        # Asked of the ENGINE's own function with commit=False rather than
+        # reimplemented here. Everything else on this page is projected by
+        # a local mirror of the engine's logic, and the discount bug was
+        # exactly what that costs when one copy learns something the other
+        # does not. Nothing is sent: commit=False returns the count and
+        # stops.
+        if _process_suspension_warning(
+            customer, config, suspension_settings, run_date, commit=False
+        ):
+            warnings.append({
+                "customer": customer,
+                # The customer's OWN cut-off date, not run_date + the
+                # notice period: warnings cover a range now, so two people
+                # warned on the same day can be cut off on different ones,
+                # and the sheet has to say which.
+                "suspend_date": suspension_block_date(customer, config, run_date),
+            })
+
+    counts = {
+        "invoices_created": sum(1 for d in documents if d["doc_type"] == "invoice"),
+        "proforma_invoices_created": sum(1 for d in documents if d["doc_type"] == "proforma"),
+        "reminders_sent": len(reminders),
+        "suspension_warnings_sent": len(warnings),
+        "suspensions_applied": sum(len(s["services"]) for s in suspensions),
+    }
+    return {
+        "run_date": run_date,
+        "partner_ids": sorted(partner_ids or []),
+        "documents": documents,
+        "reminders": reminders,
+        "suspensions": suspensions,
+        "warnings": warnings,
+        "counts": counts,
+        "grand_total": sum((d["total"] for d in documents), Decimal("0")),
+        "engine": "fixed" if hasattr(Invoice, "last_reminder_run_date") else "legacy",
+    }
+
+
+# --------------------------------------------------------------------------
+# hashing -- what an approval is an approval OF
+# --------------------------------------------------------------------------
+
+def projection_digest(projection) -> str:
+    """A stable fingerprint of the numbers, not of the moment they were
+    produced. Approving a preview approves this digest; if a tariff, a
+    service or a customer changes before Run, the digest changes and the
+    approval no longer applies. Deliberately excludes generated-at and the
+    user, so re-previewing unchanged data reproduces the same filenames."""
+    payload = {
+        "run_date": projection["run_date"].isoformat(),
+        "partner_ids": projection["partner_ids"],
+        "documents": [
+            {
+                "customer": d["customer"].pk,
+                "doc_type": d["doc_type"],
+                "date_due": d["date_due"].isoformat(),
+                "total": str(d["total"]),
+                "lines": [
+                    {
+                        "service": line["service_id"],
+                        "description": line["description"],
+                        "quantity": str(line["quantity"]),
+                        "unit_price": str(line["unit_price"]),
+                        "tax_rate_pct": str(line["tax_rate_pct"]),
+                        "period": [line["period_start"].isoformat(), line["period_end"].isoformat()],
+                        "total": str(line["total"]),
+                    }
+                    for line in d["lines"]
+                ],
+            }
+            for d in projection["documents"]
+        ],
+        "reminders": [
+            {
+                "customer": r["customer"].pk,
+                "invoice_number": r["invoice_number"],
+                "date_due": r["date_due"].isoformat(),
+                "invoice_total": str(r["invoice_total"]),
+            }
+            for r in projection["reminders"]
+        ],
+        "suspensions": [
+            {"customer": s["customer"].pk, "services": [x["service_id"] for x in s["services"]]}
+            for s in projection["suspensions"]
+        ],
+        # In the fingerprint, so an approval stops applying once the set of
+        # people about to be warned changes. A warning is an email to a
+        # customer; it belongs to what was signed off just as much as an
+        # invoice does.
+        "warnings": [
+            {"customer": w["customer"].pk, "suspend_date": w["suspend_date"].isoformat()}
+            for w in projection["warnings"]
+        ],
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()[:10]
+
+
+# --------------------------------------------------------------------------
+# the export bundle
+# --------------------------------------------------------------------------
+
+INVOICE_HEADER = [
+    "Customer id", "Customer login", "Customer name", "Customer status", "Period", "Total",
+]
+TRANSACTION_HEADER = INVOICE_HEADER[:4] + [
+    "Type", "Description", "Period", "Quantity", "Unit", "Price", "Tax %", "Total",
+]
+REMINDER_HEADER = INVOICE_HEADER[:4] + [
+    "Invoice", "Due date", "Days until due", "Invoice total", "Customer balance",
+]
+SUSPENSION_HEADER = INVOICE_HEADER[:4] + ["Service id", "Tariff", "Connection", "Service status"]
+WARNING_HEADER = INVOICE_HEADER[:4] + ["Suspension date", "Days until", "Customer balance"]
+
+# The five sheets, in the order every export (zip, HTML, xlsx) lists them --
+# one place, so a sixth sheet added later cannot appear in one format and
+# not another.
+SHEET_ORDER = ("invoice", "transaction", "reminder", "warning", "suspension")
+SHEET_TITLES = {
+    "invoice": "Invoices",
+    "transaction": "Transaction lines",
+    "reminder": "Reminders",
+    "warning": "Suspension warnings",
+    "suspension": "Suspensions",
+}
+
+
+def build_csvs(projection) -> dict:
+    """filename-stem -> csv text. Split out from the zip so tests can read a
+    sheet without unzipping, and so a future 'email this to finance' has
+    something to attach."""
+    invoice_rows, transaction_rows = [], []
+    for doc in projection["documents"]:
+        cells = _customer_cells(doc["customer"])
+        # Every line in one document shares the same period (computed once
+        # in _project_invoice, before the per-line dicts are built), so the
+        # first line's is the document's -- this sheet just surfaces it
+        # without making finance cross-reference the transaction sheet for
+        # something as basic as "which month is this invoice for". Blank
+        # only for the never-actually-happens case of a document with no
+        # lines at all.
+        period = _period(doc["lines"][0]["period_start"], doc["lines"][0]["period_end"]) if doc["lines"] else ""
+        invoice_rows.append(cells + [period, _money(doc["total"])])
+        for line in doc["lines"]:
+            transaction_rows.append(cells + [
+                line["type"],
+                line["description"],
+                _period(line["period_start"], line["period_end"]),
+                _qty(line["quantity"]),
+                line["unit"],
+                _money(line["unit_price"]),
+                _pct(line["tax_rate_pct"]),
+                _money(line["total"]),
+            ])
+
+    reminder_rows = [
+        _customer_cells(r["customer"]) + [
+            r["invoice_number"], _d(r["date_due"]), r["days_until_due"],
+            _money(r["invoice_total"]), _money(r["balance"]),
+        ]
+        for r in projection["reminders"]
+    ]
+
+    suspension_rows = []
+    for entry in projection["suspensions"]:
+        cells = _customer_cells(entry["customer"])
+        for svc in entry["services"]:
+            suspension_rows.append(cells + [
+                svc["service_id"], svc["tariff"], svc["connection_type"], svc["status"],
+            ])
+
+    # Who gets told their line is about to go off, and on what date. The
+    # sheet finance is most likely to read before approving, because it is
+    # the only one where the run's effect lands in a customer's inbox
+    # rather than on a document.
+    warning_rows = [
+        _customer_cells(w["customer"]) + [
+            _d(w["suspend_date"]),
+            (w["suspend_date"] - projection["run_date"]).days,
+            _money(w["customer"].balance),
+        ]
+        for w in projection["warnings"]
+    ]
+
+    return {
+        "invoice": _write_csv(INVOICE_HEADER, invoice_rows),
+        "transaction": _write_csv(TRANSACTION_HEADER, transaction_rows),
+        "reminder": _write_csv(REMINDER_HEADER, reminder_rows),
+        "warning": _write_csv(WARNING_HEADER, warning_rows),
+        "suspension": _write_csv(SUSPENSION_HEADER, suspension_rows),
+    }
+
+
+def _manifest(projection, digest, generated_by=None, approved_by=None, approved_at=None) -> str:
+    counts = projection["counts"]
+    lines = [
+        "Skybre recurring billing - preview",
+        "",
+        "run date        : %s" % projection["run_date"].isoformat(),
+        "partner scope   : %s" % (", ".join(str(p) for p in projection["partner_ids"]) or "all partners"),
+        "fingerprint     : %s" % digest,
+        "generated       : %s" % timezone.localtime().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "generated by    : %s" % (generated_by or "-"),
+        "approved by     : %s" % (approved_by or "not approved"),
+        "approved at     : %s" % (approved_at.strftime("%Y-%m-%d %H:%M:%S") if approved_at else "-"),
+        "",
+        "invoices        : %s" % counts["invoices_created"],
+        "pro formas      : %s" % counts["proforma_invoices_created"],
+        "reminders       : %s" % counts["reminders_sent"],
+        "suspensions     : %s" % counts["suspensions_applied"],
+        "value to invoice: %s" % _money(projection["grand_total"]),
+        "",
+        "The fingerprint is taken over the numbers above, not the time they",
+        "were produced. Run refuses unless an approved preview with this",
+        "fingerprint exists, so any change to a tariff, service or customer",
+        "between approval and Run voids the approval instead of quietly",
+        "billing something nobody signed off.",
+        "",
+        "Period columns are derived (run date to one payment period later,",
+        "minus a day); recurring line items do not carry a stored period.",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def build_zip(projection, digest=None, generated_by=None, approved_by=None, approved_at=None):
+    """(filename, bytes) for the download. Filenames mirror the reference
+    export: finance_<YYYYMMDD><fingerprint>.zip holding
+    <sheet>-<run date>-<fingerprint>.csv."""
+    digest = digest or projection_digest(projection)
+    run_date = projection["run_date"]
+    stamp = run_date.strftime("%Y-%m-%d")
+    sheets = build_csvs(projection)
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for stem in SHEET_ORDER:
+            archive.writestr("%s-%s-%s.csv" % (stem, stamp, digest), sheets[stem])
+        archive.writestr(
+            "preview-%s-%s.txt" % (stamp, digest),
+            _manifest(projection, digest, generated_by, approved_by, approved_at),
+        )
+    filename = "finance_%s%s.zip" % (run_date.strftime("%Y%m%d"), digest)
+    return filename, buffer.getvalue()
+
+
+def build_zip_from_snapshot(snapshot):
+    """(filename, bytes) rebuilt from a stored snapshot.
+
+    The sheets come back verbatim from the row -- these are the exact bytes
+    that were reviewed, not a fresh projection that might disagree with
+    them. Only the manifest is regenerated, so that a bundle downloaded
+    after approval names the approver.
+    """
+    stamp = snapshot.run_date.strftime("%Y-%m-%d")
+    sheets = snapshot.sheets or {}
+    counts = snapshot.counts or {}
+    manifest = "\r\n".join([
+        "Skybre recurring billing - preview",
+        "",
+        "run date        : %s" % snapshot.run_date.isoformat(),
+        "partner scope   : %s" % (", ".join(str(p) for p in (snapshot.partner_ids or [])) or "all partners"),
+        "fingerprint     : %s" % snapshot.fingerprint,
+        "engine          : %s" % (snapshot.engine or "-"),
+        "generated       : %s" % timezone.localtime(snapshot.created_at).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "generated by    : %s" % (getattr(snapshot.generated_by, "username", None) or "-"),
+        "approved by     : %s" % (getattr(snapshot.approved_by, "username", None) or "not approved"),
+        "approved at     : %s" % (
+            timezone.localtime(snapshot.approved_at).strftime("%Y-%m-%d %H:%M:%S") if snapshot.approved_at else "-"
+        ),
+        "billing run     : %s" % (snapshot.run_id or "not run"),
+        "",
+        "invoices        : %s" % counts.get("invoices_created", 0),
+        "pro formas      : %s" % counts.get("proforma_invoices_created", 0),
+        "reminders       : %s" % counts.get("reminders_sent", 0),
+        "suspensions     : %s" % counts.get("suspensions_applied", 0),
+        "value to invoice: %s" % _money(snapshot.grand_total or 0),
+        "",
+        "The fingerprint is taken over the numbers in these sheets, not the",
+        "time they were produced. Run refuses unless an approved preview with",
+        "this fingerprint still matches a fresh projection, so any change to a",
+        "tariff, service or customer after approval voids the approval instead",
+        "of quietly billing something nobody signed off.",
+        "",
+        "Period columns are derived (run date to one payment period later,",
+        "minus a day); recurring line items do not carry a stored period.",
+        "",
+    ])
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for stem in SHEET_ORDER:
+            if stem in sheets:
+                archive.writestr("%s-%s-%s.csv" % (stem, stamp, snapshot.fingerprint), sheets[stem])
+        archive.writestr("preview-%s-%s.txt" % (stamp, snapshot.fingerprint), manifest)
+    filename = "finance_%s%s.zip" % (snapshot.run_date.strftime("%Y%m%d"), snapshot.fingerprint)
+    return filename, buffer.getvalue()
+
+
+# --------------------------------------------------------------------------
+# HTML / Excel exports -- same reviewed bytes as the CSV/zip export, just
+# two more ways to read them. Both are built from the snapshot's STORED CSV
+# text via _rows_from_csv_text, never from a fresh projection, for the same
+# reason build_zip_from_snapshot never re-projects: the numbers on screen
+# have to be the numbers that were approved, even if a tariff or a service
+# changed in the meantime.
+# --------------------------------------------------------------------------
+
+def _rows_from_csv_text(text):
+    """(header, rows) parsed back out of CSV text written by _write_csv --
+    the exact cells that were reviewed, as lists rather than a delimited
+    string, so HTML/xlsx can render them without re-deriving anything (no
+    second money-formatting or date-formatting code path to drift from the
+    CSV one)."""
+    if not text:
+        return [], []
+    reader = csv.reader(io.StringIO(text), dialect=_SplynxDialect)
+    rows = [row for row in reader if row]
+    if not rows:
+        return [], []
+    return rows[0], rows[1:]
+
+
+def _snapshot_meta(snapshot):
+    """The manifest facts every export format shows, as plain strings --
+    shared so the HTML page and the xlsx Summary sheet cannot drift apart on
+    wording the way two hand-written copies eventually would."""
+    counts = snapshot.counts or {}
+    return [
+        ("Run date", snapshot.run_date.isoformat()),
+        ("Partner scope", ", ".join(str(p) for p in (snapshot.partner_ids or [])) or "all partners"),
+        ("Fingerprint", snapshot.fingerprint),
+        ("Generated by", getattr(snapshot.generated_by, "username", None) or "-"),
+        ("Generated at", timezone.localtime(snapshot.created_at).strftime("%Y-%m-%d %H:%M:%S %Z")),
+        ("Approved by", getattr(snapshot.approved_by, "username", None) or "not approved"),
+        (
+            "Approved at",
+            timezone.localtime(snapshot.approved_at).strftime("%Y-%m-%d %H:%M:%S")
+            if snapshot.approved_at else "-",
+        ),
+        ("Invoices", counts.get("invoices_created", 0)),
+        ("Pro formas", counts.get("proforma_invoices_created", 0)),
+        ("Reminders", counts.get("reminders_sent", 0)),
+        ("Suspensions", counts.get("suspensions_applied", 0)),
+        ("Value to invoice", _money(snapshot.grand_total or 0)),
+    ]
+
+
+_HTML_STYLE = """
+  body { font-family: Helvetica, Arial, sans-serif; font-size: 10pt; color: #1a1a1a; margin: 2cm; }
+  h1 { font-size: 16pt; margin: 0 0 4px; }
+  h2 { font-size: 12pt; margin: 28px 0 6px; }
+  .meta td { padding: 1px 10px 1px 0; }
+  .meta .label { color: #666666; }
+  table.sheet { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+  table.sheet th { background-color: #f0f2f5; text-align: left; padding: 6px 8px; font-size: 9pt; border-bottom: 1px solid #cccccc; white-space: nowrap; }
+  table.sheet td { padding: 6px 8px; border-bottom: 1px solid #e5e7eb; font-size: 9.5pt; white-space: nowrap; }
+  .empty { color: #888888; font-style: italic; }
+"""
+
+
+def _html_table(header, rows):
+    if not rows:
+        return '<p class="empty">No rows.</p>'
+    head = "".join("<th>%s</th>" % html.escape(cell) for cell in header)
+    body = "".join(
+        "<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(cell)) for cell in row)
+        for row in rows
+    )
+    return '<table class="sheet"><thead><tr>%s</tr></thead><tbody>%s</tbody></table>' % (head, body)
+
+
+def build_html_from_snapshot(snapshot):
+    """(filename, str) -- the reviewed sheets as one printable HTML page,
+    for opening straight in a browser tab rather than downloading and
+    unzipping five CSVs to glance at them."""
+    sheets = snapshot.sheets or {}
+    meta_rows = "".join(
+        '<tr><td class="label">%s</td><td>%s</td></tr>' % (html.escape(label), html.escape(str(value)))
+        for label, value in _snapshot_meta(snapshot)
+    )
+    parts = [
+        "<!doctype html><html><head><meta charset=\"utf-8\">",
+        "<title>Recurring billing preview %s</title>" % snapshot.run_date.isoformat(),
+        "<style>%s</style></head><body>" % _HTML_STYLE,
+        "<h1>Skybre recurring billing — preview</h1>",
+        '<table class="meta">%s</table>' % meta_rows,
+    ]
+    for stem in SHEET_ORDER:
+        parts.append("<h2>%s</h2>" % html.escape(SHEET_TITLES[stem]))
+        header, rows = _rows_from_csv_text(sheets.get(stem, ""))
+        parts.append(_html_table(header, rows))
+    parts.append("</body></html>")
+    filename = "finance_%s%s.html" % (snapshot.run_date.strftime("%Y%m%d"), snapshot.fingerprint)
+    return filename, "".join(parts)
+
+
+def build_xlsx_from_snapshot(snapshot):
+    """(filename, bytes) -- the reviewed sheets as one workbook, one tab per
+    sheet plus a Summary tab, so finance can open a single file instead of
+    unzipping five CSVs into a spreadsheet app by hand."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    sheets = snapshot.sheets or {}
+    bold = Font(bold=True)
+
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Summary"
+    for label, value in _snapshot_meta(snapshot):
+        summary.append([label, value])
+        summary.cell(row=summary.max_row, column=1).font = bold
+    summary.column_dimensions["A"].width = 18
+    summary.column_dimensions["B"].width = 40
+
+    for stem in SHEET_ORDER:
+        sheet = workbook.create_sheet(SHEET_TITLES[stem])
+        header, rows = _rows_from_csv_text(sheets.get(stem, ""))
+        if header:
+            sheet.append(header)
+            for cell in sheet[1]:
+                cell.font = bold
+        for row in rows:
+            sheet.append(row)
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    filename = "finance_%s%s.xlsx" % (snapshot.run_date.strftime("%Y%m%d"), snapshot.fingerprint)
+    return filename, buffer.getvalue()

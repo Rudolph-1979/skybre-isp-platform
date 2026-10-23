@@ -1,20 +1,63 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
+import { formatIsoDate } from "../../utils/billingTerms";
 import { useApiList } from "../../hooks/useApiList";
+import { usePolling } from "../../hooks/usePolling";
 import { PageHeader } from "../../components/PageHeader";
+import { SearchableSelect } from "../../components/SearchableSelect";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
-import { DayScheduleGrid } from "../../components/DayScheduleGrid";
-import type { Job, Shift, Customer, User } from "../../types";
+import { TeamDayView, UNASSIGNED_COLOUR } from "../../components/TeamDayView";
+import { JobPoolPanel } from "../../components/JobPoolPanel";
+import { JobTypesModal } from "../../components/JobTypesModal";
+import { JobExportModal } from "../../components/JobExportModal";
+import { DeletedJobsPanel } from "../../components/DeletedJobsPanel";
+import { PoolSettingsModal } from "../../components/PoolSettingsModal";
+import { apiErrorMessage } from "../../utils/apiError";
+import { MultiSelect } from "../../components/MultiSelect";
+import { byStaffName, jobAssignee, jobFieldStatus, staffFullName } from "../../utils/scheduling";
+import type { Job, JobTypeOption, Shift, Customer, User } from "../../types";
+import { JobCardsList } from "../../components/JobCardsList";
+import { JobChangelogPanel } from "../../components/JobChangelogPanel";
+import {
+  SupportNowCard,
+  SupportRotationModal,
+  SupportStrip,
+  SupportWeekModal,
+  supportWeeksForDay,
+} from "../../components/SupportRotation";
+import type { SupportRotation, SupportWeek } from "../../types";
 
-const JOB_TYPE_COLOR: Record<Job["job_type"], string> = {
-  installation: "#2a78d6",
-  repair: "#e34948",
-  maintenance: "#eda100",
-  site_visit: "#1baf7a",
-  office_task: "#4a3aa7",
-  other: "#898781",
+
+// What the technician's phone says about a job, for the calendar chip.
+//
+// "Not dispatched" is its own label rather than another word for Pending.
+// Pending means the job is on a phone and the technician has not set off;
+// not dispatched means it never got there -- nobody assigned, assigned to
+// somebody who is not a technician, or a push that failed. One of those
+// needs an office to do something and the other does not.
+const FIELD_STATUS_LABEL: Record<string, string> = {
+  not_dispatched: "Not dispatched",
+  pending: "Pending",
+  en_route: "En route",
+  checked_in: "Checked in",
+  completed: "Completed",
+  cancelled: "Cancelled",
 };
-const SHIFT_COLOR = "#eb6834";
+
+// The chip shows ONE status even when two technicians are on the job --
+// jobFieldStatus picks the least-finished of the two, since that is the
+// one still worth noticing. Each person's own status is still visible in
+// the modal / day view detail, not lost, just not both crammed onto one
+// month-grid chip.
+function fieldStatusLabel(job: Job) {
+  const combined = jobFieldStatus(job);
+  return FIELD_STATUS_LABEL[combined] ?? combined.replace(/_/g, " ");
+}
+
+// Colours belong to PEOPLE now, not job types (Rudolph, 6 Oct 2026): a job
+// takes its (first) technician's calendar colour, and an unassigned one is
+// grey. See TeamDayView.
 
 function toLocalDateKey(iso: string) {
   const d = new Date(iso);
@@ -30,14 +73,21 @@ function toDateTimeLocalInput(iso: string) {
 const EMPTY_JOB = {
   customer: "",
   ticket: "",
-  assigned_to: "",
-  job_type: "site_visit" as Job["job_type"],
+  quote: "",
+  assigned_technicians: [] as number[],
+  job_type: "site_visit" as string,
   title: "",
   description: "",
   status: "scheduled" as Job["status"],
   start: "",
   end: "",
   location: "",
+  urgent: false,
+  // Transient UI-only field, never sent to the API (handleJobSubmit strips
+  // it out): whether this job has a time at all, i.e. the opposite of "in
+  // the pool". True is the form's normal state -- the New Job button has
+  // always meant "book something", so it still defaults to a real date.
+  scheduled: true,
 };
 
 const EMPTY_SHIFT = {
@@ -52,6 +102,33 @@ const EMPTY_SHIFT = {
 type JobFormState = typeof EMPTY_JOB;
 type ShiftFormState = typeof EMPTY_SHIFT;
 
+// A job the month/day grids can actually place on a calendar -- start and
+// end narrowed to `string`, because a pool job's are null and has no place
+// on either grid. Job.start/end are typed `string | null` at the model
+// level to make that pool state visible everywhere else in this file that
+// touches a Job (openEditJob, the pool panel), so this narrowing is scoped
+// to just the two calendar-rendering paths that need it.
+type ScheduledJob = Job & { start: string; end: string };
+
+// "Monday 05/10/2026, 09:54" under a date/time field. The phone's own
+// date picker (Android) shows no weekday and can't be changed from here,
+// so the form says which day was picked (Rudolph, 5 Oct 2026). Parsed by
+// hand from the field's "YYYY-MM-DDTHH:MM" so no time-zone shift can move
+// it to the wrong day.
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+function pickedDayLabel(value: string | null | undefined): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?/.exec(value || "");
+  if (!m) return "";
+  const [, y, mo, d, h, mi] = m;
+  const weekday = WEEKDAYS[new Date(Number(y), Number(mo) - 1, Number(d)).getDay()];
+  return `${weekday} ${d}/${mo}/${y}${h ? `, ${h}:${mi}` : ""}`;
+}
+
+function PickedDay({ value }: { value: string | null | undefined }) {
+  const label = pickedDayLabel(value);
+  return label ? <p className="mt-1 text-xs font-medium text-[var(--text-muted)]">{label}</p> : null;
+}
+
 export function SchedulingPage() {
   const [monthAnchor, setMonthAnchor] = useState(() => {
     const now = new Date();
@@ -59,6 +136,8 @@ export function SchedulingPage() {
   });
   const [staffFilter, setStaffFilter] = useState("");
   const [staff, setStaff] = useState<User[]>([]);
+  // Export jobs to Excel by date range / technician (14 Oct 2026).
+  const [showExport, setShowExport] = useState(false);
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   // Month grid or a single day against the hours. Clicking a date in the
@@ -72,14 +151,138 @@ export function SchedulingPage() {
     return d;
   });
   const [jobModal, setJobModal] = useState<{ job: JobFormState; editingId: number | null } | null>(null);
+
+  // --- Quote picker (8 Oct 2026) -----------------------------------------
+  // The modal's client's open quotes and pro formas, plus whatever is
+  // already attached (it may since have become an invoice).
+  const [quoteOptions, setQuoteOptions] = useState<{ id: number; label: string }[]>([]);
+  const [quotesLoading, setQuotesLoading] = useState(false);
+  const modalCustomer = jobModal?.job.customer ?? "";
+  const modalQuote = jobModal?.job.quote ?? "";
+  useEffect(() => {
+    if (!modalCustomer) {
+      setQuoteOptions([]);
+      return;
+    }
+    type Doc = { id: number; number: string; status: string; total: string; date_created: string };
+    const label = (d: Doc) =>
+      `${d.number || `#${d.id}`} · ${d.status === "quote" ? "Quote" : d.status === "proforma" ? "Pro forma" : "Invoice"} · R ${parseFloat(d.total).toFixed(2)}${d.date_created ? ` · ${formatIsoDate(d.date_created.slice(0, 10))}` : ""}`;
+    let cancelled = false;
+    setQuotesLoading(true);
+    Promise.all(
+      ["quote", "proforma"].map((kind) =>
+        api
+          .get<{ results: Doc[] }>(`/invoices/?customer=${modalCustomer}&document_type=${kind}&page_size=100&ordering=-date_created`)
+          .then((r) => r.data.results)
+          .catch(() => [] as Doc[])
+      )
+    ).then(async ([quotes, proformas]) => {
+      const docs = [...quotes, ...proformas];
+      if (modalQuote && !docs.some((d) => String(d.id) === modalQuote)) {
+        const attached = await api.get<Doc>(`/invoices/${modalQuote}/`).then((r) => r.data).catch(() => null);
+        if (attached) docs.unshift(attached);
+      }
+      if (!cancelled) {
+        setQuoteOptions(docs.map((d) => ({ id: d.id, label: label(d) })));
+        setQuotesLoading(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modalCustomer]);
+
+  // --- Booking a job from a ticket (8 Oct 2026) ----------------------------
+  // /admin/scheduling?fromTicket=<id>[&pool=1] opens New job filled in from
+  // the ticket (and, for a technician's ticket, the job it was raised on);
+  // Save returns to the ticket so it can be resolved.
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const [returnToTicket, setReturnToTicket] = useState<string | null>(null);
+  const [ticketLabel, setTicketLabel] = useState("");
+  useEffect(() => {
+    const ticketId = searchParams.get("fromTicket");
+    if (!ticketId) return;
+    const toPool = searchParams.get("pool") === "1";
+    type Defaults = {
+      ticket: number; ticket_number: string; customer: number | null; title: string; description: string;
+      location: string; job_type: string | null; assigned_technicians: number[];
+    };
+    api
+      .get<Defaults>(`/jobs/ticket-defaults/?ticket=${ticketId}`)
+      .then(({ data }) => {
+        setReturnToTicket(ticketId);
+        setTicketLabel(data.ticket_number);
+        const start = new Date();
+        start.setDate(start.getDate() + 1);
+        start.setHours(8, 0, 0, 0);
+        const end = new Date(start);
+        end.setHours(start.getHours() + 1);
+        setJobModal({
+          job: {
+            ...EMPTY_JOB,
+            customer: data.customer ? String(data.customer) : "",
+            ticket: String(data.ticket),
+            title: data.title,
+            description: data.description,
+            location: data.location,
+            job_type: data.job_type || defaultJobType || "site_visit",
+            assigned_technicians: toPool ? [] : data.assigned_technicians,
+            start: toPool ? "" : toDateTimeLocalInput(start.toISOString()),
+            end: toPool ? "" : toDateTimeLocalInput(end.toISOString()),
+            scheduled: !toPool,
+          },
+          editingId: null,
+        });
+      })
+      .catch((err) => setJobError(apiErrorMessage(err, "Couldn't load that ticket.")));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Scheduling -> Job types (Rudolph, 5 Oct 2026).
+  const { items: jobTypes, refetch: refetchJobTypes } = useApiList<JobTypeOption>("/job-types/");
+  const [showJobTypes, setShowJobTypes] = useState(false);
+  const [showPoolSettings, setShowPoolSettings] = useState(false);
+  const jobTypeByKey = useMemo(() => new Map(jobTypes.map((t) => [t.key, t])), [jobTypes]);
+  const activeJobTypes = useMemo(() => jobTypes.filter((t) => t.is_active), [jobTypes]);
+  const staffColour = (id: number) => staff.find((s) => s.id === id)?.calendar_colour ?? UNASSIGNED_COLOUR;
+  const jobColour = (j: Job) => (j.technicians.length ? staffColour(j.technicians[0].id) : UNASSIGNED_COLOUR);
+  // Clicking a person's colour dot on the Day view. Shown at once; saved a
+  // moment after the picker stops moving, so dragging across the colour
+  // wheel doesn't send a request per pixel.
+  const colourTimers = useRef<Record<number, number>>({});
+  function changeStaffColour(id: number, colour: string) {
+    setStaff((prev) => prev.map((s) => (s.id === id ? { ...s, calendar_colour: colour } : s)));
+    window.clearTimeout(colourTimers.current[id]);
+    colourTimers.current[id] = window.setTimeout(() => {
+      api.patch(`/staff-users/${id}/colour/`, { calendar_colour: colour }).catch(() => {
+        alert("Couldn't save that colour. You may not have access to Scheduling changes.");
+      });
+    }, 500);
+  }
+  // A new job starts on Site Visit while that is switched on, else the
+  // first type that is.
+  const defaultJobType = activeJobTypes.some((t) => t.key === "site_visit")
+    ? "site_visit"
+    : activeJobTypes[0]?.key ?? "site_visit";
   const [shiftModal, setShiftModal] = useState<{ shift: ShiftFormState; editingId: number | null } | null>(null);
   const [saving, setSaving] = useState(false);
+  // What the API said about the last save or delete, one message per modal.
+  // Until now every one of them was thrown away -- see handleJobSubmit.
+  const [jobError, setJobError] = useState("");
+  const [shiftError, setShiftError] = useState("");
 
   useEffect(() => {
-    api.get<{ results: User[] }>("/staff-users/?page_size=100").then((res) => setStaff(res.data.results));
-    api.get<{ results: Customer[] }>("/customers/?page_size=500&ordering=full_name").then((res) =>
-      setCustomers(res.data.results)
-    );
+    api.get<{ results: User[] }>("/staff-users/?page_size=100").then((res) => setStaff([...res.data.results].sort(byStaffName)));
+    // /customers/picker/ rather than the paginated list, because page_size is
+    // capped at 500 and DRF clamps it silently: this dropdown held the first
+    // 500 customers by name with nothing saying so, so a job for anyone whose
+    // surname sorted past roughly the 500th could not be booked against them
+    // at all -- about 1,092 of our 1,592 customers. The picker is unpaginated,
+    // already ordered by full_name (hence no &ordering here), and partner-
+    // scoped the same way the list is. Finance, Services and Tickets moved to
+    // it already; Scheduling was the one left behind.
+    api.get<{ results: Customer[] }>("/customers/picker/").then((res) => setCustomers(res.data.results));
   }, []);
 
   // Grid always spans 6 full weeks (Sunday-start) covering the whole month.
@@ -94,6 +297,26 @@ export function SchedulingPage() {
     return d;
   }), [gridStart]);
   const gridEnd = gridDays[gridDays.length - 1];
+
+  // Weekly support rotations (#184, 16 Oct 2026): who is on vehicle /
+  // phone support each week, drawn as a strip across the month grid.
+  const [showRotation, setShowRotation] = useState(false);
+  const [supportWeeks, setSupportWeeks] = useState<SupportWeek[]>([]);
+  const [supportRotations, setSupportRotations] = useState<SupportRotation[]>([]);
+  const [openSupportWeek, setOpenSupportWeek] = useState<SupportWeek | null>(null);
+  const [supportTick, setSupportTick] = useState(0);
+  useEffect(() => {
+    const from = toLocalDateKey(gridStart.toISOString());
+    const to = toLocalDateKey(gridEnd.toISOString());
+    api
+      .get<{ weeks: SupportWeek[] }>(`/support-rotations/schedule/?from=${from}&to=${to}`)
+      .then((r) => setSupportWeeks(r.data.weeks))
+      .catch(() => setSupportWeeks([]));
+    api
+      .get<SupportRotation[]>("/support-rotations/")
+      .then((r) => setSupportRotations(r.data))
+      .catch(() => setSupportRotations([]));
+  }, [gridStart, gridEnd, supportTick]);
 
   // Only fetch what the current view shows. Day view asking for six weeks of
   // jobs would be wasteful, and month view asking for one day would be
@@ -114,21 +337,65 @@ export function SchedulingPage() {
       gridEnd.getFullYear(), gridEnd.getMonth(), gridEnd.getDate(), 23, 59, 59
     ).toISOString()}`;
   }, [view, dayAnchor, gridStart, gridEnd]);
-  const staffParam = staffFilter ? `&assigned_to=${staffFilter}` : "";
+  const staffParam = staffFilter ? `&assigned_technicians=${staffFilter}` : "";
   const shiftStaffParam = staffFilter ? `&staff=${staffFilter}` : "";
 
-  const { items: jobs, loading: jobsLoading, refetch: refetchJobs } = useApiList<Job>(
+  const {
+    items: jobs, loading: jobsLoading, refetch: refetchJobs,
+    refetchQuietly: refetchJobsQuietly,
+  } = useApiList<Job>(
     `/jobs/?page_size=500&${rangeParams}${staffParam}`
   );
-  const { items: shifts, loading: shiftsLoading, refetch: refetchShifts } = useApiList<Shift>(
+  const {
+    items: shifts, loading: shiftsLoading, refetch: refetchShifts,
+    refetchQuietly: refetchShiftsQuietly,
+  } = useApiList<Shift>(
     `/shifts/?page_size=500&${rangeParams}${shiftStaffParam}`
   );
 
+  // The pool panel's own feed -- every job with no time yet, oldest first.
+  // "true", not "1": the unscheduled filter is a tri-state BooleanFilter
+  // built on Django's NullBooleanField, which only recognises "true"/
+  // "false", the same convention the existing overdue/high_alert boolean
+  // filters elsewhere in this API already use.
+  const {
+    items: poolJobs, loading: poolLoading, refetch: refetchPool,
+    refetchQuietly: refetchPoolQuietly,
+  } = useApiList<Job>("/jobs/?unscheduled=true&ordering=created_at&page_size=200");
+  // The Deleted jobs pool (6 Oct 2026).
+  const {
+    items: deletedJobs, refetch: refetchDeleted, refetchQuietly: refetchDeletedQuietly,
+  } = useApiList<Job>("/jobs/deleted/");
+
+  // A job's status changes on a technician's phone, not in this browser.
+  // The calendar is where the office looks to see whether somebody has set
+  // off, so it has to move on its own or it is only ever as current as the
+  // last time anybody pressed refresh.
+  //
+  // Every 5 seconds (Rudolph, 5 Oct 2026 -- was 30): a technician checking
+  // in should show up while the office is still looking at the screen.
+  // Quiet (no "Loading…" flash, open forms untouched), and only while the
+  // tab is in front -- a hidden or locked screen costs nothing. An inline
+  // arrow is fine here: usePolling holds the callback in a ref, so this
+  // does not rebuild the timer.
+  usePolling(() => {
+    refetchJobsQuietly();
+    refetchShiftsQuietly();
+    refetchPoolQuietly();
+    refetchDeletedQuietly();
+  }, 5_000);
+
   const jobsByDay = useMemo(() => {
-    const map = new Map<string, Job[]>();
+    const map = new Map<string, ScheduledJob[]>();
+    // Defensive, not load-bearing: the calendar's own start_from/start_to
+    // fetch already excludes pool jobs (a NULL start never satisfies >=/<=
+    // in SQL), so this should never actually drop anything -- but it's
+    // what lets the rest of this file treat `jobsByDay`'s jobs as always
+    // having a real start/end.
     jobs.forEach((j) => {
+      if (!j.start || !j.end) return;
       const key = toLocalDateKey(j.start);
-      map.set(key, [...(map.get(key) ?? []), j]);
+      map.set(key, [...(map.get(key) ?? []), j as ScheduledJob]);
     });
     return map;
   }, [jobs]);
@@ -175,7 +442,7 @@ export function SchedulingPage() {
     setView("day");
   }
 
-  function openNewJob(prefillDate?: Date) {
+  function openNewJob(prefillDate?: Date, technicianId?: number | null) {
     const base = prefillDate ?? new Date();
     const start = new Date(base);
     // A date with no time (from the month grid) defaults to 09:00; a click
@@ -185,24 +452,85 @@ export function SchedulingPage() {
     const end = new Date(start);
     end.setHours(start.getHours() + 1);
     setJobModal({
-      job: { ...EMPTY_JOB, start: toDateTimeLocalInput(start.toISOString()), end: toDateTimeLocalInput(end.toISOString()) },
+      job: {
+        ...EMPTY_JOB,
+        job_type: defaultJobType,
+        // Clicked on a person's row in the Day view: book them.
+        assigned_technicians: technicianId ? [technicianId] : [],
+        start: toDateTimeLocalInput(start.toISOString()),
+        end: toDateTimeLocalInput(end.toISOString()),
+        scheduled: true,
+      },
       editingId: null,
     });
   }
 
+  /** "+ Add to pool" -- a new job with no time and nobody assigned yet
+   * (Rudolph, 30 Sep: "create a Job pool where jobs land before
+   * scheduled"). Everything else about it (title, type, customer...) is
+   * filled in the same modal, just without the fields that don't apply
+   * until it's actually scheduled. */
+  function openNewPoolJob() {
+    setJobModal({ job: { ...EMPTY_JOB, job_type: defaultJobType, start: "", end: "", scheduled: false }, editingId: null });
+  }
+
   function openEditJob(j: Job) {
+    // A pool job has no start/end to show -- toDateTimeLocalInput would be
+    // handed null. `scheduled` mirrors whichever state this job is
+    // actually in, so the modal opens on the right side of the toggle
+    // instead of always assuming a real date.
     setJobModal({
       job: {
         customer: j.customer ? String(j.customer) : "",
         ticket: j.ticket ? String(j.ticket) : "",
-        assigned_to: j.assigned_to ? String(j.assigned_to) : "",
+        quote: j.quote ? String(j.quote) : "",
+        assigned_technicians: j.technicians.map((t) => t.id),
         job_type: j.job_type,
         title: j.title,
         description: j.description,
         status: j.status,
-        start: toDateTimeLocalInput(j.start),
-        end: toDateTimeLocalInput(j.end),
+        start: j.start ? toDateTimeLocalInput(j.start) : "",
+        end: j.end ? toDateTimeLocalInput(j.end) : "",
         location: j.location,
+        urgent: Boolean(j.urgent),
+        scheduled: Boolean(j.start && j.end),
+      },
+      editingId: j.id,
+    });
+  }
+
+  /** Pulling a job OUT of the pool (Rudolph, 30 Sep: "Jobs can then be
+   * pulled from the pool to better schedule route and times") -- from
+   * either the pool panel's own Schedule button (no prefillDate, defaults
+   * to "now") or a drag onto a day/hour (prefillDate is the drop target).
+   * Opens the same edit modal, pre-filled and already toggled to
+   * "Schedule now", so the office still checks the time and picks a
+   * technician before Save rather than this committing silently. */
+  function openScheduleFromPool(j: Job, prefillDate?: Date, technicianId?: number | null) {
+    const base = prefillDate ?? new Date();
+    const start = new Date(base);
+    if (start.getHours() === 0 && start.getMinutes() === 0) start.setHours(9, 0, 0, 0);
+    start.setSeconds(0, 0);
+    const end = new Date(start);
+    end.setHours(start.getHours() + 1);
+    setJobModal({
+      job: {
+        customer: j.customer ? String(j.customer) : "",
+        ticket: j.ticket ? String(j.ticket) : "",
+        quote: j.quote ? String(j.quote) : "",
+        // A pool job can never carry technicians (see JobSerializer.
+        // validate) -- left for the office to pick now that it has a time,
+        // unless it was dropped on a person's row in the Day view.
+        assigned_technicians: technicianId ? [technicianId] : [],
+        job_type: j.job_type,
+        title: j.title,
+        description: j.description,
+        status: j.status,
+        start: toDateTimeLocalInput(start.toISOString()),
+        end: toDateTimeLocalInput(end.toISOString()),
+        location: j.location,
+        urgent: Boolean(j.urgent),
+        scheduled: true,
       },
       editingId: j.id,
     });
@@ -241,14 +569,25 @@ export function SchedulingPage() {
     e.preventDefault();
     if (!jobModal) return;
     setSaving(true);
+    setJobError("");
     try {
+      // `scheduled` is this form's own toggle, not a Job field -- stripped
+      // out here rather than sent, same as the ids `customer`/`ticket`
+      // that need converting to null.
+      const { scheduled, ...jobFields } = jobModal.job;
       const payload = {
-        ...jobModal.job,
+        ...jobFields,
         customer: jobModal.job.customer || null,
         ticket: jobModal.job.ticket || null,
-        assigned_to: jobModal.job.assigned_to || null,
-        start: new Date(jobModal.job.start).toISOString(),
-        end: new Date(jobModal.job.end).toISOString(),
+        quote: jobModal.job.quote || null,
+        // Unscheduled means the pool: both null (JobSerializer.validate
+        // rejects one without the other), and no technicians -- a pool job
+        // can never carry one (see that same validate for why: Conecto's
+        // push has no guard on job.start, so an assigned-but-undated job
+        // would reach a real phone with a blank start).
+        start: scheduled ? new Date(jobModal.job.start).toISOString() : null,
+        end: scheduled ? new Date(jobModal.job.end).toISOString() : null,
+        assigned_technicians: scheduled ? jobModal.job.assigned_technicians : [],
       };
       if (jobModal.editingId) {
         await api.patch(`/jobs/${jobModal.editingId}/`, payload);
@@ -256,7 +595,22 @@ export function SchedulingPage() {
         await api.post("/jobs/", payload);
       }
       setJobModal(null);
+      if (returnToTicket && !jobModal.editingId) {
+        navigate(`/admin/tickets/${returnToTicket}`);
+        return;
+      }
       refetchJobs();
+      // Either side of this save could have moved a job across the
+      // pool/scheduled line, so the pool panel needs a fresh look too.
+      refetchPool();
+    } catch (err) {
+      // Easy to hit and previously invisible: neither datetime field stops
+      // you putting End before Start, and JobSerializer.validate rejects
+      // that with "End time must be after the start time." With no catch
+      // the 400 was swallowed, so Save just did nothing -- the modal sat
+      // there, the job was never booked, and nobody was sent out. A
+      // partner-scoped 403 on someone else's job looked identical.
+      setJobError(apiErrorMessage(err, "Could not save this job — please try again."));
     } finally {
       setSaving(false);
     }
@@ -265,10 +619,19 @@ export function SchedulingPage() {
   async function handleDeleteJob() {
     if (!jobModal?.editingId) return;
     setSaving(true);
+    setJobError("");
     try {
+      // Moves it to Deleted jobs (restorable), not a real delete.
       await api.delete(`/jobs/${jobModal.editingId}/`);
       setJobModal(null);
       refetchJobs();
+      refetchPool();
+      refetchDeleted();
+    } catch (err) {
+      // A refused delete used to leave the modal open with nothing said, so
+      // it read as a click that hadn't registered -- and the job stayed in
+      // the diary.
+      setJobError(apiErrorMessage(err, "Could not delete this job — please try again."));
     } finally {
       setSaving(false);
     }
@@ -278,6 +641,7 @@ export function SchedulingPage() {
     e.preventDefault();
     if (!shiftModal) return;
     setSaving(true);
+    setShiftError("");
     try {
       const payload = {
         ...shiftModal.shift,
@@ -292,6 +656,12 @@ export function SchedulingPage() {
       }
       setShiftModal(null);
       refetchShifts();
+    } catch (err) {
+      // Same silence as the job form, and it matters more here: a shift
+      // that failed to save is a rota gap nobody was told about.
+      // ShiftSerializer.validate rejects end <= start, which an 18:00-to-
+      // 02:00 night shift typed as one day gets wrong every time.
+      setShiftError(apiErrorMessage(err, "Could not save this shift — please try again."));
     } finally {
       setSaving(false);
     }
@@ -300,10 +670,13 @@ export function SchedulingPage() {
   async function handleDeleteShift() {
     if (!shiftModal?.editingId) return;
     setSaving(true);
+    setShiftError("");
     try {
       await api.delete(`/shifts/${shiftModal.editingId}/`);
       setShiftModal(null);
       refetchShifts();
+    } catch (err) {
+      setShiftError(apiErrorMessage(err, "Could not delete this shift — please try again."));
     } finally {
       setSaving(false);
     }
@@ -333,8 +706,20 @@ export function SchedulingPage() {
         subtitle="Field jobs and staff shifts, office and field."
         actions={
           <>
+            <button className={btnSecondary} onClick={() => setShowJobTypes(true)}>
+              Job types
+            </button>
+            <button className={btnSecondary} onClick={() => setShowExport(true)}>
+              Export Excel
+            </button>
+            <button className={btnSecondary} onClick={() => setShowRotation(true)}>
+              Support rotation
+            </button>
             <button className={btnSecondary} onClick={() => openNewShift()}>
               + New shift
+            </button>
+            <button className={btnSecondary} onClick={() => openNewPoolJob()}>
+              + Add to pool
             </button>
             <button className={btnPrimary} onClick={() => openNewJob()}>
               + New job
@@ -379,37 +764,47 @@ export function SchedulingPage() {
         <select className={`${inputClass} max-w-xs`} value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)}>
           <option value="">All staff</option>
           {staff.map((s) => (
-            <option key={s.id} value={s.id}>{s.first_name || s.username}</option>
+            <option key={s.id} value={s.id}>{staffFullName(s)}</option>
           ))}
         </select>
       </div>
 
+      {/* Who is who: the people on what's showing, by colour. The job type
+          is written on each card instead of being a colour. */}
       <div className="mb-3 flex flex-wrap gap-3 text-xs text-[var(--text-muted)]">
-        {Object.entries(JOB_TYPE_COLOR).map(([type, color]) => (
-          <span key={type} className="inline-flex items-center gap-1.5 capitalize">
-            <span className="h-2 w-2 rounded-full" style={{ background: color }} />
-            {type.replace("_", " ")}
-          </span>
-        ))}
+        {staff
+          .filter((s) => jobs.some((j) => j.technicians.some((t) => t.id === s.id)) || shifts.some((sh) => sh.staff === s.id))
+          .map((s) => (
+            <span key={s.id} className="inline-flex items-center gap-1.5">
+              <span className="h-2.5 w-2.5 rounded-full" style={{ background: s.calendar_colour ?? UNASSIGNED_COLOUR }} />
+              {staffFullName(s)}
+            </span>
+          ))}
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full" style={{ background: SHIFT_COLOR }} />
-          Shift
+          <span className="h-2.5 w-2.5 rounded-sm border border-dashed border-[var(--text-muted)]" />
+          Shift (dashed, in that person's colour)
         </span>
       </div>
 
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
+      <div className="min-w-0 flex-1">
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : view === "day" ? (
-        <DayScheduleGrid
+        <TeamDayView
           day={dayAnchor}
           jobs={jobsByDay.get(toLocalDateKey(dayAnchor.toISOString())) ?? []}
           shifts={shiftsByDay.get(toLocalDateKey(dayAnchor.toISOString())) ?? []}
-          jobColour={(j) => JOB_TYPE_COLOR[j.job_type]}
-          shiftColour={SHIFT_COLOR}
-          onNewJob={openNewJob}
-          onNewShift={openNewShift}
+          staff={staff}
+          jobTypes={jobTypeByKey}
+          onNewJob={(at, techId) => openNewJob(at, techId)}
           onEditJob={openEditJob}
           onEditShift={openEditShift}
+          onDropJob={(jobId, at, techId) => {
+            const job = poolJobs.find((p) => p.id === jobId);
+            if (job) openScheduleFromPool(job, at, techId);
+          }}
+          onChangeColour={changeStaffColour}
         />
       ) : (
         <div className="overflow-x-auto">
@@ -433,6 +828,13 @@ export function SchedulingPage() {
             return (
               <div
                 key={idx}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const id = Number(e.dataTransfer.getData("text/plain"));
+                  const job = poolJobs.find((p) => p.id === id);
+                  if (job) openScheduleFromPool(job, day);
+                }}
                 className={`min-h-[110px] border-b border-r border-[var(--border-hairline)] p-1.5 ${
                   inMonth ? "" : "bg-[var(--tint-subtle)]"
                 }`}
@@ -451,6 +853,14 @@ export function SchedulingPage() {
                 >
                   {day.getDate()}
                 </button>
+                {supportWeeksForDay(supportWeeks, key).map((w) => (
+                  <SupportStrip
+                    key={`sup-${w.rotation}-${w.week_start}`}
+                    week={w}
+                    showNames={idx % 7 === 0 || w.week_start === key}
+                    onOpen={setOpenSupportWeek}
+                  />
+                ))}
                 <div className="space-y-1">
                   {visibleJobs.map((j) => (
                     <button
@@ -458,10 +868,28 @@ export function SchedulingPage() {
                       type="button"
                       onClick={() => openEditJob(j)}
                       className="block w-full truncate rounded px-1.5 py-0.5 text-left text-[11px] font-medium text-white"
-                      style={{ background: JOB_TYPE_COLOR[j.job_type], opacity: j.status === "cancelled" ? 0.45 : 1 }}
-                      title={`${j.title} — ${j.customer_name ?? "standalone"}`}
+                      style={{
+                        background: jobColour(j),
+                        opacity: j.status === "cancelled" ? 0.45 : 1,
+                        // Urgent (15 Oct 2026, Rudolph: "Maybe a red outline").
+                        outline: j.urgent ? "2px solid #ff3b3b" : undefined,
+                        outlineOffset: j.urgent ? -1 : undefined,
+                      }}
+                      title={`${j.urgent ? "URGENT — " : ""}${j.title} — ${j.customer_name ?? "standalone"} — ${jobAssignee(j)} — ${fieldStatusLabel(j)}`}
                     >
+                      {j.urgent && <span className="mr-1 rounded-sm bg-[#ff3b3b] px-1 text-[10px] font-bold">!</span>}
                       {new Date(j.start).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })} {j.title}
+                      {" · "}
+                      {/* Italic when nobody is on it: an unassigned job on
+                          Friday is the thing you want to catch from across
+                          the room, and it must not read like a tech called
+                          "Unassigned". */}
+                      <span className={j.technicians.length > 0 ? "" : "italic opacity-90"}>{jobAssignee(j)}</span>
+                      {" · "}
+                      {/* What the phone says, not what the office set. A
+                          chip that reads Pending at four in the afternoon
+                          is the one worth noticing from across the room. */}
+                      <span className="opacity-90">{fieldStatusLabel(j)}</span>
                     </button>
                   ))}
                   {visibleShifts.map((s) => (
@@ -470,10 +898,14 @@ export function SchedulingPage() {
                       type="button"
                       onClick={() => openEditShift(s)}
                       className="block w-full truncate rounded px-1.5 py-0.5 text-left text-[11px] font-medium text-white"
-                      style={{ background: SHIFT_COLOR, opacity: s.status === "cancelled" ? 0.45 : 1 }}
+                      style={{
+                        border: `1px dashed ${staffColour(s.staff)}`,
+                        color: staffColour(s.staff),
+                        opacity: s.status === "cancelled" ? 0.45 : 1,
+                      }}
                       title={`${s.staff_name} shift`}
                     >
-                      {new Date(s.start).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })} {s.staff_name}
+                      Shift {new Date(s.start).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })} {s.staff_name}
                     </button>
                   ))}
                   {overflow > 0 && (
@@ -492,10 +924,84 @@ export function SchedulingPage() {
         </div>
         </div>
       )}
+      {/* Who booked / changed which job (8 Oct 2026). */}
+      <JobChangelogPanel
+        refreshKey={jobs}
+        onOpenJob={(id) => {
+          api
+            .get<Job>(`/jobs/${id}/`)
+            .then((r) => openEditJob(r.data))
+            .catch(() => undefined);
+        }}
+      />
+      </div>
+
+      <div className="flex w-full shrink-0 flex-col gap-4 lg:w-72">
+        <SupportNowCard refreshKey={supportTick} onManage={() => setShowRotation(true)} />
+        <JobPoolPanel
+          jobs={poolJobs}
+          loading={poolLoading}
+          jobColour={jobColour}
+          onScheduleJob={(j) => openScheduleFromPool(j)}
+          onEditJob={openEditJob}
+          onSettings={() => setShowPoolSettings(true)}
+        />
+        <DeletedJobsPanel
+          jobs={deletedJobs}
+          onChanged={() => {
+            refetchDeleted();
+            refetchJobs();
+            refetchPool();
+          }}
+        />
+      </div>
+      </div>
+
+      {showPoolSettings && <PoolSettingsModal onClose={() => setShowPoolSettings(false)} />}
+
+      {showRotation && (
+        <SupportRotationModal
+          staff={staff}
+          onClose={() => setShowRotation(false)}
+          onChanged={() => setSupportTick((t) => t + 1)}
+        />
+      )}
+
+      {openSupportWeek && (
+        <SupportWeekModal
+          week={openSupportWeek}
+          staff={staff}
+          rotation={supportRotations.find((r) => r.id === openSupportWeek.rotation)}
+          onClose={() => setOpenSupportWeek(null)}
+          onChanged={() => setSupportTick((t) => t + 1)}
+        />
+      )}
+
+      {showExport && (
+        <JobExportModal
+          staff={staff}
+          defaultFrom={monthAnchor}
+          defaultTo={new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + 1, 0)}
+          onClose={() => setShowExport(false)}
+        />
+      )}
+
+      {showJobTypes && (
+        <JobTypesModal types={jobTypes} onChanged={refetchJobTypes} onClose={() => setShowJobTypes(false)} />
+      )}
 
       {jobModal && (
-        <Modal title={jobModal.editingId ? "Edit job" : "New job"} onClose={() => setJobModal(null)}>
+        <Modal
+          title={jobModal.editingId ? "Edit job" : "New job"}
+          onClose={() => { setJobModal(null); setJobError(""); }}
+        >
           <form onSubmit={handleJobSubmit}>
+            {jobModal.editingId && <JobCardsList jobId={jobModal.editingId} compact />}
+            {jobError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {jobError}
+              </p>
+            )}
             <FormField label="Title">
               <input
                 className={inputClass}
@@ -505,77 +1011,193 @@ export function SchedulingPage() {
               />
             </FormField>
             <FormField label="Customer (optional — leave blank for a standalone job)">
-              <select
-                className={inputClass}
+              {/* Not `required`: a standalone office task genuinely has no
+                  customer, which is why emptyLabel spells that out rather
+                  than leaving the picker's default "Clear selection". */}
+              <SearchableSelect
+                options={customers.map((c) => ({
+                  value: String(c.id),
+                  label: c.full_name,
+                  meta: c.customer_id,
+                  searchText: `${c.full_name} ${c.company_name ?? ""} ${c.customer_id}`,
+                }))}
                 value={jobModal.job.customer}
-                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, customer: e.target.value } })}
-              >
-                <option value="">No customer (standalone)</option>
-                {customers.map((c) => (
-                  <option key={c.id} value={c.id}>{c.full_name} ({c.customer_id})</option>
-                ))}
-              </select>
+                // A quote belongs to one client: changing client drops it.
+                onChange={(v) =>
+                  setJobModal({
+                    ...jobModal,
+                    job: { ...jobModal.job, customer: v, quote: v === jobModal.job.customer ? jobModal.job.quote : "" },
+                  })
+                }
+                placeholder="No customer (standalone)"
+                emptyLabel="No customer (standalone)"
+                hint="Search by name or payment reference."
+              />
+              {jobModal.job.ticket && (
+                <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                  Booked from ticket{" "}
+                  <a href={`/admin/tickets/${jobModal.job.ticket}`} className="text-[var(--series-1)] hover:underline">
+                    {ticketLabel || `#${jobModal.job.ticket}`}
+                  </a>
+                </span>
+              )}
             </FormField>
+            {/* The client's quote this job carries out (Rudolph, 8 Oct 2026).
+                Its lines go to the technician's app with the job notes. */}
+            {jobModal.job.customer && (
+              <FormField label="Quote (optional)">
+                <div className="flex items-center gap-2">
+                  <select
+                    className={inputClass}
+                    value={jobModal.job.quote}
+                    onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, quote: e.target.value } })}
+                  >
+                    <option value="">No quote attached</option>
+                    {quoteOptions.map((q) => (
+                      <option key={q.id} value={String(q.id)}>
+                        {q.label}
+                      </option>
+                    ))}
+                  </select>
+                  {jobModal.job.quote && (
+                    <a
+                      href={`/admin/finance/invoices/${jobModal.job.quote}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="whitespace-nowrap text-sm text-[var(--series-1)] hover:underline"
+                    >
+                      Open
+                    </a>
+                  )}
+                </div>
+                {quoteOptions.length === 0 && !quotesLoading && (
+                  <span className="mt-1 block text-xs text-[var(--text-muted)]">This client has no open quotes or pro formas.</span>
+                )}
+              </FormField>
+            )}
             <FormField label="Job type">
               <select
                 className={inputClass}
                 value={jobModal.job.job_type}
-                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, job_type: e.target.value as Job["job_type"] } })}
+                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, job_type: e.target.value } })}
               >
-                <option value="installation">Installation</option>
-                <option value="repair">Repair</option>
-                <option value="maintenance">Maintenance</option>
-                <option value="site_visit">Site Visit</option>
-                <option value="office_task">Office Task</option>
-                <option value="other">Other</option>
-              </select>
-            </FormField>
-            <FormField label="Assigned to">
-              <select
-                className={inputClass}
-                value={jobModal.job.assigned_to}
-                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, assigned_to: e.target.value } })}
-              >
-                <option value="">Unassigned</option>
-                {staff.map((s) => (
-                  <option key={s.id} value={s.id}>{s.first_name || s.username}</option>
+                {activeJobTypes.map((t) => (
+                  <option key={t.key} value={t.key}>{t.name}</option>
                 ))}
+                {/* A job already on a switched-off type keeps it. */}
+                {!activeJobTypes.some((t) => t.key === jobModal.job.job_type) && (
+                  <option value={jobModal.job.job_type}>
+                    {jobTypeByKey.get(jobModal.job.job_type)?.name ?? jobModal.job.job_type} (switched off)
+                  </option>
+                )}
               </select>
             </FormField>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-              <FormField label="Start">
+            {/* Urgent (15 Oct 2026): red outline on the calendar and pool, top of
+                the pool, and "URGENT" first in the technician's notes. */}
+            <label className="mb-3 flex items-center gap-2 text-sm font-medium" style={{ color: "#ff3b3b" }}>
+              <input
+                type="checkbox"
+                checked={Boolean(jobModal.job.urgent)}
+                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, urgent: e.target.checked } })}
+              />
+              Urgent
+              <span className="text-xs font-normal text-[var(--text-muted)]">red outline, top of the pool, flagged to the technician</span>
+            </label>
+            <FormField label="">
+              {/* The pool/scheduled toggle (Rudolph, 30 Sep: "create a Job
+                  pool where jobs land before scheduled"). Off hides Start,
+                  End and Assigned to below rather than disabling them --
+                  those fields have no meaning for a job with no time yet,
+                  and JobSerializer.validate refuses a pool job that still
+                  carries a technician, so this keeps the form from ever
+                  offering a combination the API would reject. */}
+              <label className="flex items-center gap-2 text-sm font-medium text-[var(--text-secondary)]">
                 <input
-                  type="datetime-local"
-                  className={inputClass}
-                  required
-                  value={jobModal.job.start}
-                  onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, start: e.target.value } })}
+                  type="checkbox"
+                  checked={jobModal.job.scheduled}
+                  onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, scheduled: e.target.checked } })}
                 />
-              </FormField>
-              <FormField label="End">
-                <input
-                  type="datetime-local"
-                  className={inputClass}
-                  required
-                  value={jobModal.job.end}
-                  onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, end: e.target.value } })}
-                />
-              </FormField>
-            </div>
+                Schedule now
+              </label>
+              {!jobModal.job.scheduled && (
+                <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                  Left in the pool — set a time and a technician when you're ready to schedule it.
+                </span>
+              )}
+            </FormField>
+            {jobModal.job.scheduled && (
+              <>
+                <FormField label="Assigned to">
+                  {/* A job can go to more than one technician at once (Rudolph,
+                      29 Sep: "allow me to assign to two technicians"), no cap --
+                      a bigger install can carry a whole crew. emptyLabel makes
+                      zero-selected read as "Unassigned", not "All": nobody
+                      ticked here is a real, deliberate state, not "no filter
+                      applied" the way the same control means elsewhere. */}
+                  <MultiSelect
+                    options={staff.map((s) => ({ value: s.id, label: staffFullName(s) }))}
+                    selected={jobModal.job.assigned_technicians}
+                    onChange={(next) => setJobModal({
+                      ...jobModal,
+                      job: { ...jobModal.job, assigned_technicians: next as number[] },
+                    })}
+                    emptyLabel="Unassigned"
+                    nounPlural="technicians"
+                  />
+                </FormField>
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <FormField label="Start">
+                    <input
+                      type="datetime-local"
+                      className={inputClass}
+                      required
+                      value={jobModal.job.start}
+                      onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, start: e.target.value } })}
+                    />
+                    <PickedDay value={jobModal.job.start} />
+                  </FormField>
+                  <FormField label="End">
+                    <input
+                      type="datetime-local"
+                      className={inputClass}
+                      required
+                      value={jobModal.job.end}
+                      onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, end: e.target.value } })}
+                    />
+                    <PickedDay value={jobModal.job.end} />
+                  </FormField>
+                </div>
+              </>
+            )}
             <FormField label="Location">
               <input
                 className={inputClass}
-                placeholder="Defaults to customer's address if left blank"
+                placeholder="Address or GPS — blank uses the client's; needed to schedule"
                 value={jobModal.job.location}
                 onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, location: e.target.value } })}
               />
             </FormField>
             <FormField label="Status">
+              {/* "In pool" (Rudolph, 8 Oct 2026) is not a Job status -- the
+                  pool is "no time yet" -- so it drives the Schedule now
+                  toggle: In pool clears it (status stays Scheduled, the only
+                  one the pool accepts); any other choice from the pool turns
+                  it on so a time and technician can be set. */}
               <select
                 className={inputClass}
-                value={jobModal.job.status}
-                onChange={(e) => setJobModal({ ...jobModal, job: { ...jobModal.job, status: e.target.value as Job["status"] } })}
+                value={jobModal.job.scheduled ? jobModal.job.status : "pool"}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setJobModal({
+                    ...jobModal,
+                    job:
+                      value === "pool"
+                        ? { ...jobModal.job, scheduled: false, status: "scheduled" }
+                        : { ...jobModal.job, scheduled: true, status: value as Job["status"] },
+                  });
+                }}
               >
+                <option value="pool">In pool</option>
                 <option value="scheduled">Scheduled</option>
                 <option value="in_progress">In Progress</option>
                 <option value="completed">Completed</option>
@@ -592,12 +1214,36 @@ export function SchedulingPage() {
             </FormField>
             <div className="mt-4 flex justify-between gap-2">
               {jobModal.editingId ? (
-                <button type="button" className="text-sm font-medium text-[var(--status-critical)] hover:underline" onClick={handleDeleteJob}>
-                  Delete job
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    className="text-sm font-medium text-[var(--status-critical)] hover:underline"
+                    onClick={handleDeleteJob}
+                    title="Moves it to Deleted jobs, where it can be restored"
+                  >
+                    Delete job
+                  </button>
+                  {/* Move an existing scheduled job back to the pool
+                      (Rudolph's other answer on how a job gets into the
+                      pool). Only offered for a Scheduled job -- the same
+                      guard JobSerializer.validate enforces server-side, so
+                      this never promises an office user something an
+                      in-progress or completed job would then refuse. This
+                      only flips the toggle; Save still clears the dates
+                      and technician for real. */}
+                  {jobModal.job.scheduled && jobModal.job.status === "scheduled" && (
+                    <button
+                      type="button"
+                      className="text-sm font-medium text-[var(--text-secondary)] hover:underline"
+                      onClick={() => setJobModal({ ...jobModal, job: { ...jobModal.job, scheduled: false } })}
+                    >
+                      Send back to pool
+                    </button>
+                  )}
+                </div>
               ) : <span />}
               <div className="flex gap-2">
-                <button type="button" className={btnSecondary} onClick={() => setJobModal(null)}>Cancel</button>
+                <button type="button" className={btnSecondary} onClick={() => { setJobModal(null); setJobError(""); }}>Cancel</button>
                 <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Save"}</button>
               </div>
             </div>
@@ -606,8 +1252,16 @@ export function SchedulingPage() {
       )}
 
       {shiftModal && (
-        <Modal title={shiftModal.editingId ? "Edit shift" : "New shift"} onClose={() => setShiftModal(null)}>
+        <Modal
+          title={shiftModal.editingId ? "Edit shift" : "New shift"}
+          onClose={() => { setShiftModal(null); setShiftError(""); }}
+        >
           <form onSubmit={handleShiftSubmit}>
+            {shiftError && (
+              <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+                {shiftError}
+              </p>
+            )}
             <FormField label="Staff member">
               <select
                 className={inputClass}
@@ -617,7 +1271,7 @@ export function SchedulingPage() {
               >
                 <option value="">Select staff…</option>
                 {staff.map((s) => (
-                  <option key={s.id} value={s.id}>{s.first_name || s.username}</option>
+                  <option key={s.id} value={s.id}>{staffFullName(s)}</option>
                 ))}
               </select>
             </FormField>
@@ -630,6 +1284,7 @@ export function SchedulingPage() {
                   value={shiftModal.shift.start}
                   onChange={(e) => setShiftModal({ ...shiftModal, shift: { ...shiftModal.shift, start: e.target.value } })}
                 />
+                <PickedDay value={shiftModal.shift.start} />
               </FormField>
               <FormField label="End">
                 <input
@@ -639,6 +1294,7 @@ export function SchedulingPage() {
                   value={shiftModal.shift.end}
                   onChange={(e) => setShiftModal({ ...shiftModal, shift: { ...shiftModal.shift, end: e.target.value } })}
                 />
+                <PickedDay value={shiftModal.shift.end} />
               </FormField>
             </div>
             <FormField label="Role / note">
@@ -675,7 +1331,7 @@ export function SchedulingPage() {
                 </button>
               ) : <span />}
               <div className="flex gap-2">
-                <button type="button" className={btnSecondary} onClick={() => setShiftModal(null)}>Cancel</button>
+                <button type="button" className={btnSecondary} onClick={() => { setShiftModal(null); setShiftError(""); }}>Cancel</button>
                 <button type="submit" disabled={saving} className={btnPrimary}>{saving ? "Saving…" : "Save"}</button>
               </div>
             </div>

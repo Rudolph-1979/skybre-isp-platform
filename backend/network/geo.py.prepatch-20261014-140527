@@ -1,0 +1,99 @@
+"""Networking -> Map (#173/#174, Rudolph 14 Oct 2026: "One map that services
+everything"): the serviceability check.
+
+The map, address suggestions and satellite view are Google Maps (#174,
+Rudolph: "I would like to use google maps api"), loaded in the browser with
+settings.GOOGLE_MAPS_API_KEY. Google's terms don't allow Google address
+results on a non-Google map, so the OpenStreetMap search #173 had is gone.
+
+Serviceability: the nearest UISP towers to a point (distance and bearing),
+with the sectors at each. Coverage areas (KMZ import) come later; until then
+"covered" is None and the result says coverage isn't loaded.
+"""
+import logging
+import math
+
+from . import uisp
+
+logger = logging.getLogger(__name__)
+
+NEAREST = 5
+
+
+class GeoError(Exception):
+    pass
+
+
+# --- serviceability -------------------------------------------------------------
+
+def _distance_km(lat1, lng1, lat2, lng2):
+    r = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _bearing(lat1, lng1, lat2, lng2):
+    """Degrees from north, tower -> point (which way a sector must face)."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lng2 - lng1)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return round((math.degrees(math.atan2(x, y)) + 360) % 360)
+
+
+def _compass(deg):
+    return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((deg + 22.5) // 45) % 8]
+
+
+def check_point(lat, lng):
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        raise GeoError("Those coordinates aren't on Earth.")
+    towers = []
+    if uisp.configured():
+        devices = uisp.devices()
+        sites = uisp.sites()
+        # Stand-alone UISP sites (no parent, nothing under them) are client
+        # installs, not towers -- UISP's own map leaves them off too.
+        parents = {s["parent_id"] for s in sites if s["parent_id"]}
+        for s in sites:
+            if s["latitude"] is None or s["longitude"] is None:
+                continue
+            if not s["parent_id"] and s["id"] not in parents:
+                continue
+            here = [d for d in devices if d["site"] and d["site"]["id"] == s["id"]]
+            # Sectors: UISP access points, plus MikroTik sectors, which UISP
+            # only knows as black boxes -- recognised by "sect" in the name
+            # (WTH_SECT_01, ORX Sect 02 ...).
+            aps = [d for d in here if d["kind"] == "ap" or (d["black_box"] and "sect" in d["name"].lower())]
+            bearing = _bearing(s["latitude"], s["longitude"], lat, lng)
+            towers.append({
+                "id": s["id"],
+                "name": s["name"],
+                "latitude": s["latitude"],
+                "longitude": s["longitude"],
+                "distance_km": round(_distance_km(lat, lng, s["latitude"], s["longitude"]), 2),
+                "bearing": bearing,
+                "compass": _compass(bearing),
+                "devices": len(here),
+                "devices_offline": sum(1 for d in here if not d["online"]),
+                "access_points": [
+                    {"id": d["id"], "name": d["name"], "model": d["model"], "online": d["online"],
+                     "frequency_mhz": d["frequency_mhz"], "ssid": d.get("ssid") or "",
+                     "mikrotik": d["black_box"]}
+                    for d in sorted(aps, key=lambda d: d["name"].lower())
+                ],
+            })
+        towers.sort(key=lambda t: t["distance_km"])
+    return {
+        "point": {"lat": lat, "lng": lng},
+        "coverage": {
+            "loaded": False,
+            "covered": None,
+            "areas": [],
+            "note": "Coverage areas aren't loaded yet (KMZ import comes later). Use the nearest towers as a guide.",
+        },
+        "uisp_connected": uisp.configured(),
+        "nearest": towers[:NEAREST],
+    }

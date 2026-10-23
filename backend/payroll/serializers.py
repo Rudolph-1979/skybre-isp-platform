@@ -15,12 +15,18 @@ class StaffProfileSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source="user.username", read_only=True)
     role = serializers.CharField(source="user.role", read_only=True)
     phone = serializers.CharField(source="user.phone", read_only=True)
+    # Derived, so they cannot be written and cannot disagree with the date
+    # they come from. The same three words the vehicle discs use -- see
+    # fleet/renewals.py.
+    license_days_left = serializers.IntegerField(read_only=True, allow_null=True)
+    license_status = serializers.CharField(read_only=True)
 
     class Meta:
         model = StaffProfile
         fields = [
             "id", "user", "staff_name", "username", "role", "phone", "employee_number",
-            "id_number", "license_number",
+            "id_number", "license_number", "license_expiry",
+            "license_days_left", "license_status",
             "pay_type", "monthly_salary", "hourly_rate", "standard_daily_hours",
             "overtime_multiplier",
             "annual_leave_balance", "sick_leave_balance", "family_responsibility_leave_balance",
@@ -30,6 +36,17 @@ class StaffProfileSerializer(serializers.ModelSerializer):
 
     def get_staff_name(self, obj):
         return obj.user.get_full_name() or obj.user.username
+
+    def validate_license_expiry(self, value):
+        # Same reason as the vehicle disc: a slipped year is a valid date
+        # that quietly removes the person from every list that would have
+        # chased them.
+        from fleet.renewals import expiry_is_sane
+
+        problem = expiry_is_sane(value, StaffProfile.LICENCE_TERM_YEARS)
+        if problem:
+            raise serializers.ValidationError(problem)
+        return value
 
     def validate(self, attrs):
         pay_type = attrs.get("pay_type", getattr(self.instance, "pay_type", None))
@@ -168,7 +185,13 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "status", "generated_by", "created_at", "finalized_at", "lines"]
 
     def validate(self, attrs):
-        if attrs["period_end"] < attrs["period_start"]:
+        # A PATCH sends one field, so attrs may carry only one end of the
+        # period. Subscripting both raised KeyError, which reached the caller
+        # as a 500 rather than a validation error -- and the half of the
+        # period they did send went unchecked. Fall back to what is stored.
+        start = attrs.get("period_start", getattr(self.instance, "period_start", None))
+        end = attrs.get("period_end", getattr(self.instance, "period_end", None))
+        if start is not None and end is not None and end < start:
             raise serializers.ValidationError("Period end must be on or after period start.")
         return attrs
 

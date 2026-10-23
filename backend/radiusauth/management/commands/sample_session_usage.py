@@ -18,7 +18,8 @@ number 300 times.
 
     /ppp aaa set interim-update=1m     (on the router, for 1-minute figures)
 
-It also BANKS each delta it observes into UsageBucket, which is what makes
+It also BANKS each delta it observes into UsageBucket (hourly) and
+SpeedBucket (5-minute, for the speed graph), which is what makes
 per-day and per-hour usage answerable at all -- see that model's docstring.
 The rate and the usage figure therefore come from the same measurement, so
 they can never disagree about how many bytes moved.
@@ -27,6 +28,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from ...models import RadAcct, SessionUsageSnapshot
+from ...speed import bank_speed, prune_speed_buckets
 from ...usage import bank_usage
 
 
@@ -105,6 +107,7 @@ class Command(BaseCommand):
                 # have never been banked, so they are banked now. Small by
                 # definition: the reset just happened.
                 bank_usage(row["username"] or "", now, download=out_octets, upload=in_octets)
+                bank_speed(row["username"] or "", None, now, download=out_octets, upload=in_octets)
                 banked += out_octets + in_octets
                 snap.last_input_octets = in_octets
                 snap.last_output_octets = out_octets
@@ -128,6 +131,9 @@ class Command(BaseCommand):
                 up_delta = in_octets - snap.last_input_octets
                 down_delta = out_octets - snap.last_output_octets
                 bank_usage(row["username"] or "", now, download=down_delta, upload=up_delta)
+                # Same delta, spread over the 5-minute slots it covers, for
+                # the speed graph (radiusauth.speed).
+                bank_speed(row["username"] or "", snap.last_change_at, now, download=down_delta, upload=up_delta)
                 banked += down_delta + up_delta
 
                 seconds = (now - snap.last_change_at).total_seconds()
@@ -149,7 +155,19 @@ class Command(BaseCommand):
         removed = stale.count()
         stale.delete()
 
+        # 5-minute speed detail is only kept SPEED_RETENTION_DAYS; a quarter-
+        # hourly sweep keeps the table bounded without a separate cron line.
+        if now.minute % 15 == 0:
+            prune_speed_buckets(now)
+
+        # A client whose line has just come up for the first time moves from
+        # Active to Online (customers.go_live, 6 Oct 2026).
+        from customers.go_live import promote_live_customers
+
+        went_live = promote_live_customers(now)
+
         self.stdout.write(
             f"{len(live_ids)} live session(s): {created} new, {updated} updated, "
             f"{removed} finished session(s) cleared. Banked {banked} byte(s)."
+            + (f" {went_live} client(s) went live: Active -> Online." if went_live else "")
         )

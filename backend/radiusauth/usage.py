@@ -93,6 +93,57 @@ LIVE_SESSION_STALE_SECONDS = 900
 ROUTER_RATE_STALE_SECONDS = 45
 
 
+def last_sessions(usernames):
+    """When each login's session last came up and last went down (Rudolph,
+    15 Oct 2026: "I need info of last session down and last session up time").
+
+    up_at      start of the newest session.
+    down_at    stop of the newest session that has ended, with RADIUS's
+               terminate cause (Lost-Carrier, User-Request, Admin-Reset ...).
+    state      "up"    newest session open and heard from recently;
+               "silent" newest session open but no update for
+                       LIVE_SESSION_STALE_SECONDS -- it probably dropped
+                       without sending a Stop (a CPE losing power never
+                       does), so heard_at is the best "down" we have;
+               "down"  newest session has ended.
+    """
+    out = []
+    cutoff = timezone.now() - timezone.timedelta(seconds=LIVE_SESSION_STALE_SECONDS)
+    for username in usernames:
+        newest = (
+            RadAcct.objects.filter(username=username, acctstarttime__isnull=False)
+            .order_by("-acctstarttime")
+            .values("acctstarttime", "acctstoptime", "acctupdatetime", "acctterminatecause")
+            .first()
+        )
+        if newest is None:
+            out.append({"username": username, "state": None, "up_at": None, "down_at": None,
+                        "down_cause": "", "heard_at": None})
+            continue
+        ended = (
+            RadAcct.objects.filter(username=username, acctstoptime__isnull=False)
+            .order_by("-acctstoptime")
+            .values("acctstoptime", "acctterminatecause")
+            .first()
+        )
+        heard = newest["acctupdatetime"] or newest["acctstarttime"]
+        if newest["acctstoptime"] is not None:
+            state = "down"
+        elif heard is not None and heard < cutoff:
+            state = "silent"
+        else:
+            state = "up"
+        out.append({
+            "username": username,
+            "state": state,
+            "up_at": newest["acctstarttime"],
+            "down_at": ended["acctstoptime"] if ended else None,
+            "down_cause": (ended["acctterminatecause"] or "") if ended else "",
+            "heard_at": heard,
+        })
+    return out
+
+
 def live_state(usernames):
     """Current sessions and their throughput, from the derived snapshots.
 
@@ -191,6 +242,37 @@ def parse_anchor(raw):
     return datetime.datetime.strptime(raw, "%Y-%m-%d").date()
 
 
+def _best_month_totals(usernames, start, end, session_totals):
+    """The month's figure from whichever source saw more of it.
+
+    CORRECTED 5 Oct 2026: "Used this month" read 32.5 MB beside a graph of
+    153 GB for the same month. The tile summed radacct sessions that STARTED
+    this month, so an always-on PPPoE session that began in September
+    contributed nothing; the graph sums UsageBucket, which banks bytes in
+    the hour they move. Both can only ever under-count (sessions: anything
+    still running from an earlier month; buckets: anything before
+    accumulation began), so the larger of the two is the better figure --
+    and once accumulation covers the whole month, the buckets are simply
+    right. `totals_source` says which one is showing.
+    """
+    from .models import UsageBucket
+
+    session_totals = dict(session_totals)
+    if not usernames:
+        session_totals["totals_source"] = "sessions"
+        return session_totals
+    agg = UsageBucket.objects.filter(
+        username__in=usernames, bucket_start__gte=start, bucket_start__lt=end
+    ).aggregate(down=Sum("download_bytes"), up=Sum("upload_bytes"))
+    down, up = agg["down"] or 0, agg["up"] or 0
+    if down + up >= session_totals["total_bytes"]:
+        session_totals.update(download_bytes=down, upload_bytes=up, total_bytes=down + up)
+        session_totals["totals_source"] = "accumulated"
+    else:
+        session_totals["totals_source"] = "sessions"
+    return session_totals
+
+
 def customer_usage(customer, year=None, month=None, period=None, anchor=None):
     """Everything a usage view needs for one customer.
 
@@ -206,6 +288,7 @@ def customer_usage(customer, year=None, month=None, period=None, anchor=None):
 
     usernames = usernames_for_customer(customer)
     totals = period_totals(usernames, start, end)
+    totals = _best_month_totals(usernames, start, end, totals)
 
     # The cap is per service; a customer with two services has two caps.
     # Summing them is the only sensible single number, and 0/None on any
@@ -227,6 +310,7 @@ def customer_usage(customer, year=None, month=None, period=None, anchor=None):
         "cap_bytes": cap_bytes,
         **totals,
         "live_sessions": live_state(usernames),
+        "last_sessions": last_sessions(usernames),
     }
 
     if period:
@@ -435,7 +519,57 @@ def measurement_start():
     return first
 
 
-def usage_report(customers, period="month", anchor=None, limit=None):
+#: What a report row may be sorted by, and how each one sorts. Whitelisted
+#: rather than passed through to a generic sorter, because the ordering comes
+#: off a query string: an unknown field must be ignored, not raise.
+#:
+#: Each entry is (key function, whether bigger is "first" when descending).
+#: Name sorts case-insensitively -- "van Wyk" and "Van Den Heever" filing in
+#: different places is a bug to a human reader, whatever ASCII thinks.
+REPORT_SORT_KEYS = {
+    "full_name": lambda r: (r["full_name"] or "").lower(),
+    "customer_ref": lambda r: r["customer_ref"] or "",
+    "download_bytes": lambda r: r["download_bytes"],
+    "upload_bytes": lambda r: r["upload_bytes"],
+    "total_bytes": lambda r: r["total_bytes"],
+    # Handled specially in sort_report_rows -- see there.
+    "cap_used_pct": lambda r: r["cap_used_pct"] or 0,
+}
+
+DEFAULT_ORDERING = "-total_bytes"
+
+
+def sort_report_rows(rows, ordering):
+    """Order `rows` by an `ordering` string like "full_name" or "-total_bytes".
+
+    Unknown fields leave the rows alone: the ordering arrives from a URL, and
+    a stale bookmark or a typo should show the default report rather than an
+    error page.
+    """
+    field = (ordering or "").lstrip("-")
+    key = REPORT_SORT_KEYS.get(field)
+    if key is None:
+        return rows
+    descending = (ordering or "").startswith("-")
+
+    if field == "cap_used_pct":
+        # Uncapped customers sort below every capped one in BOTH directions.
+        # "Cap" answers "who is closest to their limit", and a customer who
+        # has no limit is not an answer to it either way up. Treating them as
+        # 0% would put them first on an ascending sort -- filling the top of
+        # the page with the rows the column does not apply to -- and treating
+        # them as 100% would be a lie in the other direction. They are not on
+        # the scale, so they go after it.
+        capped = sorted(
+            (r for r in rows if r["cap_used_pct"] is not None),
+            key=key, reverse=descending,
+        )
+        return capped + [r for r in rows if r["cap_used_pct"] is None]
+
+    return sorted(rows, key=key, reverse=descending)
+
+
+def usage_report(customers, period="month", anchor=None, limit=None, ordering=None):
     """Totals per customer for one period, heaviest first.
 
     Built for "who is hammering the network this week" and "who is near their
@@ -445,6 +579,9 @@ def usage_report(customers, period="month", anchor=None, limit=None):
     login back to its customer, one to sum the buckets. The obvious
     implementation -- usage_series per customer -- is one query each and turns
     a 500-customer report into 500 round trips.
+
+    `ordering` reorders the rows for display. It is applied AFTER `limit`,
+    deliberately -- see the comment at the sort below.
     """
     from billing.models import Service
 
@@ -511,8 +648,19 @@ def usage_report(customers, period="month", anchor=None, limit=None):
 
     # Heaviest first, then by name so equal totals don't reshuffle each load.
     results.sort(key=lambda r: (-r["total_bytes"], r["full_name"]))
+    total_rows = len(results)
+
+    # The LIMIT is applied on THIS ordering, always -- before any ordering the
+    # caller asked for. Cutting after an arbitrary sort would change which
+    # customers you are looking at every time you clicked a column header:
+    # sort by name, and the top 200 becomes "A through D" with the heaviest
+    # users silently off the page. The cut decides who matters; the ordering
+    # only decides how those are arranged. `total_rows` says when a cut
+    # happened, so the page can admit it rather than quietly showing part of
+    # the answer.
     if limit:
         results = results[:limit]
+    results = sort_report_rows(results, ordering)
 
     return {
         "period": period,
@@ -520,6 +668,8 @@ def usage_report(customers, period="month", anchor=None, limit=None):
         "start": start,
         "end": end,
         "measuring_since": measurement_start(),
+        "ordering": ordering or DEFAULT_ORDERING,
+        "total_rows": total_rows,
         "results": results,
     }
 

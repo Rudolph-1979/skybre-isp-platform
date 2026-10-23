@@ -1,0 +1,203 @@
+from django.db import transaction
+from django.db.models import Count
+from django.utils import timezone
+from rest_framework import viewsets, permissions
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import Job, JobType, SchedulingSettings, Shift
+from .serializers import JobSerializer, JobTypeSerializer, SchedulingSettingsSerializer, ShiftSerializer
+from .filters import JobFilter, ShiftFilter
+from accounts.permissions import IsStaffMember, section_permission
+from customers.scoping import scope_by_customer
+
+HasSchedulingAccess = section_permission("scheduling")
+
+
+class JobViewSet(viewsets.ModelViewSet):
+    """Field jobs and standalone tasks. Internal ops tooling — scoped to
+    staff/admin/technician only; customers never see this."""
+
+    serializer_class = JobSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
+    filterset_class = JobFilter
+    ordering_fields = [
+        "start", "end", "status", "job_type",
+        "customer__full_name", "created_at",
+    ]
+
+    def get_queryset(self):
+        # Partner-scoped like every other customer-linked list. Without
+        # this, a staff member restricted to one reseller saw that
+        # reseller's customers on the Customers page and then every
+        # partner's jobs here -- name, site address and phone on the
+        # calendar card -- and, because get_object() uses this same
+        # queryset, could reschedule or delete a competitor's installation.
+        #
+        # allow_null keeps standalone jobs visible: Job.customer is blank
+        # for office work and internal errands, which belong to no
+        # reseller. scope_by_customer's own docstring names this case.
+        #
+        # assigned_technicians and conecto_jobs are now both "many" sides
+        # (a job can carry more than one technician, and since it can, more
+        # than one push record too), so both move from select_related to
+        # prefetch_related -- select_related only works one row per join.
+        qs = scope_by_customer(
+            Job.objects.select_related("customer", "ticket", "deleted_by", "quote")
+            .prefetch_related("assigned_technicians", "conecto_jobs")
+            .all(),
+            self.request.user,
+        )
+        # The Deleted jobs pool (6 Oct 2026): a deleted job is invisible to
+        # everything except the three actions that manage that pool.
+        if self.action in ("deleted", "restore", "purge"):
+            return qs.filter(deleted_at__isnull=False)
+        return qs.filter(deleted_at__isnull=True)
+
+    def perform_destroy(self, instance):
+        """DELETE moves the job to the Deleted pool rather than erasing it.
+        The save fires the usual Conecto reconcile, which withdraws it from
+        technicians' phones (conecto.signals._schedule_job)."""
+        instance.deleted_at = timezone.now()
+        instance.deleted_by = self.request.user
+        instance.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+
+    @action(detail=False, methods=["get"], url_path="ticket-defaults")
+    def ticket_defaults(self, request):
+        """GET /api/jobs/ticket-defaults/?ticket=<id> -- what a job booked
+        from a ticket starts with (Rudolph, 8 Oct 2026: "create a in pool
+        schedule job from a ticket", "This ticket requires to be rescheduled
+        and I need a option to schedule here"). A technician's internal
+        ticket (return visit, quote needed...) has no client of its own, so
+        the client, address, job type and technicians come from the job it
+        was raised on."""
+        from conecto.client import job_address
+        from tickets.models import Ticket
+
+        try:
+            ticket = Ticket.objects.select_related("customer").get(pk=int(request.query_params.get("ticket", "")))
+        except (TypeError, ValueError, Ticket.DoesNotExist):
+            return Response({"detail": "Ticket not found."}, status=404)
+        source = None
+        link = getattr(ticket, "conecto_internal", None)
+        if link is not None and link.job_id:
+            source = link.job
+        customer = ticket.customer or (source.customer if source is not None else None)
+        if customer is not None:
+            # A partner-restricted user gets no client they couldn't open.
+            from customers.scoping import partner_condition
+
+            condition = partner_condition(request.user)
+            if condition is not None and not type(customer).objects.filter(condition, pk=customer.pk).exists():
+                customer, source = None, None
+        if source is not None:
+            location = job_address(source)
+        elif customer is not None:
+            location = job_address(Job(customer=customer))
+        else:
+            location = ""
+        return Response({
+            "ticket": ticket.pk,
+            "ticket_number": ticket.ticket_number,
+            "customer": customer.pk if customer is not None else None,
+            "customer_name": customer.full_name if customer is not None else None,
+            "title": f"{ticket.ticket_number}: {ticket.subject}"[:255],
+            "description": ticket.description or "",
+            "location": location,
+            "job_type": source.job_type if source is not None else None,
+            "assigned_technicians": list(source.assigned_technicians.values_list("id", flat=True))
+            if source is not None else [],
+            "source_job": source.pk if source is not None else None,
+        })
+
+    @action(detail=False, methods=["get"])
+    def deleted(self, request):
+        """The Deleted jobs pool, most recently deleted first."""
+        qs = self.filter_queryset(self.get_queryset()).order_by("-deleted_at")[:200]
+        return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=True, methods=["post"])
+    def restore(self, request, pk=None):
+        """Back where it was -- on the calendar at its time, or in the job
+        pool if it had none. Technicians who had it are sent it again."""
+        from conecto.models import ConectoJob
+
+        job = self.get_object()
+        with transaction.atomic():
+            # Their copy was withdrawn on delete; clearing what we last
+            # pushed makes the reconcile send it again rather than treat
+            # the (unchanged) job as already on their phone.
+            ConectoJob.objects.filter(job=job).update(pushed_digest="", last_status="")
+            job.deleted_at = None
+            job.deleted_by = None
+            job.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+        return Response(self.get_serializer(job).data)
+
+    @action(detail=True, methods=["delete"])
+    def purge(self, request, pk=None):
+        """Final delete, from the Deleted pool only. Cannot be undone."""
+        job = self.get_object()
+        job.delete()
+        return Response(status=204)
+
+
+class JobTypeViewSet(viewsets.ModelViewSet):
+    """Scheduling -> Job types: anyone who can work the schedule can add,
+    rename, recolour or switch off a type. Delete only when no job uses it
+    (old jobs must keep their label) -- otherwise switch it off.
+
+    Not partner-scoped: a job type is a label, with no customer on it."""
+
+    serializer_class = JobTypeSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
+    filterset_fields = ["is_active"]
+    pagination_class = None
+    queryset = JobType.objects.all()
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["job_counts"] = dict(
+            Job.objects.values("job_type").annotate(n=Count("id")).values_list("job_type", "n")
+        )
+        return context
+
+    def destroy(self, request, *args, **kwargs):
+        jt = self.get_object()
+        used = Job.objects.filter(job_type=jt.key).count()
+        if used:
+            return Response(
+                {"detail": f"{jt.name} is on {used} job{'s' if used != 1 else ''}. Switch it off instead."},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
+class SchedulingSettingsView(APIView):
+    """GET/PATCH /scheduling-settings/ -- the daily return of uncompleted
+    jobs to the pool: on/off and the time (6 Oct 2026)."""
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
+
+    def get(self, request):
+        return Response(SchedulingSettingsSerializer(SchedulingSettings.load()).data)
+
+    def patch(self, request):
+        serializer = SchedulingSettingsSerializer(SchedulingSettings.load(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class ShiftViewSet(viewsets.ModelViewSet):
+    """Deliberately NOT partner-scoped: a Shift is a staff roster entry
+    with no customer on it at all ("not tied to a specific customer job"
+    -- Shift's own docstring), so there is no partner dimension to filter
+    on. Who is on standby on Saturday is not one reseller's business."""
+
+    serializer_class = ShiftSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
+    filterset_class = ShiftFilter
+    ordering_fields = ["start", "end", "status", "staff__username"]
+
+    def get_queryset(self):
+        return Shift.objects.select_related("staff").all()

@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from .fnb_client import validate_api_base_url
 from .models import BankAccount, BankTransaction, BankFeedSyncLog
 
 
@@ -12,23 +13,98 @@ class BankAccountSerializer(serializers.ModelSerializer):
 
     api_client_secret = serializers.CharField(write_only=True, required=False, allow_blank=True)
     api_client_secret_set = serializers.SerializerMethodField()
+    # Derived and read-only, so the balance on screen can never be
+    # something somebody typed over the top of the transactions. Strings,
+    # like every other money field on this platform -- a JSON float is the
+    # one representation a currency amount should never travel in.
+    current_balance = serializers.SerializerMethodField()
+    balance_variance = serializers.SerializerMethodField()
+    # FNB connection (#185). Tokens never leave the server -- only the state.
+    connection_status = serializers.CharField(read_only=True)
+    api_connected_by_name = serializers.CharField(source="api_connected_by.username", read_only=True, default=None)
+    fnb_redirect_uri = serializers.SerializerMethodField()
 
     class Meta:
         model = BankAccount
         fields = [
             "id", "name", "account_number", "branch_code", "is_active",
             "api_base_url", "api_client_id", "api_client_secret", "api_client_secret_set",
+            "api_token_url", "api_authorize_url", "api_scope", "api_client_auth", "api_grant", "api_account_id",
+            "connection_status", "api_connected_at", "api_connected_by_name", "api_needs_reconnect",
+            "api_token_expires_at", "fnb_redirect_uri", "bank_balance", "bank_balance_at",
+            "opening_balance", "opening_balance_date", "current_balance",
+            "confirmed_balance", "confirmed_balance_at", "balance_variance",
             "last_synced_at", "last_sync_status", "last_sync_message", "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "last_synced_at", "last_sync_status", "last_sync_message", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "last_synced_at", "last_sync_status", "last_sync_message",
+            "created_at", "updated_at",
+            # Recorded through the confirm-balance action, which stamps who
+            # and when. Writable here they would be a way to declare the
+            # account reconciled without anybody having looked.
+            "confirmed_balance", "confirmed_balance_at",
+            # Set by the FNB connect / sync code only.
+            "api_connected_at", "api_needs_reconnect", "api_token_expires_at", "bank_balance", "bank_balance_at",
+        ]
 
     def get_api_client_secret_set(self, obj):
         return obj.api_client_secret_set()
+
+    def get_fnb_redirect_uri(self, obj):
+        from django.conf import settings
+
+        return getattr(settings, "FNB_REDIRECT_URI", "") or ""
+
+    def get_current_balance(self, obj):
+        balance = obj.current_balance
+        return None if balance is None else str(balance)
+
+    def get_balance_variance(self, obj):
+        variance = obj.balance_variance
+        return None if variance is None else str(variance)
+
+    def validate_api_base_url(self, value):
+        """Reject an address that cannot be a bank's before it is saved.
+
+        The failure this prevents is quiet: a wrong base URL is only ever
+        noticed as a failed sync an hour later, and the message it
+        produced named a status code rather than the mistake. Catching it
+        on save puts the explanation in front of the person who typed it,
+        while they still have the right value to hand.
+        """
+        try:
+            return validate_api_base_url(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def _validate_url(self, value):
+        try:
+            return validate_api_base_url(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate_api_token_url(self, value):
+        return self._validate_url(value)
+
+    def validate_api_authorize_url(self, value):
+        return self._validate_url(value)
 
     def _save_with_optional_secret(self, instance, validated_data):
         # A blank/omitted secret means "leave whatever's stored alone" --
         # only overwrite it when the admin actually typed a new value.
         secret = validated_data.pop("api_client_secret", None)
+        # A connection belongs to one client at one bank address: change
+        # either and the stored FNB tokens no longer apply (#185).
+        if instance.pk and any(
+            k in validated_data and validated_data[k] != getattr(instance, k)
+            for k in ("api_base_url", "api_token_url", "api_client_id", "api_grant")
+        ):
+            instance.api_access_token_enc = ""
+            instance.api_refresh_token_enc = ""
+            instance.api_token_expires_at = None
+            instance.api_connected_at = None
+            instance.api_connected_by = None
+            instance.api_needs_reconnect = False
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         if secret:
@@ -52,11 +128,13 @@ class BankTransactionSerializer(serializers.ModelSerializer):
     matched_customer_name = serializers.CharField(source="matched_customer.full_name", read_only=True, default=None)
     matched_supplier_name = serializers.CharField(source="matched_supplier.name", read_only=True, default=None)
     confirmed_by_name = serializers.CharField(source="confirmed_by.username", read_only=True, default=None)
+    duplicate_of_source = serializers.CharField(source="duplicate_of.source", read_only=True, default=None)
 
     class Meta:
         model = BankTransaction
         fields = [
-            "id", "account", "account_name", "source", "external_id", "date", "description", "amount",
+            "id", "account", "account_name", "source", "external_id", "date", "description", "reference", "amount",
+            "duplicate_of", "duplicate_of_source",
             "status", "matched_customer", "matched_customer_name",
             "matched_supplier", "matched_supplier_name", "match_method",
             "confirmed_by", "confirmed_by_name", "confirmed_at",

@@ -20,6 +20,7 @@ from rest_framework.test import APIClient
 
 from customers.models import Customer, Partner
 from customers.views import scope_customers_to_user
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -39,13 +40,16 @@ class ImportPartnerTests(TestCase):
         self.acme_staff = User.objects.create_user(
             username="acme-imports", password="pw-for-tests",
             role=User.Role.SUPPORT, allowed_partners=[self.acme.id],
+            allowed_sections=ALL_SECTIONS,
         )
         self.both_staff = User.objects.create_user(
             username="two-partners", password="pw-for-tests",
             role=User.Role.SUPPORT, allowed_partners=[self.acme.id, self.rival.id],
+            allowed_sections=ALL_SECTIONS,
         )
         self.hq_staff = User.objects.create_user(
-            username="hq-imports", password="pw-for-tests", role=User.Role.SUPPORT
+            username="hq-imports", password="pw-for-tests", role=User.Role.SUPPORT,
+            allowed_sections=ALL_SECTIONS,
         )
 
     def _commit(self, user, body, **extra):
@@ -71,6 +75,7 @@ class ImportPartnerTests(TestCase):
         rival_staff = User.objects.create_user(
             username="rival-staff", password="pw-for-tests",
             role=User.Role.SUPPORT, allowed_partners=[self.rival.id],
+            allowed_sections=ALL_SECTIONS,
         )
         visible = scope_customers_to_user(Customer.objects.all(), rival_staff)
         self.assertFalse(visible.filter(full_name="Thabo Nkosi").exists())
@@ -147,7 +152,8 @@ class ImportMoneyAndAliasTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.staff = User.objects.create_user(
-            username="importer", password="pw-for-tests", role=User.Role.SUPPORT
+            username="importer", password="pw-for-tests", role=User.Role.SUPPORT,
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(self.staff)
 

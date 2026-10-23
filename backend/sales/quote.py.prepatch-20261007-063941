@@ -1,0 +1,78 @@
+"""The quote a lead gets (6 Oct 2026): a PDF on the company letterhead, and
+optionally emailed to the lead. Logged on the lead's timeline rather than
+in EmailLog -- a lead isn't a customer yet, and EmailLog hangs off one.
+"""
+from django.core.mail import EmailMultiAlternatives
+from django.utils import timezone
+from django.utils.html import escape, strip_tags
+
+from .models import LeadNote
+from .workflow import FlowError, quote_number, quote_totals
+
+
+def render_quote_pdf(lead) -> bytes:
+    from notifications.email_settings import get_email_config
+    from notifications.pdf import _company_block, _logo_path, _render_pdf
+
+    company, defaults = _company_block()
+    totals = quote_totals(lead)
+    items = []
+    if lead.interested_tariff_id:
+        items.append({"label": f"{lead.interested_tariff.name} (monthly)", "amount": totals["monthly"]["excl"]})
+    for item in lead.quote_items or []:
+        items.append({"label": f"{item['label']} (once-off)", "amount": item["amount"]})
+    context = {
+        "company_name": get_email_config()["company_name"],
+        "company": company,
+        "logo_path": _logo_path(defaults),
+        "generated_date": timezone.localdate(),
+        "lead": lead,
+        "number": quote_number(lead),
+        "quote_date": timezone.localtime(lead.quote_sent_at).date() if lead.quote_sent_at else timezone.localdate(),
+        "items": items,
+        "totals": totals,
+    }
+    return _render_pdf("notifications/lead_quote_pdf.html", context)
+
+
+def email_quote(lead, actor):
+    """Send the quote PDF to the lead. Raises FlowError when it can't."""
+    from notifications.email_settings import get_email_config, get_email_connection
+
+    recipient = (lead.email or "").strip()
+    if not recipient:
+        raise FlowError("This lead has no email address — add one, or download the PDF and send it yourself.")
+    config = get_email_config()
+    company = config["company_name"]
+    number = quote_number(lead)
+    totals = quote_totals(lead)
+    plan = lead.interested_tariff.name if lead.interested_tariff_id else "your internet service"
+    body = (
+        f"<p>Hi {escape(lead.full_name)},</p>"
+        f"<p>Thank you for your interest. Our quote <strong>{number}</strong> for "
+        f"<strong>{escape(plan)}</strong> is attached: R {totals['monthly']['incl']} per month incl. VAT"
+        + (f", plus R {totals['once_off']['incl']} once-off incl. VAT" if lead.quote_items else "")
+        + "."
+        + (f" It is valid until {lead.quote_valid_until:%d %B %Y}." if lead.quote_valid_until else "")
+        + "</p><p>Reply to this email to accept it, or if you have any questions.</p>"
+        f"<p>{escape(company)}</p>"
+    )
+    pdf = render_quote_pdf(lead)
+    try:
+        message = EmailMultiAlternatives(
+            subject=f"Quote {number} — {company}",
+            body=strip_tags(body),
+            from_email=config["from_email"],
+            to=[recipient],
+            connection=get_email_connection(),
+        )
+        message.attach_alternative(body, "text/html")
+        message.attach(f"{number}.pdf", pdf, "application/pdf")
+        message.send()
+    except Exception as exc:  # noqa: BLE001
+        LeadNote.objects.create(lead=lead, author=actor, kind=LeadNote.Kind.SYSTEM,
+                                body=f"Quote {number} email to {recipient} FAILED: {exc}")
+        raise FlowError(f"The quote was saved, but the email didn't go: {exc}")
+    LeadNote.objects.create(lead=lead, author=actor, kind=LeadNote.Kind.EMAIL,
+                            body=f"Quote {number} emailed to {recipient}.")
+    return recipient

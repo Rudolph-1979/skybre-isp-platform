@@ -1,0 +1,290 @@
+"""Administration -> Reports: clients per partner / per tariff (9 Oct 2026)."""
+from decimal import Decimal
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from billing.models import Service, Tariff
+from customers.models import Customer, Partner
+from customers.scoping import DIRECT
+
+User = get_user_model()
+ALL_SECTIONS = list(User.Section.values)
+
+
+class ReportFixture(TestCase):
+    def setUp(self):
+        self.vuma = Partner.objects.create(name="Vumatel")
+        self.acme = Partner.objects.create(name="Acme")
+        self.t4 = Tariff.objects.create(name="Wireless 4 Mbps", price=Decimal("149.00"), tax_rate_pct=Decimal("15"))
+        self.t10 = Tariff.objects.create(name="Fibre 10 Mbps", price=Decimal("400.00"), tax_rate_pct=Decimal("15"))
+        # Direct client, two lines: Skybre wireless (direct) + a Vumatel fibre line.
+        self.anna = Customer.objects.create(full_name="Anna", status="active")
+        Service.objects.create(customer=self.anna, tariff=self.t4, status="active")
+        Service.objects.create(customer=self.anna, tariff=self.t10, status="active", partner=self.vuma)
+        # Acme client, one suspended line (counted, not billed) + one terminated (ignored).
+        self.ben = Customer.objects.create(full_name="Ben", status="online", partner=self.acme)
+        Service.objects.create(customer=self.ben, tariff=self.t4, status="suspended")
+        Service.objects.create(customer=self.ben, tariff=self.t10, status="terminated")
+        # Acme client with no service at all.
+        self.cara = Customer.objects.create(full_name="Cara", status="active", partner=self.acme)
+        # Inactive client -- out unless the filter asks for it.
+        self.dan = Customer.objects.create(full_name="Dan", status="inactive")
+        Service.objects.create(customer=self.dan, tariff=self.t4, status="active")
+        self.api = APIClient()
+        self.staff = self._user(name="staff")
+
+    def _user(self, sections=None, role="support", allowed=None, name="u"):
+        return User.objects.create_user(
+            username=name, password="pw-for-tests-123", role=role,
+            allowed_sections=ALL_SECTIONS if sections is None else sections,
+            allowed_partners=allowed or [],
+        )
+
+    def _get(self, url, user=None):
+        self.api.force_authenticate(user or self.staff)
+        return self.api.get(url)
+
+    @staticmethod
+    def _by_name(data):
+        return {r["name"]: r for r in data["rows"]}
+
+class AdminReportTests(ReportFixture):
+    def test_per_partner_counts_each_line_partner(self):
+        res = self._get("/api/reports/clients-per-partner/?status=active,online")
+        self.assertEqual(res.status_code, 200, res.data)
+        rows = self._by_name(res.data)
+        self.assertEqual(rows["Direct (no partner)"]["clients"], 1)        # Anna
+        self.assertEqual(rows["Direct (no partner)"]["monthly_excl"], "149.00")
+        self.assertEqual(rows["Vumatel"]["clients"], 1)                     # Anna's fibre line
+        self.assertEqual(rows["Vumatel"]["monthly_excl"], "400.00")
+        self.assertEqual(rows["Acme"]["clients"], 2)                        # Ben + Cara
+        self.assertEqual(rows["Acme"]["services"], 1)                       # terminated left out
+        self.assertEqual(rows["Acme"]["monthly_excl"], "0.00")              # suspended not billed
+        # Anna is in two rows but one client.
+        self.assertEqual(res.data["total"]["clients"], 3)
+        self.assertEqual(res.data["total"]["services"], 3)
+        self.assertEqual(res.data["total"]["monthly_excl"], "549.00")
+
+    def test_per_tariff_and_no_live_service_row(self):
+        res = self._get("/api/reports/clients-per-tariff/?status=active,online")
+        rows = self._by_name(res.data)
+        self.assertEqual(rows["Wireless 4 Mbps"]["clients"], 2)             # Anna, Ben
+        self.assertEqual(rows["Wireless 4 Mbps"]["active_services"], 1)
+        self.assertEqual(rows["Fibre 10 Mbps"]["clients"], 1)               # Anna only (Ben's is terminated)
+        self.assertEqual(rows["No live service"]["clients"], 1)             # Cara
+        self.assertEqual(res.data["total"]["clients"], 3)
+
+    def test_status_filter_empty_means_all_and_bad_value_refused(self):
+        res = self._get("/api/reports/clients-per-tariff/")
+        self.assertEqual(res.data["total"]["clients"], 4)                   # Dan included
+        res = self._get("/api/reports/clients-per-tariff/?status=nonsense")
+        self.assertEqual(res.status_code, 400)
+
+    def test_click_through_lists_the_clients(self):
+        res = self._get(f"/api/reports/clients-per-partner/clients/?key={self.acme.pk}&status=active,online")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual([r["full_name"] for r in res.data["results"]], ["Ben", "Cara"])
+        ben = res.data["results"][0]
+        self.assertEqual([s["tariff"] for s in ben["services"]], ["Wireless 4 Mbps"])
+        res = self._get("/api/reports/clients-per-tariff/clients/?key=none&status=active,online")
+        self.assertEqual([r["full_name"] for r in res.data["results"]], ["Cara"])
+        res = self._get("/api/reports/clients-per-partner/clients/?key=direct&status=active,online")
+        self.assertEqual([r["full_name"] for r in res.data["results"]], ["Anna"])
+        self.assertEqual(res.data["results"][0]["monthly_excl"], "149.00")
+
+    def test_needs_administration_section(self):
+        no_admin = [s for s in ALL_SECTIONS if s != "administration"]
+        res = self._get("/api/reports/clients-per-partner/", self._user(sections=no_admin, name="desk"))
+        self.assertEqual(res.status_code, 403)
+        res = self._get("/api/reports/clients-per-tariff/clients/?key=none", self._user(sections=no_admin, name="d2"))
+        self.assertEqual(res.status_code, 403)
+        # Admin always has it, whatever is ticked.
+        res = self._get("/api/reports/clients-per-partner/", self._user(sections=[], role="admin", name="boss"))
+        self.assertEqual(res.status_code, 200)
+
+    def test_customer_role_gets_nothing(self):
+        user = User.objects.create_user(username="cust", password="pw-for-tests-123", role="customer")
+        res = self._get("/api/reports/clients-per-partner/", user)
+        self.assertEqual(res.status_code, 404)
+
+    def test_partner_restricted_user_sees_only_their_partners(self):
+        # Vumatel only: Anna is visible (her fibre line), but only that line.
+        user = self._user(allowed=[self.vuma.pk], name="vuma")
+        res = self._get("/api/reports/clients-per-partner/?status=active,online", user)
+        self.assertEqual(set(self._by_name(res.data)), {"Vumatel"})
+        self.assertEqual(res.data["total"]["monthly_excl"], "400.00")
+        res = self._get("/api/reports/clients-per-tariff/?status=active,online", user)
+        self.assertEqual(set(self._by_name(res.data)), {"Fibre 10 Mbps"})
+        # Acme + Direct: Anna's direct line, Ben, Cara -- never the Vumatel line.
+        user = self._user(allowed=[self.acme.pk, DIRECT], name="acme")
+        res = self._get("/api/reports/clients-per-partner/?status=active,online", user)
+        self.assertEqual(set(self._by_name(res.data)), {"Acme", "Direct (no partner)"})
+        self.assertEqual(res.data["total"]["clients"], 3)
+
+
+class TariffFilterTests(ReportFixture):
+    """Choose tariffs on Clients per tariff (9 Oct 2026)."""
+
+    def test_only_the_chosen_tariffs_and_their_own_total(self):
+        url = f"/api/reports/clients-per-tariff/?status=active,online&tariff={self.t10.pk}"
+        res = self._get(url)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(set(self._by_name(res.data)), {"Fibre 10 Mbps"})
+        self.assertEqual(res.data["total"]["clients"], 1)
+        self.assertEqual(res.data["total"]["monthly_excl"], "400.00")
+        # Every tariff still offered in the picker.
+        self.assertEqual([o["name"] for o in res.data["options"]],
+                         ["Fibre 10 Mbps", "Wireless 4 Mbps", "No live service"])
+
+    def test_two_tariffs_count_a_client_once(self):
+        url = f"/api/reports/clients-per-tariff/?status=active,online&tariff={self.t4.pk},{self.t10.pk}"
+        res = self._get(url)
+        self.assertEqual(res.data["total"]["clients"], 2)                   # Anna (both) + Ben
+        self.assertEqual(res.data["total"]["services"], 3)
+
+    def test_no_live_service_can_be_picked(self):
+        res = self._get("/api/reports/clients-per-tariff/?status=active,online&tariff=none")
+        self.assertEqual(set(self._by_name(res.data)), {"No live service"})
+        self.assertEqual(res.data["total"]["clients"], 1)
+
+
+class TariffPartnerFilterTests(ReportFixture):
+    """Clients per tariff, narrowed to partners (George, 13 Oct 2026)."""
+
+    def test_only_lines_with_the_picked_partner(self):
+        res = self._get(f"/api/reports/clients-per-tariff/?status=active,online&partner={self.vuma.pk}")
+        self.assertEqual(res.status_code, 200, res.data)
+        rows = self._by_name(res.data)
+        # Only Anna's Vumatel fibre line; her direct wireless line is out.
+        self.assertEqual(set(rows), {"Fibre 10 Mbps"})
+        self.assertEqual(rows["Fibre 10 Mbps"]["clients"], 1)
+        self.assertEqual(res.data["total"]["monthly_excl"], "400.00")
+        self.assertEqual(res.data["partners"], [str(self.vuma.pk)])
+
+    def test_direct_and_no_live_service_by_own_partner(self):
+        rows = self._by_name(self._get("/api/reports/clients-per-tariff/?status=active,online&partner=direct").data)
+        self.assertEqual(set(rows), {"Wireless 4 Mbps"})                  # Anna's direct line
+        rows = self._by_name(self._get(f"/api/reports/clients-per-tariff/?status=active,online&partner={self.acme.pk}").data)
+        self.assertEqual(rows["Wireless 4 Mbps"]["clients"], 1)            # Ben (suspended line)
+        self.assertEqual(rows["No live service"]["clients"], 1)            # Cara
+
+    def test_options_and_bad_partner(self):
+        data = self._get("/api/reports/clients-per-tariff/?status=active,online").data
+        self.assertIn("direct", {o["key"] for o in data["partner_options"]})
+        res = self._get("/api/reports/clients-per-tariff/?partner=99999")
+        self.assertEqual(res.status_code, 400)
+
+    def test_click_through_follows_the_partner(self):
+        url = f"/api/reports/clients-per-tariff/clients/?key={self.t4.pk}&status=active,online&partner={self.acme.pk}"
+        names = [c["full_name"] for c in self._get(url).data["results"]]
+        self.assertEqual(names, ["Ben"])
+
+
+class ExportClientsTests(ReportFixture):
+    """?clients=1 lists each row's clients for the CSV (13 Oct 2026)."""
+
+    def test_tariff_rows_carry_their_clients(self):
+        rows = self._by_name(self._get("/api/reports/clients-per-tariff/?status=active,online&clients=1").data)
+        self.assertEqual([c["full_name"] for c in rows["Wireless 4 Mbps"]["client_list"]], ["Anna", "Ben"])
+        self.assertEqual([c["full_name"] for c in rows["No live service"]["client_list"]], ["Cara"])
+
+    def test_partner_rows_carry_their_clients(self):
+        rows = self._by_name(self._get("/api/reports/clients-per-partner/?status=active,online&clients=1").data)
+        self.assertEqual([c["full_name"] for c in rows["Acme"]["client_list"]], ["Ben", "Cara"])
+
+    def test_excel_has_summary_and_clients_sheets(self):
+        import io
+
+        from openpyxl import load_workbook
+
+        res = self._get("/api/reports/clients-per-tariff/?status=active,online&filetype=xlsx")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("spreadsheetml", res["Content-Type"])
+        wb = load_workbook(io.BytesIO(res.content))
+        self.assertEqual(wb.sheetnames, ["Summary", "Clients"])
+        clients = [row[1] for row in wb["Clients"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(sorted(clients), ["Anna", "Anna", "Ben", "Cara"])
+        self.assertEqual(wb["Summary"].cell(row=wb["Summary"].max_row, column=1).value, "Total (distinct clients)")
+        res = self._get("/api/reports/clients-per-partner/?status=active,online&filetype=xlsx")
+        self.assertEqual(load_workbook(io.BytesIO(res.content)).sheetnames, ["Summary", "Clients"])
+
+    def test_left_out_unless_asked(self):
+        rows = self._get("/api/reports/clients-per-tariff/?status=active,online").data["rows"]
+        self.assertTrue(all("client_list" not in r for r in rows))
+
+
+class AlphabeticalOrderTests(ReportFixture):
+    """Rows are A-Z, numbers as numbers, "No live service" last (9 Oct 2026)."""
+
+    def test_tariff_rows_are_alphabetical(self):
+        Tariff.objects.create(name="Wireless 10 Mbps", price=Decimal("299.00"), tax_rate_pct=Decimal("15"))
+        t = Tariff.objects.get(name="Wireless 10 Mbps")
+        Service.objects.create(customer=self.cara, tariff=t, status="active")
+        Customer.objects.create(full_name="Eve", status="active")              # no live service
+        res = self._get("/api/reports/clients-per-tariff/?status=active,online")
+        self.assertEqual([r["name"] for r in res.data["rows"]],
+                         ["Fibre 10 Mbps", "Wireless 4 Mbps", "Wireless 10 Mbps", "No live service"])
+        self.assertEqual([o["name"] for o in res.data["options"]],
+                         ["Fibre 10 Mbps", "Wireless 4 Mbps", "Wireless 10 Mbps", "No live service"])
+
+    def test_partner_rows_are_alphabetical(self):
+        res = self._get("/api/reports/clients-per-partner/?status=active,online")
+        self.assertEqual([r["name"] for r in res.data["rows"]], ["Acme", "Direct (no partner)", "Vumatel"])
+
+
+class TariffCostTests(ReportFixture):
+    """Cost per tariff and markup (George, 13 Oct 2026): cost on active AND
+    suspended lines; uncosted tariffs left out and counted, never free."""
+
+    def setUp(self):
+        super().setUp()
+        self.t4.cost_price = Decimal("60.00")
+        self.t4.save()
+
+    def test_tariff_row_cost_counts_suspended_lines(self):
+        rows = self._by_name(self._get("/api/reports/clients-per-tariff/?status=active,online").data)
+        w4 = rows["Wireless 4 Mbps"]        # Anna active (R149) + Ben suspended (R0), R60 cost each
+        self.assertEqual(w4["monthly_cost"], "120.00")
+        self.assertEqual(w4["gross_profit"], "29.00")
+        self.assertEqual(w4["markup_pct"], "24.2")
+        self.assertEqual(w4["margin_pct"], "19.5")
+        self.assertEqual(w4["uncosted_lines"], 0)
+        self.assertEqual((w4["unit_price"], w4["unit_cost"], w4["unit_markup_pct"]), ("149.00", "60.00", "148.3"))
+
+    def test_uncosted_tariff_is_not_free(self):
+        rows = self._by_name(self._get("/api/reports/clients-per-tariff/?status=active,online").data)
+        f10 = rows["Fibre 10 Mbps"]
+        self.assertIsNone(f10["monthly_cost"])
+        self.assertIsNone(f10["markup_pct"])
+        self.assertEqual(f10["uncosted_lines"], 1)
+        self.assertIsNone(f10["unit_cost"])
+
+    def test_total_is_over_costed_lines_only(self):
+        total = self._get("/api/reports/clients-per-tariff/?status=active,online").data["total"]
+        self.assertEqual(total["monthly_cost"], "120.00")
+        self.assertEqual(total["gross_profit"], "29.00")
+        self.assertEqual(total["uncosted_lines"], 1)
+        self.assertEqual(total["monthly_excl"], "549.00")   # revenue total unchanged
+
+    def test_partner_report_carries_cost_too(self):
+        rows = self._by_name(self._get("/api/reports/clients-per-partner/?status=active,online").data)
+        self.assertEqual(rows["Acme"]["monthly_cost"], "60.00")      # Ben's suspended line
+        self.assertEqual(rows["Acme"]["gross_profit"], "-60.00")
+        self.assertNotIn("unit_cost", rows["Acme"])
+
+    def test_service_and_tariff_api_carry_cost(self):
+        from billing.serializers import ServiceSerializer
+
+        line = Service.objects.filter(customer=self.anna, tariff=self.t4).first()
+        self.assertEqual(ServiceSerializer(line).data["cost"], "60.00")
+        other = Service.objects.filter(customer=self.anna, tariff=self.t10).first()
+        self.assertIsNone(ServiceSerializer(other).data["cost"])
+        admin = self._user(role="admin", name="boss")
+        self.api.force_authenticate(admin)
+        res = self.api.patch(f"/api/tariffs/{self.t10.pk}/", {"cost_price": "250.00"}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["cost_price"], "250.00")
+        cleared = self.api.patch(f"/api/tariffs/{self.t10.pk}/", {"cost_price": None}, format="json")
+        self.assertIsNone(cleared.data["cost_price"])

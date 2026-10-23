@@ -4,22 +4,33 @@ import { api } from "../../api/client";
 import { useViewAs } from "../../context/ViewAsContext";
 import { StatCard } from "../../components/StatCard";
 import { StatusBadge } from "../../components/StatusBadge";
+import { pauseLabel } from "../../components/ServicePause";
 import { PageHeader } from "../../components/PageHeader";
 import { UsagePanel } from "../../components/UsagePanel";
 import type { Customer, Service, Invoice } from "../../types";
+
+// `Service.price` is the tariff's EXCLUSIVE price -- what billing multiplies
+// up, not what the customer pays. The portal shows `price_incl_vat`, computed
+// server-side from the tariff's own rate (ServiceSerializer), because this is
+// the only number a customer can reconcile against their invoice.
+//
+// Typed locally rather than widening the shared Service interface: this is the
+// one screen that needs it, and `price_incl_vat` is absent on older API
+// responses, so the optional field keeps a cached page from blanking out.
+type PortalService = Service & { price_incl_vat?: string | null };
 
 export function PortalDashboard() {
   // The signed-in customer normally, or the customer a staff member is
   // viewing the portal as (see ViewAsContext).
   const { effectiveCustomerId: customerId } = useViewAs();
   const [customer, setCustomer] = useState<Customer | null>(null);
-  const [services, setServices] = useState<Service[]>([]);
+  const [services, setServices] = useState<PortalService[]>([]);
   const [latestInvoice, setLatestInvoice] = useState<Invoice | null>(null);
 
   useEffect(() => {
     if (!customerId) return;
     api.get<Customer>(`/customers/${customerId}/`).then((res) => setCustomer(res.data));
-    api.get<{ results: Service[] }>(`/services/?customer=${customerId}`).then((res) => setServices(res.data.results));
+    api.get<{ results: PortalService[] }>(`/services/?customer=${customerId}`).then((res) => setServices(res.data.results));
     api
       .get<{ results: Invoice[] }>(`/invoices/?customer=${customerId}&ordering=-date_created&page_size=1`)
       .then((res) => setLatestInvoice(res.data.results[0] ?? null));
@@ -47,9 +58,16 @@ export function PortalDashboard() {
           <div key={s.id} className="flex items-center justify-between rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4">
             <div>
               <p className="font-medium">{s.tariff_name}</p>
-              <p className="text-sm text-[var(--text-muted)]">R {parseFloat(s.price).toFixed(2)} / month</p>
+              {/* The "incl. VAT" label is only printed when the inclusive
+                  figure is the one actually being shown. Falling back to the
+                  exclusive price under an inclusive label would understate
+                  the bill by 15% and look authoritative doing it. */}
+              <p className="text-sm text-[var(--text-muted)]">
+                R {parseFloat(s.price_incl_vat ?? s.price).toFixed(2)} / month
+                {s.price_incl_vat ? <span className="ml-1 text-xs">incl. VAT</span> : null}
+              </p>
             </div>
-            <StatusBadge status={s.status} />
+            <StatusBadge status={s.status} label={pauseLabel(s)} />
           </div>
         ))}
         {services.length === 0 && <p className="text-sm text-[var(--text-muted)]">No services on your account yet.</p>}

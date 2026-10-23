@@ -19,6 +19,7 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from customers.models import Customer, CustomerDeletionRequest, Partner
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -43,9 +44,11 @@ class BulkDeleteScopingTests(TestCase):
         self.restricted = User.objects.create_user(
             username="acme-manager", password="pw-for-tests",
             role=User.Role.MANAGEMENT, allowed_partners=[self.acme.id],
+            allowed_sections=ALL_SECTIONS,
         )
         self.unrestricted = User.objects.create_user(
-            username="hq-manager", password="pw-for-tests", role=User.Role.MANAGEMENT
+            username="hq-manager", password="pw-for-tests", role=User.Role.MANAGEMENT,
+            allowed_sections=ALL_SECTIONS,
         )
 
     def _bulk_delete(self, user, ids):

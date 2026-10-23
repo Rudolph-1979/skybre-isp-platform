@@ -4,17 +4,22 @@ import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
-import { StatusBadge } from "../../components/StatusBadge";
+import { InvoiceStatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { PdfPreviewModal } from "../../components/PdfPreviewModal";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { formatIsoDate } from "../../utils/billingTerms";
 import type { Invoice, Customer, Product, Tariff, InvoiceItemType } from "../../types";
 
 // The three document kinds share one table and one PDF endpoint; only the
-// wording differs, and it follows the row's own status.
-function docNounFor(status: Invoice["status"]) {
-  return status === "quote" ? "quote" : status === "proforma" ? "pro forma" : "invoice";
+// wording differs, and it follows the row's own status -- except a credit
+// note, which is an Invoice row with a negative total and can carry any
+// status word, so that's checked first (see billing/statements.py's
+// movements()).
+function docNounFor(invoice: Pick<Invoice, "status" | "total">) {
+  if (parseFloat(invoice.total) < 0) return "credit note";
+  return invoice.status === "quote" ? "quote" : invoice.status === "proforma" ? "pro forma" : "invoice";
 }
 
 const COLUMNS: ColumnDef[] = [
@@ -55,6 +60,31 @@ const BLANK_LINE_ITEM: LineItem = {
   period_end: "",
 };
 
+// Which KIND of document, as opposed to its exact status. Backed by
+// InvoiceFilter.document_type, which already knew how to do this --
+// "invoice" means everything that ISN'T a quote or pro forma, and no
+// exact-status filter can express that.
+//
+// Rebuilt: this existed, was compiled into the running bundle, and was
+// then lost from the source when a cumulative build zip was extracted
+// over it. The backend half survived because it lives in filters.py,
+// which that zip did not touch.
+type DocType = "" | "quote" | "proforma" | "invoice";
+
+const DOC_TYPE_TABS: { value: DocType; label: string }[] = [
+  { value: "", label: "All documents" },
+  { value: "quote", label: "Quotes" },
+  { value: "proforma", label: "Pro formas" },
+  { value: "invoice", label: "Invoices" },
+];
+
+const DOC_TYPE_SUBTITLE: Record<DocType, string> = {
+  "": "quotes, pro formas, and invoices",
+  quote: "quotes only",
+  proforma: "pro formas only",
+  invoice: "invoices only — quotes and pro formas excluded",
+};
+
 type DateFilterMode = "all" | "30" | "60" | "90" | "custom";
 
 const DATE_FILTER_TABS: { mode: DateFilterMode; label: string }[] = [
@@ -71,6 +101,10 @@ export function InvoicesPage() {
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  // Defaults to real invoices. Opening Finance to a list dominated by
+  // quotes is not what anyone came here for.
+  const [docType, setDocType] = useState<DocType>("invoice");
+  const [exporting, setExporting] = useState(false);
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("invoices", ["number"]);
 
   let dateParams = "";
@@ -81,9 +115,34 @@ export function InvoicesPage() {
     if (customTo) dateParams += `&date_created_to=${customTo}`;
   }
 
+  // Assembled once and reused by both the list and the export, so the file
+  // can never disagree with the screen it was downloaded from.
+  const filterParams = `${dateParams}${statusFilter ? `&status=${statusFilter}` : ""}${
+    docType ? `&document_type=${docType}` : ""
+  }`;
+
   const { items, count, loading, refetch } = useApiList<Invoice>(
-    `/invoices/?page_size=100&ordering=${ordering}${dateParams}${statusFilter ? `&status=${statusFilter}` : ""}`
+    `/invoices/?page_size=100&ordering=${ordering}${filterParams}`
   );
+
+  async function exportCsv() {
+    setExporting(true);
+    try {
+      // Fetched with axios rather than a plain link: the endpoint needs the
+      // bearer token, and an <a href> carries no Authorization header.
+      const res = await api.get(`/invoices/export-csv/?ordering=${ordering}${filterParams}`, {
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(new Blob([res.data], { type: "text/csv" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `invoices_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  }
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   function toggleSort(field: string) {
@@ -103,6 +162,7 @@ export function InvoicesPage() {
   const [customer, setCustomer] = useState("");
   const [dateDue, setDateDue] = useState(new Date().toISOString().slice(0, 10));
   const [lineItems, setLineItems] = useState<LineItem[]>([{ ...BLANK_LINE_ITEM }]);
+  const [clientComment, setClientComment] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
   const [tariffs, setTariffs] = useState<Tariff[]>([]);
 
@@ -156,6 +216,7 @@ export function InvoicesPage() {
       await api.post("/invoices/", {
         customer,
         date_due: dateDue,
+        note: clientComment.trim(),
         status: modalKind === "quote" ? "quote" : "unpaid",
         items: lineItems.map((it) => ({
           item_type: it.itemType,
@@ -171,6 +232,7 @@ export function InvoicesPage() {
       });
       setShowModal(false);
       setLineItems([{ ...BLANK_LINE_ITEM }]);
+      setClientComment("");
       refetch();
     } finally {
       setSaving(false);
@@ -181,7 +243,7 @@ export function InvoicesPage() {
     <div>
       <PageHeader
         title="Invoices"
-        subtitle={`${count} document${count === 1 ? "" : "s"} matching current filter (quotes, pro formas, and invoices)`}
+        subtitle={`${count} document${count === 1 ? "" : "s"} matching current filter (${DOC_TYPE_SUBTITLE[docType]})`}
         actions={
           <>
             <button
@@ -205,6 +267,23 @@ export function InvoicesPage() {
           </>
         }
       />
+
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {DOC_TYPE_TABS.map((tab) => (
+          <button
+            key={tab.value || "all"}
+            type="button"
+            onClick={() => setDocType(tab.value)}
+            className={
+              docType === tab.value
+                ? "rounded-md bg-[var(--series-1)] px-3 py-1.5 text-sm font-medium text-white"
+                : "rounded-md border border-[var(--baseline)] px-3 py-1.5 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--tint-hover)]"
+            }
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         {DATE_FILTER_TABS.map((tab) => (
@@ -236,7 +315,12 @@ export function InvoicesPage() {
             Clear status
           </button>
         )}
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          {/* Exports what these filters are showing, not the page you can
+              see -- the server re-runs the same queryset. */}
+          <button type="button" className={btnSecondary} disabled={exporting || count === 0} onClick={exportCsv}>
+            {exporting ? "Exporting…" : `Export CSV${count ? ` (${count})` : ""}`}
+          </button>
           <ColumnToggle columns={COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["number"]} />
         </div>
       </div>
@@ -298,10 +382,10 @@ export function InvoicesPage() {
                   </Link>
                 </TD>
                 {isVisible("customer") && <TD>{inv.customer_name}</TD>}
-                {isVisible("due_date") && <TD>{inv.date_due}</TD>}
+                {isVisible("due_date") && <TD>{formatIsoDate(inv.date_due)}</TD>}
                 {isVisible("total") && <TD className="tabular-nums">R {parseFloat(inv.total).toFixed(2)}</TD>}
                 {isVisible("paid") && <TD className="tabular-nums">R {parseFloat(inv.paid_amount).toFixed(2)}</TD>}
-                {isVisible("status") && <TD><StatusBadge status={inv.status} /></TD>}
+                {isVisible("status") && <TD><InvoiceStatusBadge invoice={inv} /></TD>}
                 {isVisible("preview") && (
                   <TD>
                     <button
@@ -321,7 +405,7 @@ export function InvoicesPage() {
 
       {pdfFor && (
         <PdfPreviewModal
-          title={`${pdfFor.number} — ${docNounFor(pdfFor.status)}`}
+          title={`${pdfFor.number} — ${docNounFor(pdfFor)}`}
           url={`/invoices/${pdfFor.id}/pdf/`}
           filename={`${pdfFor.number}.pdf`}
           onClose={() => setPdfFor(null)}
@@ -452,6 +536,20 @@ export function InvoicesPage() {
             >
               + Add line item
             </button>
+
+            {/* Comments for the client (George, 14 Oct 2026) -- printed on the
+                quote/invoice PDF under "Comments", and carried over when a
+                quote is converted. */}
+            <FormField label="Comments for the client (optional — shown on the document)">
+              <textarea
+                className={inputClass}
+                rows={3}
+                maxLength={2000}
+                placeholder="e.g. Installation within 5 working days of acceptance. Price valid for 7 days."
+                value={clientComment}
+                onChange={(e) => setClientComment(e.target.value)}
+              />
+            </FormField>
 
             <div className="mt-4 flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>Cancel</button>

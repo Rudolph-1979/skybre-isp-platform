@@ -2,7 +2,8 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 from .views import (
     RadiusNasClientViewSet, RadAcctViewSet, OvpnSettingsView, OvpnClientConnectionViewSet,
-    CustomerUsageView, CustomerLiveRateView, PublicUsageView, UsageReportView,
+    CustomerUsageView, CustomerLiveRateView, CustomerSpeedView, PublicUsageView, UsageReportView,
+    UsageReportExportView,
     OfflineCustomersView, SpeedWindowViewSet, ServiceSpeedNowView,
 )
 
@@ -16,10 +17,13 @@ urlpatterns = router.urls + [
     path("ovpn-settings/", OvpnSettingsView.as_view(), name="ovpn-settings"),
     path("customers/<int:pk>/usage/", CustomerUsageView.as_view(), name="customer-usage"),
     path("customers/<int:pk>/live/", CustomerLiveRateView.as_view(), name="customer-live-rate"),
+    path("customers/<int:pk>/speed/", CustomerSpeedView.as_view(), name="customer-speed"),
     # Deliberately unauthenticated -- the token in the path IS the
     # credential. See PublicUsageView for what that means for what it
     # returns.
     path("usage-report/", UsageReportView.as_view(), name="usage-report"),
+    # Same report, same scoping, no row limit -- see UsageReportExportView.
+    path("usage-report/export/", UsageReportExportView.as_view(), name="usage-report-export"),
     path("offline-customers/", OfflineCustomersView.as_view(), name="offline-customers"),
     path("services/<int:pk>/speed-now/", ServiceSpeedNowView.as_view(), name="service-speed-now"),
     path("public/usage/<str:token>/", PublicUsageView.as_view(), name="public-usage"),

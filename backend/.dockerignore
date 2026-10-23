@@ -2,6 +2,19 @@ venv/
 __pycache__/
 *.pyc
 db.sqlite3
-.env
 server.log
 staticfiles/
+
+# .env* rather than .env, matching .gitignore, which spells out why: a
+# real .env.bak exists on the VPS from a duplicate-key cleanup and holds
+# a REAL SECRET_KEY. `COPY . .` put it in an image layer that survives
+# any later deletion -- and that key signs every /media/ download link.
+.env*
+
+# Customer and staff documents: expense receipts, supplier invoices, sick
+# notes, stock-receipt scans. The build runs in the deploy directory, so
+# without this every one of them is copied into an image layer.
+media/
+*.bak
+logs/
+*.log

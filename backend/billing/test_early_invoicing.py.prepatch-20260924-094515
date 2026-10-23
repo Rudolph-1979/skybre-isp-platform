@@ -1,0 +1,298 @@
+"""Early invoicing: the 1st's invoices issued days before, dated the 1st.
+
+Decided with Rudolph 2026-09-24, matching how Skybre ran Splynx ("Preview
+Invoices around the 24th, approve and let the invoices run although invoices
+are dated 1 October"):
+
+  * invoices only, DATED the billing date (date_issued) and due from it;
+  * emailed and debited to the balance when issued;
+  * cancellations and plan changes billed as they are on the day of the
+    early run -- nothing booked for later is applied early;
+  * no reminders, cut-off warnings or suspensions -- those run on their own
+    days;
+  * needs the same approved preview as a normal run, and spends it;
+  * refuses, writing nothing, without a valid approval, for a date that is
+    not 1-14 days ahead, or when a customer is due on a different date;
+  * the normal run on the date itself invoices nobody twice and says why.
+
+"Today" is pinned to 24 Sep 2026 (or the 1st, where a test moves it) so the
+tests do not depend on the calendar.
+"""
+import datetime
+from decimal import Decimal
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIRequestFactory, force_authenticate
+
+from customers.models import Customer
+
+from . import recurring
+from .models import (
+    BillingPreviewSnapshot, CustomerBillingConfig, Invoice, RecurringBillingRun, Service, Tariff,
+)
+
+TODAY = datetime.date(2026, 9, 24)
+BILL_DATE = datetime.date(2026, 10, 1)
+User = get_user_model()
+
+
+class _Clock:
+    """Pins django.utils.timezone.localdate; `self.today` moves it."""
+
+    def setUp(self):
+        self.today = TODAY
+        patcher = mock.patch("django.utils.timezone.localdate", side_effect=lambda *a, **k: self.today)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class EarlyInvoicingTests(_Clock, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tariff = Tariff.objects.create(name="Vuma 500", price=Decimal("607.83"),
+                                            tax_rate_pct=Decimal("15.00"))
+        self.new_tariff = Tariff.objects.create(name="Vuma 1000", price=Decimal("999.00"),
+                                                tax_rate_pct=Decimal("15.00"))
+        # Like Rudolph and Lucille: next_billing_date already 1 Oct.
+        self.dated = self._customer("Dated Dora", "CUS-008801", next_billing=BILL_DATE)
+        # Like the other seven: no next_billing_date, billing day 1.
+        self.undated = self._customer("Undated Uys", "CUS-008802", next_billing=None)
+
+    # --- fixtures ---------------------------------------------------------
+
+    def _customer(self, name, code, next_billing, billing_day=1):
+        customer = Customer.objects.create(
+            full_name=name, customer_id=code, email=f"{code.lower()}@example.com",
+            status=Customer.Status.ACTIVE,
+        )
+        Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=datetime.date(2026, 1, 1), radius_username=f"early_{code.lower()}",
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.auto_create_invoices = True
+        config.send_billing_notifications = True
+        config.billing_day = billing_day
+        config.next_billing_date = next_billing
+        config.payment_due_days = None
+        config.save()
+        return customer
+
+    def _approve(self, run_date=BILL_DATE):
+        from .preview_export import project_run, projection_digest
+
+        return BillingPreviewSnapshot.objects.create(
+            run_date=run_date, partner_ids=[],
+            fingerprint=projection_digest(project_run(run_date)),
+            counts={}, grand_total=Decimal("0"), sheets={}, approved_at=timezone.now(),
+        )
+
+    def _early(self, run_date=BILL_DATE):
+        with self.captureOnCommitCallbacks(execute=True):
+            return recurring.run_recurring_billing(run_date, commit=True, early=True)
+
+    def _invoices(self, customer=None):
+        qs = Invoice.objects.all()
+        return qs.filter(customer=customer) if customer else qs
+
+    # --- what an early run does -------------------------------------------
+
+    def test_invoices_are_dated_the_billing_date_and_due_from_it(self):
+        self._approve()
+        result = self._early()
+
+        self.assertEqual(result["counts"]["invoices_created"], 2)
+        for customer in (self.dated, self.undated):
+            invoice = self._invoices(customer).get()
+            self.assertEqual(invoice.status, Invoice.Status.UNPAID)
+            self.assertEqual(invoice.date_issued, BILL_DATE)
+            self.assertEqual(invoice.date_due, BILL_DATE)
+
+    def test_balance_is_debited_now(self):
+        self._approve()
+        self._early()
+        for customer in (self.dated, self.undated):
+            customer.refresh_from_db()
+            self.assertEqual(customer.balance, self._invoices(customer).get().total)
+
+    def test_invoice_emails_go_out_now(self):
+        self._approve()
+        self._early()
+        from notifications.models import EmailLog, EmailTemplate
+
+        logged = sorted(
+            EmailLog.objects.filter(template_key=EmailTemplate.Key.INVOICE)
+            .values_list("recipient_email", flat=True)
+        )
+        self.assertEqual(logged, ["cus-008801@example.com", "cus-008802@example.com"])
+
+    def test_next_billing_date_moves_to_the_next_cycle(self):
+        self._approve()
+        self._early()
+        for customer in (self.dated, self.undated):
+            customer.billing_config.refresh_from_db()
+            self.assertEqual(customer.billing_config.next_billing_date, datetime.date(2026, 11, 1))
+
+    def test_the_pdf_is_dated_the_billing_date(self):
+        from notifications import pdf
+
+        self._approve()
+        self._early()
+        seen = {}
+        with mock.patch.object(pdf, "_render_pdf", side_effect=lambda t, c: seen.update(c) or b"%PDF"):
+            pdf.render_invoice_pdf(self._invoices(self.dated).get(), "Skybre")
+        self.assertEqual(seen["document_date"], BILL_DATE)
+
+    def test_the_run_row_is_for_the_billing_date_and_spends_the_approval(self):
+        snapshot = self._approve()
+        result = self._early()
+        run = result["run"]
+        self.assertEqual(run.run_date, BILL_DATE)
+        self.assertEqual(run.status, RecurringBillingRun.Status.PROCESSED)
+        self.assertIn("Issued early on 2026-09-24 for 2026-10-01", run.status_message)
+        snapshot.refresh_from_db()
+        self.assertEqual(snapshot.run_id, run.pk)
+
+    # --- what an early run does NOT do ------------------------------------
+
+    def test_booked_plan_changes_and_cancellations_are_not_applied_early(self):
+        service = Service.objects.get(customer=self.dated)
+        Service.objects.filter(pk=service.pk).update(
+            pending_tariff=self.new_tariff, pending_tariff_date=datetime.date(2026, 9, 30),
+            end_date=datetime.date(2026, 9, 30),
+        )
+        self._approve()
+        self._early()
+        service.refresh_from_db()
+        self.assertEqual(service.tariff_id, self.tariff.pk, "a plan change was applied early")
+        self.assertEqual(service.status, Service.Status.ACTIVE, "a cancellation was applied early")
+        # ...and the invoice bills the plan as it is today.
+        self.assertEqual(self._invoices(self.dated).get().subtotal, Decimal("607.83"))
+
+    def test_no_reminders_warnings_or_suspensions(self):
+        self._approve()
+        with mock.patch.object(recurring, "_process_reminders") as reminders, \
+                mock.patch.object(recurring, "_process_suspension_warning") as warnings, \
+                mock.patch.object(recurring, "_process_blocking") as blocking:
+            self._early()
+        reminders.assert_not_called()
+        warnings.assert_not_called()
+        blocking.assert_not_called()
+
+    # --- refusals: nothing written ----------------------------------------
+
+    def _assert_nothing_written(self):
+        self.assertEqual(self._invoices().count(), 0)
+        self.assertEqual(RecurringBillingRun.objects.count(), 0)
+        from notifications.models import EmailLog
+
+        self.assertEqual(EmailLog.objects.count(), 0)
+
+    def test_refused_without_an_approval(self):
+        with self.assertRaises(recurring.EarlyInvoicingRefused) as ctx:
+            self._early()
+        self.assertIn("No approved preview", str(ctx.exception))
+        self._assert_nothing_written()
+
+    def test_refused_when_the_approval_is_stale(self):
+        self._approve()
+        Tariff.objects.filter(pk=self.tariff.pk).update(price=Decimal("650.00"))
+        with self.assertRaises(recurring.EarlyInvoicingRefused) as ctx:
+            self._early()
+        self.assertIn("no longer matches", str(ctx.exception))
+        self._assert_nothing_written()
+
+    def test_refused_for_today_or_the_past(self):
+        for when in (TODAY, TODAY - datetime.timedelta(days=1)):
+            with self.subTest(when=when):
+                with self.assertRaises(ValueError):
+                    self._early(when)
+        self._assert_nothing_written()
+
+    def test_refused_more_than_14_days_ahead(self):
+        far = TODAY + datetime.timedelta(days=recurring.EARLY_INVOICING_MAX_DAYS + 1)
+        self._approve(far)
+        with self.assertRaises(ValueError):
+            self._early(far)
+        self._assert_nothing_written()
+
+    def test_refused_when_a_customer_is_due_on_another_date(self):
+        # Someone whose own date is the 28th would get an invoice dated the 1st.
+        self._customer("Off Otto", "CUS-008803", next_billing=datetime.date(2026, 9, 28), billing_day=28)
+        self._approve()
+        with self.assertRaises(recurring.EarlyInvoicingRefused) as ctx:
+            self._early()
+        self.assertIn("CUS-008803", str(ctx.exception))
+        self._assert_nothing_written()
+
+    def test_a_normal_committed_run_for_a_future_date_is_still_refused(self):
+        self._approve()
+        with self.assertRaises(ValueError):
+            recurring.run_recurring_billing(BILL_DATE, commit=True)
+        self.assertEqual(self._invoices().count(), 0)
+
+    # --- the day itself ---------------------------------------------------
+
+    def test_the_run_on_the_day_invoices_nobody_twice_and_says_why(self):
+        self._approve()
+        early = self._early()["run"]
+        # created_at is the real clock; pin it to the early day so this test
+        # keeps meaning the same thing after 1 October.
+        RecurringBillingRun.objects.filter(pk=early.pk).update(
+            created_at=timezone.make_aware(datetime.datetime(2026, 9, 24, 10, 0))
+        )
+        self.today = BILL_DATE
+        with self.captureOnCommitCallbacks(execute=True):
+            result = recurring.run_recurring_billing(BILL_DATE, commit=True)
+        self.assertEqual(result["counts"]["invoices_created"], 0)
+        self.assertEqual(self._invoices().count(), 2)
+        self.assertIn(f"already invoiced early by run #{early.pk} on 2026-09-24", result["status_message"])
+
+
+class EarlyInvoicingApiTests(_Clock, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user(username="early_admin", password="x", role="admin")
+        tariff = Tariff.objects.create(name="Home 100", price=Decimal("899.00"), tax_rate_pct=Decimal("15.00"))
+        customer = Customer.objects.create(full_name="Api Anna", customer_id="CUS-008901",
+                                           email="anna@example.com", status=Customer.Status.ACTIVE)
+        Service.objects.create(customer=customer, tariff=tariff, status=Service.Status.ACTIVE,
+                               start_date=datetime.date(2026, 1, 1), radius_username="early_api_anna")
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.auto_create_invoices = True
+        config.billing_day = 1
+        config.next_billing_date = BILL_DATE
+        config.save()
+
+    def _post(self, date=BILL_DATE):
+        from .views import RecurringBillingViewSet
+
+        request = APIRequestFactory().post("/recurring-billing/run-early/", {"date": date.isoformat()}, format="json")
+        force_authenticate(request, user=self.staff)
+        with self.captureOnCommitCallbacks(execute=True):
+            return RecurringBillingViewSet.as_view({"post": "run_early"})(request)
+
+    def test_409_without_an_approval(self):
+        response = self._post()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(Invoice.objects.count(), 0)
+
+    def test_400_for_today(self):
+        self.assertEqual(self._post(TODAY).status_code, 400)
+
+    def test_200_with_an_approval(self):
+        from .preview_export import project_run, projection_digest
+
+        BillingPreviewSnapshot.objects.create(
+            run_date=BILL_DATE, partner_ids=[], fingerprint=projection_digest(project_run(BILL_DATE)),
+            counts={}, grand_total=Decimal("0"), sheets={}, approved_at=timezone.now(),
+        )
+        response = self._post()
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["run_date"], "2026-10-01")
+        self.assertEqual(Invoice.objects.get().date_issued, BILL_DATE)

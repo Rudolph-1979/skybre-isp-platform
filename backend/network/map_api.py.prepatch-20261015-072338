@@ -1,0 +1,37 @@
+"""Networking -> Map API (#173).
+
+GET /api/map/geocode/?q=<address>           up to 5 matches (OpenStreetMap)
+GET /api/map/serviceability/?lat=&lng=      nearest towers + coverage (KMZ later)
+"""
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from . import geo, uisp
+from .uisp_api import PERMS
+
+
+class MapGeocodeView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        try:
+            return Response({"results": geo.geocode(request.query_params.get("q", ""))})
+        except geo.GeoError as exc:
+            return Response({"detail": str(exc)}, status=400 if "3 characters" in str(exc) else 502)
+
+
+class MapServiceabilityView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        try:
+            lat = float(request.query_params.get("lat", ""))
+            lng = float(request.query_params.get("lng", ""))
+        except ValueError:
+            return Response({"detail": "lat and lng are required numbers."}, status=400)
+        try:
+            return Response(geo.check_point(lat, lng))
+        except geo.GeoError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        except uisp.UispError as exc:
+            return Response({"detail": str(exc)}, status=502)

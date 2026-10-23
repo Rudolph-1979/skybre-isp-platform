@@ -1,8 +1,15 @@
+from django.db import transaction
+from django.db.models import Count
+from django.utils import timezone
 from rest_framework import viewsets, permissions
-from .models import Job, Shift
-from .serializers import JobSerializer, ShiftSerializer
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import Job, JobType, SchedulingSettings, Shift
+from .serializers import JobSerializer, JobTypeSerializer, SchedulingSettingsSerializer, ShiftSerializer
 from .filters import JobFilter, ShiftFilter
 from accounts.permissions import IsStaffMember, section_permission
+from customers.scoping import scope_by_customer
 
 HasSchedulingAccess = section_permission("scheduling")
 
@@ -16,14 +23,275 @@ class JobViewSet(viewsets.ModelViewSet):
     filterset_class = JobFilter
     ordering_fields = [
         "start", "end", "status", "job_type",
-        "customer__full_name", "assigned_to__username",
+        "customer__full_name", "created_at",
     ]
 
     def get_queryset(self):
-        return Job.objects.select_related("customer", "assigned_to", "ticket").all()
+        # Partner-scoped like every other customer-linked list. Without
+        # this, a staff member restricted to one reseller saw that
+        # reseller's customers on the Customers page and then every
+        # partner's jobs here -- name, site address and phone on the
+        # calendar card -- and, because get_object() uses this same
+        # queryset, could reschedule or delete a competitor's installation.
+        #
+        # allow_null keeps standalone jobs visible: Job.customer is blank
+        # for office work and internal errands, which belong to no
+        # reseller. scope_by_customer's own docstring names this case.
+        #
+        # assigned_technicians and conecto_jobs are now both "many" sides
+        # (a job can carry more than one technician, and since it can, more
+        # than one push record too), so both move from select_related to
+        # prefetch_related -- select_related only works one row per join.
+        qs = scope_by_customer(
+            Job.objects.select_related("customer", "ticket", "deleted_by", "quote")
+            .prefetch_related("assigned_technicians", "conecto_jobs")
+            .all(),
+            self.request.user,
+        )
+        # The Deleted jobs pool (6 Oct 2026): a deleted job is invisible to
+        # everything except the three actions that manage that pool.
+        if self.action in ("deleted", "restore", "purge"):
+            return qs.filter(deleted_at__isnull=False)
+        return qs.filter(deleted_at__isnull=True)
+
+    def perform_destroy(self, instance):
+        """DELETE moves the job to the Deleted pool rather than erasing it.
+        The save fires the usual Conecto reconcile, which withdraws it from
+        technicians' phones (conecto.signals._schedule_job)."""
+        instance.deleted_at = timezone.now()
+        instance.deleted_by = self.request.user
+        instance.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """GET /api/jobs/export/?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+        [&technician=<user id>][&status=scheduled,completed,...]
+
+        The scheduled jobs whose start falls on those local dates (both
+        inclusive), as an Excel workbook (George, 14 Oct 2026). Same
+        partner scoping as the calendar; pool and deleted jobs left out."""
+        import datetime
+
+        from django.http import HttpResponse
+
+        from .job_export import build_jobs_xlsx, job_rows
+
+        try:
+            date_from = datetime.date.fromisoformat((request.query_params.get("date_from") or "").strip())
+            date_to = datetime.date.fromisoformat((request.query_params.get("date_to") or "").strip())
+        except ValueError:
+            return Response({"detail": "date_from and date_to are required (YYYY-MM-DD)."}, status=400)
+        if date_to < date_from:
+            return Response({"detail": "The end date is before the start date."}, status=400)
+        if (date_to - date_from).days > 366:
+            return Response({"detail": "Export at most a year at a time."}, status=400)
+
+        tz = timezone.get_current_timezone()
+        lo = timezone.make_aware(datetime.datetime.combine(date_from, datetime.time.min), tz)
+        hi = timezone.make_aware(datetime.datetime.combine(date_to + datetime.timedelta(days=1), datetime.time.min), tz)
+        jobs = self.get_queryset().filter(start__gte=lo, start__lt=hi)
+        tech = (request.query_params.get("technician") or "").strip()
+        if tech:
+            if not tech.isdigit():
+                return Response({"detail": "technician must be a user id."}, status=400)
+            jobs = jobs.filter(assigned_technicians=int(tech)).distinct()
+        statuses = [v for v in (request.query_params.get("status") or "").split(",") if v.strip()]
+        if statuses:
+            jobs = jobs.filter(status__in=statuses)
+
+        type_names = dict(JobType.objects.values_list("key", "name"))
+        rows = job_rows(jobs, type_names)
+        payload = build_jobs_xlsx(rows, type_names, date_from, date_to)
+        resp = HttpResponse(
+            payload, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        resp["Content-Disposition"] = f'attachment; filename="jobs-{date_from.isoformat()}-to-{date_to.isoformat()}.xlsx"'
+        return resp
+
+    @action(detail=False, methods=["get"])
+    def changelog(self, request):
+        """GET /api/jobs/changelog/?job=&q=&page= -- who created, scheduled,
+        moved, re-assigned, deleted or restored which job, newest first
+        (Rudolph, 8 Oct 2026). Read from the audit trail (audit.tracking
+        registers scheduling.Job). A partner-restricted user sees only jobs
+        they could open."""
+        from audit.models import AuditEvent
+
+        events = AuditEvent.objects.filter(target_type="scheduling.Job")
+        job = (request.query_params.get("job") or "").strip()
+        if job:
+            events = events.filter(target_id=job)
+        q = (request.query_params.get("q") or "").strip()
+        if q:
+            from django.db.models import Q
+
+            events = events.filter(Q(target_label__icontains=q) | Q(actor_label__icontains=q))
+        from customers.scoping import partner_condition
+
+        if partner_condition(request.user) is not None:
+            visible = scope_by_customer(Job.objects.all(), request.user).values_list("pk", flat=True)
+            events = events.filter(target_id__in=[str(pk) for pk in visible])
+        try:
+            page = max(1, int(request.query_params.get("page", "1")))
+        except ValueError:
+            page = 1
+        size = 25
+        rows = list(events.order_by("-created_at", "-pk")[(page - 1) * size: page * size + 1])
+        live = set(
+            Job.objects.filter(pk__in=[int(r.target_id) for r in rows if r.target_id.isdigit()], deleted_at__isnull=True)
+            .values_list("pk", flat=True)
+        )
+        return Response({
+            "page": page,
+            "has_more": len(rows) > size,
+            "results": [
+                {
+                    "id": r.pk,
+                    "at": r.created_at,
+                    "who": r.actor_label or "System",
+                    "action": r.action,
+                    "job": int(r.target_id) if r.target_id.isdigit() else None,
+                    "job_exists": r.target_id.isdigit() and int(r.target_id) in live,
+                    "label": r.target_label,
+                    "changes": r.changes,
+                    "detail": r.detail,
+                }
+                for r in rows[:size]
+            ],
+        })
+
+    @action(detail=False, methods=["get"], url_path="ticket-defaults")
+    def ticket_defaults(self, request):
+        """GET /api/jobs/ticket-defaults/?ticket=<id> -- what a job booked
+        from a ticket starts with (Rudolph, 8 Oct 2026: "create a in pool
+        schedule job from a ticket", "This ticket requires to be rescheduled
+        and I need a option to schedule here"). A technician's internal
+        ticket (return visit, quote needed...) has no client of its own, so
+        the client, address, job type and technicians come from the job it
+        was raised on."""
+        from conecto.client import job_address
+        from tickets.models import Ticket
+
+        try:
+            ticket = Ticket.objects.select_related("customer").get(pk=int(request.query_params.get("ticket", "")))
+        except (TypeError, ValueError, Ticket.DoesNotExist):
+            return Response({"detail": "Ticket not found."}, status=404)
+        source = None
+        link = getattr(ticket, "conecto_internal", None)
+        if link is not None and link.job_id:
+            source = link.job
+        customer = ticket.customer or (source.customer if source is not None else None)
+        if customer is not None:
+            # A partner-restricted user gets no client they couldn't open.
+            from customers.scoping import partner_condition
+
+            condition = partner_condition(request.user)
+            if condition is not None and not type(customer).objects.filter(condition, pk=customer.pk).exists():
+                customer, source = None, None
+        if source is not None:
+            location = job_address(source)
+        elif customer is not None:
+            location = job_address(Job(customer=customer))
+        else:
+            location = ""
+        return Response({
+            "ticket": ticket.pk,
+            "ticket_number": ticket.ticket_number,
+            "customer": customer.pk if customer is not None else None,
+            "customer_name": customer.full_name if customer is not None else None,
+            "title": f"{ticket.ticket_number}: {ticket.subject}"[:255],
+            "description": ticket.description or "",
+            "location": location,
+            "job_type": source.job_type if source is not None else None,
+            "assigned_technicians": list(source.assigned_technicians.values_list("id", flat=True))
+            if source is not None else [],
+            "source_job": source.pk if source is not None else None,
+        })
+
+    @action(detail=False, methods=["get"])
+    def deleted(self, request):
+        """The Deleted jobs pool, most recently deleted first."""
+        qs = self.filter_queryset(self.get_queryset()).order_by("-deleted_at")[:200]
+        return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=True, methods=["post"])
+    def restore(self, request, pk=None):
+        """Back where it was -- on the calendar at its time, or in the job
+        pool if it had none. Technicians who had it are sent it again."""
+        from conecto.models import ConectoJob
+
+        job = self.get_object()
+        with transaction.atomic():
+            # Their copy was withdrawn on delete; clearing what we last
+            # pushed makes the reconcile send it again rather than treat
+            # the (unchanged) job as already on their phone.
+            ConectoJob.objects.filter(job=job).update(pushed_digest="", last_status="")
+            job.deleted_at = None
+            job.deleted_by = None
+            job.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+        return Response(self.get_serializer(job).data)
+
+    @action(detail=True, methods=["delete"])
+    def purge(self, request, pk=None):
+        """Final delete, from the Deleted pool only. Cannot be undone."""
+        job = self.get_object()
+        job.delete()
+        return Response(status=204)
+
+
+class JobTypeViewSet(viewsets.ModelViewSet):
+    """Scheduling -> Job types: anyone who can work the schedule can add,
+    rename, recolour or switch off a type. Delete only when no job uses it
+    (old jobs must keep their label) -- otherwise switch it off.
+
+    Not partner-scoped: a job type is a label, with no customer on it."""
+
+    serializer_class = JobTypeSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
+    filterset_fields = ["is_active"]
+    pagination_class = None
+    queryset = JobType.objects.all()
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["job_counts"] = dict(
+            Job.objects.values("job_type").annotate(n=Count("id")).values_list("job_type", "n")
+        )
+        return context
+
+    def destroy(self, request, *args, **kwargs):
+        jt = self.get_object()
+        used = Job.objects.filter(job_type=jt.key).count()
+        if used:
+            return Response(
+                {"detail": f"{jt.name} is on {used} job{'s' if used != 1 else ''}. Switch it off instead."},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
+class SchedulingSettingsView(APIView):
+    """GET/PATCH /scheduling-settings/ -- the daily return of uncompleted
+    jobs to the pool: on/off and the time (6 Oct 2026)."""
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
+
+    def get(self, request):
+        return Response(SchedulingSettingsSerializer(SchedulingSettings.load()).data)
+
+    def patch(self, request):
+        serializer = SchedulingSettingsSerializer(SchedulingSettings.load(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
+    """Deliberately NOT partner-scoped: a Shift is a staff roster entry
+    with no customer on it at all ("not tied to a specific customer job"
+    -- Shift's own docstring), so there is no partner dimension to filter
+    on. Who is on standby on Saturday is not one reseller's business."""
+
     serializer_class = ShiftSerializer
     permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasSchedulingAccess]
     filterset_class = ShiftFilter

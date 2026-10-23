@@ -19,12 +19,15 @@ export function PdfPreviewModal({
   url,
   filename,
   onClose,
+  postData,
 }: {
   title: string;
   /** API path, e.g. `/invoices/12/pdf/`. */
   url: string;
   /** Name used when the viewer saves it. */
   filename: string;
+  /** POST this body instead of a GET -- a preview of something not saved yet. */
+  postData?: unknown;
   onClose: () => void;
 }) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
@@ -34,8 +37,7 @@ export function PdfPreviewModal({
     let revoked = false;
     let created: string | null = null;
 
-    api
-      .get(url, { responseType: "blob" })
+    (postData !== undefined ? api.post(url, postData, { responseType: "blob" }) : api.get(url, { responseType: "blob" }))
       .then((res) => {
         // Force the type: some browsers refuse to render a blob whose type
         // came back empty or as octet-stream, and show a download prompt
@@ -47,7 +49,22 @@ export function PdfPreviewModal({
         }
         setBlobUrl(created);
       })
-      .catch(() => setError("Could not load this document. It may not have generated — please try again."));
+      .catch(async (err) => {
+        // A refused preview answers JSON {detail}, but as a blob.
+        const blob = (err as { response?: { data?: unknown } })?.response?.data;
+        if (blob instanceof Blob) {
+          try {
+            const detail = JSON.parse(await blob.text())?.detail;
+            if (typeof detail === "string") {
+              setError(detail);
+              return;
+            }
+          } catch {
+            /* not JSON */
+          }
+        }
+        setError("Could not load this document. It may not have generated — please try again.");
+      });
 
     // Closing mid-fetch has to revoke whatever the fetch later creates,
     // otherwise the blob leaks for the life of the tab.
@@ -55,6 +72,7 @@ export function PdfPreviewModal({
       revoked = true;
       if (created) window.URL.revokeObjectURL(created);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url]);
 
   function handleDownload() {

@@ -100,8 +100,14 @@ class Command(BaseCommand):
                 condition=Q(status__in=Invoice.DEBITED_STATUSES),
             ),
             paid=_total_per_customer(Payment),
+            # credit_note__isnull=True: once a credit has its own invoice
+            # (CreditRequest.create_credit_note_invoice), that invoice's
+            # negative total is already inside `invoiced` above, so
+            # counting the credit again here would subtract it twice and
+            # manufacture drift where the ledger actually agrees.
             credited=_total_per_customer(
-                CreditRequest, condition=Q(status=CreditRequest.Status.APPROVED),
+                CreditRequest,
+                condition=Q(status=CreditRequest.Status.APPROVED, credit_note__isnull=True),
             ),
         ).only("id", "full_name", "balance", "status")
 

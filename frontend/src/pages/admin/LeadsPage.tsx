@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
-import { FollowUpCell, LeadStageStrip, LeadStatusBadge, LEAD_SOURCES } from "../../components/LeadBits";
+import {
+  CoverageCell, FollowUpCell, LeadStageStrip, LeadStatusBadge, LEAD_SOURCES, NextActionCell, parseGps,
+} from "../../components/LeadBits";
 import type {
   Lead, LeadStatus, PipelineSummary, Paginated, Partner, Tariff, User,
 } from "../../types";
@@ -28,6 +30,7 @@ const EMPTY_FORM = {
   phone: "",
   address: "",
   city: "",
+  gps: "",
   source: "phone",
   source_detail: "",
   partner: "",
@@ -92,12 +95,34 @@ export function LeadsPage() {
 
   useEffect(load, [load]);
 
+  // Networking -> Map's "Create lead here" (#173) opens New lead with the
+  // GPS, address and the map check filled in.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.get("new") !== "1") return;
+    setForm({
+      ...EMPTY_FORM,
+      gps: searchParams.get("gps") ?? "",
+      address: searchParams.get("address") ?? "",
+      notes: searchParams.get("notes") ?? "",
+    });
+    setShowNew(true);
+    setSearchParams({}, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
+    const gps = parseGps(form.gps);
+    if (!gps) {
+      setError("GPS should look like -24.8841, 28.2906 (paste it from Google Maps).");
+      return;
+    }
     setSaving(true);
     setError("");
     try {
-      const payload: Record<string, unknown> = { ...form };
+      const { gps: _gps, ...rest } = form;
+      const payload: Record<string, unknown> = { ...rest, latitude: gps[0], longitude: gps[1] };
       // Empty strings are not empty foreign keys. Sending "" for a
       // nullable FK is a 400 that reads like a validation failure on a
       // field the person never touched.
@@ -209,11 +234,12 @@ export function LeadsPage() {
         <Table>
           <THead>
             <TR>
-              <TH>Name</TH>
+              <TH>Lead</TH>
+              <TH>Area</TH>
               <TH>Stage</TH>
-              <TH>Interested in</TH>
+              <TH>Coverage</TH>
+              <TH>Next action</TH>
               <TH>Value / month</TH>
-              <TH>Source</TH>
               <TH>Owner</TH>
               <TH>Follow up</TH>
             </TR>
@@ -228,21 +254,28 @@ export function LeadsPage() {
                   {lead.company_name && (
                     <span className="ml-1.5 text-xs text-[var(--text-muted)]">{lead.full_name}</span>
                   )}
-                  {lead.city && (
-                    <span className="block text-xs text-[var(--text-muted)]">{lead.city}</span>
+                  <span className="block text-xs text-[var(--text-muted)]">
+                    {[lead.tariff_name, lead.source_display, lead.partner_name].filter(Boolean).join(" · ")}
+                  </span>
+                </TD>
+                <TD>
+                  {lead.city || lead.address || <span className="text-[var(--text-muted)]">—</span>}
+                  {lead.latitude && lead.longitude && (
+                    <span className="block text-xs tabular-nums text-[var(--text-muted)]">
+                      GPS {Number(lead.latitude).toFixed(4)}, {Number(lead.longitude).toFixed(4)}
+                    </span>
                   )}
                 </TD>
                 <TD>
                   <LeadStatusBadge lead={lead} />
                 </TD>
-                <TD>{lead.tariff_name || <span className="text-[var(--text-muted)]">—</span>}</TD>
-                <TD className="tabular-nums">{formatMoney(lead.value)}</TD>
                 <TD>
-                  {lead.source_display}
-                  {lead.partner_name && (
-                    <span className="block text-xs text-[var(--text-muted)]">{lead.partner_name}</span>
-                  )}
+                  <CoverageCell lead={lead} />
                 </TD>
+                <TD>
+                  <NextActionCell lead={lead} />
+                </TD>
+                <TD className="tabular-nums">{formatMoney(lead.value)}</TD>
                 <TD>{lead.assigned_to_name || <span className="text-[var(--text-muted)]">Unassigned</span>}</TD>
                 <TD>
                   <FollowUpCell lead={lead} />
@@ -299,6 +332,14 @@ export function LeadsPage() {
                   className={inputClass}
                   value={form.city}
                   onChange={(e) => setForm({ ...form, city: e.target.value })}
+                />
+              </FormField>
+              <FormField label="GPS (for farms, and where the scan goes)">
+                <input
+                  className={inputClass}
+                  placeholder="-24.8841, 28.2906"
+                  value={form.gps}
+                  onChange={(e) => setForm({ ...form, gps: e.target.value })}
                 />
               </FormField>
               <FormField label="Where did they come from?">

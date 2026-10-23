@@ -29,12 +29,15 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from billing.models import (
-    CustomerBillingConfig, Invoice, RecurringBillingRun, Service, Tariff,
+    BillingPreviewSnapshot, CustomerBillingConfig, Invoice, RecurringBillingRun,
+    Service, Tariff,
 )
 from billing.recurring import (
     RecurringBillingBusy, _release_run_lock, _try_run_lock, run_recurring_billing,
 )
 from customers.models import Customer
+from billing.gate_testing import ApprovalGateOpenMixin
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -122,7 +125,7 @@ class RunLockTests(_RunTestCase):
         self.assertEqual(Invoice.objects.count(), 0)
 
 
-class RunDateTests(_RunTestCase):
+class RunDateTests(ApprovalGateOpenMixin, _RunTestCase):
     def test_a_committed_run_refuses_a_future_date(self):
         self._billable("Future Fikile")
         future = self.today + datetime.timedelta(days=90)
@@ -169,14 +172,45 @@ class RunApiTests(_RunTestCase):
         super().setUp()
         self.client = APIClient()
         self.staff = User.objects.create_user(
-            username="runner", password="pw-for-tests", role=User.Role.ACCOUNTS
+            username="runner", password="pw-for-tests", role=User.Role.ACCOUNTS,
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(self.staff)
+
+    def _approve_preview(self, run_date=None, partner_ids=None):
+        """Satisfy the approval gate the same way the UI does.
+
+        Run refuses anything an approved preview did not account for. That
+        gate arrived with the billing-preview work, and these tests -- which
+        are about what happens AFTER it -- started failing on "No approved
+        preview" instead of reaching their assertions.
+
+        The fingerprint comes from the live projection rather than a fixed
+        string, because Run recomputes it and compares: a hardcoded digest
+        would pass today and break the moment a fixture changed. Call this
+        AFTER the customers exist, or the projection will not include them and
+        the digest will not match what the run actually does.
+        """
+        from billing.preview_export import project_run, projection_digest
+
+        run_date = run_date or self.today
+        projection = project_run(run_date, partner_ids=partner_ids or None)
+        return BillingPreviewSnapshot.objects.create(
+            run_date=run_date,
+            partner_ids=sorted(partner_ids or []),
+            fingerprint=projection_digest(projection),
+            engine=projection["engine"],
+            counts=projection["counts"],
+            grand_total=projection["grand_total"],
+            sheets={},
+            approved_at=timezone.now(),
+        )
 
     def test_a_busy_run_is_a_409_not_a_500(self):
         """A second Run click is the ordinary way to get here, so it has to
         read as "wait", not "the server broke"."""
         self._billable("Busy Bheki")
+        self._approve_preview()
         with mock.patch("billing.recurring._try_run_lock", return_value=False):
             res = self.client.post(
                 "/api/recurring-billing/run/", {"date": self.today.isoformat()}, format="json"
@@ -193,6 +227,7 @@ class RunApiTests(_RunTestCase):
 
     def test_a_normal_run_still_works(self):
         self._billable("Normal Nandi")
+        self._approve_preview()
         res = self.client.post(
             "/api/recurring-billing/run/", {"date": self.today.isoformat()}, format="json"
         )
@@ -200,7 +235,7 @@ class RunApiTests(_RunTestCase):
         self.assertEqual(Invoice.objects.count(), 1)
 
 
-class StaleBillingDateTests(_RunTestCase):
+class StaleBillingDateTests(ApprovalGateOpenMixin, _RunTestCase):
     def test_a_customer_billed_mid_run_is_not_billed_again(self):
         """The re-read: each customer is locked and re-read inside their own
         transaction, so the due test sees committed state rather than a

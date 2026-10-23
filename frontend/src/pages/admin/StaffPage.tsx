@@ -6,6 +6,7 @@ import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { formatIsoDate } from "../../utils/billingTerms";
 import {
   type AttendanceRecord,
   type LeaveRequest,
@@ -41,7 +42,7 @@ function formatTime(iso: string) {
 }
 
 function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString();
+  return formatIsoDate(iso);
 }
 
 export function StaffPage() {
@@ -271,7 +272,7 @@ function AttendanceTab({
   }
 
   async function handleDelete(record: AttendanceRecord) {
-    if (!confirm(`Delete this attendance record for ${record.staff_name} on ${record.date}?`)) return;
+    if (!confirm(`Delete this attendance record for ${record.staff_name} on ${formatDate(record.date)}?`)) return;
     await api.delete(`/attendance/${record.id}/`);
     refetch();
   }

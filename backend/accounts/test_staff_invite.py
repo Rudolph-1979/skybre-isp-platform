@@ -40,8 +40,14 @@ class StaffInviteTests(TestCase):
         mail.outbox = []
 
     def _create(self, **payload):
+        # staff_code is required on create: Conecto gates app registration
+        # on it, so an account made without one cannot be used there. Not
+        # of the form STF-nnnnnn on purpose -- that is the namespace the
+        # model generates into, and a fixture squatting in it collides
+        # with a generated code as soon as primary keys reach that number.
         body = {"username": "newbie", "first_name": "New", "last_name": "Bie",
-                "email": "newbie@example.com", "role": "support", "is_active": True}
+                "email": "newbie@example.com", "role": "support", "is_active": True,
+                "staff_code": "TST-NEWBIE"}
         body.update(payload)
         request = self.factory.post("/x", body, format="json")
         force_authenticate(request, user=self.admin)

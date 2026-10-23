@@ -1,12 +1,14 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
-import type { User, Vehicle } from "../../types";
+import { formatIsoDate } from "../../utils/billingTerms";
+import { FleetcardImportModal } from "../../components/FleetcardImport";
+import type { LicenceRenewal, LicenceRenewals, RenewalStatus, User, Vehicle } from "../../types";
 
 const EMPTY_FORM = {
   make: "",
@@ -16,14 +18,83 @@ const EMPTY_FORM = {
   fuel_type: "petrol",
   assigned_to: "",
   service_interval_km: "10000",
+  tyre_rotation_interval_km: "10000",
+  licence_expiry: "",
   notes: "",
 };
 
+/** How a renewal row reads at a glance. The wording carries the meaning,
+ * not just the colour -- a red pill on its own doesn't say whether
+ * somebody is driving illegally today or has three weeks to sort it out,
+ * and that is the only question anyone brings to this list. */
+const RENEWAL_LOOK: Record<RenewalStatus, { label: string; tint: string; border: string }> = {
+  expired: { label: "Expired", tint: "text-[var(--status-critical)]", border: "border-[var(--status-critical)]" },
+  // #b3852e rather than the warning token: the token is ~1.9:1 on this
+  // surface and unreadable at 12px. Same substitution as the dashboard.
+  due_soon: { label: "Due soon", tint: "text-[#b3852e]", border: "border-[#b3852e]" },
+  unknown: { label: "Not captured", tint: "text-[var(--text-secondary)]", border: "border-[var(--border-hairline)]" },
+  ok: { label: "Up to date", tint: "text-[var(--status-good)]", border: "border-[var(--border-hairline)]" },
+};
+
+/** "Expired 5 days ago" / "12 days left" / "No date on file".
+ *
+ * Deliberately not a bare date. A date makes the reader do the
+ * subtraction, and how long they have got is the entire question. The
+ * date is still shown underneath. */
+function countdown(row: LicenceRenewal) {
+  if (row.days_left === null) return "No date on file";
+  if (row.days_left < 0) {
+    const days = Math.abs(row.days_left);
+    return `Expired ${days} day${days === 1 ? "" : "s"} ago`;
+  }
+  if (row.days_left === 0) return "Expires today";
+  return `${row.days_left} day${row.days_left === 1 ? "" : "s"} left`;
+}
+
+function RenewalPill({ status }: { status: RenewalStatus }) {
+  const look = RENEWAL_LOOK[status];
+  return (
+    <span className={`inline-block rounded-full border px-2 py-0.5 text-xs font-medium ${look.border} ${look.tint}`}>
+      {look.label}
+    </span>
+  );
+}
+
+const BANDS: { status: RenewalStatus; heading: string; blurb: string }[] = [
+  {
+    status: "expired",
+    heading: "Expired",
+    blurb: "Driving on these is illegal today. Nothing else on this page matters more.",
+  },
+  {
+    status: "due_soon",
+    heading: "Coming up",
+    blurb:
+      "Inside the notice period for that document — 30 days for a licence disc, 60 for a driver's card, because a card means a testing-centre booking and a disc means a counter.",
+  },
+  {
+    status: "unknown",
+    heading: "Nothing captured",
+    blurb:
+      "Nobody has recorded a date for these, so they could already have expired without anything saying so. Read the disc or the card and capture it.",
+  },
+  {
+    status: "ok",
+    heading: "Up to date",
+    blurb: "Nothing to do. Listed so this page is the whole fleet rather than a subset of it.",
+  },
+];
+
 export function VehiclesPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get("tab") === "renewals" ? "renewals" : "fleet";
+
   const [assignedFilter, setAssignedFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [tyreStatusFilter, setTyreStatusFilter] = useState("");
   const [staffList, setStaffList] = useState<User[]>([]);
+  const [showFleetcard, setShowFleetcard] = useState(false);
   const { items, loading, refetch } = useApiList<Vehicle>(
     `/vehicles/?page_size=200${assignedFilter ? `&assigned_to=${assignedFilter}` : ""}`
   );
@@ -32,11 +103,41 @@ export function VehiclesPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    api.get<{ results: User[] }>("/staff-users/?page_size=200").then((r) => setStaffList(r.data.results));
+  // Loaded whichever tab is open, so the count can sit ON the tab. A tab
+  // that only admits there is something to do once you have already
+  // opened it is not a reminder.
+  const [renewals, setRenewals] = useState<LicenceRenewals | null>(null);
+  const [renewalsError, setRenewalsError] = useState("");
+  const [renewing, setRenewing] = useState<LicenceRenewal | null>(null);
+  const [renewDate, setRenewDate] = useState("");
+  const [renewSaving, setRenewSaving] = useState(false);
+  const [renewError, setRenewError] = useState("");
+
+  const loadRenewals = useCallback(() => {
+    api
+      .get<LicenceRenewals>("/vehicles/renewals/")
+      .then((r) => {
+        setRenewals(r.data);
+        setRenewalsError("");
+      })
+      .catch(() => setRenewalsError("Could not load licence renewals."));
   }, []);
 
-  const filteredItems = statusFilter ? items.filter((v) => v.service_status === statusFilter) : items;
+  useEffect(() => {
+    api.get<{ results: User[] }>("/staff-users/?page_size=200").then((r) => setStaffList(r.data.results));
+    loadRenewals();
+  }, [loadRenewals]);
+
+  function setTab(next: "fleet" | "renewals") {
+    const params = new URLSearchParams(searchParams);
+    if (next === "fleet") params.delete("tab");
+    else params.set("tab", "renewals");
+    setSearchParams(params, { replace: true });
+  }
+
+  const filteredItems = items
+    .filter((v) => !statusFilter || v.service_status === statusFilter)
+    .filter((v) => !tyreStatusFilter || v.tyre_rotation_status === tyreStatusFilter);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -51,118 +152,378 @@ export function VehiclesPage() {
         fuel_type: form.fuel_type,
         assigned_to: form.assigned_to || null,
         service_interval_km: Number(form.service_interval_km),
+        tyre_rotation_interval_km: Number(form.tyre_rotation_interval_km),
+        // Blank stays null rather than becoming a guess. An invented date
+        // would put the vehicle straight onto the compliant list, which is
+        // the one outcome this whole feature exists to prevent.
+        licence_expiry: form.licence_expiry || null,
         notes: form.notes,
       });
       setShowModal(false);
       setForm(EMPTY_FORM);
       refetch();
+      loadRenewals();
     } catch (err) {
-      const detail = (err as { response?: { data?: unknown } })?.response?.data;
-      setError(
-        typeof detail === "string"
-          ? detail
-          : (detail as { registration_number?: string[]; non_field_errors?: string[] })?.registration_number?.[0] ||
-              (detail as { non_field_errors?: string[] })?.non_field_errors?.[0] ||
-              "Failed to save vehicle."
-      );
+      const detail = (err as { response?: { data?: Record<string, string[] | string> | string } })?.response?.data;
+      if (typeof detail === "string") {
+        setError(detail);
+      } else {
+        const fields = detail as Record<string, string[] | string> | undefined;
+        const first = fields?.registration_number ?? fields?.licence_expiry ?? fields?.non_field_errors;
+        setError((Array.isArray(first) ? first[0] : (first as string)) || "Failed to save vehicle.");
+      }
     } finally {
       setSaving(false);
     }
   }
 
+  function openRenew(row: LicenceRenewal) {
+    setRenewing(row);
+    setRenewDate("");
+    setRenewError("");
+  }
+
+  /** Renewing sends NO date unless one was typed. The default -- a year on
+   * for a disc, five for a card, counted from the CURRENT expiry so
+   * renewing early doesn't throw away the days still left on it -- is
+   * worked out on the server. Recomputing it here would be a second copy
+   * of that rule, free to drift, and the drift would be invisible. */
+  async function handleRenew(e: FormEvent) {
+    e.preventDefault();
+    if (!renewing) return;
+    setRenewSaving(true);
+    setRenewError("");
+    try {
+      if (renewing.kind === "vehicle_disc") {
+        await api.post(`/vehicles/${renewing.vehicle_id}/renew-licence/`, {
+          ...(renewDate ? { licence_expiry: renewDate } : {}),
+        });
+      } else {
+        await api.post("/vehicles/renew-driver-licence/", {
+          staff_profile: renewing.staff_profile_id,
+          ...(renewDate ? { license_expiry: renewDate } : {}),
+        });
+      }
+      setRenewing(null);
+      loadRenewals();
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, string[] | string> } })?.response?.data;
+      const first = data && Object.values(data)[0];
+      setRenewError((Array.isArray(first) ? first[0] : (first as string)) || "Could not record the renewal.");
+    } finally {
+      setRenewSaving(false);
+    }
+  }
+
+  const pending = renewals ? renewals.counts.action_needed : 0;
+
   return (
     <div>
       <PageHeader
         title="Vehicles"
-        subtitle="Fleet vehicles, assigned drivers, odometer history, and service intervals."
+        subtitle="Fleet vehicles, assigned drivers, odometer history, service and tyre rotation intervals, and licence renewals."
         actions={
-          <button className={btnPrimary} onClick={() => setShowModal(true)}>
-            + New vehicle
-          </button>
+          <>
+            {/* FNB Fleetcard statement -> fuel log (#201). */}
+            <button className={btnSecondary} onClick={() => setShowFleetcard(true)}>
+              Import FNB Fleetcard
+            </button>
+            <button className={btnPrimary} onClick={() => setShowModal(true)}>
+              + New vehicle
+            </button>
+          </>
         }
       />
+      {showFleetcard && <FleetcardImportModal onClose={() => setShowFleetcard(false)} onImported={() => refetch()} />}
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <select className={filterSelectClass} value={assignedFilter} onChange={(e) => setAssignedFilter(e.target.value)}>
-          <option value="">All drivers</option>
-          {staffList.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.first_name || s.username} {s.last_name}
-            </option>
-          ))}
-        </select>
-        <select className={filterSelectClass} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-          <option value="">All service statuses</option>
-          <option value="ok">OK</option>
-          <option value="due_soon">Due soon</option>
-          <option value="overdue">Overdue</option>
-          <option value="in_service">In service</option>
-        </select>
-        {(assignedFilter || statusFilter) && (
-          <button
-            type="button"
-            className={btnSecondary}
-            onClick={() => {
-              setAssignedFilter("");
-              setStatusFilter("");
-            }}
-          >
-            Clear filters
-          </button>
-        )}
+      <div className="mb-4 flex gap-1 border-b border-[var(--border-hairline)]">
+        <button
+          type="button"
+          onClick={() => setTab("fleet")}
+          className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium ${
+            tab === "fleet"
+              ? "border-[var(--series-1)] text-[var(--text-primary)]"
+              : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+          }`}
+        >
+          Fleet
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("renewals")}
+          className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium ${
+            tab === "renewals"
+              ? "border-[var(--series-1)] text-[var(--text-primary)]"
+              : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+          }`}
+        >
+          Licence renewals
+          {pending > 0 && (
+            <span className="ml-2 rounded-full bg-[var(--status-critical)] px-2 py-0.5 text-xs font-semibold text-white">
+              {pending}
+            </span>
+          )}
+        </button>
       </div>
 
-      {loading ? (
-        <p className="text-[var(--text-muted)]">Loading…</p>
-      ) : (
-        <Table>
-          <THead>
-            <tr>
-              <TH>Registration</TH>
-              <TH>Make / model</TH>
-              <TH>Year</TH>
-              <TH>Fuel</TH>
-              <TH>Assigned to</TH>
-              <TH>Current km</TH>
-              <TH>Next service due</TH>
-              <TH>Status</TH>
-            </tr>
-          </THead>
-          <tbody>
-            {filteredItems.map((v) => (
-              <TR key={v.id} onClick={() => navigate(`/admin/vehicles/${v.id}`)}>
-                <TD className="font-medium">{v.registration_number}</TD>
-                <TD>
-                  {v.make} {v.model}
-                </TD>
-                <TD>{v.year}</TD>
-                <TD className="capitalize">{v.fuel_type}</TD>
-                <TD>{v.assigned_to_name || "—"}</TD>
-                <TD className="tabular-nums">{v.current_odometer_km.toLocaleString()} km</TD>
-                <TD className="tabular-nums">{v.next_service_due_km.toLocaleString()} km</TD>
-                <TD>
-                  <StatusBadge status={v.service_status} />
-                  {/* A flag would say it's at the workshop; the count says
-                      whether that's still reasonable. Eleven days off the
-                      road is a different conversation from booked in this
-                      morning. */}
-                  {v.service_status === "in_service" && v.days_in_service != null && (
-                    <span className="ml-2 text-xs text-[var(--text-muted)]">
-                      {v.days_in_service === 0
-                        ? "since today"
-                        : `${v.days_in_service} day${v.days_in_service === 1 ? "" : "s"}`}
-                    </span>
-                  )}
-                </TD>
-              </TR>
-            ))}
-            {filteredItems.length === 0 && (
-              <TR>
-                <TD className="text-[var(--text-muted)]">No vehicles match the current filters.</TD>
-              </TR>
+      {tab === "fleet" && (
+        <>
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <select className={filterSelectClass} value={assignedFilter} onChange={(e) => setAssignedFilter(e.target.value)}>
+              <option value="">All drivers</option>
+              {staffList.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.first_name || s.username} {s.last_name}
+                </option>
+              ))}
+            </select>
+            <select className={filterSelectClass} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              <option value="">All service statuses</option>
+              <option value="ok">OK</option>
+              <option value="due_soon">Due soon</option>
+              <option value="overdue">Overdue</option>
+              <option value="in_service">In service</option>
+            </select>
+            <select
+              className={filterSelectClass}
+              value={tyreStatusFilter}
+              onChange={(e) => setTyreStatusFilter(e.target.value)}
+            >
+              <option value="">All tyre rotation statuses</option>
+              <option value="ok">OK</option>
+              <option value="due_soon">Due soon</option>
+              <option value="overdue">Overdue</option>
+            </select>
+            {(assignedFilter || statusFilter || tyreStatusFilter) && (
+              <button
+                type="button"
+                className={btnSecondary}
+                onClick={() => {
+                  setAssignedFilter("");
+                  setStatusFilter("");
+                  setTyreStatusFilter("");
+                }}
+              >
+                Clear filters
+              </button>
             )}
-          </tbody>
-        </Table>
+          </div>
+
+          {loading ? (
+            <p className="text-[var(--text-muted)]">Loading…</p>
+          ) : (
+            <Table>
+              <THead>
+                <tr>
+                  <TH>Registration</TH>
+                  <TH>Make / model</TH>
+                  <TH>Year</TH>
+                  <TH>Fuel</TH>
+                  <TH>Assigned to</TH>
+                  <TH>Current km</TH>
+                  <TH>Next service due</TH>
+                  <TH>Licence disc</TH>
+                  <TH>Status</TH>
+                  <TH>Tyre rotation</TH>
+                </tr>
+              </THead>
+              <tbody>
+                {filteredItems.map((v) => (
+                  <TR key={v.id} onClick={() => navigate(`/admin/vehicles/${v.id}`)}>
+                    <TD className="font-medium">{v.registration_number}</TD>
+                    <TD>
+                      {v.make} {v.model}
+                    </TD>
+                    <TD>{v.year}</TD>
+                    <TD className="capitalize">{v.fuel_type}</TD>
+                    <TD>{v.assigned_to_name || "—"}</TD>
+                    <TD className="tabular-nums">{v.current_odometer_km.toLocaleString()} km</TD>
+                    <TD className="tabular-nums">{v.next_service_due_km.toLocaleString()} km</TD>
+                    <TD>
+                      {v.licence_expiry ? (
+                        <span
+                          className={
+                            v.licence_status === "expired"
+                              ? "font-medium text-[var(--status-critical)]"
+                              : v.licence_status === "due_soon"
+                                ? "font-medium text-[#b3852e]"
+                                : "text-[var(--text-secondary)]"
+                          }
+                        >
+                          {formatIsoDate(v.licence_expiry)}
+                        </span>
+                      ) : (
+                        <span className="text-[var(--text-muted)]">Not captured</span>
+                      )}
+                    </TD>
+                    <TD>
+                      <StatusBadge status={v.service_status} />
+                      {/* A flag would say it's at the workshop; the count says
+                          whether that's still reasonable. Eleven days off the
+                          road is a different conversation from booked in this
+                          morning. */}
+                      {v.service_status === "in_service" && v.days_in_service != null && (
+                        <span className="ml-2 text-xs text-[var(--text-muted)]">
+                          {v.days_in_service === 0
+                            ? "since today"
+                            : `${v.days_in_service} day${v.days_in_service === 1 ? "" : "s"}`}
+                        </span>
+                      )}
+                    </TD>
+                    <TD>
+                      <StatusBadge status={v.tyre_rotation_status} />
+                    </TD>
+                  </TR>
+                ))}
+                {filteredItems.length === 0 && (
+                  <TR>
+                    <TD className="text-[var(--text-muted)]">No vehicles match the current filters.</TD>
+                  </TR>
+                )}
+              </tbody>
+            </Table>
+          )}
+        </>
+      )}
+
+      {tab === "renewals" && (
+        <>
+          {renewalsError && <p className="mb-4 text-sm text-[var(--status-critical)]">{renewalsError}</p>}
+          {!renewals && !renewalsError && <p className="text-[var(--text-muted)]">Loading…</p>}
+
+          {renewals && (
+            <>
+              <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {(["expired", "due_soon", "unknown", "ok"] as RenewalStatus[]).map((status) => (
+                  <div
+                    key={status}
+                    className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3 shadow-sm"
+                  >
+                    <p className="text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
+                      {RENEWAL_LOOK[status].label}
+                    </p>
+                    <p className={`mt-1 text-2xl font-semibold tabular-nums ${RENEWAL_LOOK[status].tint}`}>
+                      {renewals.counts[status]}
+                    </p>
+                  </div>
+                ))}
+              </div>
+
+              <p className="mb-4 text-xs text-[var(--text-muted)]">
+                Licence discs for every active vehicle, and drivers' licences for staff who have a vehicle
+                assigned or a licence on file — as at {renewals.as_of}. A licence is valid through the last
+                day printed on it, so one expiring today still counts as valid.
+              </p>
+
+              {BANDS.map((band) => {
+                const rows = renewals.results.filter((r) => r.status === band.status);
+                if (rows.length === 0) return null;
+                return (
+                  <div key={band.status} className="mb-6">
+                    <h2 className={`text-sm font-semibold ${RENEWAL_LOOK[band.status].tint}`}>
+                      {band.heading} · {rows.length}
+                    </h2>
+                    <p className="mb-2 mt-0.5 text-xs text-[var(--text-muted)]">{band.blurb}</p>
+                    <ul className="divide-y divide-[var(--border-hairline)] rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]">
+                      {rows.map((row) => (
+                        <li key={row.key} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium text-[var(--text-primary)]">
+                              {row.title}{" "}
+                              <span className="font-normal text-[var(--text-muted)]">· {row.document}</span>
+                            </p>
+                            <p className="text-xs text-[var(--text-muted)]">
+                              {row.subtitle} · {row.holder}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-4">
+                            <div className="text-right">
+                              <p className={`text-sm font-semibold ${RENEWAL_LOOK[row.status].tint}`}>
+                                {countdown(row)}
+                              </p>
+                              <p className="text-xs text-[var(--text-muted)]">
+                                {row.expiry ? `Expires ${formatIsoDate(row.expiry)}` : `Warns ${row.notice_days} days ahead`}
+                              </p>
+                            </div>
+                            <RenewalPill status={row.status} />
+                            <div className="flex gap-2">
+                              {row.kind === "vehicle_disc" && (
+                                <button
+                                  type="button"
+                                  className={btnSecondary}
+                                  onClick={() => navigate(`/admin/vehicles/${row.vehicle_id}`)}
+                                >
+                                  Open
+                                </button>
+                              )}
+                              <button type="button" className={btnPrimary} onClick={() => openRenew(row)}>
+                                {row.expiry ? "Renew" : "Capture"}
+                              </button>
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })}
+
+              {renewals.results.length === 0 && (
+                <p className="rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] px-3 py-4 text-sm text-[var(--text-secondary)]">
+                  <strong className="text-[var(--text-primary)]">Nothing to track yet.</strong> Licence discs
+                  appear here for every active vehicle, and drivers' licences for staff who have a vehicle
+                  assigned or a licence number on file.
+                </p>
+              )}
+            </>
+          )}
+        </>
+      )}
+
+      {renewing && (
+        <Modal
+          title={`${renewing.expiry ? "Renew" : "Capture"} — ${renewing.document.toLowerCase()}`}
+          onClose={() => setRenewing(null)}
+        >
+          <form onSubmit={handleRenew}>
+            <p className="mb-3 text-sm text-[var(--text-secondary)]">
+              {renewing.title}
+              {renewing.expiry ? (
+                <>
+                  {" "}
+                  — currently expires <strong className="text-[var(--text-primary)]">{formatIsoDate(renewing.expiry)}</strong>.
+                </>
+              ) : (
+                <> — no date on file.</>
+              )}
+            </p>
+            <p className="mb-3 text-xs text-[var(--text-muted)]">
+              Leave the date blank and it moves {renewing.term_years} year
+              {renewing.term_years === 1 ? "" : "s"} on
+              {renewing.expiry
+                ? " from the current expiry, so renewing early doesn't lose the days still left on it — or from today if it has already lapsed."
+                : " from today."}
+            </p>
+            <FormField label="New expiry date (optional)">
+              <input
+                type="date"
+                className={inputClass}
+                value={renewDate}
+                onChange={(e) => setRenewDate(e.target.value)}
+              />
+            </FormField>
+            {renewError && <p className="mb-3 text-sm text-[var(--status-critical)]">{renewError}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setRenewing(null)}>
+                Cancel
+              </button>
+              <button type="submit" className={btnPrimary} disabled={renewSaving}>
+                {renewSaving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </form>
+        </Modal>
       )}
 
       {showModal && (
@@ -235,6 +596,24 @@ export function VehiclesPage() {
                 min="1"
                 value={form.service_interval_km}
                 onChange={(e) => setForm({ ...form, service_interval_km: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Tyre rotation interval (km)">
+              <input
+                type="number"
+                className={inputClass}
+                required
+                min="1"
+                value={form.tyre_rotation_interval_km}
+                onChange={(e) => setForm({ ...form, tyre_rotation_interval_km: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Licence disc expires (optional)">
+              <input
+                type="date"
+                className={inputClass}
+                value={form.licence_expiry}
+                onChange={(e) => setForm({ ...form, licence_expiry: e.target.value })}
               />
             </FormField>
             <FormField label="Notes (optional)">

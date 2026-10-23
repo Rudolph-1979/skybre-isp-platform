@@ -1,0 +1,470 @@
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
+import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMap, useMapEvents } from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+import { api } from "../../api/client";
+import { PageHeader } from "../../components/PageHeader";
+import { inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { parseGps } from "../../components/LeadBits";
+import { useAuth } from "../../context/AuthContext";
+import { usePolling } from "../../hooks/usePolling";
+import { canAccessSection } from "../../utils/permissions";
+import type { TechnicianPosition } from "../../types";
+import { claimLabel, pin as techPin, statusLabel } from "./TechnicianPositionsPage";
+
+/**
+ * Networking -> Map (#173, Rudolph 14 Oct 2026: "One map that services
+ * everything"). Layers: UISP towers and backhaul links, technicians live
+ * (Conecto), and the serviceability check -- type an address, paste GPS or
+ * click the map. Coverage areas from KMZ files come later; until then the
+ * check shows the nearest towers (distance and the direction a sector must
+ * face) and can start a lead with the GPS filled in.
+ */
+
+type Site = {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  device_count: number;
+  devices_offline: number;
+};
+type Device = {
+  id: string;
+  name: string;
+  kind: string;
+  online: boolean;
+  flags: string[];
+  site: { id: string; name: string } | null;
+  downlink_use_pct: number | null;
+  ap_device_id?: string | null;
+  ap_site_id?: string | null;
+};
+type GeoHit = { label: string; lat: number; lng: number; kind: string };
+type Tower = {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  distance_km: number;
+  bearing: number;
+  compass: string;
+  devices: number;
+  devices_offline: number;
+  access_points: { id: string; name: string; model: string; online: boolean; frequency_mhz: number | null; ssid: string; mikrotik: boolean }[];
+};
+type Check = {
+  point: { lat: number; lng: number };
+  coverage: { loaded: boolean; covered: boolean | null; areas: { name: string }[]; note: string };
+  uisp_connected: boolean;
+  nearest: Tower[];
+};
+type Point = { lat: number; lng: number; label: string };
+
+const FALLBACK_CENTRE: [number, number] = [-27.6547, 27.2349];
+const GOOD = "#22c55e";
+const WARN = "#eda100";
+const BAD = "#e34948";
+const LAYERS_KEY = "netmap.layers";
+
+const BASES = {
+  map: {
+    url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  },
+  satellite: {
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics",
+  },
+} as const;
+
+type Layers = { towers: boolean; links: boolean; techs: boolean; labels: boolean };
+const DEFAULT_LAYERS: Layers = { towers: true, links: true, techs: true, labels: false };
+
+function readLayers(): Layers {
+  try {
+    return { ...DEFAULT_LAYERS, ...JSON.parse(localStorage.getItem(LAYERS_KEY) ?? "{}") };
+  } catch {
+    return DEFAULT_LAYERS;
+  }
+}
+
+const pointIcon = L.divIcon({
+  className: "",
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+  html: `<div style="width:18px;height:18px;border-radius:50%;background:#2a78d6;border:3px solid #fff;box-shadow:0 0 0 2px #2a78d6,0 2px 6px rgba(0,0,0,.4)"></div>`,
+});
+
+function km(v: number) {
+  return v < 1 ? `${Math.round(v * 1000)} m` : `${v.toFixed(v < 10 ? 2 : 1)} km`;
+}
+
+/** Clicks on the map pick the point to check. */
+function ClickToCheck({ onPick }: { onPick: (p: Point) => void }) {
+  useMapEvents({
+    click(e) {
+      onPick({ lat: +e.latlng.lat.toFixed(6), lng: +e.latlng.lng.toFixed(6), label: "Picked on the map" });
+    },
+  });
+  return null;
+}
+
+/** Fly to the checked point; fit the towers once on first load. */
+function Camera({ point, towers }: { point: Point | null; towers: [number, number][] }) {
+  const map = useMap();
+  const fitted = useRef(false);
+  useEffect(() => {
+    if (!fitted.current && towers.length) {
+      map.fitBounds(L.latLngBounds(towers), { padding: [30, 30], maxZoom: 12 });
+      fitted.current = true;
+    }
+  }, [towers, map]);
+  useEffect(() => {
+    if (point) map.flyTo([point.lat, point.lng], Math.max(map.getZoom(), 12), { duration: 0.6 });
+  }, [point, map]);
+  return null;
+}
+
+export function NetworkMapPage() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const canTechs = canAccessSection(user, "scheduling");
+  const canLeads = canAccessSection(user, "sales");
+
+  const [base, setBase] = useState<keyof typeof BASES>("map");
+  const [layers, setLayers] = useState<Layers>(readLayers);
+  const [sites, setSites] = useState<Site[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [techs, setTechs] = useState<TechnicianPosition[]>([]);
+  const [uispError, setUispError] = useState("");
+
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<GeoHit[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [point, setPoint] = useState<Point | null>(null);
+  const [check, setCheck] = useState<Check | null>(null);
+  const [checkError, setCheckError] = useState("");
+
+  function toggle(key: keyof Layers) {
+    const next = { ...layers, [key]: !layers[key] };
+    setLayers(next);
+    try {
+      localStorage.setItem(LAYERS_KEY, JSON.stringify(next));
+    } catch {
+      /* not remembered in a private window */
+    }
+  }
+
+  function loadNetwork() {
+    Promise.all([api.get<{ results?: Site[]; detail?: string }>("/uisp/sites/"), api.get<{ results?: Device[] }>("/uisp/devices/")])
+      .then(([s, d]) => {
+        setSites(s.data.results ?? []);
+        setDevices(d.data.results ?? []);
+        setUispError(s.data.results ? "" : "UISP isn't connected.");
+      })
+      .catch((err) => setUispError(err?.response?.data?.detail ?? "Couldn't read UISP."));
+  }
+  function loadTechs() {
+    if (!canTechs) return;
+    api
+      .get<TechnicianPosition[] | { results: TechnicianPosition[] }>("/technician-positions/")
+      .then((r) => setTechs(Array.isArray(r.data) ? r.data : r.data.results ?? []))
+      .catch(() => setTechs([]));
+  }
+  useEffect(() => {
+    loadNetwork();
+    loadTechs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  usePolling(loadNetwork, 60_000);
+  usePolling(loadTechs, 20_000);
+
+  useEffect(() => {
+    if (!point) return;
+    let cancelled = false;
+    setCheck(null);
+    setCheckError("");
+    api
+      .get<Check>(`/map/serviceability/?lat=${point.lat}&lng=${point.lng}`)
+      .then((r) => !cancelled && setCheck(r.data))
+      .catch((err) => !cancelled && setCheckError(err?.response?.data?.detail ?? "Couldn't check this point."));
+    return () => {
+      cancelled = true;
+    };
+  }, [point]);
+
+  async function search(e: FormEvent) {
+    e.preventDefault();
+    setSearchError("");
+    setHits(null);
+    const q = query.trim();
+    if (!q) return;
+    const gps = parseGps(q);
+    if (gps && gps[0] && gps[1]) {
+      setPoint({ lat: Number(gps[0]), lng: Number(gps[1]), label: `GPS ${Number(gps[0])}, ${Number(gps[1])}` });
+      return;
+    }
+    setSearching(true);
+    try {
+      const r = await api.get<{ results: GeoHit[] }>(`/map/geocode/?q=${encodeURIComponent(q)}`);
+      setHits(r.data.results);
+      if (r.data.results.length === 1) pick(r.data.results[0]);
+      if (!r.data.results.length) setSearchError("Not found on OpenStreetMap. Paste the GPS or click the map instead.");
+    } catch (err: any) {
+      setSearchError(err?.response?.data?.detail ?? "Address search failed.");
+    } finally {
+      setSearching(false);
+    }
+  }
+  function pick(h: GeoHit) {
+    setPoint({ lat: h.lat, lng: h.lng, label: h.label });
+  }
+
+  const placedSites = useMemo(() => {
+    const parents = new Set(sites.map((s) => s.parent_id).filter(Boolean));
+    // Stand-alone UISP sites are client installs, not towers.
+    return sites.filter((s) => s.latitude != null && s.longitude != null && (s.parent_id || parents.has(s.id)));
+  }, [sites]);
+  const siteById = useMemo(() => Object.fromEntries(sites.map((s) => [s.id, s])), [sites]);
+
+  const links = useMemo(() => {
+    const byId = Object.fromEntries(devices.map((d) => [d.id, d]));
+    const pairs: Record<string, { a: Site; b: Site; radios: Device[] }> = {};
+    for (const d of devices) {
+      if (!d.ap_site_id || !d.site || d.ap_site_id === d.site.id) continue;
+      const a = siteById[d.ap_site_id];
+      const b = siteById[d.site.id];
+      if (!a || !b || a.latitude == null || b.latitude == null) continue;
+      const key = [a.id, b.id].sort().join("|");
+      const entry = (pairs[key] ??= { a, b, radios: [] });
+      entry.radios.push(d);
+      if (d.ap_device_id && byId[d.ap_device_id]) entry.radios.push(byId[d.ap_device_id]);
+    }
+    return Object.entries(pairs).map(([key, p]) => {
+      const colour = p.radios.some((r) => !r.online)
+        ? BAD
+        : p.radios.some((r) => r.flags.includes("busy") || r.flags.includes("low_link"))
+          ? WARN
+          : GOOD;
+      const uses = p.radios.map((r) => r.downlink_use_pct).filter((v): v is number => v != null);
+      return { key, ...p, colour, use: uses.length ? Math.round(Math.max(...uses)) : null };
+    });
+  }, [devices, siteById]);
+
+  const towerCoords = useMemo(() => placedSites.map((s) => [s.latitude!, s.longitude!] as [number, number]), [placedSites]);
+  const placedTechs = techs.filter((t) => t.lat != null && t.lng != null);
+
+  function createLead() {
+    if (!point) return;
+    const near = check?.nearest[0];
+    const notes = near ? `Map check: nearest tower ${near.name}, ${km(near.distance_km)} ${near.compass} of the tower (bearing ${near.bearing}°).` : "";
+    const params = new URLSearchParams({
+      new: "1",
+      gps: `${point.lat}, ${point.lng}`,
+      address: point.label.startsWith("GPS ") || point.label === "Picked on the map" ? "" : point.label.split(", South Africa")[0],
+      notes,
+    });
+    navigate(`/admin/leads?${params.toString()}`);
+  }
+
+  const chip = (on: boolean) =>
+    `rounded-md border px-2 py-1 text-xs ${on ? "border-[var(--series-1)] text-[var(--text-primary)]" : "border-[var(--baseline)] text-[var(--text-muted)]"}`;
+
+  return (
+    <div>
+      <PageHeader
+        title="Map"
+        subtitle="Towers and links from UISP, technicians live, and the serviceability check. Click the map, paste GPS or search an address."
+      />
+      <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
+        {/* ---- left: search + result ---- */}
+        <div className="space-y-3">
+          <form onSubmit={search} className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3">
+            <p className="mb-2 text-sm font-semibold">Can we service it?</p>
+            <div className="flex gap-2">
+              <input
+                className={inputClass}
+                placeholder="Address, or GPS -27.65, 27.23"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              <button type="submit" className={btnPrimary} disabled={searching}>
+                {searching ? "…" : "Check"}
+              </button>
+            </div>
+            <p className="mt-1.5 text-[11px] text-[var(--text-muted)]">Or click anywhere on the map. Address search uses OpenStreetMap; farm roads may be missing.</p>
+            {searchError && <p className="mt-2 text-xs text-[var(--status-critical)]">{searchError}</p>}
+            {hits && hits.length > 1 && (
+              <ul className="mt-2 space-y-1">
+                {hits.map((h) => (
+                  <li key={`${h.lat},${h.lng}`}>
+                    <button type="button" className="w-full rounded px-2 py-1 text-left text-xs hover:bg-[var(--tint-hover)]" onClick={() => pick(h)}>
+                      {h.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </form>
+
+          {point && (
+            <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3 text-sm">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <div>
+                  <p className="font-semibold">{point.label}</p>
+                  <p className="font-mono text-xs text-[var(--text-muted)]">
+                    {point.lat}, {point.lng}
+                  </p>
+                </div>
+                <button type="button" className="text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => { setPoint(null); setCheck(null); }}>
+                  Clear
+                </button>
+              </div>
+              {checkError && <p className="text-xs text-[var(--status-critical)]">{checkError}</p>}
+              {!check && !checkError && <p className="text-xs text-[var(--text-muted)]">Checking…</p>}
+              {check && (
+                <>
+                  <p className="mb-2 rounded-md bg-[var(--tint-hover)] px-2 py-1.5 text-xs text-[var(--text-secondary)]">
+                    {check.coverage.loaded
+                      ? check.coverage.covered
+                        ? `Covered by ${check.coverage.areas.map((a) => a.name).join(", ")}`
+                        : "Outside the coverage areas"
+                      : check.coverage.note}
+                  </p>
+                  {!check.uisp_connected && <p className="text-xs text-[var(--text-muted)]">UISP isn't connected, so no towers to compare.</p>}
+                  <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Nearest towers</p>
+                  <ul className="space-y-2">
+                    {check.nearest.map((t) => (
+                      <li key={t.id} className="rounded-md border border-[var(--border-hairline)] px-2 py-1.5">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="font-medium">
+                            <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ background: t.devices_offline ? BAD : GOOD }} />
+                            {t.name}
+                          </span>
+                          <span className="tabular-nums">{km(t.distance_km)}</span>
+                        </div>
+                        <p className="text-[11px] text-[var(--text-muted)]">
+                          Point is {t.compass} of the tower (bearing {t.bearing}°){t.devices_offline ? ` · ${t.devices_offline} device(s) down` : ""}
+                        </p>
+                        {t.access_points.length > 0 ? (
+                          <p className="mt-0.5 text-[11px] text-[var(--text-secondary)]">
+                            Sectors: {t.access_points.map((a) => `${a.name}${a.online ? "" : " (down)"}`).join(", ")}
+                          </p>
+                        ) : (
+                          <p className="mt-0.5 text-[11px] text-[var(--text-muted)]">No sectors at this site in UISP (backhaul only).</p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {canLeads && (
+                      <button type="button" className={btnPrimary} onClick={createLead}>
+                        Create lead here
+                      </button>
+                    )}
+                    <a className={btnSecondary} href={`https://www.google.com/maps?q=${point.lat},${point.lng}`} target="_blank" rel="noreferrer">
+                      Google Maps
+                    </a>
+                  </div>
+                  <p className="mt-2 text-[11px] text-[var(--text-muted)]">Distance only — line of sight still needs an electronic or scan check.</p>
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Layers</p>
+            <div className="flex flex-wrap gap-1.5">
+              <button type="button" className={chip(layers.towers)} onClick={() => toggle("towers")}>Towers</button>
+              <button type="button" className={chip(layers.links)} onClick={() => toggle("links")}>Backhaul links</button>
+              {canTechs && <button type="button" className={chip(layers.techs)} onClick={() => toggle("techs")}>Technicians</button>}
+              <button type="button" className={chip(layers.labels)} onClick={() => toggle("labels")}>Tower names</button>
+              <button type="button" className={chip(false)} disabled title="KMZ import comes later">Coverage (later)</button>
+            </div>
+            <div className="mt-2 inline-flex rounded-md border border-[var(--baseline)] p-0.5">
+              {(Object.keys(BASES) as (keyof typeof BASES)[]).map((b) => (
+                <button key={b} type="button" onClick={() => setBase(b)} className={`rounded px-2.5 py-1 text-xs ${base === b ? "bg-[var(--tint-hover)] font-medium" : "text-[var(--text-muted)]"}`}>
+                  {b === "map" ? "Map" : "Satellite"}
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-[var(--text-muted)]">
+              <span><span className="mr-1 inline-block h-0.5 w-3 align-middle" style={{ background: GOOD }} />link fine</span>
+              <span><span className="mr-1 inline-block h-0.5 w-3 align-middle" style={{ background: WARN }} />busy / low link</span>
+              <span><span className="mr-1 inline-block h-0.5 w-3 align-middle" style={{ background: BAD }} />radio down</span>
+            </div>
+            {uispError && <p className="mt-2 text-xs text-[var(--status-critical)]">{uispError}</p>}
+          </div>
+        </div>
+
+        {/* ---- right: the map ---- */}
+        <div className="overflow-hidden rounded-lg border border-[var(--border-hairline)]">
+          <MapContainer center={FALLBACK_CENTRE} zoom={10} style={{ height: "78vh", width: "100%" }} scrollWheelZoom>
+            <TileLayer key={base} url={BASES[base].url} attribution={BASES[base].attribution} maxZoom={19} />
+            <ClickToCheck onPick={setPoint} />
+            <Camera point={point} towers={towerCoords} />
+
+            {layers.links &&
+              links.map((l) => (
+                <Polyline key={l.key} positions={[[l.a.latitude!, l.a.longitude!], [l.b.latitude!, l.b.longitude!]]} pathOptions={{ color: l.colour, weight: 3, opacity: 0.85 }}>
+                  <Tooltip sticky>
+                    {l.a.name} ↔ {l.b.name}: {[...new Set(l.radios.map((r) => r.name))].join(" / ")}
+                    {l.use != null ? ` · ${l.use}% downlink use` : ""}
+                  </Tooltip>
+                </Polyline>
+              ))}
+
+            {layers.towers &&
+              placedSites.map((s) => (
+                <CircleMarker
+                  key={`${s.id}-${layers.labels}`}
+                  center={[s.latitude!, s.longitude!]}
+                  radius={6}
+                  pathOptions={{ color: "#fff", weight: 2, fillColor: s.devices_offline ? BAD : "#2a78d6", fillOpacity: 1 }}
+                >
+                  <Tooltip permanent={layers.labels} direction="right" offset={[8, 0]}>
+                    {s.name}
+                    {s.devices_offline ? ` · ${s.devices_offline} down` : ""}
+                  </Tooltip>
+                </CircleMarker>
+              ))}
+
+            {canTechs &&
+              layers.techs &&
+              placedTechs.map((t) => (
+                <Marker key={t.code} position={[t.lat as number, t.lng as number]} icon={techPin(t)}>
+                  <Popup>
+                    <div className="text-xs">
+                      <div className="font-semibold">{t.name}</div>
+                      <div>
+                        {statusLabel(t.status)} · {claimLabel(t)}
+                      </div>
+                      {t.job_title && <div className="mt-1">{t.job_title}{t.customer_name ? ` — ${t.customer_name}` : ""}</div>}
+                    </div>
+                  </Popup>
+                </Marker>
+              ))}
+
+            {point && (
+              <>
+                {check?.nearest.slice(0, 3).map((t) => (
+                  <Polyline key={`n-${t.id}`} positions={[[point.lat, point.lng], [t.latitude, t.longitude]]} pathOptions={{ color: "#2a78d6", weight: 2, dashArray: "6 6", opacity: 0.8 }}>
+                    <Tooltip permanent direction="center" className="!bg-white/90 !px-1 !py-0 !text-[10px]">
+                      {km(t.distance_km)}
+                    </Tooltip>
+                  </Polyline>
+                ))}
+                <Marker position={[point.lat, point.lng]} icon={pointIcon} />
+              </>
+            )}
+          </MapContainer>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,280 @@
+"""The unauthenticated payment-details endpoint behind /suspension.
+
+A suspended customer's browser is inside the walled garden: DNS and the
+portal host, nothing else. They have no session -- being cut off is
+precisely the moment they can't get to a login form -- so the page that
+tells them where to pay has to be readable with no credential at all.
+
+That makes what this endpoint returns a deliberate, narrow decision, and
+these tests are what keep it narrow. It answers ONE question: "who do I
+pay, and how". It must never grow into a general-purpose read of
+BillingDefaults, because BillingDefaults also carries the platform's
+billing behaviour -- blocking_period_days, minimum_balance,
+payment_due_days, VAT registration -- and none of that is a stranger's
+business.
+"""
+from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
+
+from billing.models import BillingDefaults
+
+
+class PublicPaymentDetailsTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.url = reverse("public-payment-details")
+        d = BillingDefaults.load()
+        d.company_legal_name = "Skybre Pty Ltd"
+        d.company_phone = "057 000 0000"
+        d.company_email = "accounts@skybre.co.za"
+        d.bank_name = "FNB"
+        d.bank_account_number = "62000000000"
+        d.bank_branch_code = "250655"
+        d.vat_number = "4123456789"
+        d.save()
+
+    def test_readable_with_no_credential(self):
+        """The whole point. An authenticated-only endpoint here would mean
+        the page renders an empty "Where to pay" box for every customer it
+        was built for."""
+        res = self.client.get(self.url)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["bank_account_number"], "62000000000")
+        self.assertEqual(res.data["bank_name"], "FNB")
+        self.assertEqual(res.data["bank_branch_code"], "250655")
+        self.assertEqual(res.data["company_name"], "Skybre Pty Ltd")
+        self.assertEqual(res.data["email"], "accounts@skybre.co.za")
+        self.assertEqual(res.data["phone"], "057 000 0000")
+
+    def test_returns_nothing_but_payment_details(self):
+        """The guard against this endpoint drifting into a BillingDefaults
+        dump. Anything added to that model in future is invisible here
+        unless somebody deliberately adds it to the key list -- and this
+        test is what makes them think about it first."""
+        res = self.client.get(self.url)
+        self.assertEqual(
+            set(res.data.keys()),
+            {
+                "company_name", "phone", "email",
+                "bank_name", "bank_account_number", "bank_branch_code",
+            },
+        )
+        # Named explicitly, because these are the ones it would be most
+        # tempting to include and most wrong to: the platform's own
+        # suspension thresholds and its SARS registration.
+        body = res.content.decode()
+        for leaked in ("4123456789", "blocking_period_days", "minimum_balance", "payment_due_days"):
+            self.assertNotIn(leaked, body)
+
+    def test_missing_banking_details_yield_blanks_not_an_error(self):
+        """A fresh install has no banking details captured. The page has to
+        degrade to "contact accounts" rather than 500 -- an error here
+        would take out the only page a cut-off customer can reach."""
+        d = BillingDefaults.load()
+        d.bank_name = ""
+        d.bank_account_number = ""
+        d.bank_branch_code = ""
+        d.company_legal_name = ""
+        d.save()
+        res = self.client.get(self.url)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["bank_account_number"], "")
+        # Falls back to the email settings' company name rather than going
+        # blank, so the page is still branded.
+        self.assertTrue(res.data["company_name"])
+
+    def test_write_methods_are_refused(self):
+        """AllowAny plus a ModelSerializer is how a public read becomes a
+        public write. This is the test that would have caught it."""
+        for method in ("post", "patch", "put", "delete"):
+            with self.subTest(method=method):
+                res = getattr(self.client, method)(self.url, {"bank_account_number": "1"}, format="json")
+                self.assertEqual(res.status_code, 405)
+        self.assertEqual(BillingDefaults.load().bank_account_number, "62000000000")
+
+
+class SuspensionEmailContextTests(TestCase):
+    """The suspension email is the only part of this that a suspended
+    customer can read comfortably -- inside the walled garden they can
+    reach the portal and not much else, so they will open the email on
+    their phone's mobile data. That makes the email, not the page, the
+    thing that has to carry the bank details and the reference."""
+
+    def setUp(self):
+        from customers.models import Customer
+
+        d = BillingDefaults.load()
+        d.bank_name = "FNB"
+        d.bank_account_number = "62000000000"
+        d.bank_branch_code = "250655"
+        d.save()
+        self.customer = Customer.objects.create(
+            full_name="Test Customer", email="t@example.com",
+        )
+
+    def test_suspension_url_carries_the_customer_reference(self):
+        from notifications.models import EmailTemplate
+        from notifications.services import build_context
+
+        ctx = build_context(EmailTemplate.Key.SUSPENSION, self.customer)
+        self.assertIn("/suspension?ref=", ctx["suspension_url"])
+        self.assertIn(self.customer.customer_id, ctx["suspension_url"])
+        # Not /login. The point of the change: a suspended customer sent to
+        # a login form has nothing they can do there.
+        self.assertNotIn("/login", ctx["suspension_url"])
+
+    def test_reference_is_url_quoted(self):
+        """customer_id is editable (see the payment-reference change), so it
+        can legitimately contain a space or an ampersand -- either of which
+        silently truncates or corrupts the link if pasted in raw."""
+        from notifications.models import EmailTemplate
+        from notifications.services import build_context
+
+        self.customer.customer_id = "OLD REF&1"
+        self.customer.save(update_fields=["customer_id"])
+        ctx = build_context(EmailTemplate.Key.SUSPENSION, self.customer)
+        self.assertIn("OLD%20REF%261", ctx["suspension_url"])
+
+    def test_banking_placeholders_available_to_every_template(self):
+        from notifications.models import EmailTemplate
+        from notifications.services import build_context
+
+        for key in (EmailTemplate.Key.SUSPENSION, EmailTemplate.Key.PAYMENT_REMINDER,
+                    EmailTemplate.Key.INVOICE):
+            with self.subTest(key=key):
+                ctx = build_context(key, self.customer)
+                self.assertEqual(ctx["bank_account_number"], "62000000000")
+                self.assertEqual(ctx["bank_name"], "FNB")
+                self.assertEqual(ctx["bank_branch_code"], "250655")
+
+
+class AutoSuspendOnRunTests(TestCase):
+    """"When billing runs and there's a suspension, the client is auto
+    suspended on the system."
+
+    That behaviour already existed -- recurring._process_blocking writes
+    Service.status = SUSPENDED through the normal .save() path, so
+    radiusauth's signals re-address the session into the walled garden
+    exactly as they do for a manual suspension. What did NOT exist was a
+    test proving the whole chain fires from a run, end to end, with the
+    four gates in blocking_candidate_services satisfied by real rows
+    rather than by hand-set flags.
+
+    This is that test, and it is deliberately shaped like the seed script
+    (seed_suspension_test.py) so the two cannot drift: same blocking
+    period, same backdated invoice, same apply_balance_debit call. If the
+    seed script stops producing a suspension on the box, this test is
+    where the reason shows up.
+    """
+    def setUp(self):
+        import datetime
+        from decimal import Decimal
+
+        from billing.models import (
+            CustomerBillingConfig, Invoice, InvoiceItem, Service, SuspensionSettings, Tariff,
+        )
+        from customers.models import Customer
+
+        self.today = __import__("django.utils", fromlist=["timezone"]).timezone.localdate()
+        self.blocking_days = 3
+
+        s = SuspensionSettings.load()
+        s.auto_suspend_enabled = True
+        s.save()
+
+        tariff = Tariff.objects.create(
+            name="Test 20/10", price=Decimal("575.00"), tax_rate_pct=Decimal("15.00"),
+            speed_download_kbps=20000, speed_upload_kbps=10000,
+        )
+        self.customer = Customer.objects.create(full_name="Blocked Customer", email="b@example.com")
+        self.service = Service.objects.create(
+            customer=self.customer, tariff=tariff, status=Service.Status.ACTIVE,
+            radius_username="blocked_test", radius_password="x",
+            radius_connection_type=Service.ConnectionType.PPPOE,
+        )
+        config = CustomerBillingConfig.for_customer(self.customer)
+        config.billing_enabled = True
+        config.blocking_period_days = self.blocking_days
+        config.minimum_balance = Decimal("0")
+        # Off, so the run's only effect is the suspension -- an invoice
+        # raised in the same pass would make it impossible to say which
+        # invoice did the blocking.
+        config.auto_create_invoices = False
+        config.send_billing_notifications = False
+        config.save()
+        self.config = config
+
+        due = self.today - datetime.timedelta(days=self.blocking_days + 7)
+        inv = Invoice.objects.create(
+            customer=self.customer, status=Invoice.Status.UNPAID, date_due=due,
+        )
+        InvoiceItem.objects.create(
+            invoice=inv, item_type=InvoiceItem.ItemType.TARIFF, tariff=tariff, service=self.service,
+            description="Test", quantity=1, unit_price=tariff.price, tax_rate_pct=tariff.tax_rate_pct,
+        )
+        inv.recalc_totals()
+        # The step that is easy to leave out and fatal to leave out: without
+        # it the balance stays at zero, `balance <= minimum_balance` exempts
+        # the customer, and nothing is ever suspended.
+        inv.apply_balance_debit()
+        self.invoice = inv
+        self.customer.refresh_from_db()
+
+    def test_the_four_gates_are_satisfied(self):
+        from billing.recurring import blocking_candidate_services
+
+        self.assertGreater(self.customer.balance, self.config.minimum_balance)
+        self.assertEqual(
+            [s.pk for s in blocking_candidate_services(self.customer, self.config, self.today)],
+            [self.service.pk],
+        )
+
+    def test_a_preview_counts_it_and_writes_nothing(self):
+        from billing.models import Service
+        from billing.recurring import run_recurring_billing
+
+        result = run_recurring_billing(self.today, commit=False)
+        self.assertEqual(result["counts"]["suspensions_applied"], 1)
+        self.service.refresh_from_db()
+        self.assertEqual(self.service.status, Service.Status.ACTIVE)
+
+    def test_a_committed_run_suspends_the_service(self):
+        from billing.models import RecurringBillingRun, Service
+        from billing.recurring import run_recurring_billing
+
+        result = run_recurring_billing(self.today, commit=True)
+        self.assertEqual(result["counts"]["suspensions_applied"], 1)
+        self.service.refresh_from_db()
+        self.assertEqual(self.service.status, Service.Status.SUSPENDED)
+        # And it is on the run row, not just in the return value -- the run
+        # row is what staff see in Finance -> History.
+        run = RecurringBillingRun.objects.latest("pk")
+        self.assertEqual(run.suspensions_applied_count, 1)
+
+    def test_the_master_switch_stops_it(self):
+        from billing.models import Service, SuspensionSettings
+        from billing.recurring import run_recurring_billing
+
+        s = SuspensionSettings.load()
+        s.auto_suspend_enabled = False
+        s.save()
+        result = run_recurring_billing(self.today, commit=True)
+        self.assertEqual(result["counts"]["suspensions_applied"], 0)
+        self.service.refresh_from_db()
+        self.assertEqual(self.service.status, Service.Status.ACTIVE)
+
+    def test_a_paid_invoice_does_not_block(self):
+        """The gate that matters most in the other direction: a customer
+        who has paid must not be cut off by the next run."""
+        from billing.models import Invoice, Service
+        from billing.recurring import run_recurring_billing
+
+        self.invoice.status = Invoice.Status.PAID
+        self.invoice.save()
+        self.invoice.apply_balance_debit()
+        self.customer.refresh_from_db()
+        result = run_recurring_billing(self.today, commit=True)
+        self.assertEqual(result["counts"]["suspensions_applied"], 0)
+        self.service.refresh_from_db()
+        self.assertEqual(self.service.status, Service.Status.ACTIVE)

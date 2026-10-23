@@ -1,0 +1,221 @@
+"""A changed RADIUS answer has to reach the session already running.
+
+network.signals kicks on a status or tariff change. Nothing kicked on an
+address change -- and an address change does not go through Service.save()
+at all, it goes through assign_specific_customer_ip / release_customer_ip.
+So the customer stayed on the old address, the old address was freed for
+someone else to be given while still in use, and a re-auth inside that
+window could get an Accept with no Framed-IP-Address at all.
+
+The harness here is the one radiusauth/test_enforcement.py already uses,
+and both of its awkward parts are real rather than test artefacts: the push
+is registered with transaction.on_commit (so captureOnCommitCallbacks is
+needed or it is rolled back unrun) and then runs in a daemon thread (so the
+assertion has to wait for it).
+"""
+import threading
+from decimal import Decimal
+from unittest import mock
+
+from django.test import TestCase
+from django.utils import timezone
+
+from billing.models import Service, Tariff
+from customers.models import Customer
+from network.models import IPAddress, IPPool
+from radiusauth.models import RadAcct, RadCheck, RadReply
+from radiusauth.signals import (
+    _radius_answer, assign_specific_customer_ip, sync_service_radius,
+)
+
+
+class AnswerChangeKickTests(TestCase):
+    def setUp(self):
+        self.tariff = Tariff.objects.create(
+            name="A", price=Decimal("1"), speed_download_kbps=4096, speed_upload_kbps=4096
+        )
+        self.customer = Customer.objects.create(full_name="Addy Ann", email="a@x.com")
+        self.pool = IPPool.objects.create(
+            name="Customers", category=IPPool.Category.CUSTOMER,
+            network_cidr="10.10.0.0/24", gateway="10.10.0.1",
+        )
+        self.first = IPAddress.objects.create(pool=self.pool, address="10.10.0.5")
+        self.second = IPAddress.objects.create(pool=self.pool, address="10.10.0.6")
+        self.service = Service.objects.create(
+            customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date="2026-08-01", radius_username="addy", radius_password="pw",
+            radius_connection_type=Service.ConnectionType.PPPOE,
+            ip_assignment_mode=Service.IPAssignmentMode.POOL, ip_pool=self.pool,
+        )
+        # A push only happens for a customer who is actually connected --
+        # otherwise the new rows are simply what they get at their next
+        # login, and there is nothing to correct. Every "does it push" test
+        # below therefore needs a live accounting session to exist.
+        self.session = RadAcct.objects.create(
+            acctsessionid="s1", acctuniqueid="u1", username="addy",
+            nasipaddress="127.0.0.1", acctstarttime=timezone.now(),
+            acctupdatetime=timezone.now(), framedipaddress="10.10.0.5",
+        )
+
+    def _capture(self, mutate):
+        """Returns the (service, reason) pushed FOR self.service, or None.
+
+        Filtered by username rather than taking the first call that arrives:
+        the pushes run in daemon threads, so a stray from an earlier test in
+        this class can land inside the wait window and would otherwise be
+        read as this test's result.
+        """
+        fired = threading.Event()
+        captured = {}
+
+        def spy(service, reason, **kwargs):
+            if (service.radius_username or "") == self.service.radius_username:
+                captured["args"] = (service, reason)
+                fired.set()
+            return True
+
+        with mock.patch("radiusauth.enforcement.apply_change", side_effect=spy):
+            with self.captureOnCommitCallbacks(execute=True):
+                mutate()
+            fired.wait(timeout=5)
+        return captured.get("args")
+
+    # ---- the answer itself ----------------------------------------------
+
+    def test_answer_reads_reject_and_address(self):
+        RadCheck.objects.all().delete()
+        RadReply.objects.all().delete()
+        self.assertEqual(_radius_answer("nobody"), (False, None))
+        RadCheck.objects.create(
+            username="nobody", attribute="Auth-Type", op=":=", value="Reject"
+        )
+        self.assertEqual(_radius_answer("nobody"), (True, None))
+
+    # ---- the missing kick ------------------------------------------------
+
+    def _reassign(self, address):
+        """What billing.serializers.ServiceSerializer._apply_ip_address_selection
+        does: attach the address, then regenerate radreply."""
+        assign_specific_customer_ip(self.service, address.pk)
+        sync_service_radius(self.service)
+
+    def test_reassigning_the_address_pushes_to_the_live_session(self):
+        pushed = self._capture(lambda: self._reassign(self.second))
+        self.assertIsNotNone(pushed, "an address change must reach the live session")
+        self.assertEqual(pushed[1], "address")
+
+    def test_reassigning_the_same_address_does_not_push(self):
+        self._reassign(self.first)
+        pushed = self._capture(lambda: self._reassign(self.first))
+        self.assertIsNone(pushed, "an unchanged answer must not cost a router round trip")
+
+    def test_an_unchanged_resave_does_not_push(self):
+        pushed = self._capture(lambda: self.service.save())
+        self.assertIsNone(pushed)
+
+    def test_a_status_change_is_left_to_network_signals(self):
+        """Two pushes for one change is a wasted round trip and a confusing
+        pair of RadiusAction rows -- network.signals owns this case."""
+        def mutate():
+            self.service.status = Service.Status.SUSPENDED
+            self.service.save()
+
+        # network.signals' own handler is patched out, so anything captured
+        # here came from the new code rather than from the existing path.
+        with mock.patch("network.signals._apply_radius_change", return_value=True):
+            pushed = self._capture(mutate)
+        self.assertIsNone(pushed)
+
+    def test_push_can_be_suppressed_for_bulk_repair(self):
+        """resync_radius rewrites every service's rows -- the case where the
+        answer changes by definition. Pushing there would disconnect the whole
+        book in one pass to deliver rows that land at the next reconnect
+        anyway, so that caller opts out."""
+        def mutate():
+            assign_specific_customer_ip(self.service, self.second.pk)
+            sync_service_radius(self.service, push_to_session=False)
+
+        self.assertIsNone(self._capture(mutate))
+
+    def test_creating_a_service_does_not_push(self):
+        """A brand-new service has no session running under older terms. This
+        regressed radiusauth.test_enforcement's speed-change test: the create
+        in its setUp scheduled a disconnect that arrived after the test had
+        made a live session, so the fake NAS saw a CoA *and* a Disconnect.
+
+        Asserted on WHICH service was pushed rather than on "nothing was
+        pushed at all": these pushes run in daemon threads, so a stray from
+        an earlier test in the class can still land inside the wait window
+        and has nothing to do with what this test is checking.
+        """
+        pushes = []
+        fired = threading.Event()
+
+        def spy(service, reason, **kwargs):
+            pushes.append(((service.radius_username or ""), reason))
+            fired.set()
+            return True
+
+        with mock.patch("radiusauth.enforcement.apply_change", side_effect=spy):
+            with self.captureOnCommitCallbacks(execute=True):
+                Service.objects.create(
+                    customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+                    start_date="2026-08-01", radius_username="brand_new", radius_password="pw",
+                    radius_connection_type=Service.ConnectionType.PPPOE,
+                    ip_assignment_mode=Service.IPAssignmentMode.MANUAL, static_ip="10.10.0.99",
+                )
+            fired.wait(timeout=2)
+
+        self.assertNotIn(
+            "brand_new", [username for username, _ in pushes],
+            "a brand-new service has no session to drop",
+        )
+
+    def test_never_kicks_into_an_answer_with_no_address(self):
+        """Dropping a working session into "accepted, no Framed-IP-Address"
+        puts the customer on the router's own pool -- worse than leaving them
+        where they are. Reached legitimately mid-update, when the serializer
+        has released the old address and not yet attached the new one."""
+        self._reassign(self.first)
+
+        def mutate():
+            from radiusauth.signals import release_customer_ip
+            release_customer_ip(self.service)
+            sync_service_radius(self.service)
+
+        self.assertIsNone(self._capture(mutate))
+
+    # ---- deletion --------------------------------------------------------
+
+    def test_deleting_a_service_drops_its_live_session(self):
+        dropped = threading.Event()
+        calls = []
+
+        def spy(service):
+            calls.append(service)
+            dropped.set()
+            return 1
+
+        with mock.patch("network.router_sync.disconnect_service_sessions", side_effect=spy):
+            with self.captureOnCommitCallbacks(execute=True):
+                self.service.delete()
+            dropped.wait(timeout=5)
+
+        self.assertTrue(calls, "a deleted service must not leave the customer online")
+
+    def test_deleting_a_service_still_frees_its_address(self):
+        self._reassign(self.first)
+        with mock.patch("network.router_sync.disconnect_service_sessions", return_value=0):
+            with self.captureOnCommitCallbacks(execute=True):
+                self.service.delete()
+        self.first.refresh_from_db()
+        self.assertEqual(self.first.status, IPAddress.Status.FREE)
+        self.assertIsNone(self.first.assigned_service_id)
+
+    def test_deleting_a_service_with_no_username_is_quiet(self):
+        self.service.radius_username = ""
+        self.service.save()
+        with mock.patch("network.router_sync.disconnect_service_sessions") as spy:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.service.delete()
+        spy.assert_not_called()

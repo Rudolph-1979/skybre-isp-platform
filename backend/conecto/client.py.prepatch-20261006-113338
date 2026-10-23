@@ -1,0 +1,631 @@
+"""Calling Conecto's endpoints.
+
+Every call here obeys one rule: IT MUST NOT BREAK THE THING THAT
+TRIGGERED IT. Creating a ticket in Skybre, or saving a customer, cannot
+be allowed to fail because a Cloud Run function in another project is
+slow or down. So every call is wrapped, given a short timeout, and its
+outcome recorded in a ConectoCall row instead of raised.
+
+That is not fire-and-forget. Fire-and-forget loses the event; this keeps
+it. `conecto_resync` replays the failures, which is the answer to
+Conecto having no retry queue of its own -- their spec says a failed
+webhook is simply logged and dropped, so the durability has to live on
+our side or nowhere.
+
+Conecto gives each function its own Cloud Run URL rather than one base
+with paths, so the endpoints are configured individually and every one is
+overridable by environment variable.
+
+Five endpoints at first (tickets, alerts, towns, client codes); Job
+Dispatch added two more -- scheduleJob and setStockChecklist -- in the
+section at the bottom.
+"""
+import logging
+
+import requests
+from django.conf import settings
+from django.utils import timezone
+
+from .models import ConectoCall
+
+logger = logging.getLogger(__name__)
+
+# Seconds. Short on purpose: this runs inside a request/response cycle a
+# staff member is waiting on. A push that takes longer than this is one
+# the resync command should deal with, not one to keep somebody waiting
+# for.
+TIMEOUT = getattr(settings, "CONECTO_TIMEOUT_SECONDS", 6)
+
+#: Only the first of these is kept from an error body -- enough to see
+#: what went wrong without storing a Cloud Run HTML error page in full.
+DETAIL_LIMIT = 2000
+
+
+def _enabled():
+    """Off unless a key is configured.
+
+    Deliberately opt-in: a fresh install, a staging copy, or a developer's
+    laptop must not start posting real customer data at a production
+    Firebase project because it inherited the code.
+    """
+    return bool(getattr(settings, "CONECTO_API_KEY", ""))
+
+
+#: The two Job Dispatch endpoints, whose URLs Conecto published outright.
+#:
+#: Defaulted rather than left blank like the original six, because the
+#: settings block that holds those was written before Job Dispatch existed
+#: and is already deployed -- and a second patch of config/settings.py, to
+#: add two keys to a dict, is more risk than a documented default. The
+#: master switch is unchanged: with CONECTO_API_KEY unset nothing is sent
+#: to these or to anything else. Putting the keys into CONECTO_URLS still
+#: overrides them.
+DEFAULT_URLS = {
+    "scheduleJob": "https://africa-south1-skybre-connecto.cloudfunctions.net/scheduleJob",
+    "setStockChecklist": "https://africa-south1-skybre-connecto.cloudfunctions.net/setStockChecklist",
+    "cancelJob": "https://africa-south1-skybre-connecto.cloudfunctions.net/cancelJob",
+    "addTicketReply": "https://africa-south1-skybre-connecto.cloudfunctions.net/addTicketReply",
+    "invoiceCreated": "https://africa-south1-skybre-connecto.cloudfunctions.net/invoiceCreated",
+    "statementCreated": "https://africa-south1-skybre-connecto.cloudfunctions.net/statementCreated",
+    # NOT CONFIRMED BY CONECTO. Every other URL in this dict was
+    # published by them; this one follows their naming and is a guess
+    # until they say otherwise. It is safe to guess here because
+    # nothing calls push_usage except conecto_push_usage, which is a
+    # dry run unless asked otherwise -- and a wrong URL shows up as a
+    # 404 in ConectoCall on the first real run rather than as silence.
+    "usageUpdated": "https://africa-south1-skybre-connecto.cloudfunctions.net/usageUpdated",
+}
+
+
+def _url(name):
+    configured = getattr(settings, "CONECTO_URLS", {}).get(name, "")
+    return configured or DEFAULT_URLS.get(name, "")
+
+
+def _headers():
+    return {
+        "Authorization": f"Bearer {settings.CONECTO_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def call(endpoint, payload, *, url=None, method="post", subject_kind="", subject_ref="",
+         existing=None):
+    """Make one call, record it, and never raise.
+
+    Returns the parsed response dict on success, or None. Callers that
+    need the response (createTicket returns the id everything else keys
+    off) must handle None -- and the ConectoCall row is what makes that
+    recoverable rather than lost.
+
+    `existing` is a ConectoCall being RETRIED: it is updated in place and
+    its attempt count raised, rather than a second row appearing beside
+    it. A replay is another attempt at one event, not a new event, and a
+    table that grew a row per retry would stop being readable as "what
+    still needs fixing" -- which is the only reason it exists.
+    """
+    target = url or _url(endpoint)
+    if not _enabled() or not target:
+        # Not an error worth a row: the integration is simply switched off.
+        return None
+
+    if existing is not None:
+        record = existing
+        record.attempts += 1
+        record.status = ConectoCall.Status.FAILED
+        record.http_status = None
+        record.detail = ""
+    else:
+        record = ConectoCall(
+            endpoint=endpoint,
+            payload=payload,
+            status=ConectoCall.Status.FAILED,
+            subject_kind=subject_kind,
+            subject_ref=str(subject_ref or ""),
+        )
+
+    try:
+        response = requests.request(
+            method, target, json=payload, headers=_headers(), timeout=TIMEOUT
+        )
+        record.http_status = response.status_code
+        if response.ok:
+            record.status = ConectoCall.Status.OK
+            record.completed_at = timezone.now()
+            record.save()
+            try:
+                return response.json()
+            except ValueError:
+                # 200 with a body we can't parse. The call landed, so it is
+                # not a failure -- but the caller gets nothing, which for
+                # createTicket means no id to store.
+                logger.warning("Conecto %s returned unparseable JSON", endpoint)
+                return None
+        record.detail = (response.text or "")[:DETAIL_LIMIT]
+    except requests.RequestException as exc:
+        # Timeout, DNS, connection reset, TLS. No http_status to record.
+        record.detail = f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
+
+    record.save()
+    logger.warning(
+        "Conecto %s failed (%s) for %s %s: %s",
+        endpoint, record.http_status, subject_kind, subject_ref, record.detail[:200],
+    )
+    return None
+
+
+# --- tickets, alerts, towns, client codes ---------------------------------
+
+
+def health():
+    """Unauthenticated by Conecto's design, so this bypasses the key check
+    and is usable to test connectivity before anything is configured."""
+    target = _url("health")
+    if not target:
+        return None
+    try:
+        response = requests.get(target, timeout=TIMEOUT)
+        return response.json() if response.ok else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def register_client_code(customer):
+    """Upsert a customer's client code. Safe to call repeatedly."""
+    payload = {
+        "client_code": customer.customer_id,
+        "vexar_id": str(customer.pk),
+        "first_name": (customer.full_name or "").split(" ")[0],
+        "last_name": " ".join((customer.full_name or "").split(" ")[1:]),
+        "email": customer.email or "",
+        "phone": customer.phone or "",
+        # Conecto matches this against a registered town EXACTLY and
+        # case-sensitively, and silently stores the code with no town when
+        # it doesn't match. conecto_register_towns pushes our towns first
+        # so this has something to hit.
+        "city": customer.city or "",
+    }
+    return call(
+        "registerClientCode", payload,
+        subject_kind="customer", subject_ref=customer.customer_id,
+    )
+
+
+def register_staff_code(user, *, code=None, is_active=None):
+    """Tell Conecto a staff code exists, what role it carries, and whether
+    it is still valid. Safe to call repeatedly -- upsert, like
+    register_client_code.
+
+    is_active is the revocation channel. There is no separate delete
+    call: one endpoint that can also say "no longer valid" is idempotent,
+    survives being replayed by conecto_resync, and cannot leave a code
+    half-removed. A staff member who leaves is deactivated in the
+    platform and loses app access from the same action -- which is the
+    only arrangement that actually holds, because anything requiring a
+    second, separate step in another system is a step that eventually
+    does not happen.
+
+    A demotion out of the staff roles counts as inactive too: somebody
+    turned back into a customer account should not keep a field app.
+    """
+    from .mapping import staff_role_to_conecto
+
+    # `code` overrides the one on the row, which is how a code that has
+    # been CHANGED gets revoked: the row already holds the new one, and
+    # the call that has to go out is about the old one.
+    code = code or user.staff_code
+    if not code:
+        return None
+
+    payload = {
+        "staff_code": code,
+        "role": staff_role_to_conecto(user.role),
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "email": user.email or "",
+        "is_active": (
+            bool(user.is_active and user.is_staff_member)
+            if is_active is None else bool(is_active)
+        ),
+    }
+    return call(
+        "registerStaffCode", payload,
+        subject_kind="staff", subject_ref=code,
+    )
+
+
+def create_ticket(ticket):
+    from .mapping import category_from_department, priority_to_conecto, status_to_conecto
+
+    payload = {
+        "client_code": ticket.customer.customer_id,
+        "subject": ticket.subject,
+        "description": ticket.description or "",
+        "category": category_from_department(ticket.department),
+        "priority": priority_to_conecto(ticket.priority),
+        "status": status_to_conecto(ticket.status),
+        # We are Vexar, so our own number is the id Conecto echoes back on
+        # the ticket-closed webhook.
+        "vexar_ticket_id": ticket.ticket_number,
+        "ticket_number": ticket.ticket_number,
+    }
+    return call(
+        "createTicket", payload,
+        subject_kind="ticket", subject_ref=ticket.ticket_number,
+    )
+
+
+def update_ticket(conecto_ticket_id, *, status=None, priority=None, subject_ref=""):
+    """The id goes in the URL PATH, not the body -- see Conecto's spec."""
+    payload = {}
+    if status is not None:
+        payload["status"] = status
+    if priority is not None:
+        payload["priority"] = priority
+    if not payload:
+        return None
+
+    base = _url("updateTicket").rstrip("/")
+    return call(
+        "updateTicket", payload,
+        url=f"{base}/{conecto_ticket_id}",
+        method="patch",
+        subject_kind="ticket", subject_ref=subject_ref or conecto_ticket_id,
+    )
+
+
+def add_ticket_reply(conecto_ticket_id, message, *, author_name=None, subject_ref=""):
+    """Append a reply to a Conecto ticket, visible to the client.
+
+    THE ID GOES IN THE URL PATH, like updateTicket -- the stored URL is
+    the bare function and the id is appended here, so a configured value
+    carrying a literal "{ticketId}" would be wrong.
+
+    TWO THINGS CONECTO TOLD US THAT SHAPE THIS.
+
+    There is no internal-note mode. Everything sent here lands in the
+    same thread the client reads and fires a push notification to their
+    phone. So the decision about WHAT may be sent cannot live here; it
+    lives at the signal, which refuses internal notes outright.
+
+    The author is a label, never a person. Conecto's own app shows staff
+    replies as "Support Team" rather than a name, and sending a real one
+    would leak our staff's identities to customers through a channel
+    nobody chose that for. CONECTO_REPLY_AUTHOR_NAME overrides the label
+    if the wording should change; it is not a place to put a username.
+    """
+    message = (message or "").strip()
+    if not message:
+        # Their API rejects an empty message with a 400, and a blank reply
+        # would notify the client about nothing at all.
+        return None
+
+    base = _url("addTicketReply").rstrip("/")
+    if not base:
+        return None
+
+    payload = {
+        "message": message,
+        "author_name": author_name or getattr(
+            settings, "CONECTO_REPLY_AUTHOR_NAME", "Support Team"
+        ),
+    }
+    return call(
+        "addTicketReply", payload,
+        url=f"{base}/{conecto_ticket_id}",
+        subject_kind="ticket", subject_ref=subject_ref or conecto_ticket_id,
+    )
+
+
+def send_alert(description, *, title="", town="", alert_type="outage",
+               scheduled_start=None, scheduled_end=None):
+    """Outage/maintenance notice.
+
+    `town` must EXACTLY match a town already registered with Conecto, or
+    the alert is stored active and shown to nobody -- their spec says so,
+    and it answers 200 either way. Callers are warned rather than left to
+    discover that from an absence of complaints.
+    """
+    if not town:
+        logger.warning(
+            "Conecto alert sent with no town: it will be stored but pushed to nobody. %r",
+            description[:80],
+        )
+    payload = {
+        "description": description,
+        "title": title or "",
+        "affected_area": "town" if town else "",
+        "affected_value": town or "",
+        "type": alert_type,
+    }
+    if scheduled_start:
+        payload["scheduled_start"] = scheduled_start
+    if scheduled_end:
+        payload["scheduled_end"] = scheduled_end
+    return call("sendAlert", payload, subject_kind="alert", subject_ref=town or "-")
+
+
+def register_town(name, *, province="", area_code="", is_active=True):
+    payload = {
+        "name": name,
+        "province": province,
+        "area_code": area_code,
+        "is_active": is_active,
+    }
+    return call("registerTown", payload, subject_kind="town", subject_ref=name)
+
+
+# --- job dispatch ---------------------------------------------------------
+
+
+def schedule_job(job, technician_code="", staff_code=""):
+    """Put a job on a technician's list, or update the one already there.
+
+    Conecto treats a repeat call for the same vexar_job_id as an update,
+    so this is the only call needed for a reschedule or a change of
+    address -- there is no separate edit endpoint.
+
+    NO lat/lng is sent, and that is a gap rather than a decision: nothing
+    on this platform stores coordinates for a customer or a job, so there
+    is nothing to send. Conecto geocodes the address instead, which is
+    worse for a plot in a farm road than a pin would be. If technicians
+    start reporting that navigation takes them to the wrong place, a
+    lat/lng on the customer is the fix.
+    """
+    # One of the two, never neither. Conecto matches technician_code
+    # against a field their admin sets by hand, and (once they ship it)
+    # staff_code against the code this platform issues. Sending a blank
+    # one alongside a real one would be a value they have to decide how to
+    # interpret, so only the one being used goes.
+    if not technician_code and not staff_code:
+        logger.warning(
+            "Refusing to schedule job %s with no technician or staff code -- "
+            "Conecto would create it and attach it to nobody.", job.pk,
+        )
+        return None
+
+    payload = {
+        "vexar_job_id": str(job.pk),
+        "address": job_address(job),
+        "scheduled_for": job.start.isoformat(),
+        "notes": job.description or "",
+    }
+    if technician_code:
+        payload["technician_code"] = technician_code
+    if staff_code:
+        payload["staff_code"] = staff_code
+    if job.customer_id and getattr(job.customer, "customer_id", ""):
+        payload["client_code"] = job.customer.customer_id
+    if job.ticket_id and getattr(job.ticket, "ticket_number", ""):
+        payload["ticket_vexar_id"] = job.ticket.ticket_number
+        link = getattr(job.ticket, "conecto", None)
+        if link is not None:
+            payload["ticket_conecto_id"] = link.conecto_ticket_id
+
+    return call(
+        "scheduleJob", payload,
+        subject_kind="job", subject_ref=str(job.pk),
+    )
+
+
+def cancel_job(*, conecto_job_id="", vexar_job_id="", reason="", subject_ref=""):
+    """Take a job off a technician's phone.
+
+    Conecto shipped this on 2026-09-21. Before it existed, a job that was
+    cancelled or moved to somebody else stayed on the original
+    technician's list until they completed or ignored it -- which is a
+    person driving to work that is not happening, and the single worst
+    failure this integration had.
+
+    Either identifier will do. conecto_job_id is the one they returned
+    from scheduleJob and is preferred; vexar_job_id is our own primary
+    key and is the fallback for a job whose id we never captured.
+
+    Their answers: 404 for a job they do not recognise, 409 for one
+    already completed or cancelled. Both are recorded in a ConectoCall row
+    rather than raised, like every other call here -- a failed withdrawal
+    is something to see and replay, not something to crash a save over.
+    """
+    if not conecto_job_id and not vexar_job_id:
+        return None
+
+    payload = {}
+    if conecto_job_id:
+        payload["conecto_job_id"] = conecto_job_id
+    if vexar_job_id:
+        payload["vexar_job_id"] = vexar_job_id
+    if reason:
+        payload["reason"] = reason
+
+    return call(
+        "cancelJob", payload,
+        subject_kind="job", subject_ref=subject_ref or vexar_job_id,
+    )
+
+
+def job_address(job):
+    """Where the technician is actually going.
+
+    The job's own location field wins; a blank one falls back to the
+    customer's address, which is what Job.location's own help text
+    promises ("Defaults to the customer's address if left blank") and
+    which nothing had implemented. A job pushed with an empty address is
+    one a technician cannot navigate to.
+    """
+    if (job.location or "").strip():
+        return job.location.strip()
+    customer = job.customer
+    if customer is None:
+        return ""
+    parts = [
+        (customer.address or "").strip(),
+        (customer.complex_or_area or "").strip(),
+        (customer.city or "").strip(),
+        (customer.zip_code or "").strip(),
+    ]
+    return ", ".join(p for p in parts if p)
+
+
+def set_stock_checklist(technician_code, effective_date, items):
+    """Replace a technician's tick-list for one day.
+
+    Conecto replaces rather than merges, which is why this takes the whole
+    list: sending one item would silently remove the rest.
+    """
+    payload = {
+        "technician_code": technician_code,
+        "effective_date": effective_date.isoformat()
+        if hasattr(effective_date, "isoformat")
+        else str(effective_date),
+        "items": list(items),
+    }
+    return call(
+        "setStockChecklist", payload,
+        subject_kind="checklist", subject_ref=f"{technician_code}:{payload['effective_date']}",
+    )
+
+
+#: Our invoice statuses that Conecto has a word for. Anything not in here is
+#: not sent AT ALL -- see push_invoice.
+INVOICE_STATUS_TO_CONECTO = {
+    "unpaid": "unpaid",
+    "paid": "paid",
+    "overdue": "overdue",
+}
+
+
+def push_invoice(invoice, *, number=None):
+    """Send one issued invoice to the client's app.
+
+    WHAT IS DELIBERATELY NOT SENT.
+
+    Quotes, pro formas, drafts and cancellations. A draft is a document
+    nobody has agreed to yet -- figures still moving, possibly to be deleted
+    outright -- and showing one in a customer's app is a bill they were
+    shown and then had withdrawn. Conecto's schema has three statuses and
+    none of them means "ignore this", so the filtering has to happen here
+    and nowhere else.
+
+    `number` overrides the invoice's current one, which matters because
+    billing REISSUES the number on conversion: a quote accepted today stops
+    being QUO-000123 and becomes INV-000456. Pushing under the new number
+    is correct -- it is a different document -- but a caller correcting an
+    earlier push needs to name the key Conecto actually holds.
+    """
+    # A CREDIT NOTE IS NOT AN INVOICE, and Conecto's schema has no word for
+    # one: amount, plus unpaid/paid/overdue. Credit notes live in this same
+    # table -- a CN number, a negative total, status "paid" -- so the status
+    # filter below passes them straight through, and the client's app shows
+    # a bill for minus five hundred rand.
+    #
+    # Found in a backfill dry run on a real customer with three of them in
+    # thirty documents, before anything was sent. The status filter was
+    # never going to catch these; "is this a bill" and "has this bill been
+    # settled" are different questions and only one of them was being asked.
+    #
+    # BOTH markers are tested because either alone could drift. A change to
+    # the numbering defeats the prefix; a zero-value credit defeats the
+    # sign. Today they agree exactly, and there is no field on the model
+    # that says "credit note" to use instead.
+    if (invoice.total or 0) < 0 or (invoice.number or "").upper().startswith("CN"):
+        logger.info(
+            "Credit note %s not pushed: Conecto's invoice schema has no credit "
+            "state, so it would reach the client as a negative bill.",
+            invoice.number,
+        )
+        return None
+
+    status = INVOICE_STATUS_TO_CONECTO.get(invoice.status)
+    if status is None:
+        return None
+
+    customer_code = getattr(invoice.customer, "customer_id", "")
+    if not customer_code:
+        # Conecto key everything on the client code; without one there is
+        # nothing for the invoice to attach to on their side.
+        logger.warning(
+            "Invoice %s not pushed: customer %s has no client code.",
+            invoice.number, invoice.customer_id,
+        )
+        return None
+
+    payload = {
+        "client_code": customer_code,
+        "invoice_number": number or invoice.number,
+        "amount": float(invoice.total or 0),
+        "currency": "ZAR",
+        "due_date": invoice.date_due.isoformat() if invoice.date_due else None,
+        "status": status,
+    }
+    return call(
+        "invoiceCreated", payload,
+        subject_kind="invoice", subject_ref=payload["invoice_number"],
+    )
+
+
+def push_statement(customer, period):
+    """Tell the app a statement exists for this customer and month.
+
+    No figures beyond the period: the statement itself is the document, and
+    two renderings of the same month would eventually disagree. `pdf_url` is
+    deliberately absent -- Conecto ask us for a fresh one at the moment the
+    client taps, because a URL captured here and opened weeks later is a
+    dead link by construction.
+    """
+    customer_code = getattr(customer, "customer_id", "")
+    if not customer_code:
+        return None
+    return call(
+        "statementCreated",
+        {"client_code": customer_code, "period": period, "line_items": []},
+        subject_kind="statement", subject_ref=f"{customer_code} {period}",
+    )
+
+
+def usage_digest(download_bytes, upload_bytes, cap_bytes):
+    """The figures as Conecto will hold them, hashed.
+
+    `as_of` is deliberately absent -- see ConectoUsagePush's docstring.
+    """
+    import hashlib
+
+    blob = f"{int(download_bytes)}|{int(upload_bytes)}|{cap_bytes if cap_bytes else ''}"
+    return hashlib.md5(blob.encode()).hexdigest()
+
+
+def push_usage(customer, period, download_bytes, upload_bytes, cap_bytes=None, as_of=None):
+    """Tell the app how much this customer has used this calendar month.
+
+    BYTES, NOT GIGABYTES, and one representation of the figure rather than
+    two. A payload carrying both would eventually disagree with itself at
+    some rounding boundary, and the customer would be looking at whichever
+    one their app happened to render.
+
+    `as_of` is not decoration. A month-to-date total with no timestamp reads
+    as a final figure, and a client comparing it against a speed test twenty
+    minutes later has no way to know it is looking at last night's number.
+
+    `cap_bytes` is null for an uncapped service, and null the moment ANY of
+    a customer's services is uncapped -- a line with a cap and a line
+    without cannot meaningfully be "80% used". That rule lives in
+    radiusauth.usage.usage_report; it is not re-implemented here.
+    """
+    customer_code = getattr(customer, "customer_id", "")
+    if not customer_code:
+        return None
+
+    download_bytes = int(download_bytes or 0)
+    upload_bytes = int(upload_bytes or 0)
+    payload = {
+        "client_code": customer_code,
+        "period": period,
+        "download_bytes": download_bytes,
+        "upload_bytes": upload_bytes,
+        "total_bytes": download_bytes + upload_bytes,
+        "cap_bytes": int(cap_bytes) if cap_bytes else None,
+        "as_of": (as_of or timezone.now()).isoformat(),
+    }
+    return call(
+        "usageUpdated", payload,
+        subject_kind="usage", subject_ref=f"{customer_code} {period}",
+    )

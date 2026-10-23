@@ -1,6 +1,7 @@
 from django.utils import timezone
 from rest_framework import serializers
 from .models import SpeedWindow, RadiusNasClient, RadAcct, OvpnSettings, OvpnClientConnection
+from .models import RadiusNasClientAudit
 
 
 class RadiusNasClientSerializer(serializers.ModelSerializer):
@@ -9,12 +10,26 @@ class RadiusNasClientSerializer(serializers.ModelSerializer):
     # frontend one is on file without exposing the value.
     secret = serializers.CharField(write_only=True, required=False, allow_blank=True)
     secret_set = serializers.SerializerMethodField()
+    # Last-saved-by, for the column on Networking -> RADIUS Clients. The
+    # full history sits behind RadiusNasClientAudit; this is the part that
+    # belongs on the row itself, so the list answers "when did this last
+    # move" without anybody opening an audit view.
+    #
+    # A method field rather than CharField(source="changed_by.username"):
+    # the dotted source needs a `default` to survive changed_by being null,
+    # and DRF skips defaults entirely on a PATCH, so the field would
+    # silently vanish from exactly the responses an edit produces.
+    changed_by_username = serializers.SerializerMethodField()
+
+    def get_changed_by_username(self, obj):
+        return obj.changed_by.username if obj.changed_by_id else None
 
     class Meta:
         model = RadiusNasClient
         fields = [
             "id", "name", "ip_address", "shortname", "secret", "secret_set",
             "realm", "description", "is_active", "created_at",
+            "updated_at", "changed_by_username",
         ]
         read_only_fields = ["id", "created_at"]
 
@@ -27,6 +42,23 @@ class RadiusNasClientSerializer(serializers.ModelSerializer):
         if "secret" in validated_data and not validated_data["secret"]:
             validated_data.pop("secret")
         return super().update(instance, validated_data)
+
+
+class RadiusNasClientAuditSerializer(serializers.ModelSerializer):
+    """Read-only. Note there is no `secret` here and no route by which one
+    could appear -- see RadiusNasClientAudit's docstring."""
+
+    changed_by_username = serializers.SerializerMethodField()
+
+    def get_changed_by_username(self, obj):
+        return obj.changed_by.username if obj.changed_by_id else None
+
+    class Meta:
+        model = RadiusNasClientAudit
+        fields = [
+            "id", "client", "client_pk", "shortname", "action",
+            "changed_fields", "changed_by_username", "changed_at",
+        ]
 
 
 class OvpnSettingsSerializer(serializers.ModelSerializer):
@@ -84,6 +116,24 @@ class RadAcctSerializer(serializers.ModelSerializer):
     # interval. null when no fresh router reading exists.
     live_input_octets = serializers.SerializerMethodField()
     live_output_octets = serializers.SerializerMethodField()
+    # How long since this session last said anything, and what that makes it.
+    #
+    # `is_active` above is just "no stop time recorded", which is not the
+    # same as connected: a CPE that loses power never sends an
+    # Accounting-Stop, so its row reads active for ever. These two answer
+    # the question staff are actually asking.
+    #
+    # THREE states, matching RadAcctViewSet's filter:
+    #   online  open, and heard from within LIVE_SESSION_STALE_SECONDS
+    #   stale   open, and silent for longer than that -- dropped without
+    #           telling us, which is the one worth a phone call
+    #   ended   a real Accounting-Stop arrived
+    #
+    # The age travels with the state deliberately. A green pill on its own
+    # is unfalsifiable; a green pill beside "2781 min" is obviously wrong,
+    # and that is how this bug was found in the first place.
+    heartbeat_age_seconds = serializers.SerializerMethodField()
+    connection_state = serializers.SerializerMethodField()
 
     class Meta:
         model = RadAcct
@@ -92,6 +142,7 @@ class RadAcctSerializer(serializers.ModelSerializer):
             "acctstarttime", "acctupdatetime", "acctstoptime", "acctsessiontime",
             "acctinputoctets", "acctoutputoctets", "acctterminatecause", "is_active",
             "duration_seconds", "live_input_octets", "live_output_octets",
+            "heartbeat_age_seconds", "connection_state",
         ]
 
     def get_duration_seconds(self, obj):
@@ -102,6 +153,28 @@ class RadAcctSerializer(serializers.ModelSerializer):
         # Falls back to whatever the NAS last reported, which is better than
         # nothing for a row with no start time at all.
         return obj.acctsessiontime
+
+    def _last_seen(self, obj):
+        return obj.acctupdatetime or obj.acctstarttime
+
+    def get_heartbeat_age_seconds(self, obj):
+        """Seconds since the NAS last reported on this session, or None."""
+        last = self._last_seen(obj)
+        if last is None:
+            return None
+        return int((timezone.now() - last).total_seconds())
+
+    def get_connection_state(self, obj):
+        from .usage import LIVE_SESSION_STALE_SECONDS
+
+        if obj.acctstoptime:
+            return "ended"
+        age = self.get_heartbeat_age_seconds(obj)
+        if age is None:
+            # Open, and the NAS has never told us anything at all -- not a
+            # session anyone should trust.
+            return "stale"
+        return "online" if age <= LIVE_SESSION_STALE_SECONDS else "stale"
 
     def _router(self, obj):
         return self.context.get("router_rates", {}).get(obj.username)

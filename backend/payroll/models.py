@@ -32,6 +32,14 @@ class StaffProfile(models.Model):
     # license on file here.
     id_number = models.CharField(max_length=30, blank=True, help_text="National ID / passport number.")
     license_number = models.CharField(max_length=30, blank=True, help_text="Driver's license number.")
+    # The date on the card, not the card number. Nullable, and null means
+    # "nobody has told us" rather than "fine" -- see license_status. Most
+    # staff will never have one and that is correct: only people who
+    # actually drive reach the renewals list (fleet/views.py, `renewals`).
+    license_expiry = models.DateField(
+        null=True, blank=True, verbose_name="Driver's licence expires",
+        help_text="The expiry date printed on the card. A South African card runs five years.",
+    )
     pay_type = models.CharField(max_length=10, choices=PayType.choices, default=PayType.HOURLY)
     monthly_salary = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     hourly_rate = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
@@ -60,6 +68,41 @@ class StaffProfile(models.Model):
             next_num = (last.id + 1) if last else 1
             self.employee_number = f"EMP-{next_num:04d}"
         super().save(*args, **kwargs)
+
+    # A driver's licence gets a far wider notice period than a vehicle
+    # disc, and the gap is not arbitrary. A disc is a form and a payment.
+    # A card renewal is a booking at a testing centre that is routinely
+    # weeks out, an eye test, and a temporary licence while the card is
+    # printed -- start 30 days before it expires and you are already too
+    # late to finish in time. 60 days is the point where it is still
+    # possible to get a slot.
+    RENEWAL_NOTICE_DAYS = 60
+
+    # A South African card runs five years. The default when somebody
+    # presses Renew without typing a date.
+    LICENCE_TERM_YEARS = 5
+
+    @property
+    def license_days_left(self):
+        """Days until the card expires. Negative once it has. None when
+        nobody has captured a date."""
+        from fleet.renewals import days_until
+
+        return days_until(self.license_expiry)
+
+    @property
+    def license_status(self):
+        """"expired", "due_soon", "ok", or "unknown".
+
+        Imported from fleet rather than written out again here: this is
+        read off the same screen as the vehicle discs, and two copies of
+        the same three comparisons is exactly how "due soon" ends up
+        meaning two different things on one list. fleet/renewals.py holds
+        no models, so nothing circular comes back the other way.
+        """
+        from fleet.renewals import renewal_status
+
+        return renewal_status(self.license_expiry, self.RENEWAL_NOTICE_DAYS)
 
     def hourly_equivalent_rate(self):
         """The rate overtime is priced at. For hourly staff this is just

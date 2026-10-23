@@ -1,0 +1,201 @@
+"""A customer may only be put on their own partner's plans.
+
+The rule is one line -- Tariff.available_to -- and these pin the three
+things that make it worth having:
+
+  * the API REFUSES a cross-partner tariff. Filtering the dropdown is a
+    courtesy; the API is reachable directly, a stale browser tab holds an
+    old tariff list, and the CSV importer never sees the form at all.
+  * the dropdown OFFERS exactly what the API accepts. A list that shows a
+    choice the server then rejects is worse than no filtering.
+  * "empty means unrestricted" holds at both ends, so nothing stops being
+    sellable between deploying this and finishing the backfill.
+"""
+from decimal import Decimal
+from io import StringIO
+
+from django.core.management import call_command
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from billing.models import Service, Tariff
+from customers.models import Customer, Partner
+
+
+class TariffPartnerRuleTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(username="boss", password="x", role=User.Role.ADMIN)
+        self.client.force_authenticate(self.admin)
+
+        self.mtd = Partner.objects.create(name="MTD")
+        self.vuma = Partner.objects.create(name="Vumatel")
+
+        self.mtd_plan = self._tariff("MTD 50 Mbps", partner=self.mtd)
+        self.vuma_plan = self._tariff("Vuma BF 30/30 Mbps", partner=self.vuma)
+        self.shared_plan = self._tariff("Installation fee", partner=None)
+
+        self.mtd_customer = Customer.objects.create(
+            full_name="Lani Grunder", email="lani@x.com", partner=self.mtd
+        )
+        self.direct_customer = Customer.objects.create(full_name="Direct Dave", email="d@x.com")
+
+    def _tariff(self, name, partner):
+        return Tariff.objects.create(
+            name=name, price=Decimal("539.00"), speed_download_kbps=51200,
+            speed_upload_kbps=51200, partner=partner,
+        )
+
+    def _create_service(self, customer, tariff, **extra):
+        payload = {
+            "customer": customer.pk,
+            "tariff": tariff.pk,
+            "status": Service.Status.ACTIVE,
+            "start_date": str(timezone.localdate()),
+            **extra,
+        }
+        return self.client.post("/api/services/", payload, format="json")
+
+    # --- the rule --------------------------------------------------------
+
+    def test_a_customer_can_be_put_on_their_own_partners_plan(self):
+        res = self._create_service(self.mtd_customer, self.mtd_plan)
+        self.assertEqual(res.status_code, 201, res.content)
+
+    def test_a_customer_cannot_be_put_on_another_partners_plan(self):
+        res = self._create_service(self.mtd_customer, self.vuma_plan)
+
+        self.assertEqual(res.status_code, 400, res.content)
+        message = str(res.json()["tariff"])
+        # The message has to name both sides -- "invalid" tells whoever hit
+        # it nothing about which of the two things to change.
+        self.assertIn("Vumatel", message)
+        self.assertIn("MTD", message)
+
+    def test_a_shared_plan_is_available_to_everyone(self):
+        """Null partner means unrestricted, so nothing stops being sellable
+        between this deploying and the backfill finishing."""
+        res = self._create_service(self.mtd_customer, self.shared_plan)
+        self.assertEqual(res.status_code, 201, res.content)
+
+    def test_a_customer_with_no_partner_may_take_any_plan(self):
+        res = self._create_service(self.direct_customer, self.vuma_plan)
+        self.assertEqual(res.status_code, 201, res.content)
+
+    def test_a_booked_tariff_change_is_checked_too(self):
+        """Booking a customer onto another partner's plan for next month is
+        the same mistake deferred, and would go through silently on the day
+        it applied."""
+        res = self._create_service(
+            self.mtd_customer,
+            self.mtd_plan,
+            pending_tariff=self.vuma_plan.pk,
+            pending_tariff_date=str(timezone.localdate()),
+        )
+
+        self.assertEqual(res.status_code, 400, res.content)
+        self.assertIn("pending_tariff", res.json())
+
+    def test_editing_an_existing_service_is_checked(self):
+        service = Service.objects.create(
+            customer=self.mtd_customer, tariff=self.mtd_plan, status=Service.Status.ACTIVE
+        )
+
+        res = self.client.patch(
+            f"/api/services/{service.pk}/", {"tariff": self.vuma_plan.pk}, format="json"
+        )
+
+        self.assertEqual(res.status_code, 400, res.content)
+
+    # --- the dropdown agrees with the rule -------------------------------
+
+    def test_the_tariff_list_offers_exactly_what_the_api_will_accept(self):
+        res = self.client.get(f"/api/tariffs/?for_customer={self.mtd_customer.pk}")
+
+        offered = {t["id"] for t in res.json()["results"]}
+        self.assertIn(self.mtd_plan.pk, offered)
+        self.assertIn(self.shared_plan.pk, offered)
+        self.assertNotIn(self.vuma_plan.pk, offered)
+
+        # And every offered tariff really is accepted, rather than the two
+        # rules merely looking similar.
+        for tariff_id in offered:
+            created = self._create_service(self.mtd_customer, Tariff.objects.get(pk=tariff_id))
+            self.assertEqual(created.status_code, 201, created.content)
+
+    def test_a_customer_with_no_partner_is_offered_everything(self):
+        res = self.client.get(f"/api/tariffs/?for_customer={self.direct_customer.pk}")
+        self.assertEqual(len(res.json()["results"]), 3)
+
+    def test_an_unknown_customer_narrows_nothing_rather_than_emptying_the_list(self):
+        """An empty dropdown with no explanation is the worst outcome here;
+        the serializer still refuses anything genuinely mismatched."""
+        res = self.client.get("/api/tariffs/?for_customer=999999")
+        self.assertEqual(len(res.json()["results"]), 3)
+
+    def test_the_service_row_reports_the_tariffs_partner(self):
+        service = Service.objects.create(
+            customer=self.mtd_customer, tariff=self.mtd_plan, status=Service.Status.ACTIVE
+        )
+
+        row = self.client.get(f"/api/services/{service.pk}/").json()
+
+        self.assertEqual(row["partner"], self.mtd.pk)
+        self.assertEqual(row["partner_name"], "MTD")
+
+
+class AssignTariffPartnersCommandTests(TestCase):
+    def setUp(self):
+        self.mtd = Partner.objects.create(name="MTD")
+        self.vuma = Partner.objects.create(name="Vumatel")
+        for name in ("MTD 50 Mbps", "MTD 100 Mbps", "Vuma BF 30/30 Mbps", "SCF 500 Mbps"):
+            Tariff.objects.create(
+                name=name, price=Decimal("1"), speed_download_kbps=1, speed_upload_kbps=1
+            )
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("assign_tariff_partners", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def test_dry_run_writes_nothing(self):
+        output = self._run()
+        self.assertIn("Dry run", output)
+        self.assertEqual(Tariff.objects.filter(partner__isnull=False).count(), 0)
+
+    def test_it_matches_on_the_partners_own_name(self):
+        self._run("--apply")
+        self.assertEqual(Tariff.objects.filter(partner=self.mtd).count(), 2)
+
+    def test_a_name_the_partner_does_not_start_needs_an_explicit_rule(self):
+        """"Vuma BF 30/30" does not start with "Vumatel", so it is reported
+        rather than guessed at."""
+        output = self._run()
+        self.assertIn('--map "Vuma=<partner>"', output)
+
+        self._run("--map", "Vuma=Vumatel", "--apply")
+        self.assertEqual(Tariff.objects.get(name="Vuma BF 30/30 Mbps").partner, self.vuma)
+
+    def test_an_unmatched_tariff_is_left_available_to_everyone(self):
+        self._run("--map", "Vuma=Vumatel", "--apply")
+        self.assertIsNone(Tariff.objects.get(name="SCF 500 Mbps").partner)
+
+    def test_a_typo_in_a_partner_name_stops_the_run(self):
+        output = self._run("--map", "Vuma=Vumatell", "--apply")
+        self.assertIn("No partner named", output)
+        self.assertEqual(Tariff.objects.filter(partner__isnull=False).count(), 0)
+
+    def test_an_existing_assignment_is_left_alone_without_overwrite(self):
+        tariff = Tariff.objects.get(name="MTD 50 Mbps")
+        tariff.partner = self.vuma
+        tariff.save()
+
+        self._run("--apply")
+        tariff.refresh_from_db()
+        self.assertEqual(tariff.partner, self.vuma)
+
+        self._run("--apply", "--overwrite")
+        tariff.refresh_from_db()
+        self.assertEqual(tariff.partner, self.mtd)

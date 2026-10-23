@@ -12,6 +12,11 @@ type NavItem = {
   label: string;
   end?: boolean;
   section?: Section;
+  // Gated on role directly rather than a Section a staff member's
+  // allowed_sections can grant -- for a page like the ticket KPI report
+  // that the backend restricts to Management/Admin via IsManagement (see
+  // ManagementRoute, which is the same check on the route itself).
+  managementOnly?: boolean;
   /** Nested entries, shown indented under this one. One level only. */
   children?: NavItem[];
 };
@@ -25,6 +30,12 @@ type NavItem = {
 // access keeps it (see buildNav below for how that case renders).
 const NAV: NavItem[] = [
   { to: "/admin", label: "Dashboard", end: true },
+  // The support desk's own page (#212): tickets, who is offline, cut-offs
+  // and response times. Same gate as Support Tickets.
+  { to: "/admin/support", label: "Support", section: "tickets" },
+  // Technician positions lives on Networking -> Map (#175); the Scheduling
+  // shortcut to it was removed (Rudolph, 14 Oct: "we have it in networking
+  // map now"). Old /admin/scheduling/positions links still redirect there.
   { to: "/admin/scheduling", label: "Scheduling", section: "scheduling" },
   // Above Customers, because that is the order the lifecycle runs in: an
   // enquiry becomes a customer, not the other way round.
@@ -37,19 +48,43 @@ const NAV: NavItem[] = [
       { to: "/admin/usage-report", label: "Usage report", section: "customers" },
       { to: "/admin/offline-customers", label: "Recently offline", section: "customers" },
       { to: "/admin/tickets", label: "Support Tickets", section: "tickets" },
+      { to: "/admin/tickets/kpi-report", label: "Ticket KPI Report", section: "tickets", managementOnly: true },
     ],
   },
   { to: "/admin/services", label: "Services", section: "services" },
   { to: "/admin/finance", label: "Finance", section: "finance" },
   { to: "/admin/accountant", label: "Accountant", section: "accountant" },
   { to: "/admin/inventory", label: "Stock / Inventory", section: "inventory" },
-  { to: "/admin/networking", label: "Networking", section: "networking" },
+  {
+    to: "/admin/networking",
+    label: "Networking",
+    section: "networking",
+    // Backhaul / APs / core from UISP, read-only (14 Oct 2026).
+    children: [
+      { to: "/admin/networking/map", label: "Map", section: "networking" },
+      { to: "/admin/networking/uisp", label: "Network (UISP)", section: "networking" },
+    ],
+  },
   { to: "/admin/vehicles", label: "Vehicles", section: "vehicles" },
+  // Reports (Rudolph, 9 Oct 2026). New reports go here as children.
+  // Above Email (George, 9 Oct 2026).
+  {
+    to: "/admin/administration",
+    label: "Administration",
+    section: "administration",
+    end: true,
+    children: [
+      { to: "/admin/administration/clients-per-partner", label: "Clients per partner", section: "administration" },
+      { to: "/admin/administration/clients-per-tariff", label: "Clients per tariff", section: "administration" },
+      { to: "/admin/administration/revenue", label: "Revenue", section: "administration" },
+    ],
+  },
   { to: "/admin/bulk-email", label: "Email", section: "bulk_email" },
   { to: "/admin/configs", label: "Configs", section: "configs" },
 ];
 
 function permitted(user: User | null | undefined, item: NavItem): boolean {
+  if (item.managementOnly && !(user?.role === "management" || user?.role === "admin")) return false;
   return !item.section || canAccessSection(user, item.section);
 }
 

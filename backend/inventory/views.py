@@ -1,13 +1,19 @@
+from django.db import transaction
 from rest_framework import viewsets, permissions, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from accounts.permissions import IsStaffMember, section_permission
-from .models import Supplier, Product, SerializedUnit, StockReceipt, StockIssue, StockMovement
+from .models import (
+    Supplier, SupplierCategory, StockSite, Product, SerializedUnit,
+    StockReceipt, StockIssue, StockMovement,
+)
 
 HasInventoryAccess = section_permission("inventory")
 from .serializers import (
+    SupplierCategorySerializer,
     SupplierSerializer,
+    StockSiteSerializer,
     ProductSerializer,
     SerializedUnitSerializer,
     StockReceiptSerializer,
@@ -15,7 +21,51 @@ from .serializers import (
     StockIssueSerializer,
     StockIssueCreateSerializer,
 )
-from .filters import ProductFilter, SerializedUnitFilter, StockReceiptFilter, StockIssueFilter
+from .filters import (
+    ProductFilter,
+    SerializedUnitFilter,
+    StockReceiptFilter,
+    StockIssueFilter,
+    StockSiteFilter,
+)
+
+
+class SupplierCategoryViewSet(viewsets.ModelViewSet):
+    """Supplier categories and the expense account each one pre-fills.
+
+    Same permission shape as SupplierViewSet: anybody on staff can read
+    the list, because the Expenses form needs it to explain where a
+    pre-filled account came from, but changing one needs the Inventory
+    section -- that is where suppliers are maintained.
+    """
+
+    serializer_class = SupplierCategorySerializer
+    queryset = SupplierCategory.objects.select_related("default_account").all()
+    ordering_fields = ["name"]
+    search_fields = ["name"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), IsStaffMember()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasInventoryAccess()]
+
+    def destroy(self, request, *args, **kwargs):
+        """Deleting a category detaches its suppliers rather than removing
+        them -- but say how many first, because "delete Bandwidth" reads
+        like it affects a label and actually un-categorises every supplier
+        under it."""
+        category = self.get_object()
+        count = category.suppliers.count()
+        if count and request.query_params.get("confirm") != "yes":
+            return Response(
+                {"detail": (
+                    f"{count} supplier(s) are in {category.name}. Deleting it leaves them with no "
+                    "category, and expenses already captured keep the account they were saved with. "
+                    "Re-send with ?confirm=yes to go ahead."
+                )},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
@@ -42,6 +92,43 @@ class SupplierViewSet(viewsets.ModelViewSet):
         return Supplier.objects.all()
 
 
+class StockSiteViewSet(viewsets.ModelViewSet):
+    """Store rooms and vehicles -- the places stock can be."""
+
+    serializer_class = StockSiteSerializer
+    filterset_class = StockSiteFilter
+    ordering_fields = ["name", "site_type", "created_at"]
+    search_fields = ["name", "code", "address", "vehicle__registration_number"]
+
+    def get_permissions(self):
+        # Same split as SupplierViewSet: any staff member can read the site
+        # list, because Scheduling and Tickets both need to say where a
+        # technician's stock is without being given the Inventory section.
+        # Creating or editing a site still needs Inventory.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), IsStaffMember()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasInventoryAccess()]
+
+    def get_queryset(self):
+        # select_related so the label columns don't cost a query per row --
+        # holder_name reaches through vehicle to its driver, hence the
+        # two-hop entry.
+        return StockSite.objects.select_related("vehicle__assigned_to", "network_site")
+
+    def destroy(self, request, *args, **kwargs):
+        # Refusing rather than cascading: the default site is what every
+        # movement without an explicit location resolves to. Deleting it
+        # would leave that stock pointing at nothing, and the error people
+        # would eventually see would be nowhere near this action.
+        site = self.get_object()
+        if site.is_default:
+            return Response(
+                {"detail": "This is the default site. Make another site the default before deleting it."},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
 class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
     filterset_class = ProductFilter
@@ -57,6 +144,34 @@ class ProductViewSet(viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [permissions.IsAuthenticated(), IsStaffMember()]
         return [permissions.IsAuthenticated(), IsStaffMember(), HasInventoryAccess()]
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a product -- for a duplicate or a mistake (George, 14 Oct
+        2026). Only while it has NO stock history: a product that was ever
+        received, issued, adjusted or given serial units is part of the
+        stock record and the VAT trail, so it is refused with a pointer to
+        "make it inactive" instead. Quote/invoice lines that used it keep
+        their own description and price (InvoiceItem.product is SET_NULL);
+        its scanner barcodes go with it."""
+        product = self.get_object()
+        history = []
+        if product.receipt_lines.exists():
+            history.append("stock receipts")
+        if product.issue_lines.exists():
+            history.append("stock issues")
+        if product.movements.exists():
+            history.append("stock movements")
+        if product.serialized_units.exists():
+            history.append("serial units")
+        if history:
+            return Response(
+                {"detail": (
+                    f"'{product.name}' can't be deleted: it has {', '.join(history)} on record. "
+                    "Edit it and untick Active to retire it instead."
+                )},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def get_queryset(self):
         # The cost/margin properties walk this product's receipt lines and each
@@ -88,14 +203,38 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
         if delta == 0:
             return Response({"detail": "quantity must be non-zero."}, status=400)
-        if delta < 0 and product.quantity_on_hand + delta < 0:
-            return Response(
-                {"detail": f"Cannot remove {-delta} — only {product.quantity_on_hand} in stock."},
-                status=400,
+
+        # Under the same product-row lock the stock-issue path takes.
+        # quantity_on_hand is a SUM over StockMovement, so checking it and
+        # then writing a movement is the identical read-then-write race:
+        # a technician drawing the last 5 boxes while a storeman writes 5
+        # off for breakage both saw 5 and both wrote, leaving -5. The
+        # issue path was given the lock and this endpoint was not, so the
+        # invariant only held on one side of it.
+        # At one location (13 Oct 2026): the one sent, else the default site.
+        site_id = request.data.get("site")
+        site = (
+            StockSite.objects.filter(pk=site_id, is_active=True).first() if site_id else StockSite.default_site()
+        )
+        if site is None and site_id:
+            return Response({"detail": "That location isn't active."}, status=400)
+        with transaction.atomic():
+            product = (
+                Product.objects.select_for_update().get(pk=product.pk)
             )
-        note = request.data.get("note", "") or "Manual adjustment"
+            held = product.quantity_at(site)
+            if delta < 0 and held + delta < 0:
+                return Response(
+                    {"detail": f"Cannot remove {-delta} — only {held} " + (f"at {site.name}." if site else "in stock.")},
+                    status=400,
+                )
+            note = request.data.get("note", "") or "Manual adjustment"
+            return self._write_adjustment(product, delta, note, request, site)
+
+    def _write_adjustment(self, product, delta, note, request, site=None):
         StockMovement.objects.create(
             product=product,
+            site=site,
             movement_type=StockMovement.MovementType.ADJUSTMENT,
             quantity=delta,
             note=note,
@@ -134,7 +273,7 @@ class SerializedUnitViewSet(
         # received_via_line -> receipt -> supplier. Without this the units
         # list is three extra queries per row.
         return SerializedUnit.objects.select_related(
-            "product", "received_via_line__receipt__supplier"
+            "product", "site", "received_via_line__receipt__supplier"
         ).all()
 
 
@@ -151,7 +290,7 @@ class StockReceiptViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return (
-            StockReceipt.objects.select_related("supplier", "received_by")
+            StockReceipt.objects.select_related("supplier", "received_by", "site")
             .prefetch_related("lines__units", "lines__product")
             .all()
         )
@@ -170,7 +309,7 @@ class StockIssueViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return (
-            StockIssue.objects.select_related("job", "issued_to", "job__customer")
+            StockIssue.objects.select_related("job", "issued_to", "job__customer", "from_site", "to_site")
             .prefetch_related("lines__product", "lines__serial_unit")
             .all()
         )

@@ -199,10 +199,12 @@ def _visible_customer(user, pk):
     could read any other customer's history by id -- the History tab
     would become the hole in a restriction applied everywhere else.
     """
+    from customers.scoping import partner_condition
+
     qs = Customer.objects.all()
-    allowed = getattr(user, "allowed_partners", None) or []
-    if allowed and user.role != user.Role.ADMIN:
-        qs = qs.filter(Q(partner_id__in=allowed) | Q(partner__isnull=True))
+    condition = partner_condition(user)
+    if condition is not None:
+        qs = qs.filter(condition)
     return qs.filter(pk=pk).first()
 
 

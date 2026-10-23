@@ -10,8 +10,16 @@ import { CSVImportModal } from "../../components/CSVImportModal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
 import { canAccessSection } from "../../utils/permissions";
+import { apiErrorMessage } from "../../utils/apiError";
+import { applyPaymentMethodTerms } from "../../utils/billingTerms";
 import { ActivityList } from "../../components/ActivityFeed";
 import { SpeedWindowsPanel } from "../../components/SpeedWindowsPanel";
+import { RecurringChargesTab } from "../../components/RecurringChargesTab";
+import { OnceOffItemsTab } from "../../components/OnceOffItemsTab";
+import { ContractsConfigTab } from "../../components/ContractsConfigTab";
+import { PublicHolidaysTab } from "../../components/PublicHolidaysTab";
+import { SupportSettingsTab } from "../../components/SupportSettingsTab";
+import { PartnerAccessFields, partnerAccessSummary } from "../../components/PartnerAccessFields";
 import {
   SECTION_LABELS,
   ROLE_LABELS,
@@ -25,6 +33,7 @@ import {
   type StaffAccountEntry,
   type StaffPermissionEntry,
   type PaymentMethod,
+  type PaymentMethodApplyResult,
   type BillingDefaultsConfig,
   type ReminderSettingsConfig,
   type SuspensionSettingsConfig,
@@ -42,6 +51,7 @@ import {
 type Tab =
   | "tariffs"
   | "email-templates"
+  | "contracts"
   | "users"
   | "permissions"
   | "partners"
@@ -49,7 +59,8 @@ type Tab =
   | "billing"
   | "radius"
   | "activity"
-  | "speed-windows";
+  | "speed-windows"
+  | "support";
 
 // Array-based, like Finance's Invoices tab -- Tariffs needs two buttons
 // registered at once ("Import CSV" and "+ New tariff"), while Email
@@ -82,6 +93,8 @@ export function ConfigsPage() {
   const TABS: { key: Tab; label: string }[] = [
     { key: "tariffs", label: "Tariffs" },
     { key: "email-templates", label: "Email Templates" },
+    // Digital contract signing (6 Oct 2026): templates + automatic sending.
+    { key: "contracts", label: "Contracts" },
     ...(isAdmin ? [{ key: "users" as Tab, label: "Users" }] : []),
     ...(isManagement ? [{ key: "permissions" as Tab, label: "Permissions" }] : []),
     ...(isManagement ? [{ key: "partners" as Tab, label: "Partners" }] : []),
@@ -95,6 +108,9 @@ export function ConfigsPage() {
     // Next to Tariffs, because a window changes what every customer on a
     // plan gets -- the same kind of decision as the plan's own speed.
     ...(isAdmin ? [{ key: "speed-windows" as Tab, label: "Speed windows" }] : []),
+    // What the Support page measures against (#212): reply target, office
+    // hours, outage threshold.
+    ...(isAdmin ? [{ key: "support" as Tab, label: "Support" }] : []),
   ];
 
   return (
@@ -131,6 +147,7 @@ export function ConfigsPage() {
       </div>
       {tab === "tariffs" && <TariffsTab onRegisterNewAction={setNewAction} />}
       {tab === "email-templates" && <EmailTemplatesTab onRegisterNewAction={setNewAction} />}
+      {tab === "contracts" && <ContractsConfigTab onRegisterNewAction={setNewAction} />}
       {tab === "users" && isAdmin && <UsersTab onRegisterNewAction={setNewAction} />}
       {tab === "permissions" && isManagement && <PermissionsTab isAdmin={isAdmin} onRegisterNewAction={setNewAction} />}
       {tab === "partners" && isManagement && <PartnersTab onRegisterNewAction={setNewAction} />}
@@ -139,6 +156,7 @@ export function ConfigsPage() {
       {tab === "radius" && canSeeRadius && <RadiusClientsTab onRegisterNewAction={setNewAction} />}
       {tab === "activity" && <ActivityLogTab onRegisterNewAction={setNewAction} />}
       {tab === "speed-windows" && isAdmin && <SpeedWindowsPanel />}
+      {tab === "support" && isAdmin && <SupportSettingsTab />}
     </div>
   );
 }
@@ -149,9 +167,16 @@ export function ConfigsPage() {
 
 const TARIFF_COLUMNS: ColumnDef[] = [
   { key: "name", label: "Name" },
+  { key: "partner", label: "Partner" },
   { key: "type", label: "Type" },
   { key: "speed", label: "Speed" },
-  { key: "price", label: "Price" },
+  { key: "price", label: "Price (excl VAT)" },
+  { key: "price_incl", label: "Incl VAT" },
+  { key: "cost", label: "Cost (excl VAT)" },
+  { key: "cost_incl", label: "Cost incl VAT" },
+  { key: "profit_excl", label: "Profit (excl VAT)" },
+  { key: "profit_incl", label: "Profit incl VAT" },
+  { key: "markup", label: "Markup" },
   { key: "billing_period", label: "Billing period" },
   { key: "status", label: "Status" },
 ];
@@ -165,6 +190,21 @@ function mbpsHint(kbps: number | null | undefined) {
   return `${rounded} Mbps`;
 }
 
+// `price` is the EXCLUSIVE amount -- billing.recurring copies it into
+// InvoiceItem.unit_price and Invoice.recalc_totals() adds tax_rate_pct on
+// top. The form used to say only "Price (R)", so the inclusive retail
+// figure got typed in instead and every tariff sat 15% high: MTD 20 Mbps
+// held 435.85 (what the customer pays) and would have been invoiced at
+// 435.85 + 15% = R501.23. Showing the inclusive figure next to the field
+// as you type is what stops that happening again -- you enter 379.00 and
+// see R435.85, so a wrong entry is wrong on screen immediately.
+function inclusive(price: string | number | null | undefined, taxPct: string | number | null | undefined) {
+  const p = parseFloat(String(price ?? ""));
+  if (!Number.isFinite(p)) return null;
+  const rate = parseFloat(String(taxPct ?? "0"));
+  return p * (1 + (Number.isFinite(rate) ? rate : 0) / 100);
+}
+
 function speedCell(down: number | null, up: number | null) {
   if (!down) return "—";
   return `${down}/${up ?? "?"} Kbps`;
@@ -176,6 +216,14 @@ const IMPORT_TEMPLATE_HEADERS = [
   "tax_rate_pct", "is_active", "description",
 ];
 
+// Markup on cost: (price - cost) / cost (13 Oct 2026). "—" with no cost.
+function markupText(price: string | undefined | null, cost: string | undefined | null) {
+  const p = parseFloat(price ?? "");
+  const c = parseFloat(cost ?? "");
+  if (!isFinite(p) || !isFinite(c) || c <= 0) return "—";
+  return `${(((p - c) / c) * 100).toFixed(1)}%`;
+}
+
 const EMPTY_TARIFF: Partial<Tariff> = {
   name: "",
   service_type: "internet",
@@ -185,10 +233,22 @@ const EMPTY_TARIFF: Partial<Tariff> = {
   speed_upload_kbps: null,
   tax_rate_pct: "15",
   is_active: true,
+  // null = sellable by every partner. Left that way on purpose for a new
+  // tariff: somebody adding a plan in a hurry gets one that works for
+  // everyone, rather than one that silently belongs to nobody's dropdown.
+  partner: null,
 };
 
 function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  // Rudolph, 30 Sep: "In tariffs there need to be a option to add standard
+  // recurring billing like IP rental, Domain Rental etc" -- its own tab
+  // alongside the plan list, rather than a separate page, since it's the
+  // same section (Configs) making the same kind of decision.
+  const [subTab, setSubTab] = useState<"plans" | "charges" | "onceoff">("plans");
   const [ordering, setOrdering] = useState("name");
+  // Fetched here rather than reused from the Partners tab: tabs mount
+  // independently, so a list fetched over there does not exist over here.
+  const { items: partners } = useApiList<Partner>("/partners/?page_size=200&ordering=name");
   const [typeFilter, setTypeFilter] = useState("");
   const [activeFilter, setActiveFilter] = useState("");
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("tariffs", ["name"]);
@@ -235,13 +295,19 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   }
 
   useEffect(() => {
+    // Only on the Plans sub-tab -- Recurring Charges manages its own "+
+    // New charge" button inline rather than through this shared slot.
+    if (subTab !== "plans") {
+      onRegisterNewAction(null);
+      return;
+    }
     onRegisterNewAction([
       { label: "Import CSV", variant: "secondary", onClick: () => setShowImport(true) },
       { label: "+ New tariff", onClick: openCreate },
     ]);
     return () => onRegisterNewAction(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [subTab]);
 
   async function handleDelete() {
     if (!editing) return;
@@ -287,6 +353,34 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
 
   return (
     <div>
+      <div className="mb-4 flex gap-1 border-b border-[var(--border-hairline)]">
+        {(
+          [
+            ["plans", "Plans"],
+            ["charges", "Recurring Charges"],
+            ["onceoff", "Once-off Items"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setSubTab(key)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              subTab === key
+                ? "border-[var(--series-1)] text-[var(--text-primary)]"
+                : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {subTab === "charges" && <RecurringChargesTab />}
+      {subTab === "onceoff" && <OnceOffItemsTab />}
+
+      {subTab === "plans" && (
+        <>
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <select className={filterSelectClass} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
           <option value="">All types</option>
@@ -328,9 +422,17 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
           <THead>
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
+              {isVisible("partner") && <SortableTH field="partner__name" ordering={ordering} onSort={toggleSort}>Partner</SortableTH>}
               {isVisible("type") && <SortableTH field="service_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>}
               {isVisible("speed") && <SortableTH field="speed_download_kbps" ordering={ordering} onSort={toggleSort}>Speed</SortableTH>}
-              {isVisible("price") && <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price</SortableTH>}
+              {isVisible("price") && <SortableTH field="price" ordering={ordering} onSort={toggleSort}>Price (excl VAT)</SortableTH>}
+              {/* Not sortable: it is derived per row, not a database column. */}
+              {isVisible("price_incl") && <TH>Incl VAT</TH>}
+              {isVisible("cost") && <SortableTH field="cost_price" ordering={ordering} onSort={toggleSort}>Cost (excl VAT)</SortableTH>}
+              {isVisible("cost_incl") && <TH>Cost incl VAT</TH>}
+              {isVisible("profit_excl") && <TH>Profit (excl VAT)</TH>}
+              {isVisible("profit_incl") && <TH>Profit incl VAT</TH>}
+              {isVisible("markup") && <TH>Markup</TH>}
               {isVisible("billing_period") && <SortableTH field="billing_period" ordering={ordering} onSort={toggleSort}>Billing period</SortableTH>}
               {isVisible("status") && <SortableTH field="is_active" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
             </tr>
@@ -339,6 +441,14 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
             {items.map((t) => (
               <TR key={t.id} onClick={() => openEdit(t)}>
                 <TD className="font-medium">{t.name}</TD>
+                {/* "All partners" rather than an em dash: an unassigned
+                    tariff is not missing data, it is sellable by everyone,
+                    and that is a decision somebody may have made on purpose. */}
+                {isVisible("partner") && (
+                  <TD>
+                    {t.partner_name ?? <span className="text-[var(--text-muted)]">All partners</span>}
+                  </TD>
+                )}
                 {isVisible("type") && <TD className="capitalize">{t.service_type}</TD>}
                 {isVisible("speed") && (
                   <TD>
@@ -349,6 +459,46 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                   </TD>
                 )}
                 {isVisible("price") && <TD className="tabular-nums">R {parseFloat(t.price).toFixed(2)}</TD>}
+                {isVisible("price_incl") && (
+                  <TD className="tabular-nums font-medium">
+                    R {(inclusive(t.price, t.tax_rate_pct) ?? 0).toFixed(2)}
+                  </TD>
+                )}
+                {isVisible("cost") && (
+                  <TD className="tabular-nums">
+                    {t.cost_price ? `R ${parseFloat(t.cost_price).toFixed(2)}` : <span className="text-[var(--text-muted)]">Not set</span>}
+                  </TD>
+                )}
+                {/* Cost with VAT at the tariff's rate (George, 13 Oct 2026). */}
+                {isVisible("cost_incl") && (
+                  <TD className="tabular-nums font-medium">
+                    {t.cost_price ? (
+                      `R ${(inclusive(t.cost_price, t.tax_rate_pct) ?? 0).toFixed(2)}`
+                    ) : (
+                      <span className="text-[var(--text-muted)]">Not set</span>
+                    )}
+                  </TD>
+                )}
+                {/* Rand profit a line a month, price less cost (George, 13 Oct 2026). */}
+                {isVisible("profit_excl") && (
+                  <TD className={`tabular-nums ${t.cost_price && parseFloat(t.price) - parseFloat(t.cost_price) < 0 ? "text-red-600" : ""}`}>
+                    {t.cost_price ? (
+                      `R ${(parseFloat(t.price) - parseFloat(t.cost_price)).toFixed(2)}`
+                    ) : (
+                      <span className="text-[var(--text-muted)]">—</span>
+                    )}
+                  </TD>
+                )}
+                {isVisible("profit_incl") && (
+                  <TD className={`tabular-nums font-medium ${t.cost_price && parseFloat(t.price) - parseFloat(t.cost_price) < 0 ? "text-red-600" : ""}`}>
+                    {t.cost_price ? (
+                      `R ${((inclusive(t.price, t.tax_rate_pct) ?? 0) - (inclusive(t.cost_price, t.tax_rate_pct) ?? 0)).toFixed(2)}`
+                    ) : (
+                      <span className="text-[var(--text-muted)]">—</span>
+                    )}
+                  </TD>
+                )}
+                {isVisible("markup") && <TD className="tabular-nums">{markupText(t.price, t.cost_price)}</TD>}
                 {isVisible("billing_period") && <TD className="capitalize">{t.billing_period}</TD>}
                 {isVisible("status") && <TD><StatusBadge status={t.is_active ? "active" : "inactive"} /></TD>}
               </TR>
@@ -386,7 +536,7 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 <option value="other">Other</option>
               </select>
             </FormField>
-            <FormField label="Price (R)">
+            <FormField label="Price excluding VAT (R)">
               <input
                 type="number"
                 step="0.01"
@@ -396,6 +546,38 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 onChange={(e) => setForm({ ...form, price: e.target.value })}
               />
             </FormField>
+            {/* 13 Oct 2026: feeds markup on Administration -> Clients per
+                tariff and on the client's Services table. */}
+            <FormField label="Cost per month excluding VAT (R, optional)">
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                className={inputClass}
+                placeholder="Blank = not known yet"
+                value={form.cost_price ?? ""}
+                onChange={(e) => setForm({ ...form, cost_price: e.target.value === "" ? null : e.target.value })}
+              />
+            </FormField>
+            {form.cost_price && form.price ? (
+              <p className="-mt-1 mb-3 text-xs text-[var(--text-muted)]">
+                Markup on cost: <strong>{markupText(form.price, form.cost_price)}</strong>, R{" "}
+                {(parseFloat(form.price) - parseFloat(form.cost_price)).toFixed(2)} a line a month before VAT.
+              </p>
+            ) : null}
+            {/* The inclusive figure is the one the customer recognises, so
+                it is what you check this against. */}
+            <p className="-mt-1 mb-3 text-xs text-[var(--text-muted)]">
+              VAT is added on top at the rate below. Enter the{" "}
+              <strong>exclusive</strong> price here — not the advertised one.
+              {inclusive(form.price, form.tax_rate_pct) !== null ? (
+                <>
+                  {" "}The customer is billed{" "}
+                  <strong>R {(inclusive(form.price, form.tax_rate_pct) ?? 0).toFixed(2)}</strong>{" "}
+                  including VAT.
+                </>
+              ) : null}
+            </p>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <FormField label="Download speed (Kbps)">
                 <input
@@ -521,6 +703,26 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                 <option value="annually">Annually</option>
               </select>
             </FormField>
+            <FormField label="Partner">
+              <select
+                className={inputClass}
+                value={form.partner ?? ""}
+                onChange={(e) =>
+                  setForm({ ...form, partner: e.target.value ? Number(e.target.value) : null })
+                }
+              >
+                <option value="">All partners</option>
+                {partners.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-[var(--text-muted)]">
+                Only customers on this partner will be offered this plan when a service is created.
+                Leave as “All partners” for a plan anyone can be put on.
+              </p>
+            </FormField>
             <FormField label="Description (optional)">
               <textarea
                 className={inputClass}
@@ -582,6 +784,8 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
           onImported={refetch}
         />
       )}
+        </>
+      )}
     </div>
   );
 }
@@ -595,6 +799,7 @@ function TariffsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
 // {{ placeholders }} are available.
 const COMMON_PLACEHOLDERS = [
   "company_name", "customer_name", "customer_id", "customer_email", "portal_url", "balance", "today",
+  "site_url", "bank_name", "bank_account_number", "bank_branch_code",
 ];
 const EXTRA_PLACEHOLDERS: Record<string, string[]> = {
   statement: ["statement_date"],
@@ -602,7 +807,11 @@ const EXTRA_PLACEHOLDERS: Record<string, string[]> = {
   quote: ["invoice_number", "invoice_total", "invoice_due_date (the quote's valid-until date)"],
   proforma: ["invoice_number", "invoice_total", "invoice_due_date"],
   payment_reminder: ["invoice_number (blank if none)", "invoice_due_date (blank if none)"],
+  contract: ["contract_title", "contract_reference", "signing_url", "link_expires"],
+  contract_signed: ["contract_title", "contract_reference (the signed PDF is attached)"],
+  suspension: ["suspension_url (the public page showing where to pay -- carries the customer's reference)"],
   payment_received: ["payment_amount", "invoice_number (blank if this payment wasn't tied to a specific invoice)"],
+  service_restored: ["(sent once when a suspended client's line comes back after payment)"],
 };
 
 function EmailTemplatesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
@@ -734,6 +943,7 @@ function EmailTemplatesTab({ onRegisterNewAction }: { onRegisterNewAction: (acti
 
 const EMPTY_USER_FORM = {
   username: "",
+  staff_code: "",
   password: "",
   first_name: "",
   last_name: "",
@@ -741,11 +951,27 @@ const EMPTY_USER_FORM = {
   phone: "",
   role: "support" as Exclude<Role, "customer">,
   is_active: true,
+  is_noc: false,
+  // Scheduling calendar colour (6 Oct 2026); "" = automatic.
+  calendar_colour: "",
 };
 
 function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const { user: currentUser } = useAuth();
   const { items, loading, refetch } = useApiList<StaffAccountEntry>("/staff-accounts/?page_size=200");
+  // Partner access on Edit user too (Rudolph, 5 Oct 2026) -- the same
+  // allowed_partners Configs -> Permissions sets.
+  const { items: partners } = useApiList<Partner>("/partners/?page_size=200&ordering=name");
+  const [partnersRestricted, setPartnersRestricted] = useState(false);
+  const [checkedPartners, setCheckedPartners] = useState<Set<number>>(new Set());
+  function togglePartner(id: number) {
+    setCheckedPartners((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
   const [inviteResult, setInviteResult] = useState<{ sent: boolean; detail: string } | null>(null);
   const [inviteBusyId, setInviteBusyId] = useState<number | null>(null);
   const [showModal, setShowModal] = useState(false);
@@ -765,6 +991,8 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
         onClick: () => {
           setEditing(null);
           setForm(EMPTY_USER_FORM);
+          setPartnersRestricted(false);
+          setCheckedPartners(new Set());
           setError("");
           setShowModal(true);
         },
@@ -778,6 +1006,7 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
     setEditing(entry);
     setForm({
       username: entry.username,
+      staff_code: entry.staff_code ?? "",
       password: "",
       first_name: entry.first_name,
       last_name: entry.last_name,
@@ -785,7 +1014,12 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
       phone: entry.phone,
       role: entry.role as Exclude<Role, "customer">,
       is_active: entry.is_active,
+      is_noc: entry.is_noc,
+      calendar_colour: entry.calendar_colour ?? "",
     });
+    const allowed = entry.allowed_partners ?? [];
+    setPartnersRestricted(allowed.length > 0);
+    setCheckedPartners(new Set(allowed));
     setError("");
     setShowModal(true);
   }
@@ -797,12 +1031,16 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
     try {
       const payload: Record<string, unknown> = {
         username: form.username,
+        staff_code: form.staff_code,
         first_name: form.first_name,
         last_name: form.last_name,
         email: form.email,
         phone: form.phone,
         role: form.role,
         is_active: form.is_active,
+        is_noc: form.is_noc,
+        allowed_partners: partnersRestricted ? Array.from(checkedPartners) : [],
+        calendar_colour: form.calendar_colour,
       };
       // Blank password on an edit means "leave it unchanged" -- only send
       // it when the admin actually typed a new one (always sent, and
@@ -946,7 +1184,18 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
                   <TD className="text-[var(--text-secondary)]">{entry.username}</TD>
                   <TD className="text-[var(--text-secondary)]">{entry.email || "—"}</TD>
                   <TD className="text-[var(--text-secondary)]">{entry.phone || "—"}</TD>
-                  <TD>{ROLE_LABELS[entry.role]}</TD>
+                  <TD>
+                    {ROLE_LABELS[entry.role]}
+                    {entry.is_noc && (
+                      <span
+                        className="ml-1.5 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+                        style={{ background: "var(--surface-2)", color: "var(--text-secondary)" }}
+                        title="Can accept or reject a ticket escalated to NOC"
+                      >
+                        NOC
+                      </span>
+                    )}
+                  </TD>
                   <TD><StatusBadge status={entry.is_active ? "active" : "inactive"} /></TD>
                   <TD>
                     <button className="text-xs text-[var(--series-1)] hover:underline" onClick={() => openEdit(entry)}>
@@ -1016,6 +1265,22 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
                 name="staff-username"
               />
             </FormField>
+            <FormField label="Staff code">
+              <input
+                className={inputClass}
+                required
+                value={form.staff_code}
+                onChange={(e) => setForm({ ...form, staff_code: e.target.value })}
+                placeholder="STF-000015"
+                autoComplete="off"
+                name="staff-code"
+              />
+            </FormField>
+            <p className="-mt-2 mb-3 text-xs text-[var(--text-muted)]">
+              {editing
+                ? "The Conecto app checks this before letting them register. Changing it revokes the old code — anyone already registered on it will have to register again with the new one."
+                : "The Conecto app checks this before letting them register. Must be unique across all staff."}
+            </p>
             <FormField
               label={
                 editing
@@ -1026,7 +1291,7 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
               <input
                 type="password"
                 className={inputClass}
-                minLength={8}
+                minLength={10}
                 value={form.password}
                 onChange={(e) => setForm({ ...form, password: e.target.value })}
                 autoComplete="new-password"
@@ -1088,6 +1353,48 @@ function UsersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
                 ))}
               </select>
             </FormField>
+            <label className="mb-3 flex items-center gap-2 text-sm text-[var(--text-primary)]">
+              <input
+                type="checkbox"
+                checked={form.is_noc}
+                onChange={(e) => setForm({ ...form, is_noc: e.target.checked })}
+              />
+              NOC (can accept or reject a ticket escalated to them)
+            </label>
+            {/* Their colour on the Scheduling calendar. Also changeable from
+                Scheduling itself by clicking the person's colour dot. */}
+            <div className="mb-3">
+              <p className="mb-1 text-sm font-medium text-[var(--text-secondary)]">Calendar colour</p>
+              <div className="flex items-center gap-3 text-sm">
+                <input
+                  type="color"
+                  className="h-9 w-12 cursor-pointer rounded border border-[var(--border-hairline)] bg-transparent"
+                  value={form.calendar_colour || editing?.display_colour || "#2a6fd0"}
+                  onChange={(e) => setForm({ ...form, calendar_colour: e.target.value })}
+                />
+                {form.calendar_colour ? (
+                  <button
+                    type="button"
+                    className="text-xs text-[var(--series-1)] hover:underline"
+                    onClick={() => setForm({ ...form, calendar_colour: "" })}
+                  >
+                    Use automatic colour
+                  </button>
+                ) : (
+                  <span className="text-xs text-[var(--text-muted)]">Automatic — pick one to choose your own.</span>
+                )}
+              </div>
+            </div>
+            {partners.length > 0 && (
+              <PartnerAccessFields
+                partners={partners}
+                role={form.role}
+                restricted={partnersRestricted}
+                onRestrictedChange={setPartnersRestricted}
+                checked={checkedPartners}
+                onToggle={togglePartner}
+              />
+            )}
             {editing && (
               <label className="mb-3 flex items-center gap-2 text-sm text-[var(--text-primary)]">
                 <input
@@ -1157,10 +1464,15 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
   const { items, loading, setItems } = useApiList<StaffPermissionEntry>("/staff-permissions/?page_size=200");
   const { items: partners } = useApiList<Partner>("/partners/?page_size=200&ordering=name");
   const [editing, setEditing] = useState<StaffPermissionEntry | null>(null);
-  // Whether the person being edited is limited to a subset of sections at
-  // all. Off = allowed_sections saved as [] (unrestricted, the default).
-  // On = only the checked sections below are saved. Admin-only to change.
-  const [restricted, setRestricted] = useState(false);
+  // The sections this person can see. There is no longer an
+  // "unrestricted" state to toggle: an empty list means NO access, so
+  // every non-admin has an explicit list and this is simply it.
+  //
+  // The toggle that used to sit here saved [] when switched off, and the
+  // table called that "Full access". Both were true under the old rule
+  // and both became exactly backwards under the new one -- an admin
+  // using this screen to grant access would have revoked it, and been
+  // told the opposite. Removed rather than relabelled.
   const [checked, setChecked] = useState<Set<Section>>(new Set());
   // Same idea, but for which reseller partners' customers this staff
   // member can see (User.allowed_partners) -- Management can change this
@@ -1177,7 +1489,7 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
 
   function openEdit(entry: StaffPermissionEntry) {
     setEditing(entry);
-    setRestricted(entry.allowed_sections.length > 0);
+    // No toggle to prime any more -- the ticked set IS the access.
     setChecked(new Set(entry.allowed_sections));
     setPartnersRestricted(entry.allowed_partners.length > 0);
     setCheckedPartners(new Set(entry.allowed_partners));
@@ -1206,16 +1518,13 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
   }
 
   function accessSummary(entry: StaffPermissionEntry): string {
+    // Admin bypasses the section check entirely, so its empty list is
+    // genuinely full access. For everybody else an empty list is no
+    // access -- this row used to say "Full access" for both, which was
+    // the same word for opposite outcomes.
     if (entry.role === "admin") return "Full access (Admin)";
-    if (entry.allowed_sections.length === 0) return "Full access";
+    if (entry.allowed_sections.length === 0) return "No access";
     return entry.allowed_sections.map((s) => SECTION_LABELS[s]).join(", ");
-  }
-
-  function partnerAccessSummary(entry: StaffPermissionEntry): string {
-    if (entry.role === "admin") return "Sees all partners (Admin)";
-    if (entry.allowed_partners.length === 0) return "Sees all partners";
-    const names = partners.filter((p) => entry.allowed_partners.includes(p.id)).map((p) => p.name);
-    return names.join(", ") || `${entry.allowed_partners.length} partner(s)`;
   }
 
   async function handleSave(e: FormEvent) {
@@ -1233,7 +1542,7 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
         allowed_partners: partnersRestricted ? Array.from(checkedPartners) : [],
       };
       if (isAdmin) {
-        payload.allowed_sections = restricted ? Array.from(checked) : [];
+        payload.allowed_sections = Array.from(checked);
       }
       const res = await api.patch<StaffPermissionEntry>(`/staff-permissions/${editing.id}/`, payload);
       setItems((prev) => prev.map((it) => (it.id === editing.id ? res.data : it)));
@@ -1251,8 +1560,11 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
     <div>
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
         Control which sidebar sections each staff member can see and work in, and which reseller partners' customers
-        they can see. Leave someone with "Full access"/"Sees all partners" to keep them unrestricted (the default) —
-        Admin accounts always have full access regardless of either setting.
+        they can see. A staff member sees only the sections ticked for them — tick nothing and they see nothing, so a
+        new account has to be given what it needs. Partner access works the other way round: leave it at
+        "Sees all partners" and they see every partner's customers. Once restricted, they see only the partners
+        ticked — and direct customers only if "Direct customers" is ticked. Admin accounts always have full access
+        regardless of either setting. Partner access can also be set on Users → Edit user.
       </p>
 
       {loading ? (
@@ -1279,7 +1591,7 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
                 <TD><StatusBadge status={entry.is_active ? "active" : "inactive"} /></TD>
                 <TD className="max-w-md text-[var(--text-secondary)]">{accessSummary(entry)}</TD>
                 {partners.length > 0 && (
-                  <TD className="max-w-md text-[var(--text-secondary)]">{partnerAccessSummary(entry)}</TD>
+                  <TD className="max-w-md text-[var(--text-secondary)]">{partnerAccessSummary(entry, partners)}</TD>
                 )}
                 <TD>
                   {entry.role !== "admin" && (
@@ -1302,21 +1614,36 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
           <form onSubmit={handleSave}>
             {isAdmin && (
               <>
-                <label className="mb-4 flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={restricted}
-                    onChange={(e) => setRestricted(e.target.checked)}
-                  />
-                  <span className="font-medium text-[var(--text-secondary)]">Restrict to selected sections only</span>
-                </label>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <span className="text-sm font-medium text-[var(--text-secondary)]">
+                    Sections this person can see
+                  </span>
+                  {/* "Give them everything" used to be the off position of
+                      a toggle. It still needs to be one click, but now it
+                      says what it does instead of doing it by omission. */}
+                  <span className="flex gap-2">
+                    <button
+                      type="button"
+                      className="text-xs text-[var(--series-1)] hover:underline"
+                      onClick={() => setChecked(new Set(ALL_SECTIONS))}
+                    >
+                      Select all
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs text-[var(--series-1)] hover:underline"
+                      onClick={() => setChecked(new Set())}
+                    >
+                      Clear
+                    </button>
+                  </span>
+                </div>
 
-                <div className={`mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2 ${restricted ? "" : "opacity-40"}`}>
+                <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
                   {ALL_SECTIONS.map((section) => (
                     <label key={section} className="flex items-center gap-2 text-sm">
                       <input
                         type="checkbox"
-                        disabled={!restricted}
                         checked={checked.has(section)}
                         onChange={() => toggleSection(section)}
                       />
@@ -1325,9 +1652,11 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
                   ))}
                 </div>
 
-                {restricted && checked.size === 0 && (
-                  <p className="mb-4 text-xs text-[var(--status-warning,#b45309)]">
-                    No sections selected — this has the same effect as "Full access" until at least one is checked.
+                {checked.size === 0 && (
+                  <p className="mb-4 text-xs text-[var(--status-critical)]">
+                    Nothing ticked — this person will not be able to open any part of the platform. That is a valid
+                    thing to save (it is how you suspend someone's access without disabling the account), but it is
+                    almost never what you want if you came here to grant something.
                   </p>
                 )}
               </>
@@ -1336,34 +1665,14 @@ function PermissionsTab({ isAdmin, onRegisterNewAction }: { isAdmin: boolean; on
             {partners.length > 0 && (
               <>
                 <div className="my-4 border-t border-[var(--border-hairline)]" />
-                <label className="mb-4 flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={partnersRestricted}
-                    onChange={(e) => setPartnersRestricted(e.target.checked)}
-                  />
-                  <span className="font-medium text-[var(--text-secondary)]">Restrict to selected partners only</span>
-                </label>
-
-                <div className={`mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2 ${partnersRestricted ? "" : "opacity-40"}`}>
-                  {partners.map((p) => (
-                    <label key={p.id} className="flex items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        disabled={!partnersRestricted}
-                        checked={checkedPartners.has(p.id)}
-                        onChange={() => togglePartner(p.id)}
-                      />
-                      <span>{p.name}</span>
-                    </label>
-                  ))}
-                </div>
-
-                {partnersRestricted && checkedPartners.size === 0 && (
-                  <p className="mb-4 text-xs text-[var(--status-warning,#b45309)]">
-                    No partners selected — this has the same effect as "Sees all partners" until at least one is checked.
-                  </p>
-                )}
+                <PartnerAccessFields
+                  partners={partners}
+                  role={editing.role}
+                  restricted={partnersRestricted}
+                  onRestrictedChange={setPartnersRestricted}
+                  checked={checkedPartners}
+                  onToggle={togglePartner}
+                />
               </>
             )}
 
@@ -1862,7 +2171,7 @@ function EmailSettingsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
 // CustomerDetailPage's per-customer Billing config section.
 // ---------------------------------------------------------------------------
 
-type BillingSubTab = "payment-methods" | "defaults" | "reminders" | "auto-suspension";
+type BillingSubTab = "payment-methods" | "defaults" | "reminders" | "auto-suspension" | "holidays";
 
 const PAYMENT_PERIOD_OPTIONS: { value: RecurringPaymentPeriod; label: string }[] = [
   { value: "monthly", label: "1 month" },
@@ -1924,6 +2233,17 @@ export function recurringBillingFieldsToFormState(f: RecurringBillingFields): Re
   };
 }
 
+// A reminder offset is signed: positive fires before the due date, negative
+// after it. The plain `value ? Number(value) : null` the other numeric fields
+// use is wrong here, because a half-typed "-" is truthy and Number("-") is
+// NaN -- which JSON.stringify turns into null, silently clearing a field the
+// user was in the middle of filling in.
+function signedDay(value: string): number | null {
+  if (value === "" || value === "-") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function recurringBillingFormStateToPayload(s: RecurringBillingFormState): Record<string, unknown> {
   return {
     payment_period: s.payment_period,
@@ -1941,9 +2261,9 @@ export function recurringBillingFormStateToPayload(s: RecurringBillingFormState)
     proforma_payment_period: s.proforma_payment_period,
     create_proforma_for: s.create_proforma_for,
     reminder_enabled: s.reminder_enabled,
-    reminder_1_day: s.reminder_1_day ? Number(s.reminder_1_day) : null,
-    reminder_2_day: s.reminder_2_day ? Number(s.reminder_2_day) : null,
-    reminder_3_day: s.reminder_3_day ? Number(s.reminder_3_day) : null,
+    reminder_1_day: signedDay(s.reminder_1_day),
+    reminder_2_day: signedDay(s.reminder_2_day),
+    reminder_3_day: signedDay(s.reminder_3_day),
   };
 }
 
@@ -1975,13 +2295,34 @@ export function RecurringBillingFieldsFormBody({
   form,
   onChange,
   paymentMethods,
+  fillFromPaymentMethod = false,
+  billingDayHint,
 }: {
   form: RecurringBillingFormState;
   onChange: (next: RecurringBillingFormState) => void;
   paymentMethods: PaymentMethod[];
+  /** Customer form only: choosing a method copies its terms into the form. */
+  fillFromPaymentMethod?: boolean;
+  /** Customer form only: when the customer is next billed, and when a change applies. */
+  billingDayHint?: string;
 }) {
+  // Name of the method whose terms were last copied in, for the hint under
+  // the dropdown. Cleared when the dropdown is set back to "None".
+  const [filledFrom, setFilledFrom] = useState<string | null>(null);
+
   function set<K extends keyof RecurringBillingFormState>(key: K, value: RecurringBillingFormState[K]) {
     onChange({ ...form, [key]: value });
+  }
+
+  function choosePaymentMethod(value: string) {
+    const method = fillFromPaymentMethod ? paymentMethods.find((pm) => String(pm.id) === value) : undefined;
+    if (method) {
+      onChange(applyPaymentMethodTerms(form, method));
+      setFilledFrom(method.name);
+    } else {
+      set("payment_method", value);
+      setFilledFrom(null);
+    }
   }
 
   return (
@@ -1998,15 +2339,24 @@ export function RecurringBillingFieldsFormBody({
             ))}
           </select>
         </FormField>
-        <FormField label="Payment method">
-          <select className={inputClass} value={form.payment_method} onChange={(e) => set("payment_method", e.target.value)}>
+        <FormField
+          label="Payment method"
+          hint={
+            !fillFromPaymentMethod
+              ? undefined
+              : filledFrom
+                ? `Terms below filled in from ${filledFrom}. Check them, then save.`
+                : "Choosing a method fills in its terms below. Nothing is saved until you save."
+          }
+        >
+          <select className={inputClass} value={form.payment_method} onChange={(e) => choosePaymentMethod(e.target.value)}>
             <option value="">— None —</option>
             {paymentMethods.map((pm) => (
               <option key={pm.id} value={pm.id}>{pm.name}</option>
             ))}
           </select>
         </FormField>
-        <FormField label="Billing day (1–28)">
+        <FormField label="Billing day (1–28)" hint={billingDayHint}>
           <input
             type="number"
             min={1}
@@ -2138,34 +2488,39 @@ export function RecurringBillingFieldsFormBody({
         <span className="font-medium text-[var(--text-secondary)]">Send payment reminders for this billing cycle</span>
       </label>
       <p className="mb-2 text-xs text-[var(--text-muted)]">
-        Days before the due date each reminder fires — only takes effect if that reminder slot is also enabled under
-        Configs → Billing → Reminders.
+        Days from the due date each reminder fires. A positive number warns before it falls due; a negative number
+        chases an invoice that is already late (-7 is a week after). Only takes effect if that reminder slot is also
+        enabled under Configs → Billing → Reminders. A chaser set further out than the blocking period arrives after
+        the line is already off.
       </p>
       <div className={`grid grid-cols-1 gap-x-4 sm:grid-cols-3 ${form.reminder_enabled ? "" : "opacity-40"}`}>
-        <FormField label="Reminder #1 (days before due)">
+        <FormField label="Reminder #1 (days from due, negative chases)">
           <input
             type="number"
-            min={0}
+            min={-365}
+            max={365}
             className={inputClass}
             disabled={!form.reminder_enabled}
             value={form.reminder_1_day}
             onChange={(e) => set("reminder_1_day", e.target.value)}
           />
         </FormField>
-        <FormField label="Reminder #2 (days before due)">
+        <FormField label="Reminder #2 (days from due, negative chases)">
           <input
             type="number"
-            min={0}
+            min={-365}
+            max={365}
             className={inputClass}
             disabled={!form.reminder_enabled}
             value={form.reminder_2_day}
             onChange={(e) => set("reminder_2_day", e.target.value)}
           />
         </FormField>
-        <FormField label="Reminder #3 (days before due)">
+        <FormField label="Reminder #3 (days from due, negative chases)">
           <input
             type="number"
-            min={0}
+            min={-365}
+            max={365}
             className={inputClass}
             disabled={!form.reminder_enabled}
             value={form.reminder_3_day}
@@ -2185,6 +2540,7 @@ function BillingConfigTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
     { key: "defaults", label: "Billing Defaults" },
     { key: "reminders", label: "Reminders" },
     { key: "auto-suspension", label: "Auto-suspension" },
+    { key: "holidays", label: "Public holidays" },
   ];
 
   return (
@@ -2208,13 +2564,46 @@ function BillingConfigTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
       {subTab === "defaults" && <BillingDefaultsSubTab onRegisterNewAction={onRegisterNewAction} />}
       {subTab === "reminders" && <RemindersSubTab onRegisterNewAction={onRegisterNewAction} />}
       {subTab === "auto-suspension" && <AutoSuspensionSubTab onRegisterNewAction={onRegisterNewAction} />}
+      {subTab === "holidays" && <PublicHolidaysTab onRegisterNewAction={onRegisterNewAction} />}
     </div>
   );
 }
 
 // --- Payment Methods --------------------------------------------------------
 
-const EMPTY_PAYMENT_METHOD: Partial<PaymentMethod> = { name: "", is_active: true };
+// Terms a brand-new method starts with. Deliberately cautious: no
+// blocking period, so a method created in a hurry cannot suspend anybody
+// until someone sets one on purpose.
+const EMPTY_PAYMENT_METHOD: Partial<PaymentMethod> = {
+  name: "",
+  is_active: true,
+  payment_period: "monthly",
+  billing_day: 1,
+  use_date_of_customer_creation: false,
+  payment_due_days: null,
+  blocking_period_days: null,
+  deactivation_period_days: null,
+  minimum_balance: "0.00",
+  auto_create_invoices: true,
+  send_billing_notifications: true,
+  reminder_enabled: false,
+  reminder_1_day: null,
+  reminder_2_day: null,
+  reminder_3_day: null,
+};
+
+// Every term field, so opening an existing method for edit copies all of
+// them rather than whichever ones someone remembered to list.
+const PAYMENT_METHOD_TERM_FIELDS: (keyof PaymentMethod)[] = [
+  "payment_period", "billing_day", "use_date_of_customer_creation",
+  "payment_due_days", "blocking_period_days", "deactivation_period_days", "minimum_balance",
+  "auto_create_invoices", "send_billing_notifications",
+  "reminder_enabled", "reminder_1_day", "reminder_2_day", "reminder_3_day",
+];
+
+function numOrNull(value: string) {
+  return value === "" ? null : Number(value);
+}
 
 function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const { items, loading, refetch } = useApiList<PaymentMethod>("/payment-methods/?page_size=100&ordering=name");
@@ -2223,6 +2612,14 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
   const [form, setForm] = useState<Partial<PaymentMethod>>(EMPTY_PAYMENT_METHOD);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  // "Apply to existing customers" is a two-step: preview, then commit.
+  // Never one click -- see handleApplyPreview.
+  const [applying, setApplying] = useState<PaymentMethod | null>(null);
+  const [preview, setPreview] = useState<PaymentMethodApplyResult | null>(null);
+  const [applyBusy, setApplyBusy] = useState(false);
+  const [applyError, setApplyError] = useState("");
+  const [applied, setApplied] = useState<PaymentMethodApplyResult | null>(null);
 
   useEffect(() => {
     onRegisterNewAction([
@@ -2242,7 +2639,11 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
 
   function openEdit(pm: PaymentMethod) {
     setEditing(pm);
-    setForm({ name: pm.name, is_active: pm.is_active });
+    const next: Partial<PaymentMethod> = { name: pm.name, is_active: pm.is_active };
+    for (const field of PAYMENT_METHOD_TERM_FIELDS) {
+      (next as Record<string, unknown>)[field] = pm[field];
+    }
+    setForm(next);
     setError("");
     setShowModal(true);
   }
@@ -2268,12 +2669,61 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
     }
   }
 
+  // Preview first, always. Shortening a blocking period and applying it
+  // does not fail or warn -- it means the next billing run finds customers
+  // past their new, shorter grace period and cuts them off, and that run
+  // is minutes away. The backend answers both passes with the real
+  // blocking logic, so this shows who actually crosses the line.
+  async function handleApplyPreview(pm: PaymentMethod) {
+    setApplying(pm);
+    setPreview(null);
+    setApplied(null);
+    setApplyError("");
+    setApplyBusy(true);
+    try {
+      const res = await api.post<PaymentMethodApplyResult>(
+        `/payment-methods/${pm.id}/apply-to-existing/`, { commit: false }
+      );
+      setPreview(res.data);
+    } catch (err) {
+      setApplyError(apiErrorMessage(err, "Couldn't work out what applying this would change."));
+    } finally {
+      setApplyBusy(false);
+    }
+  }
+
+  async function handleApplyCommit() {
+    if (!applying) return;
+    setApplyBusy(true);
+    setApplyError("");
+    try {
+      const res = await api.post<PaymentMethodApplyResult>(
+        `/payment-methods/${applying.id}/apply-to-existing/`, { commit: true }
+      );
+      setApplied(res.data);
+      setPreview(null);
+      refetch();
+    } catch (err) {
+      setApplyError(apiErrorMessage(err, "Couldn't apply these terms."));
+    } finally {
+      setApplyBusy(false);
+    }
+  }
+
+  function closeApply() {
+    setApplying(null);
+    setPreview(null);
+    setApplied(null);
+    setApplyError("");
+  }
+
   return (
     <div>
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        Named payment conventions (e.g. "EFT 1st", "Cash") tagged onto a customer's billing config for reference —
-        these don't drive due-date/blocking timing on their own; that comes from the Billing Defaults / each
-        customer's own settings below.
+        A payment method carries the terms a customer is billed on — when payment falls due, how long after that
+        they're blocked, and the minimum balance that has to be outstanding before blocking applies. Selecting a
+        method on a customer <strong>copies</strong> these onto them; it doesn't link them. Editing a method changes
+        nothing for anyone already on it until you press <strong>Apply to existing</strong>.
       </p>
 
       {loading ? (
@@ -2283,6 +2733,10 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
           <THead>
             <tr>
               <TH>Name</TH>
+              <TH>Payment due</TH>
+              <TH>Blocks after</TH>
+              <TH>Min balance</TH>
+              <TH>Customers</TH>
               <TH>Status</TH>
               <TH></TH>
             </tr>
@@ -2291,29 +2745,164 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
             {items.map((pm) => (
               <TR key={pm.id}>
                 <TD className="font-medium">{pm.name}</TD>
+                <TD>{pm.payment_due_days == null ? "Same day" : `${pm.payment_due_days} days`}</TD>
+                {/* "Never" is the honest word for a blank blocking period --
+                    it is not a missing value, it is auto-suspension off. */}
+                <TD>
+                  {pm.blocking_period_days == null
+                    ? <span className="text-[var(--text-muted)]">Never</span>
+                    : `${pm.blocking_period_days} days`}
+                </TD>
+                <TD className="tabular-nums">R {parseFloat(pm.minimum_balance ?? "0").toFixed(2)}</TD>
+                <TD className="tabular-nums">{pm.customer_count ?? 0}</TD>
                 <TD><StatusBadge status={pm.is_active ? "active" : "inactive"} /></TD>
                 <TD>
-                  <button type="button" className={btnSecondary} onClick={() => openEdit(pm)}>
-                    Edit
-                  </button>
+                  <div className="flex gap-2">
+                    <button type="button" className={btnSecondary} onClick={() => openEdit(pm)}>
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className={btnSecondary}
+                      disabled={!pm.customer_count}
+                      title={pm.customer_count ? "" : "No customers are on this method yet"}
+                      onClick={() => handleApplyPreview(pm)}
+                    >
+                      Apply to existing
+                    </button>
+                  </div>
                 </TD>
               </TR>
             ))}
+            {items.length === 0 && (
+              <TR>
+                <TD className="text-[var(--text-muted)]">
+                  No payment methods yet — create one to set billing terms customers can be put on.
+                </TD>
+              </TR>
+            )}
           </tbody>
         </Table>
       )}
 
       {showModal && (
-        <Modal title={editing ? "Edit payment method" : "New payment method"} onClose={() => setShowModal(false)}>
+        <Modal title={editing ? `Edit payment method — ${editing.name}` : "New payment method"} onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
             <FormField label="Name">
               <input
                 className={inputClass}
                 required
+                placeholder="e.g. EFT 1st, Debit order 25th"
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
               />
             </FormField>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <FormField label="Payment period">
+                <select
+                  className={inputClass}
+                  value={form.payment_period ?? "monthly"}
+                  onChange={(e) => setForm({ ...form, payment_period: e.target.value as PaymentMethod["payment_period"] })}
+                >
+                  <option value="monthly">1 month</option>
+                  <option value="quarterly">3 months</option>
+                  <option value="biannually">6 months</option>
+                  <option value="annually">12 months</option>
+                </select>
+              </FormField>
+              <FormField label="Billing day (1–28)">
+                <input
+                  type="number" min={1} max={28}
+                  className={inputClass}
+                  value={form.billing_day ?? 1}
+                  onChange={(e) => setForm({ ...form, billing_day: Number(e.target.value) })}
+                />
+              </FormField>
+              <FormField label="Payment due (days after invoice)">
+                <input
+                  type="number" min={0}
+                  className={inputClass}
+                  placeholder="Blank = same day"
+                  value={form.payment_due_days ?? ""}
+                  onChange={(e) => setForm({ ...form, payment_due_days: numOrNull(e.target.value) })}
+                />
+              </FormField>
+              <FormField label="Blocking period (days after due)">
+                <input
+                  type="number" min={0}
+                  className={inputClass}
+                  placeholder="Blank = never block"
+                  value={form.blocking_period_days ?? ""}
+                  onChange={(e) => setForm({ ...form, blocking_period_days: numOrNull(e.target.value) })}
+                />
+              </FormField>
+              <FormField label="Minimum balance (R)">
+                <input
+                  type="number" step="0.01"
+                  className={inputClass}
+                  value={form.minimum_balance ?? "0.00"}
+                  onChange={(e) => setForm({ ...form, minimum_balance: e.target.value })}
+                />
+              </FormField>
+              <FormField label="Deactivation (days after blocking)">
+                <input
+                  type="number" min={0}
+                  className={inputClass}
+                  placeholder="Blank = disabled"
+                  value={form.deactivation_period_days ?? ""}
+                  onChange={(e) => setForm({ ...form, deactivation_period_days: numOrNull(e.target.value) })}
+                />
+              </FormField>
+            </div>
+
+            {/* Said plainly, because "minimum balance" reads like a credit
+                limit and is not one: it is how much has to be owed before
+                blocking counts at all. */}
+            <p className="-mt-1 mb-3 text-xs text-[var(--text-muted)]">
+              A customer is only blocked once they are past the blocking period <em>and</em> owe more than the
+              minimum balance. Set the minimum balance to shield small amounts from cutting someone off.
+            </p>
+
+            <label className="mb-2 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={form.send_billing_notifications ?? true}
+                onChange={(e) => setForm({ ...form, send_billing_notifications: e.target.checked })}
+              />
+              <span>Send billing notifications</span>
+            </label>
+            <label className="mb-2 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={form.reminder_enabled ?? false}
+                onChange={(e) => setForm({ ...form, reminder_enabled: e.target.checked })}
+              />
+              <span>Send payment reminders</span>
+            </label>
+
+            {form.reminder_enabled && (
+              <div className="mb-3 grid grid-cols-3 gap-3">
+                {([1, 2, 3] as const).map((n) => (
+                  <FormField key={n} label={`Reminder ${n} (days)`}>
+                    <input
+                      type="number"
+                      className={inputClass}
+                      value={(form[`reminder_${n}_day` as keyof PaymentMethod] as number | null) ?? ""}
+                      onChange={(e) => setForm({ ...form, [`reminder_${n}_day`]: numOrNull(e.target.value) })}
+                    />
+                  </FormField>
+                ))}
+              </div>
+            )}
+
+            {form.reminder_enabled && (
+              <p className="-mt-1 mb-3 text-xs text-[var(--text-muted)]">
+                Reminders also have to be switched on globally under Configs → Billing → Reminders; these day
+                offsets do nothing on their own.
+              </p>
+            )}
+
             <label className="mb-4 flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -2334,6 +2923,67 @@ function PaymentMethodsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
               </button>
             </div>
           </form>
+        </Modal>
+      )}
+
+      {applying && (
+        <Modal title={`Apply terms — ${applying.name}`} onClose={closeApply}>
+          {applyBusy && !preview && !applied && <p className="text-[var(--text-muted)]">Working out what would change…</p>}
+
+          {applyError && <p className="mb-3 text-sm text-[var(--status-critical)]">{applyError}</p>}
+
+          {preview && (
+            <div>
+              <p className="mb-3 text-sm">
+                This will copy <strong>{applying.name}</strong>'s terms onto{" "}
+                <strong>{preview.customers}</strong> customer{preview.customers === 1 ? "" : "s"} already on it.
+              </p>
+
+              {preview.newly_blocked.length > 0 ? (
+                <div className="mb-3 rounded-md border border-[var(--status-critical)] p-3">
+                  <p className="mb-2 text-sm font-medium text-[var(--status-critical)]">
+                    {preview.newly_blocked.length} of them would be blocked at the next billing run:
+                  </p>
+                  <ul className="max-h-48 overflow-y-auto text-sm">
+                    {preview.newly_blocked.map((row) => (
+                      <li key={row.customer_id} className="py-0.5">
+                        {row.customer} <span className="text-[var(--text-muted)]">({row.reference})</span> —{" "}
+                        {row.services} service{row.services === 1 ? "" : "s"}
+                      </li>
+                    ))}
+                  </ul>
+                  {!preview.auto_suspend_enabled && (
+                    <p className="mt-2 text-xs text-[var(--text-muted)]">
+                      Auto-suspension is currently switched off platform-wide, so nobody would actually be
+                      disconnected until it's turned on.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="mb-3 text-sm text-[var(--text-muted)]">
+                  Nobody would become blocked by this change.
+                </p>
+              )}
+
+              <div className="mt-4 flex justify-end gap-2">
+                <button type="button" className={btnSecondary} onClick={closeApply}>Cancel</button>
+                <button type="button" className={btnPrimary} disabled={applyBusy} onClick={handleApplyCommit}>
+                  {applyBusy ? "Applying…" : `Apply to ${preview.customers} customer${preview.customers === 1 ? "" : "s"}`}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {applied && (
+            <div>
+              <p className="mb-3 text-sm">
+                Applied to <strong>{applied.customers}</strong> customer{applied.customers === 1 ? "" : "s"}.
+              </p>
+              <div className="mt-4 flex justify-end">
+                <button type="button" className={btnPrimary} onClick={closeApply}>Close</button>
+              </div>
+            </div>
+          )}
         </Modal>
       )}
     </div>
@@ -2775,11 +3425,15 @@ function AutoSuspensionSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [confirmingEnable, setConfirmingEnable] = useState(false);
+  // Held as text while it is being typed, so a half-deleted "1" doesn't
+  // round-trip to the server as a 1-day notice period.
+  const [warningDays, setWarningDays] = useState("3");
 
   function load() {
     setLoading(true);
     api.get<SuspensionSettingsConfig>("/suspension-settings/").then((r) => {
       setSettings(r.data);
+      setWarningDays(String(r.data.warning_days ?? 3));
       setLoading(false);
     });
   }
@@ -2790,16 +3444,18 @@ function AutoSuspensionSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function save(nextEnabled: boolean) {
+  // Takes a partial rather than a boolean: this panel now holds three
+  // settings, and one saver for all of them keeps the error and "saved"
+  // handling in a single place.
+  async function save(patch: Partial<SuspensionSettingsConfig>) {
     if (!settings) return;
     setError("");
     setSaved(false);
     setSaving(true);
     try {
-      const res = await api.patch<SuspensionSettingsConfig>("/suspension-settings/", {
-        auto_suspend_enabled: nextEnabled,
-      });
+      const res = await api.patch<SuspensionSettingsConfig>("/suspension-settings/", patch);
       setSettings(res.data);
+      setWarningDays(String(res.data.warning_days ?? 3));
       setSaved(true);
     } catch (err) {
       const data = (err as { response?: { data?: Record<string, unknown> } })?.response?.data;
@@ -2818,7 +3474,7 @@ function AutoSuspensionSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
     if (checked) {
       setConfirmingEnable(true);
     } else {
-      save(false);
+      save({ auto_suspend_enabled: false });
     }
   }
 
@@ -2860,7 +3516,7 @@ function AutoSuspensionSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
               <button type="button" className={btnSecondary} onClick={() => setConfirmingEnable(false)}>
                 Cancel
               </button>
-              <button type="button" className={btnPrimary} disabled={saving} onClick={() => save(true)}>
+              <button type="button" className={btnPrimary} disabled={saving} onClick={() => save({ auto_suspend_enabled: true })}>
                 {saving ? "Saving…" : "Yes, enable auto-suspension"}
               </button>
             </div>
@@ -2869,6 +3525,50 @@ function AutoSuspensionSubTab({ onRegisterNewAction }: { onRegisterNewAction: (a
 
         {error && <p className="mt-4 text-sm text-[var(--status-critical)]">{error}</p>}
         {saved && !error && !confirmingEnable && <p className="mt-4 text-sm text-[#0ca30c]">Settings saved.</p>}
+      </div>
+
+      {/* Its own card below the master switch, and deliberately NOT gated
+          on it. Warning people is not the dangerous half of this feature,
+          and running warnings for a cycle before arming the cut-off is a
+          reasonable way to start. */}
+      <div className="mt-4 max-w-2xl rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-5">
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            checked={settings.warning_enabled}
+            disabled={saving}
+            onChange={(e) => save({ warning_enabled: e.target.checked })}
+          />
+          <span className="font-medium text-[var(--text-secondary)]">
+            Warn customers by email before their line is suspended
+          </span>
+        </label>
+        <p className="mt-2 text-sm text-[var(--text-secondary)]">
+          Goes to anyone who would be suspended this many days from now, naming the date. Without
+          it, a customer's last contact is a payment reminder saying “to avoid any interruption”,
+          and the next thing they hear is that the line is already off.
+        </p>
+        <div className="mt-3 flex items-center gap-2 text-sm">
+          <span className="text-[var(--text-secondary)]">Warn</span>
+          <input
+            type="number"
+            min="1"
+            max="60"
+            className={`${inputClass} w-20`}
+            disabled={saving || !settings.warning_enabled}
+            value={warningDays}
+            onChange={(e) => setWarningDays(e.target.value)}
+            onBlur={() => {
+              const days = Number(warningDays);
+              if (days >= 1 && days !== settings.warning_days) save({ warning_days: days });
+            }}
+          />
+          <span className="text-[var(--text-secondary)]">days before the cut-off</span>
+        </div>
+        <p className="mt-3 text-xs text-[var(--text-muted)]">
+          Nothing is sent unless the <strong>Suspension warning</strong> email template exists —
+          see Configs → Email templates. Warnings show up in Preview before any Run sends them.
+        </p>
       </div>
     </div>
   );
@@ -2912,7 +3612,26 @@ function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<RadiusNasClient | null>(null);
   const [form, setForm] = useState(emptyNasForm);
+  // A generated secret is shown in clear text deliberately. The API never
+  // returns it again -- the list only says "(set)" -- so if it is not copied
+  // onto the router before this modal closes, the only way back is to
+  // generate another one and re-key both ends.
+  const [secretRevealed, setSecretRevealed] = useState(false);
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("radius-nas-clients", ["name"]);
+
+  // Hex rather than a fuller alphabet: this string gets pasted into
+  // RouterOS's `/radius add secret=...` and into clients.conf, where a
+  // quote, backslash or space is a quoting problem in one or the other --
+  // and a broken secret fails as a silent timeout, not an error. 20 bytes
+  // of crypto.getRandomValues is 160 bits, far past anything RADIUS's
+  // MD5-based authenticator needs.
+  function generateSecret() {
+    const bytes = new Uint8Array(20);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    setForm((prev) => ({ ...prev, secret: hex }));
+    setSecretRevealed(true);
+  }
 
   useEffect(() => {
     onRegisterNewAction([{ label: "+ New RADIUS client", onClick: () => openCreate() }]);
@@ -2958,11 +3677,13 @@ function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
   function openCreate() {
     setEditing(null);
     setForm(emptyNasForm);
+    setSecretRevealed(false);
     setShowModal(true);
   }
 
   function openEdit(client: RadiusNasClient) {
     setEditing(client);
+    setSecretRevealed(false);
     setForm({
       name: client.name,
       ip_address: client.ip_address,
@@ -3166,15 +3887,38 @@ function RadiusClientsTab({ onRegisterNewAction }: { onRegisterNewAction: (actio
               />
             </FormField>
             <FormField label={`Shared secret${editing?.secret_set ? " (set — leave blank to keep)" : ""}`}>
-              <input
-                type="password"
-                className={inputClass}
-                placeholder={editing?.secret_set ? "••••••••" : "Set a shared secret"}
-                value={form.secret}
-                onChange={(e) => setForm({ ...form, secret: e.target.value })}
-                autoComplete="new-password"
-                name="nas-secret"
-              />
+              <div className="flex items-center gap-2">
+                <input
+                  type={secretRevealed ? "text" : "password"}
+                  className={`${inputClass} ${secretRevealed ? "font-mono" : ""}`}
+                  placeholder={editing?.secret_set ? "••••••••" : "Set a shared secret"}
+                  value={form.secret}
+                  onChange={(e) => {
+                    setForm({ ...form, secret: e.target.value });
+                    setSecretRevealed(false);
+                  }}
+                  autoComplete="new-password"
+                  name="nas-secret"
+                />
+                <button type="button" className={btnSecondary} onClick={generateSecret}>
+                  Generate
+                </button>
+                {form.secret && (
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    onClick={() => setSecretRevealed((v) => !v)}
+                    title={secretRevealed ? "Hide" : "Show"}
+                  >
+                    {secretRevealed ? "Hide" : "Show"}
+                  </button>
+                )}
+              </div>
+              {secretRevealed && form.secret && (
+                <p className="mt-1 text-xs text-[var(--status-warning)]">
+                  Copy this onto the router now — it is never shown again once saved.
+                </p>
+              )}
             </FormField>
             <FormField label="Realm">
               <input

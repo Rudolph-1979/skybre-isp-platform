@@ -1,0 +1,121 @@
+"""Customers list Payment status column (customers.payment_status)."""
+import datetime
+from decimal import Decimal as D
+
+from django.contrib.auth import get_user_model
+from django.db import connection
+from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
+from rest_framework.test import APIRequestFactory, force_authenticate
+
+from billing.models import Invoice
+from customers.models import Customer
+from customers.payment_status import payment_status
+from customers.serializers import CustomerSerializer
+from customers.views import CustomerViewSet
+
+User = get_user_model()
+
+
+class PaymentStatusTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(username="admin1", password="x", role="admin")
+        self.today = timezone.localdate()
+
+    def _customer(self, name, balance="0"):
+        c = Customer.objects.create(full_name=name, email=f"{name.lower().replace(' ', '')}@x.com", status="active")
+        Customer.objects.filter(pk=c.pk).update(balance=D(balance))
+        return c
+
+    def _invoice(self, customer, total, paid="0", status="unpaid", due_in_days=10):
+        inv = Invoice.objects.create(customer=customer, status="draft", date_due=self.today)
+        # Straight to the columns: these tests are about how the list reads
+        # invoices, not about the balance/allocation machinery behind them.
+        Invoice.objects.filter(pk=inv.pk).update(
+            total=D(total), paid_amount=D(paid), status=status,
+            date_due=self.today + datetime.timedelta(days=due_in_days),
+        )
+        return inv
+
+    def _list(self, **params):
+        request = APIRequestFactory().get("/customers/", params)
+        force_authenticate(request, user=self.staff)
+        return CustomerViewSet.as_view({"get": "list"})(request).data
+
+    def _setup_book(self):
+        self._customer("Paid Up")
+        self._invoice(self._customer("Due Later", "500"), "500")
+        self._invoice(self._customer("Some Paid", "300"), "500", paid="200")
+        self._invoice(self._customer("Late", "500"), "500", due_in_days=-3)
+        self._invoice(self._customer("Late Some Paid", "250"), "500", paid="250", due_in_days=-3)
+        self._customer("Ahead", "-120")
+        self._customer("Owes No Invoice", "80")
+        settled = self._customer("Settled")
+        self._invoice(settled, "500", paid="500", status="paid", due_in_days=-30)
+        cancelled = self._customer("Cancelled Only")
+        self._invoice(cancelled, "500", status="cancelled", due_in_days=-30)
+
+    EXPECTED = {
+        "Paid Up": ("paid", "Paid up"),
+        "Due Later": ("unpaid", "Unpaid"),
+        "Some Paid": ("partial", "Partially Paid"),
+        "Late": ("overdue", "Overdue"),
+        "Late Some Paid": ("overdue_partial", "Partially Paid - Overdue"),
+        "Ahead": ("credit", "In credit"),
+        "Owes No Invoice": ("unpaid", "Unpaid"),
+        "Settled": ("paid", "Paid up"),
+        "Cancelled Only": ("paid", "Paid up"),
+    }
+
+    def test_list_shows_each_status(self):
+        self._setup_book()
+        rows = {r["full_name"]: (r["payment_status"], r["payment_status_label"]) for r in self._list()["results"]}
+        self.assertEqual(rows, self.EXPECTED)
+
+    def test_fallback_without_annotation_agrees(self):
+        self._setup_book()
+        for c in Customer.objects.all():
+            self.assertEqual(payment_status(c), self.EXPECTED[c.full_name][0], c.full_name)
+            data = CustomerSerializer(c).data
+            self.assertEqual(data["payment_status_label"], self.EXPECTED[c.full_name][1])
+
+    def test_sort_worst_first(self):
+        self._setup_book()
+        names = [r["full_name"] for r in self._list(ordering="payment_rank,full_name")["results"]]
+        self.assertEqual(names[:5], ["Late Some Paid", "Late", "Some Paid", "Due Later", "Owes No Invoice"])
+        self.assertEqual(names[-1], "Ahead")
+        names_desc = [r["full_name"] for r in self._list(ordering="-payment_rank")["results"]]
+        self.assertEqual(names_desc[0], "Ahead")
+
+    def test_no_query_per_row(self):
+        self._setup_book()
+        with CaptureQueriesContext(connection) as small:
+            self._list()
+        for i in range(6):
+            self._invoice(self._customer(f"Extra {i}", "100"), "100", due_in_days=-1)
+        with CaptureQueriesContext(connection) as big:
+            self._list()
+        self.assertEqual(len(small.captured_queries), len(big.captured_queries))
+
+    def test_filter(self):
+        self._setup_book()
+
+        def names(value):
+            return sorted(r["full_name"] for r in self._list(payment_status=value, page_size=100)["results"])
+
+        self.assertEqual(names("overdue"), ["Late", "Late Some Paid"])
+        self.assertEqual(names("overdue_partial"), ["Late Some Paid"])
+        self.assertEqual(names("partial"), ["Some Paid"])
+        self.assertEqual(names("unpaid"), ["Due Later", "Owes No Invoice"])
+        self.assertEqual(names("paid"), ["Cancelled Only", "Paid Up", "Settled"])
+        self.assertEqual(names("credit"), ["Ahead"])
+        self.assertEqual(names("owing"), ["Due Later", "Late", "Late Some Paid", "Owes No Invoice", "Some Paid"])
+        self.assertEqual(len(names("nonsense")), len(self.EXPECTED))
+
+    def test_filter_on_select_all_ids(self):
+        self._setup_book()
+        request = APIRequestFactory().get("/customers/ids/", {"payment_status": "overdue"})
+        force_authenticate(request, user=self.staff)
+        data = CustomerViewSet.as_view({"get": "ids"})(request).data
+        self.assertEqual(data["count"], 2)

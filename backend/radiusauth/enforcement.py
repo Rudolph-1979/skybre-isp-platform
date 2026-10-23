@@ -33,7 +33,7 @@ from django.utils import timezone
 
 from . import dynauth
 from .models import RadAcct, RadiusAction, RadiusNasClient
-from .signals import _mikrotik_rate_limit
+from .signals import _mikrotik_rate_limit, record_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,9 @@ def _record(service, action, transport, ok, detail):
 def apply_change(service, reason, allow_disconnect_fallback=True):
     """Push a Service change out to the customer's live session.
 
-    `reason` is one of "tariff" (speed only) or "status" (address changes).
+    `reason` is one of "tariff" (speed only), "status" (address changes)
+    or "address" (an IP reassignment, which needs the same disconnect a
+    status change does -- CoA cannot move a session to a new address).
     Returns True when the router confirmed it. Never raises: this runs from a
     post-commit background thread where nothing upstream can act on an
     exception -- but unlike before, the failure lands in RadiusAction where
@@ -143,6 +145,16 @@ def apply_change(service, reason, allow_disconnect_fallback=True):
                     framed_ip=session.framedipaddress,
                     port=dynauth.coa_port(),
                 )
+                # The CoA changed the live session and nothing else.
+                # radreply is what they are handed at their NEXT login, so
+                # it has to move as well -- otherwise one router reboot
+                # silently restores the old rate, and because
+                # last_pushed_rate_limit below now matches the target, the
+                # scheduled run reports "already correct" and never sends
+                # it again. speeds.py's whole premise is that the value in
+                # radreply and the value on the live session can never
+                # disagree; this is the line that keeps that true.
+                record_rate_limit(username, rate)
                 # Remember what the router was last told, so the
                 # scheduled policy run pushes only what CHANGED rather
                 # than re-sending an identical limit every few minutes.

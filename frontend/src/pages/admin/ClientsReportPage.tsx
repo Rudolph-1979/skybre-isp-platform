@@ -1,0 +1,413 @@
+import { Fragment, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { api } from "../../api/client";
+import { PageHeader } from "../../components/PageHeader";
+import { MultiSelect } from "../../components/MultiSelect";
+import { StatusBadge } from "../../components/StatusBadge";
+import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { btnSecondary, filterSelectClass } from "../../components/Modal";
+import type { ClientsReport, ClientsReportClient } from "../../types";
+
+/**
+ * Administration -> Reports: clients per partner / clients per tariff
+ * (Rudolph, 9 Oct 2026). One page, two reports -- they differ only in what
+ * a row is. How clients are counted lives in the backend
+ * (customers/admin_reports.py) and is summarised under the table.
+ */
+
+export type ClientsReportKind = "partner" | "tariff";
+
+const STATUS_OPTIONS = [
+  { value: "new", label: "New" },
+  { value: "active", label: "Active" },
+  { value: "online", label: "Online" },
+  { value: "suspended", label: "Suspended" },
+  { value: "bad_debt", label: "Bad Debt" },
+  { value: "inactive", label: "Inactive" },
+];
+const DEFAULT_STATUSES = ["active", "online"];
+
+const COPY: Record<ClientsReportKind, { title: string; subtitle: string; column: string; endpoint: string; file: string }> = {
+  partner: {
+    title: "Clients per partner",
+    subtitle: "How many clients each partner has, with their lines and monthly value.",
+    column: "Partner",
+    endpoint: "/reports/clients-per-partner/",
+    file: "clients-per-partner",
+  },
+  tariff: {
+    title: "Clients per tariff",
+    subtitle: "How many clients are on each tariff, with their lines and monthly value.",
+    column: "Tariff",
+    endpoint: "/reports/clients-per-tariff/",
+    file: "clients-per-tariff",
+  },
+};
+
+function rands(value: string | number) {
+  return `R ${Number(value).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// Cost columns (13 Oct 2026). "—" means no cost is known, never zero.
+function money(value: string | null | undefined) {
+  return value === null || value === undefined ? "—" : rands(value);
+}
+function pct(value: string | null | undefined) {
+  return value === null || value === undefined ? "—" : `${value}%`;
+}
+
+function csvCell(value: string | number) {
+  const text = String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+export function ClientsReportPage({ kind }: { kind: ClientsReportKind }) {
+  const copy = COPY[kind];
+  const [statuses, setStatuses] = useState<string[]>(DEFAULT_STATUSES);
+  // Clients per tariff: which tariffs to show (empty = all), 9 Oct 2026.
+  const [tariffs, setTariffs] = useState<string[]>([]);
+  // Clients per tariff: which partners' lines to count (empty = all), 13 Oct 2026.
+  const [partners, setPartners] = useState<string[]>([]);
+  const [data, setData] = useState<ClientsReport | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [clients, setClients] = useState<ClientsReportClient[] | null>(null);
+  const [clientsError, setClientsError] = useState("");
+
+  const statusParam = statuses.join(",");
+  const filterQuery =
+    `status=${encodeURIComponent(statusParam)}` +
+    (kind === "tariff" && tariffs.length ? `&tariff=${encodeURIComponent(tariffs.join(","))}` : "");
+  const partnerQuery =
+    kind === "tariff" && partners.length ? `&partner=${encodeURIComponent(partners.join(","))}` : "";
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setOpenKey(null);
+    api
+      .get<ClientsReport>(`${copy.endpoint}?${filterQuery}${partnerQuery}`)
+      .then((res) => {
+        if (cancelled) return;
+        setData(res.data);
+        setError("");
+      })
+      .catch(() => {
+        if (!cancelled) setError("Couldn't load the report.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [copy.endpoint, filterQuery, partnerQuery]);
+
+  function toggleRow(key: string) {
+    if (openKey === key) {
+      setOpenKey(null);
+      return;
+    }
+    setOpenKey(key);
+    setClients(null);
+    setClientsError("");
+    api
+      .get<{ key: string; results: ClientsReportClient[] }>(
+        `${copy.endpoint}clients/?key=${encodeURIComponent(key)}&status=${encodeURIComponent(statusParam)}${partnerQuery}`
+      )
+      .then((res) => setClients(res.data.results))
+      .catch(() => setClientsError("Couldn't load the clients."));
+  }
+
+  async function exportCsv() {
+    if (!data) return;
+    // The clients behind every row (George, 13 Oct 2026: "The export needs
+    // to show clients as well"), fetched with the same filters.
+    let full: ClientsReport;
+    try {
+      full = (await api.get<ClientsReport>(`${copy.endpoint}?${filterQuery}${partnerQuery}&clients=1`)).data;
+    } catch {
+      setError("Couldn't export the report.");
+      return;
+    }
+    const clientLines: (string | number)[][] = [
+      [],
+      [copy.column, "Client", "Client code", "Client status", "Services", "Monthly incl. VAT", "Monthly cost",
+        "Discount (negative = charged extra)", "After discount", "Discount detail"],
+      ...full.rows.flatMap((r) =>
+        (r.client_list ?? []).map((c) => [
+          r.name,
+          c.full_name,
+          c.customer_ref,
+          c.status,
+          c.services.length === 0
+            ? "No live service"
+            : c.services.map((s) => (s.status === "active" ? s.tariff : `${s.tariff} (${s.status})`)).join("; "),
+          c.monthly_incl,
+          c.monthly_cost ?? "",
+          c.discount ?? "",
+          c.monthly_after_discount ?? "",
+          c.discount_detail ?? "",
+        ])
+      ),
+    ];
+    const lines = [
+      [copy.column, "Clients", "Live services", "Active services", "Monthly incl. VAT",
+        ...(kind === "tariff" ? ["Price per line", "Cost per line"] : []),
+        "Monthly cost", "Gross profit", "Markup %", "Margin %", "Uncosted lines"],
+      ...data.rows.map((r) => [r.name, r.clients, r.services, r.active_services, r.monthly_incl,
+        ...(kind === "tariff" ? [r.unit_price ?? "", r.unit_cost ?? ""] : []),
+        r.monthly_cost ?? "", r.gross_profit ?? "", r.markup_pct ?? "", r.margin_pct ?? "", r.uncosted_lines ?? 0]),
+      ["Total (distinct clients)", data.total.clients, data.total.services, data.total.active_services, data.total.monthly_incl,
+        ...(kind === "tariff" ? ["", ""] : []),
+        data.total.monthly_cost ?? "", data.total.gross_profit ?? "", data.total.markup_pct ?? "",
+        data.total.margin_pct ?? "", data.total.uncosted_lines ?? 0],
+      ...clientLines,
+    ];
+    const csv = lines.map((row) => row.map(csvCell).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${copy.file}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // Excel (13 Oct 2026): built on the server -- Summary + Clients sheets.
+  const [exportingXlsx, setExportingXlsx] = useState(false);
+  async function exportXlsx() {
+    setExportingXlsx(true);
+    try {
+      const res = await api.get(`${copy.endpoint}?${filterQuery}${partnerQuery}&filetype=xlsx`, { responseType: "blob" });
+      const url = URL.createObjectURL(
+        new Blob([res.data], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })
+      );
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${copy.file}-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch {
+      setError("Couldn't export the report.");
+    } finally {
+      setExportingXlsx(false);
+    }
+  }
+
+  const rows = data?.rows ?? [];
+
+  return (
+    <div>
+      <PageHeader
+        title={copy.title}
+        subtitle={copy.subtitle}
+        actions={
+          <>
+            <Link to="/admin/administration" className={btnSecondary}>All reports</Link>
+            <button type="button" className={btnSecondary} disabled={!data || rows.length === 0 || exportingXlsx} onClick={exportXlsx}>
+              {exportingXlsx ? "Exporting…" : "Export Excel"}
+            </button>
+            <button type="button" className={btnSecondary} disabled={!data || rows.length === 0} onClick={exportCsv}>
+              Export CSV
+            </button>
+          </>
+        }
+      />
+
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <MultiSelect
+          options={STATUS_OPTIONS}
+          selected={statuses}
+          onChange={(next) => setStatuses(next.map(String))}
+          allLabel="All statuses"
+          nounPlural="statuses"
+          buttonClassName={filterSelectClass}
+        />
+        {kind === "tariff" && (
+          <MultiSelect
+            options={(data?.options ?? []).map((o) => ({ value: o.key, label: o.name }))}
+            selected={tariffs}
+            onChange={(next) => setTariffs(next.map(String))}
+            allLabel="All tariffs"
+            nounPlural="tariffs"
+            buttonClassName={filterSelectClass}
+          />
+        )}
+        {kind === "tariff" && (
+          <MultiSelect
+            options={(data?.partner_options ?? []).map((o) => ({ value: o.key, label: o.name }))}
+            selected={partners}
+            onChange={(next) => setPartners(next.map(String))}
+            allLabel="All partners"
+            nounPlural="partners"
+            buttonClassName={filterSelectClass}
+          />
+        )}
+        {kind === "tariff" && tariffs.length > 0 && (
+          <button type="button" className="text-xs text-[var(--series-1)] hover:underline" onClick={() => setTariffs([])}>
+            Clear tariffs
+          </button>
+        )}
+        {kind === "tariff" && partners.length > 0 && (
+          <button type="button" className="text-xs text-[var(--series-1)] hover:underline" onClick={() => setPartners([])}>
+            Clear partners
+          </button>
+        )}
+        {loading && data && <span className="text-xs text-[var(--text-muted)]">Updating…</span>}
+      </div>
+
+      {error ? (
+        <p className="text-sm text-[var(--status-critical)]">{error}</p>
+      ) : loading && !data ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] px-3 py-4 text-sm text-[var(--text-secondary)]">
+          No clients with these statuses.
+        </p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>{copy.column}</TH>
+              <TH>Clients</TH>
+              <TH>Live services</TH>
+              <TH>Monthly incl. VAT</TH>
+              {kind === "tariff" && <TH>Price / cost per line</TH>}
+              <TH>Monthly cost</TH>
+              <TH>Gross profit</TH>
+              <TH>
+                <span title="Gross profit ÷ cost. Margin is gross profit ÷ revenue.">Markup / margin</span>
+              </TH>
+            </tr>
+          </THead>
+          <tbody>
+            {rows.map((r) => (
+              <Fragment key={r.key}>
+                <TR onClick={() => toggleRow(r.key)} className={openKey === r.key ? "bg-[var(--tint-subtle)]" : ""}>
+                  <TD>
+                    <span className="mr-2 inline-block w-3 text-xs text-[var(--text-muted)]">{openKey === r.key ? "▾" : "▸"}</span>
+                    <span className="font-medium">{r.name}</span>
+                  </TD>
+                  <TD className="tabular-nums">{r.clients}</TD>
+                  <TD className="tabular-nums">
+                    {r.services}
+                    {r.services !== r.active_services && (
+                      <span className="ml-1 text-xs text-[var(--text-muted)]">({r.active_services} active)</span>
+                    )}
+                  </TD>
+                  <TD className="tabular-nums">{rands(r.monthly_incl)}</TD>
+                  {kind === "tariff" && (
+                    <TD className="tabular-nums">
+                      {r.unit_price ? rands(r.unit_price) : "—"}
+                      <span className="block text-xs text-[var(--text-muted)]">
+                        {r.unit_cost ? `cost ${rands(r.unit_cost)} · ${pct(r.unit_markup_pct)}` : r.unit_price ? "No cost set" : ""}
+                      </span>
+                    </TD>
+                  )}
+                  <TD className="tabular-nums">
+                    {money(r.monthly_cost)}
+                    {(r.uncosted_lines ?? 0) > 0 && (
+                      <span className="block text-xs text-[var(--status-warning)]">{r.uncosted_lines} line(s) without a cost</span>
+                    )}
+                  </TD>
+                  <TD className="tabular-nums">{money(r.gross_profit)}</TD>
+                  <TD className="tabular-nums">
+                    {pct(r.markup_pct)}
+                    <span className="block text-xs text-[var(--text-muted)]">{r.margin_pct ? `margin ${r.margin_pct}%` : ""}</span>
+                  </TD>
+                </TR>
+                {openKey === r.key && (
+                  <tr className="border-b border-[var(--border-hairline)] bg-[var(--surface-2)]">
+                    <td colSpan={kind === "tariff" ? 8 : 7} className="px-4 py-3">
+                      {clientsError ? (
+                        <p className="text-sm text-[var(--status-critical)]">{clientsError}</p>
+                      ) : clients === null ? (
+                        <p className="text-sm text-[var(--text-muted)]">Loading clients…</p>
+                      ) : (
+                        <table className="w-full text-sm">
+                          <tbody>
+                            {clients.map((c) => (
+                              <tr key={c.id} className="border-b border-[var(--border-hairline)] last:border-0">
+                                <td className="py-1.5 pr-4">
+                                  <Link to={`/admin/customers/${c.id}`} className="font-medium text-[var(--series-1)] hover:underline">
+                                    {c.full_name}
+                                  </Link>
+                                  <span className="ml-2 text-xs text-[var(--text-muted)]">{c.customer_ref}</span>
+                                </td>
+                                <td className="py-1.5 pr-4"><StatusBadge status={c.status} /></td>
+                                <td className="py-1.5 pr-4 text-[var(--text-secondary)]">
+                                  {c.services.length === 0
+                                    ? "No live service"
+                                    : c.services.map((s) => (s.status === "active" ? s.tariff : `${s.tariff} (${s.status})`)).join(", ")}
+                                </td>
+                                <td className="py-1.5 text-right tabular-nums">
+                                  {rands(c.monthly_incl)}
+                                  {c.monthly_cost && (
+                                    <span className="block text-xs text-[var(--text-muted)]">cost {rands(c.monthly_cost)}</span>
+                                  )}
+                                  {c.discount && (
+                                    <span className="block text-xs text-[var(--status-warning)]" title={c.discount_detail}>
+                                      {Number(c.discount) < 0
+                                        ? `plus ${rands(-Number(c.discount))} special pricing`
+                                        : `less ${rands(c.discount)} discount`}
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+            {data && (
+              <tr className="border-t-2 border-[var(--border-hairline)] font-semibold">
+                <td className="px-4 py-2.5">Total (distinct clients)</td>
+                <td className="px-4 py-2.5 tabular-nums">{data.total.clients}</td>
+                <td className="px-4 py-2.5 tabular-nums">{data.total.services}</td>
+                <td className="px-4 py-2.5 tabular-nums">{rands(data.total.monthly_incl)}</td>
+                {kind === "tariff" && <td className="px-4 py-2.5" />}
+                <td className="px-4 py-2.5 tabular-nums">
+                  {money(data.total.monthly_cost)}
+                  {(data.total.uncosted_lines ?? 0) > 0 && (
+                    <span className="block text-xs font-normal text-[var(--status-warning)]">
+                      {data.total.uncosted_lines} line(s) without a cost
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-2.5 tabular-nums">{money(data.total.gross_profit)}</td>
+                <td className="px-4 py-2.5 tabular-nums">
+                  {pct(data.total.markup_pct)}
+                  <span className="block text-xs font-normal text-[var(--text-muted)]">
+                    {data.total.margin_pct ? `margin ${data.total.margin_pct}%` : ""}
+                  </span>
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </Table>
+      )}
+
+      <p className="mt-3 max-w-3xl text-xs text-[var(--text-muted)]">
+        Live services are the client's lines that aren't terminated (active, suspended or pending).{" "}
+        {kind === "partner"
+          ? "A client counts under the partner of each live line (the line's own partner, otherwise the client's), so a client with lines at two partners is in both rows. A client with no live line counts under their own partner."
+          : "A client counts under the tariff of each live line, so a client on two tariffs is in both rows. Clients with no live line are in “No live service”. The partner filter counts only lines with the picked partners (the line's own partner, otherwise the client's); a client with no live line is counted by their own partner."}{" "}
+        The total counts each client once. Monthly is the tariff price of active lines, incl. VAT; suspended and
+        pending lines add nothing, and discounts aren't taken off here (each client's discount shows in the list and the exports).
+      </p>
+      <p className="mt-2 max-w-3xl text-xs text-[var(--text-muted)]">
+        Cost is each tariff's cost per month (captured excl. VAT in Configs → Tariffs, shown here with VAT), counted on active <strong>and suspended</strong> lines:
+        a suspended line still costs but bills nothing, so it lowers markup. Lines on a tariff with no cost set are left
+        out of cost, gross profit, markup and margin, and shown as "without a cost". Markup is gross profit ÷ cost;
+        margin is gross profit ÷ revenue. All rand figures incl. VAT at each tariff's rate.
+      </p>
+    </div>
+  );
+}

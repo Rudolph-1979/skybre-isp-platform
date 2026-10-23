@@ -1,0 +1,12 @@
+from rest_framework.routers import DefaultRouter
+from django.urls import path
+from .views import JobTypeViewSet, JobViewSet, SchedulingSettingsView, ShiftViewSet
+
+router = DefaultRouter()
+router.register("jobs", JobViewSet, basename="job")
+router.register("shifts", ShiftViewSet, basename="shift")
+router.register("job-types", JobTypeViewSet, basename="job-type")
+
+urlpatterns = router.urls + [
+    path("scheduling-settings/", SchedulingSettingsView.as_view(), name="scheduling-settings"),
+]

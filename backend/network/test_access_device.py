@@ -157,6 +157,10 @@ class ConnectedCustomersTests(TestCase):
         )
         self.client.force_authenticate(tech)
         res = self.client.get(f"/api/devices/{self.sector.pk}/connected-customers/")
+        self.assertEqual({r["customer_name"] for r in res.data["results"]}, {"Mine"})
+        tech.allowed_partners = [mine.pk, 0]  # tick "Direct"
+        tech.save(update_fields=["allowed_partners"])
+        res = self.client.get(f"/api/devices/{self.sector.pk}/connected-customers/")
         self.assertEqual({r["customer_name"] for r in res.data["results"]}, {"Mine", "Direct"})
 
     def test_the_device_list_carries_the_count(self):

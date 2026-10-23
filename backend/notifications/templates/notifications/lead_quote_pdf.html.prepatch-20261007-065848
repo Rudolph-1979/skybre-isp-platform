@@ -1,0 +1,56 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block content %}
+  <div class="doc-title">Quotation</div>
+
+  <table class="meta-table" style="width:240pt;">
+    <tr><td class="meta-label" style="width:100pt;">Quote number</td><td>{{ number }}</td></tr>
+    <tr><td class="meta-label">Date</td><td>{{ quote_date|date:"d/m/Y" }}</td></tr>
+    {% if lead.quote_valid_until %}<tr><td class="meta-label">Valid until</td><td>{{ lead.quote_valid_until|date:"d/m/Y" }}</td></tr>{% endif %}
+    {% if company.vat_number %}<tr><td class="meta-label">Our VAT number</td><td>{{ company.vat_number }}</td></tr>{% endif %}
+  </table>
+
+  <div class="addr-block">
+    <div class="addr-label">Prepared for</div>
+    <div>{{ lead.full_name }}</div>
+    {% if lead.company_name and lead.company_name != lead.full_name %}<div>{{ lead.company_name }}</div>{% endif %}
+    {% if lead.address %}<div>{{ lead.address }}</div>{% endif %}
+    {% if lead.city or lead.zip_code %}<div>{{ lead.city }} {{ lead.zip_code }}</div>{% endif %}
+    {% if lead.email %}<div>{{ lead.email }}</div>{% endif %}
+    {% if lead.phone %}<div>{{ lead.phone }}</div>{% endif %}
+  </div>
+
+  <table class="items" style="width:478pt;">
+    <thead>
+      <tr>
+        <th style="width:378pt; padding-left:4px; padding-right:4px;">Description</th>
+        <th class="num" style="width:100pt; padding-left:4px; padding-right:4px;">Excl. VAT</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td style="padding-left:4px; padding-right:4px;">{{ item.label }}</td>
+        <td class="num" style="padding-left:4px; padding-right:4px;">R {{ item.amount }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table style="width:478pt; margin-top:10px;" cellpadding="3">
+    <tr><td style="width:178pt;"></td><td style="width:90pt;"></td><td class="num" style="width:105pt;"><b>Monthly</b></td><td class="num" style="width:105pt;"><b>Once-off</b></td></tr>
+    <tr><td></td><td>Excl. VAT</td><td class="num">R {{ totals.monthly.excl }}</td><td class="num">R {{ totals.once_off.excl }}</td></tr>
+    <tr><td></td><td>VAT ({{ totals.rate_pct|floatformat:"-2" }}%)</td><td class="num">R {{ totals.monthly.vat }}</td><td class="num">R {{ totals.once_off.vat }}</td></tr>
+    <tr><td></td><td style="font-weight:bold; border-top:1px solid #333333;">Incl. VAT</td><td class="num" style="font-weight:bold; border-top:1px solid #333333;">R {{ totals.monthly.incl }}</td><td class="num" style="font-weight:bold; border-top:1px solid #333333;">R {{ totals.once_off.incl }}</td></tr>
+  </table>
+
+  {% if lead.coverage_result == "pass" or lead.coverage_result == "fibre_confirmed" %}
+  <p style="margin-top:16px; font-size:9pt; color:#444444;">
+    Coverage: {{ lead.get_coverage_method_display }} — {{ lead.get_coverage_result_display }}{% if lead.coverage_result == "fibre_confirmed" and lead.coverage_partner %} on {{ lead.coverage_partner.name }}{% endif %}.
+  </p>
+  {% endif %}
+
+  <p style="margin-top:12px; font-size:9pt; color:#444444;">
+    To accept this quote, reply to the email it came with or call us{% if company.phone %} on {{ company.phone }}{% endif %}.
+    We will then book your installation.
+  </p>
+{% endblock %}

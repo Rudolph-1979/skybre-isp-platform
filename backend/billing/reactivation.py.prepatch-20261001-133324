@@ -1,0 +1,143 @@
+"""Putting a line back on when the money arrives.
+
+WHAT WAS BROKEN
+
+Nothing reconnected anybody, ever. The chain was cut in two places:
+
+  * billing.recurring._process_blocking suspended a service by setting
+    its status and saving, and left no mark saying WHO did it or WHY;
+  * the only restore path in the codebase -- customers.signals -- fires
+    when a CUSTOMER row goes ACTIVE and restores services flagged
+    `auto_suspended_with_customer`, which the billing run never set.
+
+So a customer could pay in full, go into credit, and stay cut off until
+somebody noticed and clicked Edit. One did.
+
+THE RULE, AND WHY IT IS THE EXACT INVERSE
+
+blocking_candidate_services suspends on a conjunction: the customer's
+balance is worse than their minimum_balance AND an invoice is overdue
+past their blocking period. Failing EITHER half fails the whole
+predicate, so `balance <= minimum_balance` is necessary and sufficient
+to say "this customer no longer qualifies for suspension".
+
+That is deliberately the same field read the same way. A reactivation
+rule invented independently would drift from the suspension rule, and
+the day they disagree is the day somebody is reconnected at 15:00 and
+cut off again at 15:01, or paid and stayed off.
+
+WHAT IS NEVER TOUCHED
+
+A service a human suspended. Abuse, hardware recovery, a dispute, a
+customer who asked to be paused -- none of those are undone by money
+arriving. `Service.suspended_for_nonpayment` is set only by the billing
+run's own blocking pass and cleared the moment anybody changes that
+service's status by hand, so a manual suspension can never inherit the
+right to auto-reconnect.
+
+WHY .save() AND NOT .update()
+
+Because the signals ARE the enforcement. RADIUS rewrites, the router
+block list and dropping the live session all hang off Service's
+post_save. A bulk update would mark the row ACTIVE and leave the
+customer walled-garden'd in reality -- the mirror image of the bug
+customers.signals was written to fix.
+"""
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _config(customer):
+    from .models import CustomerBillingConfig
+
+    return CustomerBillingConfig.for_customer(customer)
+
+
+def is_clear(customer, config=None):
+    """Does this customer still meet the suspension rule?
+
+    False means they do -- they still owe more than their cushion allows
+    and must stay off. See this module's docstring for why the single
+    balance test is the whole answer.
+    """
+    config = config or _config(customer)
+    return customer.balance <= config.minimum_balance
+
+
+def candidates(customer=None, include_unflagged=False):
+    """[(service, config)] -- suspended services that should come back on.
+
+    `include_unflagged` is the one-off sweep for services suspended
+    before `suspended_for_nonpayment` existed. It cannot tell a billing
+    suspension from a manual one, which is exactly why it is opt-in, off
+    by default, and why the command that offers it prints the list and
+    changes nothing without --commit.
+    """
+    from customers.models import Customer
+
+    from .models import Service
+
+    services = Service.objects.filter(status=Service.Status.SUSPENDED)
+    if not include_unflagged:
+        services = services.filter(suspended_for_nonpayment=True)
+    if customer is not None:
+        services = services.filter(customer=customer)
+    services = services.select_related("customer").order_by("customer__customer_id", "pk")
+
+    found = []
+    for service in services:
+        # Re-read the customer so the balance is the stored one, not a
+        # copy from before this payment. Every write to that column goes
+        # through .update(balance=F("balance") + ...), which changes the
+        # row and leaves any in-memory object holding the old value --
+        # the same trap billing.statements.reconciliation fell into.
+        owner = Customer.objects.filter(pk=service.customer_id).first()
+        if owner is None:
+            continue
+        config = _config(owner)
+        if is_clear(owner, config):
+            service.customer = owner
+            found.append((service, config))
+    return found
+
+
+def reactivate(service, *, reason="payment received"):
+    """Put one service back on, through the normal save path."""
+    from .models import Service
+
+    service.status = Service.Status.ACTIVE
+    service.suspended_for_nonpayment = False
+    # Tells customers.signals this was the billing engine's own doing, so
+    # it does not read the change as a human overriding us.
+    service._billing_action = True
+    service.save()
+    logger.info(
+        "Service %s reactivated (%s) -- customer %s balance %s",
+        service.pk, reason, service.customer_id, service.customer.balance,
+    )
+    return service
+
+
+def reconnect_customer(customer_id, *, reason="payment received"):
+    """Everything this one customer has that should come back on.
+
+    Called from the Payment signal, so it must be cheap and must never
+    raise into the caller's transaction -- a reconnection that fails is a
+    support call; a payment that fails to record is an accounting
+    problem.
+    """
+    from customers.models import Customer
+
+    customer = Customer.objects.filter(pk=customer_id).first()
+    if customer is None:
+        return []
+    done = []
+    for service, _config in candidates(customer=customer):
+        try:
+            done.append(reactivate(service, reason=reason))
+        except Exception:
+            logger.exception(
+                "Reactivating service %s for customer %s failed", service.pk, customer_id
+            )
+    return done

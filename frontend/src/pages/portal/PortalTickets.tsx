@@ -1,9 +1,11 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api } from "../../api/client";
+import { usePolling } from "../../hooks/usePolling";
 import { useViewAs } from "../../context/ViewAsContext";
 import { PageHeader } from "../../components/PageHeader";
 import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { formatIsoDate, formatIsoDateTime } from "../../utils/billingTerms";
 import type { Ticket } from "../../types";
 
 export function PortalTickets() {
@@ -17,12 +19,20 @@ export function PortalTickets() {
   const [form, setForm] = useState({ subject: "", description: "", department: "support", priority: "medium" });
   const [reply, setReply] = useState("");
   const [sending, setSending] = useState(false);
+  const [updatingStatus, setUpdatingStatus] = useState<number | null>(null);
 
   function load() {
     if (!customerId) return;
     api.get<{ results: Ticket[] }>(`/tickets/?customer=${customerId}&ordering=-created_at`).then((res) => setTickets(res.data.results));
   }
   useEffect(load, [customerId]);
+
+  // So a staff reply shows up here without a manual reload -- same reason
+  // TicketDetailPage polls the admin side every 15s. Nothing here is
+  // "loading" state (tickets just replaces in place) and the reply draft
+  // below is separate state load() never touches, so there's nothing for
+  // a background refresh to disturb mid-type.
+  usePolling(load, 15_000);
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
@@ -49,6 +59,20 @@ export function PortalTickets() {
     }
   }
 
+  // Rudolph, 26 Sep: "Only clients may resolve tickets." The customer is
+  // now the one who says a ticket is actually fixed -- or, if it turns
+  // out it wasn't, reopens it themselves rather than waiting on support
+  // to notice. See TicketViewSet.perform_update for the rule this mirrors.
+  async function handleSetStatus(ticketId: number, status: "resolved" | "open") {
+    setUpdatingStatus(ticketId);
+    try {
+      await api.patch(`/tickets/${ticketId}/`, { status });
+      load();
+    } finally {
+      setUpdatingStatus(null);
+    }
+  }
+
   return (
     <div>
       <PageHeader
@@ -67,7 +91,7 @@ export function PortalTickets() {
             <div className="flex cursor-pointer items-center justify-between" onClick={() => setExpanded(expanded === t.id ? null : t.id)}>
               <div>
                 <p className="font-medium">{t.ticket_number}: {t.subject}</p>
-                <p className="text-xs text-[var(--text-muted)]">{t.department} · {new Date(t.created_at).toLocaleDateString()}</p>
+                <p className="text-xs text-[var(--text-muted)]">{t.department} · {formatIsoDate(t.created_at)}</p>
               </div>
               <div className="flex items-center gap-2">
                 <StatusBadge status={t.priority} />
@@ -79,7 +103,7 @@ export function PortalTickets() {
                 <p className="text-sm text-[var(--text-secondary)]">{t.description}</p>
                 {t.comments.map((c) => (
                   <div key={c.id} className="rounded-md bg-[var(--tint-subtle)] p-2 text-sm">
-                    <p className="text-xs text-[var(--text-muted)]">{c.author_name ?? "Support"} · {new Date(c.created_at).toLocaleString()}</p>
+                    <p className="text-xs text-[var(--text-muted)]">{c.author_name ?? "Support"} · {formatIsoDateTime(c.created_at)}</p>
                     <p>{c.message}</p>
                   </div>
                 ))}
@@ -89,17 +113,45 @@ export function PortalTickets() {
                     yours, on the customer's ticket. Answer it from Tickets in the admin area instead.
                   </p>
                 ) : (
-                  <div className="flex gap-2 pt-2">
-                    <input
-                      className={inputClass}
-                      placeholder="Type a reply…"
-                      value={reply}
-                      onChange={(e) => setReply(e.target.value)}
-                    />
-                    <button className={btnPrimary} disabled={sending} onClick={() => handleReply(t.id)}>
-                      {sending ? "…" : "Send"}
-                    </button>
-                  </div>
+                  <>
+                    <div className="flex items-center justify-between gap-2 border-t border-[var(--border-hairline)] pt-2">
+                      <span className="text-xs text-[var(--text-muted)]">
+                        {t.status === "resolved" || t.status === "closed"
+                          ? "Marked resolved. Not actually fixed?"
+                          : "Is this sorted now?"}
+                      </span>
+                      {t.status === "resolved" || t.status === "closed" ? (
+                        <button
+                          type="button"
+                          className={btnSecondary}
+                          disabled={updatingStatus === t.id}
+                          onClick={() => handleSetStatus(t.id, "open")}
+                        >
+                          {updatingStatus === t.id ? "…" : "Reopen this ticket"}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className={btnPrimary}
+                          disabled={updatingStatus === t.id}
+                          onClick={() => handleSetStatus(t.id, "resolved")}
+                        >
+                          {updatingStatus === t.id ? "…" : "Mark as resolved"}
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex gap-2 pt-2">
+                      <input
+                        className={inputClass}
+                        placeholder="Type a reply…"
+                        value={reply}
+                        onChange={(e) => setReply(e.target.value)}
+                      />
+                      <button className={btnPrimary} disabled={sending} onClick={() => handleReply(t.id)}>
+                        {sending ? "…" : "Send"}
+                      </button>
+                    </div>
+                  </>
                 )}
               </div>
             )}

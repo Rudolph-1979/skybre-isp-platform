@@ -1,5 +1,6 @@
 import datetime
 import logging
+import re
 from datetime import timedelta
 from django.contrib.auth.hashers import check_password
 from django.contrib.auth.password_validation import validate_password
@@ -8,7 +9,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
-from django.db.models import Sum, Count, Q
+from django.db.models import Q, Sum, Count, Q
 from rest_framework import generics, serializers, status, viewsets
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -24,7 +25,7 @@ from .serializers import (
     StaffPermissionsSerializer,
     StaffAccountsSerializer,
 )
-from .permissions import IsStaffMember, IsAdmin, IsManagement
+from .permissions import IsStaffMember, IsAdmin, IsManagement, section_permission
 from .password_reset import send_password_reset_email, send_staff_invite_email
 from . import two_factor
 
@@ -97,6 +98,33 @@ class StaffListView(generics.ListAPIView):
 
     def get_queryset(self):
         return User.objects.filter(role__in=STAFF_ROLES, is_active=True).order_by("username")
+
+
+class StaffColourView(APIView):
+    """PATCH /staff-users/<pk>/colour/ {"calendar_colour": "#1a9e6e" | ""}
+
+    Anyone who works the schedule can change a person's calendar colour
+    from the Scheduling page itself (Rudolph, 6 Oct 2026: "staff colours
+    should be editable") -- it is a display preference, not an account
+    setting, so it doesn't need the Admin-only Users screen. "" puts the
+    automatic colour back.
+    """
+
+    permission_classes = [IsAuthenticated, IsStaffMember, section_permission("scheduling")]
+
+    def patch(self, request, pk):
+        from .serializers import clean_calendar_colour
+
+        user = User.objects.filter(pk=pk, role__in=STAFF_ROLES).first()
+        if user is None:
+            return Response({"detail": "Not found."}, status=404)
+        try:
+            colour = clean_calendar_colour(request.data.get("calendar_colour", ""))
+        except serializers.ValidationError as e:
+            return Response({"calendar_colour": e.detail}, status=400)
+        user.calendar_colour = colour
+        user.save(update_fields=["calendar_colour"])
+        return Response({"id": user.id, "calendar_colour": user.display_colour, "custom": bool(colour)})
 
 
 class StaffPermissionsViewSet(viewsets.ModelViewSet):
@@ -254,25 +282,70 @@ class MeView(APIView):
         """Self-service only: lets a staff member set their own
         `visible_partners` -- their personal default filter for which
         reseller partners' customers show up on the Customers page (see
-        User.visible_partners). Handled by hand here, deliberately not
-        routed through UserSerializer's write path, so this endpoint can't
-        be used to edit anything else about the account (name, email,
+        User.visible_partners) -- and/or their own `dashboard_layout` (the
+        order of their dashboard tiles) and/or `panel_state` (which foldable
+        panels they keep open, per page; merged page by page, null = back to
+        the page's default). Handled by hand here, deliberately
+        not routed through UserSerializer's write path, so this endpoint
+        can't be used to edit anything else about the account (name, email,
         role, is_active, allowed_sections/allowed_partners, ...)."""
-        if set(request.data.keys()) - {"visible_partners"}:
-            return Response({"detail": "Only visible_partners can be updated here."}, status=400)
-        if "visible_partners" not in request.data:
-            return Response({"detail": "visible_partners is required."}, status=400)
+        keys = set(request.data.keys())
+        if keys - {"visible_partners", "dashboard_layout", "panel_state"}:
+            return Response({"detail": "Only visible_partners, dashboard_layout and panel_state can be updated here."}, status=400)
+        if not keys:
+            return Response({"detail": "visible_partners, dashboard_layout or panel_state is required."}, status=400)
 
-        raw = request.data.get("visible_partners")
-        if not isinstance(raw, list) or not all(isinstance(v, int) for v in raw):
-            return Response({"visible_partners": "Must be a list of partner ids."}, status=400)
+        fields = []
+        if "visible_partners" in request.data:
+            raw = request.data.get("visible_partners")
+            if not isinstance(raw, list) or not all(isinstance(v, int) for v in raw):
+                return Response({"visible_partners": "Must be a list of partner ids."}, status=400)
 
-        allowed = request.user.allowed_partners or []
-        if allowed and any(v not in allowed for v in raw):
-            return Response({"visible_partners": "Can only include partners you have access to."}, status=400)
+            allowed = request.user.allowed_partners or []
+            if allowed and any(v not in allowed for v in raw):
+                return Response({"visible_partners": "Can only include partners you have access to."}, status=400)
+            request.user.visible_partners = raw
+            fields.append("visible_partners")
 
-        request.user.visible_partners = raw
-        request.user.save(update_fields=["visible_partners"])
+        if "dashboard_layout" in request.data:
+            layout = request.data.get("dashboard_layout")
+            order = layout.get("order") if isinstance(layout, dict) else None
+            if (
+                not isinstance(layout, dict)
+                or set(layout.keys()) - {"order"}
+                or not isinstance(order, list)
+                or len(order) > 100
+                or not all(isinstance(k, str) and re.fullmatch(r"[a-z0-9_]{1,40}", k) for k in order)
+                or len(set(order)) != len(order)
+            ):
+                return Response({"dashboard_layout": 'Must be {"order": [tile keys]}.'}, status=400)
+            request.user.dashboard_layout = {"order": order} if order else {}
+            fields.append("dashboard_layout")
+
+        if "panel_state" in request.data:
+            pages = request.data.get("panel_state")
+            key_ok = lambda k: isinstance(k, str) and re.fullmatch(r"[a-z0-9_]{1,40}", k)  # noqa: E731
+            if not isinstance(pages, dict) or not pages or len(pages) > 20 or not all(
+                key_ok(page)
+                and (
+                    panels is None
+                    or (isinstance(panels, list) and len(panels) <= 30 and all(key_ok(k) for k in panels) and len(set(panels)) == len(panels))
+                )
+                for page, panels in pages.items()
+            ):
+                return Response({"panel_state": 'Must be {"page": [panel keys] or null}.'}, status=400)
+            state = dict(request.user.panel_state or {})
+            for page, panels in pages.items():
+                if panels is None:
+                    state.pop(page, None)
+                else:
+                    state[page] = panels
+            if len(state) > 50:
+                return Response({"panel_state": "Too many pages."}, status=400)
+            request.user.panel_state = state
+            fields.append("panel_state")
+
+        request.user.save(update_fields=fields)
 
         data = UserSerializer(request.user).data
         customer_profile = getattr(request.user, "customer_profile", None)
@@ -366,10 +439,44 @@ class DashboardSummaryView(APIView):
 
     permission_classes = [IsAuthenticated, IsStaffMember]
 
+    @staticmethod
+    def _count_online_services():
+        """Active services with a live RADIUS session right now.
+
+        "Online" means an open accounting row still being interim-updated --
+        the same staleness cut-off enforcement.py uses (900s), so this panel
+        and the enforcement code agree on what "live" means. A service that
+        is merely status=active but disconnected is NOT online; that count is
+        the neighbouring services_active key.
+        """
+        from billing.models import Service
+        from radiusauth.models import RadAcct
+
+        cutoff = timezone.now() - timezone.timedelta(seconds=900)
+        live_usernames = set(
+            RadAcct.objects.filter(
+                acctstoptime__isnull=True,
+                acctupdatetime__isnull=False,
+                acctupdatetime__gte=cutoff,
+            ).values_list("username", flat=True)
+        )
+        if not live_usernames:
+            return 0
+        return (
+            Service.objects.filter(status="active")
+            .exclude(radius_username="")
+            .exclude(radius_username__isnull=True)
+            .filter(radius_username__in=live_usernames)
+            .count()
+        )
+
     def get(self, request):
         from customers.models import Customer
+        from customers.suspension import suspended_services
         from billing.models import Invoice, Payment, Service
+        from billing.overdue import overdue_q, owed_q
         from network.models import Device
+        from radiusauth.offline import offline_service_counts
         from sales.models import Lead
         from tickets.models import Ticket
 
@@ -377,11 +484,20 @@ class DashboardSummaryView(APIView):
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
         revenue_this_month = Payment.objects.filter(date__gte=month_start).aggregate(total=Sum("amount"))["total"] or 0
-        outstanding = Invoice.objects.filter(status__in=["unpaid", "overdue"]).aggregate(total=Sum("total"))["total"] or 0
+        # What clients actually owe (Rudolph, 6 Oct 2026: "Outstanding balance
+        # should only show the unpaid balance of all clients"). The sum of
+        # every client's balance that is in debit -- payments, part-payments
+        # and credits already taken off -- not the face value of unpaid
+        # invoices, which counted a half-paid invoice in full. Clients in
+        # credit don't reduce it.
+        owing = Customer.objects.filter(balance__gt=0)
+        outstanding = owing.aggregate(total=Sum("balance"))["total"] or 0
+        customers_owing = owing.count()
 
         return Response({
             "customers_total": Customer.objects.count(),
-            "customers_active": Customer.objects.filter(status="active").count(),
+            # Online (6 Oct 2026) is a live client too.
+            "customers_active": Customer.objects.filter(status__in=Customer.LIVE_STATUSES).count(),
             # Customers who have left. "Inactive" is what the status is called
             # in the data; "Cancelled" is what staff call it, so the tile says
             # that and the filter it links to is the same one.
@@ -411,11 +527,37 @@ class DashboardSummaryView(APIView):
                 next_follow_up__lte=timezone.localdate(),
             ).count(),
             "leads_open": Lead.objects.filter(status__in=Lead.OPEN_STATUSES).count(),
+            # Customers with a line off right now. Billing suspends the
+            # SERVICE and leaves Customer.status alone, so none of the status
+            # counts above include these. Same definition as the Customers
+            # list's line_suspended filter the tile opens.
+            "customers_suspended_nonpayment": Customer.objects.filter(
+                pk__in=suspended_services(nonpayment_only=True).values("customer_id")
+            ).count(),
+            "customers_with_suspended_lines": Customer.objects.filter(
+                pk__in=suspended_services().values("customer_id")
+            ).count(),
             "services_active": Service.objects.filter(status="active").count(),
+            # Active services with a LIVE session (open accounting row with a
+            # recent interim update). That is the number "Online services" on
+            # the dashboard means -- a service that is pollable right now,
+            # not merely active on paper.
+            "services_online": DashboardSummaryView._count_online_services(),
+            # Active lines that are NOT up right now, and how many clients
+            # they belong to (8 Oct 2026) -- radiusauth.offline, the same
+            # rule as the Customers list's Offline filter the tile opens.
+            **dict(zip(("services_offline", "services_offline_customers"), offline_service_counts())),
             "revenue_this_month": revenue_this_month,
             "outstanding_balance": outstanding,
-            "invoices_unpaid": Invoice.objects.filter(status="unpaid").count(),
-            "invoices_overdue": Invoice.objects.filter(status="overdue").count(),
+            "customers_owing": customers_owing,
+            # Every invoice still owed, and of those the ones past their due
+            # date. Nothing ever flips an invoice's status to "overdue" --
+            # overdue is a date question, answered by billing.overdue, the
+            # same rule the Finance ageing table and quick filters use.
+            # Counting status="overdue" showed 0 overdue next to invoices
+            # three months late (6 Oct 2026).
+            "invoices_unpaid": Invoice.objects.filter(owed_q()).count(),
+            "invoices_overdue": Invoice.objects.filter(overdue_q()).count(),
             "devices_total": Device.objects.count(),
             "devices_online": Device.objects.filter(status="online").count(),
             "devices_offline": Device.objects.filter(status="offline").count(),
@@ -548,10 +690,12 @@ class HighAlertCustomersView(APIView):
 
         # Mirror CustomerViewSet.get_queryset's partner scoping.
         user = request.user
+        from customers.scoping import partner_condition
+
         visible = Customer.objects.all()
-        allowed = getattr(user, "allowed_partners", None) or []
-        if allowed and user.role != user.Role.ADMIN:
-            visible = visible.filter(Q(partner_id__in=allowed) | Q(partner__isnull=True))
+        condition = partner_condition(user)
+        if condition is not None:
+            visible = visible.filter(condition)
 
         # The counting itself lives in tickets.alerts, shared with the
         # Customers page's high_alert filter -- this endpoint's count is what

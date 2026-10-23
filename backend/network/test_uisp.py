@@ -1,0 +1,192 @@
+"""Network (UISP) read-only integration (14 Oct 2026). The fixtures are trimmed
+copies of Skybre's own UISP answers taken that day."""
+import json
+import os
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+
+from network import uisp
+
+User = get_user_model()
+HERE = os.path.join(os.path.dirname(__file__), "fixtures_uisp")
+
+
+def load(name):
+    with open(os.path.join(HERE, name)) as fh:
+        return json.load(fh)
+
+
+class FakeResponse:
+    def __init__(self, data, status=200):
+        self.status_code = status
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+def fake_get(url, **kwargs):
+    if url.endswith("/devices"):
+        return FakeResponse(load("devices.json"))
+    if url.endswith("/sites"):
+        return FakeResponse(load("sites.json"))
+    if url.endswith("/outages"):
+        return FakeResponse(load("outages.json"))
+    if url.endswith("/statistics"):
+        return FakeResponse(load("statistics_orx_week.json"))
+    return FakeResponse({}, 404)
+
+
+@override_settings(UISP_URL="https://uisp.test", UISP_TOKEN="t0ken", UISP_VERIFY_TLS=False)
+class UispTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.client.force_authenticate(User.objects.create_user(username="boss", password="x", role="admin"))
+
+    def rows(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get):
+            return {r["name"]: r for r in uisp.devices()}
+
+    def test_fields_match_what_uisp_shows(self):
+        rows = self.rows()
+        orx = rows["ORX-SS"]
+        self.assertEqual(orx["kind"], "ptp")
+        self.assertEqual(orx["link_potential_pct"], 99.9)
+        self.assertEqual(orx["downtime_pct"], 0.5)   # UISP's "Uptime" column: 1%
+        self.assertEqual(orx["ip"], "10.200.6.98")
+        self.assertEqual(rows["BB-SPA"]["link_potential_pct"], 33.5)
+        self.assertIn("low_link", rows["BB-SPA"]["flags"])
+        self.assertIn("busy", rows["BB-SPA"]["flags"])
+        self.assertEqual(rows["OFH_Sect_02"]["kind"], "ap")
+        self.assertEqual(rows["RC Home ST"]["kind"], "ptp")   # sta-ptp: UISP lists it under Point to Point
+        self.assertEqual(rows["WTH Core"]["kind"], "router")
+        self.assertTrue(rows["WTH_SECT_01"]["black_box"])
+        self.assertIsNone(rows["WTH_SECT_01"]["signal_dbm"])
+        # #172: a station knows its AP (the link the Topology map draws)
+        self.assertTrue(rows["RC Home ST"]["ap_device_id"])
+        self.assertTrue(rows["RC Home ST"]["ap_site_id"])
+
+    def test_token_and_tls_setting_are_used(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get) as get:
+            uisp.devices()
+        args, kwargs = get.call_args
+        self.assertEqual(args[0], "https://uisp.test/nms/api/v2.1/devices")
+        self.assertEqual(kwargs["headers"]["x-auth-token"], "t0ken")
+        self.assertFalse(kwargs["verify"])
+
+    def test_answers_are_cached_for_a_minute(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get) as get:
+            uisp.devices()
+            uisp.devices()
+        self.assertEqual(get.call_count, 1)
+
+    def test_api_summary_devices_sites_outages(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get):
+            summary = self.client.get("/api/uisp/summary/").data
+            ptp = self.client.get("/api/uisp/devices/?kind=ptp").data
+            sites = self.client.get("/api/uisp/sites/").data
+            outs = self.client.get("/api/uisp/outages/").data
+        self.assertTrue(summary["connected"])
+        self.assertEqual(summary["devices"], 13)
+        self.assertEqual(summary["devices_online"], 12)
+        self.assertGreaterEqual(summary["ptp_radios"], 6)
+        self.assertTrue(all(r["kind"] == "ptp" for r in ptp["results"]))
+        names = {s["name"]: s for s in sites["results"]}
+        self.assertEqual(names["Winter Hoek"]["parent_id"], names["Fair Weather Heights"]["id"])
+        self.assertEqual(len(outs["items"]), 10)
+        self.assertEqual(outs["total"], 5762)
+        # Dashboard tile (15 Oct): split per tab, adds up to the total.
+        self.assertEqual(sum(summary["low_link_tabs"].values()), summary["low_link"])
+        self.assertGreaterEqual(summary["low_link_tabs"]["ptp"], 1)
+
+    @override_settings(UISP_URL="", UISP_TOKEN="")
+    def test_not_configured(self):
+        res = self.client.get("/api/uisp/summary/")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.data["connected"])
+
+    def test_unreachable_and_bad_token(self):
+        import requests
+
+        with mock.patch("network.uisp.requests.get", side_effect=requests.ConnectTimeout("x")):
+            res = self.client.get("/api/uisp/summary/")
+        self.assertEqual(res.status_code, 502)
+        self.assertIn("Couldn't reach UISP", res.data["detail"])
+        cache.clear()
+        with mock.patch("network.uisp.requests.get", return_value=FakeResponse({}, 401)):
+            res = self.client.get("/api/uisp/devices/")
+        self.assertIn("401", res.data["detail"])
+
+    def test_needs_networking_access(self):
+        desk = APIClient()
+        desk.force_authenticate(User.objects.create_user(username="desk", password="x", role="support",
+                                                         allowed_sections=["tickets"]))
+        self.assertEqual(desk.get("/api/uisp/summary/").status_code, 403)
+
+
+ORX_SS = "fcd7c254-6644-4e2f-ad28-76a69c5b5623"      # ap-ptp
+RC_HOME_ST = "14581bfc-f08f-4998-9f68-5964db9ca9a5"  # sta-ptp
+
+
+@override_settings(UISP_URL="https://uisp.test", UISP_TOKEN="t0ken", UISP_VERIFY_TLS=False)
+class UispGraphTests(TestCase):
+    """#170: one device's graphs from UISP's statistics."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.client.force_authenticate(User.objects.create_user(username="boss", password="x", role="admin"))
+
+    def get(self, device_id, interval="week"):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get) as get:
+            res = self.client.get(f"/api/uisp/devices/{device_id}/statistics/?interval={interval}")
+        return res, get
+
+    def test_series_as_uisp_keeps_them(self):
+        res, get = self.get(ORX_SS)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(get.call_args_list[-1].kwargs["params"], {"interval": "week"})
+        data = res.data
+        self.assertEqual(data["period_s"], 3600)
+        self.assertEqual(data["interface"], "5GHz")
+        self.assertEqual(len(data["points"]), 24)
+        first = data["points"][0]
+        self.assertEqual(first["t"], 1791374400000)
+        for key in ("down_bps", "up_bps", "downlinkCapacity", "signal", "remoteSignal", "localChain0",
+                    "linkScore", "downlinkUtilization", "cpu", "ram"):
+            self.assertIn(key, data["series"])
+        self.assertLessEqual(first["linkScore"], 100)          # a percentage, not 0..1
+        self.assertGreater(first["linkScore"], 90)
+
+    def test_downlink_is_ap_transmit_and_station_receive(self):
+        raw = load("statistics_orx_week.json")
+        radio = next(i for i in raw["interfaces"] if i["id"] == "main")
+        tx0 = radio["transmit"]["avg"][0]["y"]
+        rx0 = radio["receive"]["avg"][0]["y"]
+        ap = self.get(ORX_SS)[0].data["points"][0]
+        cache.clear()
+        st = self.get(RC_HOME_ST)[0].data["points"][0]
+        self.assertAlmostEqual(ap["down_bps"], tx0, places=0)
+        self.assertAlmostEqual(ap["up_bps"], rx0, places=0)
+        self.assertAlmostEqual(st["down_bps"], rx0, places=0)
+        self.assertAlmostEqual(st["up_bps"], tx0, places=0)
+
+    def test_bad_range_and_bad_id(self):
+        res, _ = self.get(ORX_SS, "decade")
+        self.assertEqual(res.status_code, 400)
+        res, get = self.get("x;y")
+        self.assertEqual(res.status_code, 502)
+        self.assertIn("Unknown device", res.data["detail"])
+        self.assertFalse(any("/statistics" in c.args[0] for c in get.call_args_list))
+
+    def test_cached_per_device_and_range(self):
+        with mock.patch("network.uisp.requests.get", side_effect=fake_get) as get:
+            uisp.statistics(ORX_SS, "week")
+            uisp.statistics(ORX_SS, "week")
+            uisp.statistics(ORX_SS, "day")
+        self.assertEqual(sum(1 for c in get.call_args_list if c.args[0].endswith("/statistics")), 2)

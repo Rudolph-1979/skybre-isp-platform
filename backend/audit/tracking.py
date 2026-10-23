@@ -37,6 +37,12 @@ SENSITIVE_FIELDS = frozenset(
         "radius_password",
         "smtp_password",
         "api_key",
+        # The SNMP community is the read password for every device on the
+        # network. The API keeps it write_only and the admin excludes it,
+        # and both of those were pointless while an edit wrote the old and
+        # new values into the audit trail in plain text -- which is read by
+        # more people than the device page itself.
+        "snmp_community",
     }
 )
 
@@ -69,6 +75,8 @@ REGISTRY = {
     # settles. Rendered per-customer via the customer FK.
     "customers.CustomerTask": Tracked(customer="customer"),
     "billing.Service": Tracked(customer="customer"),
+    # Pauses (#211): who paused a line, the dates, and who resumed it.
+    "billing.ServicePause": Tracked(customer="customer"),
     "billing.Tariff": Tracked(),
     "billing.Invoice": Tracked(customer="customer"),
     "billing.Payment": Tracked(customer="customer"),
@@ -84,12 +92,27 @@ REGISTRY = {
         ],
     ),
     "tickets.Ticket": Tracked(customer="customer"),
+    # Comments carry their own author, so "who said this" was never in
+    # doubt. What was missing is who EDITED or DELETED one -- a comment
+    # could be reworded or removed after the fact and nothing recorded
+    # it, which is the one thing an audit trail exists for.
+    #
+    # The message body is tracked deliberately: it is the whole content
+    # of the change. Without it the row says only that something was
+    # altered, which answers nothing.
+    "tickets.TicketComment": Tracked(customer="ticket.customer"),
     # Who moved a lead to Lost, and when. The stage a deal died at is a
     # thing people argue about later; LeadNote records the narrative, this
     # records the fields.
     "sales.Lead": Tracked(customer="customer"),
     "network.NetworkSite": Tracked(),
     "network.Device": Tracked(),
+    # Who booked, moved, re-assigned, deleted or restored a job (Rudolph,
+    # 8 Oct 2026: "a Job change & Changelog tile to see who schedule,
+    # changed the jobs"). Shown under the Scheduling calendar
+    # (GET /api/jobs/changelog/) and on the client's History tab.
+    # return_count only ever moves with returned_at, which is shown.
+    "scheduling.Job": Tracked(customer="customer", exclude=("return_count",)),
 }
 
 
@@ -186,7 +209,16 @@ def _customer_for(instance, config):
     if config.customer == "self":
         return instance if instance.pk else None
     try:
-        customer = getattr(instance, config.customer, None)
+        # Walked as a dotted path, so a model one hop away from the
+        # customer can still say whose record it belongs on -- a ticket
+        # comment is "ticket.customer". A single getattr returned None for
+        # those, which silently dropped them off the customer History tab
+        # rather than failing loudly.
+        customer = instance
+        for part in config.customer.split("."):
+            customer = getattr(customer, part, None)
+            if customer is None:
+                return None
     except Exception:
         # Mid-cascade the related row can already be gone. Losing the
         # per-customer link is acceptable; losing the event is not.
@@ -294,6 +326,11 @@ def _on_m2m_change(sender, instance, action, pk_set, reverse, model, **kwargs):
     """
     if action not in ("post_add", "post_remove", "post_clear"):
         return
+    if action != "post_clear" and not pk_set:
+        # .set() re-saving the same people still sends an add/remove with
+        # nothing in it -- an "added: (none)" row says somebody did
+        # something when they did not (8 Oct 2026).
+        return
     if reverse:
         # The change is being made from the far side; it will be
         # recorded against the far object if that one is tracked.
@@ -357,7 +394,9 @@ def _on_delete(sender, instance, **kwargs):
     # the row is about to be gone, and the FK would null out immediately.
     if key == "customers.Customer":
         customer = None
-    record("deleted", instance=instance, customer=customer)
+    from .context import current_delete_detail
+
+    record("deleted", instance=instance, customer=customer, detail=current_delete_detail())
     if key == "customers.Customer" and instance.pk:
         # The customer's own post_delete is the last one in the cascade,
         # so the flag has done its job by here.

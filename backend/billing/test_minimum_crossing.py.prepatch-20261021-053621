@@ -1,0 +1,82 @@
+"""Going over the minimum balance restarts the reminder rule (21 Oct 2026,
+Aubrey Pie SW1948: R14 owed for weeks, under the R50 cushion; a new invoice
+at 12:05 took him over it and the 15:00 run cut him off on the strength of a
+September reminder about the R14. Rudolph: "Once the total invoices reached
+above R50.00 the notifications was supposed to start firing" / "This does not
+include extensions")."""
+import datetime
+from decimal import Decimal
+from unittest import mock
+
+from django.test import TestCase
+
+from billing.models import CustomerBillingConfig, Invoice, ReminderSettings, Service, Tariff
+from billing.recurring import (
+    _process_reminders, blocking_candidate_services, crossed_minimum_on, suspension_block_date, upcoming_blocks,
+)
+from customers.models import Customer
+
+D = datetime.date
+TUE = D(2026, 10, 20)
+
+
+class MinimumCrossingTests(TestCase):
+    def setUp(self):
+        rs = ReminderSettings.load()
+        rs.reminder_1_enabled = True
+        rs.save()
+        self.rs = rs
+        tariff = Tariff.objects.create(name="Wireless 5", price=Decimal("249.00"), tax_rate_pct=Decimal("15.00"))
+        self.c = Customer.objects.create(full_name="Aubrey Pie", email="a@example.com", status=Customer.Status.ACTIVE,
+                                         balance=Decimal("14.00"))
+        Service.objects.create(customer=self.c, tariff=tariff, status=Service.Status.ACTIVE, start_date=D(2026, 1, 1))
+        self.g = CustomerBillingConfig.for_customer(self.c)
+        self.g.billing_enabled = True
+        self.g.auto_create_invoices = False
+        self.g.blocking_period_days = 4
+        self.g.minimum_balance = Decimal("50.00")
+        self.g.reminder_enabled = True
+        self.g.reminder_1_day = -2   # 2 days after due; gap to cut-off = 4 - 2 = 2 days
+        self.g.save()
+        self.old = self.invoice(D(2026, 9, 1), D(2026, 9, 1), "334.85", "320.85", reminded=D(2026, 9, 3))
+
+    def invoice(self, issued, due, total, paid="0", reminded=None):
+        inv = Invoice.objects.create(customer=self.c, status=Invoice.Status.UNPAID, date_due=due)
+        Invoice.objects.filter(pk=inv.pk).update(total=Decimal(total), paid_amount=Decimal(paid),
+                                                 last_reminder_run_date=reminded, date_issued=issued)
+        return inv
+
+    def go_over(self):
+        self.new = self.invoice(TUE, TUE, "654.02")
+        self.c.balance = Decimal("668.02")
+        self.c.save()
+
+    def test_crossing_date(self):
+        self.assertIsNone(crossed_minimum_on([(D(2026, 9, 1), Decimal("14"))], Decimal("50")))
+        self.assertEqual(crossed_minimum_on([(D(2026, 9, 1), Decimal("14")), (TUE, Decimal("654"))], Decimal("50")), TUE)
+
+    def test_not_cut_off_the_day_he_goes_over(self):
+        self.go_over()
+        self.assertEqual(blocking_candidate_services(self.c, self.g, TUE), [])
+        # Reminder today, then the 2 waiting days: Thursday 22/10.
+        self.assertEqual(suspension_block_date(self.c, self.g, TUE), D(2026, 10, 22))
+        with mock.patch("django.utils.timezone.localdate", return_value=TUE):
+            rows = upcoming_blocks(TUE, horizon_days=7, customers=Customer.objects.filter(pk=self.c.pk))
+        self.assertEqual([r["block_date"] for r in rows], [D(2026, 10, 22)])
+
+    def test_a_reminder_goes_out_and_then_he_is_cut(self):
+        self.go_over()
+        self.assertEqual(_process_reminders(self.c, self.g, self.rs, TUE, commit=False), 1)
+        Invoice.objects.filter(pk=self.old.pk).update(last_reminder_run_date=TUE)   # as the send records it
+        self.assertEqual(blocking_candidate_services(self.c, self.g, D(2026, 10, 21)), [])
+        self.assertNotEqual(blocking_candidate_services(self.c, self.g, D(2026, 10, 22)), [])
+
+    def test_under_the_minimum_nothing_changes(self):
+        self.assertEqual(blocking_candidate_services(self.c, self.g, TUE), [])   # R14: balance under R50
+
+    def test_extension_date_still_cuts_on_the_day(self):
+        self.go_over()
+        self.g.suspension_extended_until = D(2026, 10, 21)
+        self.g.save()
+        self.assertNotEqual(blocking_candidate_services(self.c, self.g, D(2026, 10, 21)), [])
+        self.assertEqual(suspension_block_date(self.c, self.g, D(2026, 10, 21)), D(2026, 10, 21))

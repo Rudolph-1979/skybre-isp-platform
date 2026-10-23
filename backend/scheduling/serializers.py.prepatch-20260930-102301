@@ -1,0 +1,142 @@
+from django.contrib.auth import get_user_model
+from rest_framework import serializers
+from .models import Job, Shift
+
+#: Same roles as Job.assigned_technicians' own limit_choices_to. Spelled out
+#: again here because DRF's auto-generated field for a M2M does not reliably
+#: apply a model field's limit_choices_to the way it does for a plain FK --
+#: without this a customer or an accounts-only login neither the calendar
+#: dropdown nor the model would ever offer could still be POSTed in directly.
+TECHNICIAN_ROLES = ["admin", "support", "sales", "technician", "management", "accounts"]
+
+
+def staff_display_name(user):
+    """What to call a staff member on a calendar.
+
+    Their first name, falling back to the username. The username is a
+    LOGIN -- "cbosman", "admin2" -- and these fields were serialising it
+    straight onto the schedule, so a calendar of who is doing what showed
+    account names instead of people. Every staff dropdown on the page
+    already does `first_name || username`; this is the same rule on the
+    other side of the API, so the chip and the picker agree.
+
+    First name rather than full name on purpose: a month cell is about
+    120px wide, and a chip that truncates loses the surname anyway --
+    while costing the job title the room it needed to be recognisable.
+    """
+    if user is None:
+        return None
+    return (getattr(user, "first_name", "") or "").strip() or user.username
+
+
+
+#: What the technician's PHONE says about a job, as one value the calendar
+#: can render.
+#:
+#: "not_dispatched" is deliberately not folded into "pending". Pending means
+#: Conecto has the job and the technician has not set off yet. Not
+#: dispatched means it never reached a phone at all -- nobody assigned,
+#: assigned to somebody who is not a technician, or a push that failed.
+#: Showing both as "Pending" would hide the one that needs somebody to act,
+#: behind the one that needs nobody to do anything.
+FIELD_STATUS = {
+    "": "pending",
+    "scheduled": "pending",
+    "en_route": "en_route",
+    "checked_in": "checked_in",
+    "checked_out": "completed",
+    "completed": "completed",
+    "cancelled": "cancelled",
+}
+
+
+def _one_field_status(conecto_job):
+    """Same mapping as before, for one technician's own push record.
+
+    An unknown value passes through rather than becoming "pending": a
+    status we have not seen before should appear on screen as itself, so
+    somebody asks about it, rather than being quietly rounded down to the
+    most reassuring thing we have.
+    """
+    if conecto_job is None:
+        return "not_dispatched"
+    return FIELD_STATUS.get(conecto_job.last_status, conecto_job.last_status or "pending")
+
+
+def field_status(job):
+    """Kept for anything still calling the old singular helper directly
+    (management commands, a shell one-liner) -- the first technician's
+    status, or not_dispatched if the job carries nobody. `technicians`
+    below is what the API and the frontend actually use now that a job
+    can have more than one person on it, each possibly at a different
+    stage of their own drive.
+    """
+    links = {cj.technician_id: cj for cj in getattr(job, "conecto_jobs").all()}
+    technicians = list(job.assigned_technicians.all())
+    if not technicians:
+        return "not_dispatched"
+    return _one_field_status(links.get(technicians[0].id))
+
+
+class JobSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.full_name", read_only=True, default=None)
+    ticket_number = serializers.CharField(source="ticket.ticket_number", read_only=True, default=None)
+    # One entry per assigned technician, each with THEIR OWN field_status --
+    # two people on the same job can be at different stages (one en route,
+    # one already checked in), so this can no longer be a single value the
+    # way it was when a job only ever had one person on it. Ordered by name
+    # so the calendar chip and the modal always list the same two people in
+    # the same order.
+    technicians = serializers.SerializerMethodField()
+    assigned_technicians = serializers.PrimaryKeyRelatedField(
+        many=True, required=False,
+        queryset=get_user_model().objects.filter(role__in=TECHNICIAN_ROLES),
+    )
+
+    def get_technicians(self, obj):
+        links = {cj.technician_id: cj for cj in obj.conecto_jobs.all()}
+        people = sorted(obj.assigned_technicians.all(), key=lambda u: staff_display_name(u) or "")
+        return [
+            {
+                "id": u.id,
+                "name": staff_display_name(u),
+                "field_status": _one_field_status(links.get(u.id)),
+            }
+            for u in people
+        ]
+
+    class Meta:
+        model = Job
+        fields = [
+            "id", "customer", "customer_name", "ticket", "ticket_number",
+            "assigned_technicians", "technicians", "job_type", "title", "description",
+            "status", "start", "end", "location",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        start = attrs.get("start", getattr(self.instance, "start", None))
+        end = attrs.get("end", getattr(self.instance, "end", None))
+        if start and end and end <= start:
+            raise serializers.ValidationError("End time must be after the start time.")
+        return attrs
+
+
+class ShiftSerializer(serializers.ModelSerializer):
+    staff_name = serializers.SerializerMethodField()
+
+    def get_staff_name(self, obj):
+        return staff_display_name(obj.staff)
+
+    class Meta:
+        model = Shift
+        fields = ["id", "staff", "staff_name", "start", "end", "role_note", "status", "notes", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+    def validate(self, attrs):
+        start = attrs.get("start", getattr(self.instance, "start", None))
+        end = attrs.get("end", getattr(self.instance, "end", None))
+        if start and end and end <= start:
+            raise serializers.ValidationError("End time must be after the start time.")
+        return attrs

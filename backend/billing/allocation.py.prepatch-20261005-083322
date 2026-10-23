@@ -1,0 +1,255 @@
+"""Allocating a payment across the invoices it actually settles.
+
+The gap this fills: a Payment with an `invoice` credits that one invoice's
+paid_amount, and a Payment without one only moves Customer.balance. Bank
+feeds take the second path (confirm posts a customer, never an invoice), so
+the normal case leaves a customer square on their balance while every
+invoice still reads UNPAID -- wrong on the invoice list, the aging report,
+the statement and the customer portal.
+
+The rule that keeps the ledger honest: **the balance moves exactly once, when
+the payment is recorded** (PaymentSerializer.create, with F()). Allocation
+only distributes money the balance has already accounted for across the
+invoices it pays off. Nothing in this module touches Customer.balance, and
+anything that starts doing so is a double-count.
+
+Conventions copied deliberately from the rest of billing:
+  * invoices are re-read under select_for_update() rather than trusting a
+    copy loaded during validation -- two EFTs allocated to one invoice at
+    the same time each added to the paid_amount they had read, and one
+    vanished;
+  * saves are update_fields=["paid_amount", "status"], never a full save(),
+    which would write this request's stale status and balance_debited over
+    a concurrent apply_balance_debit;
+  * invoices are locked in a deterministic order (by pk) so two staff
+    members allocating overlapping sets cannot deadlock.
+"""
+from decimal import Decimal
+
+from django.db import transaction
+from django.db.models import F, Sum
+
+from .models import Invoice, Payment, PaymentAllocation
+
+ZERO = Decimal("0")
+
+# The same set PaymentSerializer.validate refuses a direct payment against,
+# and for the same reasons: quotes and pro formas are not debts yet, a
+# cancelled invoice is not owed, and a draft has never been issued so
+# nothing debited the balance for it.
+UNALLOCATABLE_STATUSES = tuple(Invoice.PRE_INVOICE_STATUSES) + (
+    Invoice.Status.CANCELLED,
+    Invoice.Status.DRAFT,
+)
+
+
+class AllocationError(Exception):
+    """Something about this allocation doesn't add up. Carries a message
+    written for the person doing the mapping, not for a log."""
+
+
+def open_invoices(customer):
+    """This customer's invoices with money still outstanding, oldest due
+    first -- the order staff allocate in, and the order auto_allocate
+    fills."""
+    return (
+        Invoice.objects.filter(customer=customer)
+        .exclude(status__in=UNALLOCATABLE_STATUSES)
+        .filter(paid_amount__lt=F("total"))
+        .order_by("date_due", "pk")
+    )
+
+
+def allocated_total(payment) -> Decimal:
+    return payment.allocations.aggregate(total=Sum("amount"))["total"] or ZERO
+
+
+def unallocated_amount(payment) -> Decimal:
+    """What of this payment is not yet pinned to an invoice. Negative
+    payments (the "Manual Adjustment" ledger correction path) are never
+    allocatable, so they report nothing outstanding."""
+    if payment.amount <= ZERO:
+        return ZERO
+    return payment.amount - allocated_total(payment)
+
+
+def _apply(invoice, amount):
+    """Move `amount` onto a locked invoice's paid_amount."""
+    invoice.paid_amount = invoice.paid_amount + amount
+    if invoice.paid_amount >= invoice.total and invoice.total > ZERO:
+        invoice.status = Invoice.Status.PAID
+    invoice.save(update_fields=["paid_amount", "status"])
+
+
+def _unapply(invoice, amount):
+    """Take `amount` back off a locked invoice's paid_amount. Mirrors
+    Payment.reverse_ledger_effect: an invoice that had been flipped to Paid
+    goes back to Unpaid, and anything that was not Paid is left alone -- a
+    cancelled invoice does not become unpaid because an allocation against
+    it was undone."""
+    invoice.paid_amount = invoice.paid_amount - amount
+    if invoice.status == Invoice.Status.PAID and invoice.paid_amount < invoice.total:
+        invoice.status = Invoice.Status.UNPAID
+    invoice.save(update_fields=["paid_amount", "status"])
+
+
+def allocate(payment, pairs, user=None):
+    """Pin parts of `payment` to specific invoices.
+
+    `pairs` is an iterable of (invoice_id, amount). Returns the created
+    PaymentAllocation rows. All-or-nothing: one bad line rejects the whole
+    mapping, because a half-applied allocation is the worst of the three
+    possible outcomes.
+    """
+    cleaned = []
+    for invoice_id, amount in pairs:
+        amount = Decimal(str(amount))
+        if amount <= ZERO:
+            raise AllocationError("An allocation of zero or less has no effect.")
+        cleaned.append((int(invoice_id), amount))
+    if not cleaned:
+        raise AllocationError("Nothing to allocate.")
+
+    seen = set()
+    for invoice_id, _ in cleaned:
+        if invoice_id in seen:
+            raise AllocationError("The same invoice appears twice in one mapping.")
+        seen.add(invoice_id)
+
+    created = []
+    with transaction.atomic():
+        # Lock the payment first: the check "is there enough of this payment
+        # left" and the writes that consume it have to be one step, or two
+        # people mapping the same EFT can each allocate the full amount.
+        locked_payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        if locked_payment.amount <= ZERO:
+            raise AllocationError(
+                "A zero or negative payment can't be allocated to invoices -- it is a ledger "
+                "adjustment, not money received."
+            )
+
+        remaining = unallocated_amount(locked_payment)
+        requested = sum(amount for _, amount in cleaned)
+        if requested > remaining:
+            raise AllocationError(
+                "That allocates R%s but only R%s of this payment is unallocated."
+                % (requested, remaining)
+            )
+
+        for invoice_id, amount in sorted(cleaned):
+            try:
+                invoice = Invoice.objects.select_for_update().get(pk=invoice_id)
+            except Invoice.DoesNotExist:
+                raise AllocationError("Invoice %s no longer exists." % invoice_id)
+
+            if invoice.customer_id != locked_payment.customer_id:
+                raise AllocationError(
+                    "%s belongs to a different customer." % (invoice.number or invoice_id)
+                )
+            if invoice.status in UNALLOCATABLE_STATUSES:
+                raise AllocationError(
+                    "%s is a %s -- nothing is owed on it."
+                    % (invoice.number or invoice_id, invoice.get_status_display().lower())
+                )
+            if PaymentAllocation.objects.filter(
+                payment=locked_payment, invoice=invoice
+            ).exists():
+                # The (payment, invoice) pair is unique -- one row per pair,
+                # so re-mapping the same invoice means replacing or undoing
+                # the existing line rather than adding a second one. Caught
+                # here so it reads as a sentence instead of an IntegrityError.
+                raise AllocationError(
+                    "%s already has part of this payment allocated to it. Clear the mapping "
+                    "first (or use Replace) to change it."
+                    % (invoice.number or invoice_id)
+                )
+            if amount > invoice.balance_due:
+                raise AllocationError(
+                    "%s only has R%s outstanding; R%s was allocated to it."
+                    % (invoice.number or invoice_id, invoice.balance_due, amount)
+                )
+
+            created.append(
+                PaymentAllocation.objects.create(
+                    payment=locked_payment, invoice=invoice, amount=amount, created_by=user
+                )
+            )
+            _apply(invoice, amount)
+    return created
+
+
+def auto_allocate(payment, user=None):
+    """Fill oldest due first with whatever of the payment is unallocated,
+    capped per invoice at what is still owed on it. Any remainder stays
+    unallocated and sits as account credit -- which is what the balance
+    already does, so there is nothing extra to explain to anyone."""
+    remaining = unallocated_amount(payment)
+    if remaining <= ZERO:
+        return []
+    # An invoice this payment has already been mapped to is left alone: its
+    # row exists, the pair is unique, and topping it up would need the
+    # existing line replaced rather than a second one added.
+    already = set(payment.allocations.values_list("invoice_id", flat=True))
+    pairs = []
+    for invoice in open_invoices(payment.customer):
+        if invoice.pk in already:
+            continue
+        if remaining <= ZERO:
+            break
+        take = min(remaining, invoice.balance_due)
+        if take > ZERO:
+            pairs.append((invoice.pk, take))
+            remaining -= take
+    if not pairs:
+        return []
+    return allocate(payment, pairs, user=user)
+
+
+def unallocate(allocation):
+    """Undo one allocation, putting the money back to unallocated."""
+    with transaction.atomic():
+        invoice = Invoice.objects.select_for_update().get(pk=allocation.invoice_id)
+        _unapply(invoice, allocation.amount)
+        allocation.delete()
+
+
+def reverse_allocations(payment):
+    """Undo every allocation on this payment.
+
+    Called by Payment.reverse_ledger_effect before a payment is deleted.
+    The rows would disappear on CASCADE anyway -- the point is to take the
+    money back off each invoice's paid_amount first, or deleting a mapped
+    payment would leave its invoices reading as paid by money that no
+    longer exists.
+    """
+    for allocation in list(
+        payment.allocations.all().order_by("invoice_id").select_related(None)
+    ):
+        if allocation.invoice_id is None:
+            allocation.delete()
+            continue
+        invoice = Invoice.objects.select_for_update().get(pk=allocation.invoice_id)
+        _unapply(invoice, allocation.amount)
+        allocation.delete()
+
+
+def summarise(payment):
+    """What the mapping screen needs to render one payment."""
+    return {
+        "payment": payment.pk,
+        "customer": payment.customer_id,
+        "amount": str(payment.amount),
+        "allocated": str(allocated_total(payment)),
+        "unallocated": str(unallocated_amount(payment)),
+        "allocations": [
+            {
+                "id": a.pk,
+                "invoice": a.invoice_id,
+                "invoice_number": a.invoice.number if a.invoice_id else "",
+                "amount": str(a.amount),
+                "created_at": a.created_at.isoformat(),
+                "created_by_name": getattr(a.created_by, "username", None),
+            }
+            for a in payment.allocations.select_related("invoice", "created_by").all()
+        ],
+    }

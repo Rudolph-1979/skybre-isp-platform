@@ -1,0 +1,95 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block content %}
+  <div class="doc-title">Quotation</div>
+
+  <table class="meta-table" style="width:240pt;">
+    <tr><td class="meta-label" style="width:100pt;">Quote number</td><td>{{ number }}</td></tr>
+    <tr><td class="meta-label">Date</td><td>{{ quote_date|date:"d/m/Y" }}</td></tr>
+    {% if lead.quote_valid_until %}<tr><td class="meta-label">Valid until</td><td>{{ lead.quote_valid_until|date:"d/m/Y" }}</td></tr>{% endif %}
+    {% if company.vat_number %}<tr><td class="meta-label">Our VAT number</td><td>{{ company.vat_number }}</td></tr>{% endif %}
+  </table>
+
+  <div class="addr-block">
+    <div class="addr-label">Prepared for</div>
+    <div>{{ lead.full_name }}</div>
+    {% if lead.company_name and lead.company_name != lead.full_name %}<div>{{ lead.company_name }}</div>{% endif %}
+    {% if lead.address %}<div>{{ lead.address }}</div>{% endif %}
+    {% if lead.city or lead.zip_code %}<div>{{ lead.city }} {{ lead.zip_code }}</div>{% endif %}
+    {% if lead.email %}<div>{{ lead.email }}</div>{% endif %}
+    {% if lead.phone %}<div>{{ lead.phone }}</div>{% endif %}
+  </div>
+
+  {% if totals.pro_rata_period %}
+  <table class="items" style="width:478pt;">
+    <thead>
+      <tr>
+        <th style="width:378pt; padding-left:4px; padding-right:4px;">Description</th>
+        <th class="num" style="width:100pt; padding-left:4px; padding-right:4px;">Excl. VAT</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td style="padding-left:4px; padding-right:4px;">{{ item.label }}{% if item.first_month %}<br/><span style="font-size:8.5pt; color:#555555;">First month {{ lead.quote_start_date|date:"d/m" }}–{{ totals.pro_rata_period.to|slice:"8:10" }}/{{ totals.pro_rata_period.to|slice:"5:7" }}: {{ item.first_month }}</span>{% endif %}</td>
+        <td class="num" style="padding-left:4px; padding-right:4px;">R {{ item.amount }}{% if item.first_month_amount %}<br/><span style="font-size:8.5pt; color:#555555;">R {{ item.first_month_amount }}</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      <tr>
+        <td style="padding-left:4px; padding-right:4px; font-weight:bold;">First month total ({{ totals.pro_rata_period.days }} of {{ totals.pro_rata_period.month_days }} days)</td>
+        <td class="num" style="padding-left:4px; padding-right:4px; font-weight:bold;">R {{ totals.pro_rata.excl }}</td>
+      </tr>
+    </tbody>
+  </table>
+  {% else %}
+  <table class="items" style="width:478pt;">
+    <thead>
+      <tr>
+        <th style="width:378pt; padding-left:4px; padding-right:4px;">Description</th>
+        <th class="num" style="width:100pt; padding-left:4px; padding-right:4px;">Excl. VAT</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td style="padding-left:4px; padding-right:4px;">{{ item.label }}</td>
+        <td class="num" style="padding-left:4px; padding-right:4px;">R {{ item.amount }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <table style="width:478pt; margin-top:10px;" cellpadding="3">
+    <tr><td style="width:118pt;"></td><td style="width:70pt;"></td><td class="num" style="width:96pt;"><b>Monthly</b></td>{% if totals.pro_rata_period %}<td class="num" style="width:96pt;"><b>Pro rata</b></td>{% endif %}<td class="num" style="width:96pt;"><b>Once-off</b></td></tr>
+    <tr><td></td><td>Excl. VAT</td><td class="num">R {{ totals.monthly.excl }}</td>{% if totals.pro_rata_period %}<td class="num">R {{ totals.pro_rata.excl }}</td>{% endif %}<td class="num">R {{ totals.once_off.excl }}</td></tr>
+    <tr><td></td><td>VAT ({{ totals.rate_pct|floatformat:"-2" }}%)</td><td class="num">R {{ totals.monthly.vat }}</td>{% if totals.pro_rata_period %}<td class="num">R {{ totals.pro_rata.vat }}</td>{% endif %}<td class="num">R {{ totals.once_off.vat }}</td></tr>
+    <tr><td></td><td style="font-weight:bold; border-top:1px solid #333333;">Incl. VAT</td><td class="num" style="font-weight:bold; border-top:1px solid #333333;">R {{ totals.monthly.incl }}</td>{% if totals.pro_rata_period %}<td class="num" style="font-weight:bold; border-top:1px solid #333333;">R {{ totals.pro_rata.incl }}</td>{% endif %}<td class="num" style="font-weight:bold; border-top:1px solid #333333;">R {{ totals.once_off.incl }}</td></tr>
+  </table>
+  {% if calculation %}
+  <div style="margin-top:10px; padding:6px 8px; border:1px solid #dddddd; background-color:#f7f7f7; font-size:8.5pt; color:#333333;">
+    <b>How this is calculated</b> — all prices are excl. VAT; VAT is added on the total.<br/>
+    {% for line in calculation %}{{ line }}{% if not forloop.last %}<br/>{% endif %}{% endfor %}
+  </div>
+  {% endif %}
+  {% if totals.discount.monthly_after %}
+  <p style="margin-top:10px; font-size:9pt; color:#444444;">
+    The monthly discount applies for the first {{ totals.discount.months }} month{{ totals.discount.months|pluralize }}; after that it is R {{ totals.discount.monthly_after.incl }} per month incl. VAT.
+  </p>
+  {% endif %}
+  {% if lead.quote_start_date %}
+  <p style="margin-top:10px; font-size:9pt; color:#444444;">
+    Service starts {{ lead.quote_start_date|date:"d/m/Y" }}.{% if totals.pro_rata_period %} The rest of that month is charged pro rata; monthly billing starts on the 1st of the next month.{% endif %}
+  </p>
+  {% endif %}
+
+  {% if lead.coverage_result == "pass" or lead.coverage_result == "fibre_confirmed" %}
+  <p style="margin-top:16px; font-size:9pt; color:#444444;">
+    Coverage: {{ lead.get_coverage_method_display }} — {{ lead.get_coverage_result_display }}{% if lead.coverage_result == "fibre_confirmed" and lead.coverage_partner %} on {{ lead.coverage_partner.name }}{% endif %}.
+  </p>
+  {% endif %}
+
+  <p style="margin-top:12px; font-size:9pt; color:#444444;">
+    To accept this quote, reply to the email it came with or call us{% if company.phone %} on {{ company.phone }}{% endif %}.
+    We will then book your installation.
+  </p>
+{% endblock %}

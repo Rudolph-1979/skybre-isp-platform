@@ -1,0 +1,331 @@
+"""Who gets chased for money, for which invoice, and how often.
+
+Three defects, all in _process_reminders, all live:
+
+  * WHO. The decision was made on invoice status alone. A customer whose
+    account is settled -- paid off the balance, or in credit -- but who
+    still has an invoice row sitting at "unpaid" got a demand quoting
+    "an outstanding balance of R 0.00". The email's entire content is
+    the balance, so this is not a cosmetic slip; it is a demand for
+    money the customer does not owe.
+
+  * WHICH. The candidate invoices were read in no particular order, and
+    the invoice the same run had just raised was among them. Its due
+    date is run_date + payment_due_days, so where that happens to equal
+    a reminder offset it matched first and won -- and the loop `break`s
+    on the first match, so the invoice actually falling due was silently
+    dropped. The customer is reminded about an invoice issued minutes
+    ago and not about the one that is nearly late.
+
+  * HOW OFTEN. Dedupe was "has this customer had a payment_reminder
+    logged today", which is wrong in both directions. An EmailLog row is
+    written for a FAILED send too, so a mail outage marked the day done
+    and the re-run sent nothing -- the reminders were not delayed, they
+    were skipped. And because the key is the real calendar day rather
+    than anything about the invoice, re-running a backdated Run for the
+    same run_date on a later day re-sent the lot.
+"""
+import datetime
+from decimal import Decimal
+from unittest import mock
+
+from django.test import TestCase
+from django.utils import timezone
+
+from billing.models import (
+    CustomerBillingConfig, Invoice, InvoiceItem, ReminderSettings, Service, Tariff,
+)
+from billing.recurring import run_recurring_billing
+from customers.models import Customer
+from billing.gate_testing import ApprovalGateOpenMixin
+from notifications.models import EmailLog, EmailTemplate
+
+
+class ReminderTestCase(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240,
+        )
+        settings_row = ReminderSettings.load()
+        settings_row.reminder_1_enabled = True
+        settings_row.save()
+
+    def _customer(self, name, balance=Decimal("575.00"), invoice_due_in=7, with_service=False):
+        """A customer with one unpaid invoice falling due in `invoice_due_in`
+        days, and a reminder configured for exactly that offset."""
+        customer = Customer.objects.create(
+            full_name=name, email=f"{name.split()[0].lower()}@example.com",
+            status=Customer.Status.ACTIVE, balance=balance,
+        )
+        if with_service:
+            Service.objects.create(
+                customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+                start_date=self.today - datetime.timedelta(days=90),
+            )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.auto_create_invoices = with_service
+        config.next_billing_date = self.today
+        config.reminder_enabled = True
+        config.reminder_1_day = 7
+        config.save()
+        self._invoice(customer, due_in=invoice_due_in)
+        return customer
+
+    def _invoice(self, customer, due_in, paid=Decimal("0.00")):
+        invoice = Invoice.objects.create(
+            customer=customer, status=Invoice.Status.UNPAID,
+            date_due=self.today + datetime.timedelta(days=due_in), paid_amount=paid,
+        )
+        InvoiceItem.objects.create(
+            invoice=invoice, item_type=InvoiceItem.ItemType.CUSTOM,
+            description="Internet", quantity=1, unit_price=Decimal("500.00"),
+            tax_rate_pct=Decimal("15.00"),
+        )
+        Invoice.objects.filter(pk=invoice.pk).update(
+            subtotal=Decimal("500.00"), tax_total=Decimal("75.00"), total=Decimal("575.00"),
+        )
+        invoice.refresh_from_db()
+        return invoice
+
+    def _spy(self):
+        """Records (template_key, customer pk, invoice number) per send."""
+        sent = []
+
+        def record(template_key, customer, **kwargs):
+            invoice = kwargs.get("invoice")
+            sent.append((template_key, customer.pk, invoice.number if invoice else None))
+            return EmailLog(status=EmailLog.Status.SENT)
+
+        return sent, mock.patch("billing.recurring.send_customer_email", side_effect=record)
+
+
+class WhoGetsChasedTests(ReminderTestCase):
+    def test_a_customer_who_owes_nothing_is_not_chased(self):
+        customer = self._customer("Anna Able", balance=Decimal("0.00"))
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            result = run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(
+            [s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER], [],
+            "a settled customer was sent a demand for R 0.00",
+        )
+        self.assertEqual(result["counts"]["reminders_sent"], 0)
+        self.assertIsNotNone(customer)
+
+    def test_a_customer_in_credit_is_not_chased(self):
+        self._customer("Boris Bright", balance=Decimal("-250.00"))
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual([s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER], [])
+
+    def test_a_customer_who_does_owe_is_still_chased(self):
+        """The fix must not become a way to stop chasing anybody."""
+        customer = self._customer("Carol Clear", balance=Decimal("575.00"))
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(
+            [s[:2] for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER],
+            [(EmailTemplate.Key.PAYMENT_REMINDER, customer.pk)],
+        )
+
+    def test_a_preview_agrees_with_the_run(self):
+        """Preview is what staff look at before clicking Run; it must not
+        promise reminders the run will not send."""
+        self._customer("Dora Dunn", balance=Decimal("0.00"))
+
+        preview = run_recurring_billing(self.today, commit=False)
+
+        self.assertEqual(preview["counts"]["reminders_sent"], 0)
+
+
+class WhichInvoiceGetsChasedTests(ApprovalGateOpenMixin, ReminderTestCase):
+    def test_the_run_does_not_chase_the_invoice_it_just_raised(self):
+        """payment_due_days equal to a reminder offset is the reproducing
+        case: the new invoice's own due date matches the offset exactly,
+        so it qualifies as something to chase seconds after being issued.
+
+        No other invoice exists here, so there is nothing for the ordering
+        to rescue -- pre-fix the customer is chased for a document they
+        have not even received yet.
+        """
+        customer = Customer.objects.create(
+            full_name="Eve Early", email="eve@example.com",
+            status=Customer.Status.ACTIVE, balance=Decimal("575.00"),
+        )
+        Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90),
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.next_billing_date = self.today
+        config.payment_due_days = 7
+        config.reminder_enabled = True
+        config.reminder_1_day = 7
+        config.save()
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            result = run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(result["counts"]["invoices_created"], 1)
+        self.assertEqual(
+            [s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER], [],
+            "the customer was chased about the invoice raised seconds earlier",
+        )
+
+    def test_the_invoice_falling_due_wins_over_the_one_just_raised(self):
+        """Both qualify. The one that is nearly late is the honest choice."""
+        customer = self._customer(
+            "Eve Early", balance=Decimal("1150.00"), invoice_due_in=7, with_service=True
+        )
+        config = customer.billing_config
+        config.payment_due_days = 7
+        config.save()
+        existing = Invoice.objects.get(customer=customer)
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        reminders = [s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]
+        self.assertEqual(len(reminders), 1)
+        self.assertEqual(
+            reminders[0][2], existing.number,
+            "the customer was reminded about the invoice raised minutes ago, "
+            "not the one falling due",
+        )
+
+    def test_the_oldest_matching_invoice_wins(self):
+        """Two invoices matching a slot must resolve the same way every
+        time, and the more urgent one is the honest choice."""
+        customer = self._customer("Fred Fast", balance=Decimal("1150.00"), invoice_due_in=7)
+        older = Invoice.objects.get(customer=customer)
+        newer = self._invoice(customer, due_in=7)
+        self.assertGreater(newer.pk, older.pk)
+        Invoice.objects.filter(pk=older.pk).update(
+            date_due=self.today + datetime.timedelta(days=7)
+        )
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        reminders = [s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]
+        self.assertEqual(reminders[0][2], older.number)
+
+    def test_a_settled_invoice_is_not_the_one_chased(self):
+        """An invoice whose own payments cover it is not a debt, whatever
+        its status row still says."""
+        customer = self._customer("Gina Good", balance=Decimal("575.00"), invoice_due_in=7)
+        settled = Invoice.objects.get(customer=customer)
+        Invoice.objects.filter(pk=settled.pk).update(paid_amount=Decimal("575.00"))
+        still_owed = self._invoice(customer, due_in=7)
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        reminders = [s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]
+        self.assertEqual(len(reminders), 1)
+        self.assertEqual(reminders[0][2], still_owed.number)
+
+
+class HowOftenTests(ReminderTestCase):
+    def test_a_failed_send_does_not_count_as_sent(self):
+        """A mail outage must delay the day's reminders, not skip them."""
+        customer = self._customer("Hank Hard", balance=Decimal("575.00"))
+
+        def fail(template_key, cust, **kwargs):
+            return EmailLog.objects.create(
+                customer=cust, template_key=template_key, recipient_email=cust.email,
+                subject="", status=EmailLog.Status.FAILED, error_message="SMTP down",
+            )
+
+        with mock.patch("billing.recurring.send_customer_email", side_effect=fail):
+            with self.captureOnCommitCallbacks(execute=True):
+                run_recurring_billing(self.today, commit=True)
+
+        self.assertTrue(
+            EmailLog.objects.filter(
+                customer=customer, template_key=EmailTemplate.Key.PAYMENT_REMINDER,
+                status=EmailLog.Status.FAILED,
+            ).exists()
+        )
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(
+            len([s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]), 1,
+            "the re-run after a mail outage sent nothing -- the day was marked done",
+        )
+
+    def test_the_same_run_date_repeated_on_a_later_day_does_not_re_send(self):
+        """A backdated Run is allowed to be repeated. It must be idempotent
+        on the thing that matters -- the invoice and the date it was for --
+        not on the real calendar day it happened to be clicked."""
+        self._customer("Ivy Idle", balance=Decimal("575.00"))
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+        first = len([s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER])
+        self.assertEqual(first, 1)
+
+        # Tomorrow, somebody re-runs the same run_date.
+        EmailLog.objects.all().delete()
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(
+            len([s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]), 0,
+            "re-running the same run_date chased the customer twice",
+        )
+
+    def test_a_different_reminder_slot_still_fires(self):
+        """Dedupe must not turn into "one reminder per invoice, ever".
+
+        Run for two different run_dates against one invoice: the earlier
+        one lands on the 7-day slot, today lands on the 2-day slot. Both
+        run_dates are in the past or present, because a committed run
+        refuses a future date -- see run_recurring_billing.
+        """
+        customer = self._customer("Jack Just", balance=Decimal("575.00"), invoice_due_in=2)
+        config = customer.billing_config
+        config.reminder_2_day = 2
+        config.save()
+        settings_row = ReminderSettings.load()
+        settings_row.reminder_2_enabled = True
+        settings_row.save()
+
+        five_days_ago = self.today - datetime.timedelta(days=5)
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(five_days_ago, commit=True)
+        self.assertEqual(
+            len([s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]), 1,
+            "the 7-day slot did not fire",
+        )
+
+        sent, patcher = self._spy()
+        with patcher, self.captureOnCommitCallbacks(execute=True):
+            run_recurring_billing(self.today, commit=True)
+
+        self.assertEqual(
+            len([s for s in sent if s[0] == EmailTemplate.Key.PAYMENT_REMINDER]), 1,
+            "the second reminder slot never fired",
+        )

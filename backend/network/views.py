@@ -54,7 +54,19 @@ class DeviceViewSet(viewsets.ModelViewSet):
         from billing.models import Service
 
         qs = (
-            Device.objects.prefetch_related("readings", "visible_partners")
+            # `readings` is deliberately NOT prefetched. The serializer wants
+            # exactly one row per device (the newest, for latest_reading), and
+            # prefetching pulled EVERY MonitoringReading ever recorded for
+            # every device on the page into memory to pick it -- an unbounded
+            # table that the monitoring poller appends to for ever, loaded in
+            # full every time somebody opened Networking or Services.
+            #
+            # Without it, obj.readings.first() is one LIMIT 1 per device
+            # straight down the (device, -timestamp) index that already
+            # exists for it. That is a query per row, which prefetching
+            # normally exists to avoid -- but a handful of index seeks
+            # bounded by page size beats one scan bounded by nothing.
+            Device.objects.prefetch_related("visible_partners")
             .select_related("site")
             # One aggregate for the whole page instead of a count per row.
             .annotate(
@@ -108,11 +120,11 @@ class DeviceViewSet(viewsets.ModelViewSet):
         # The same reseller scoping the customer list uses. A staff member
         # restricted to one partner must not learn another partner's
         # customer names through the networking page.
-        allowed = getattr(request.user, "allowed_partners", None) or []
-        if allowed and request.user.role != request.user.Role.ADMIN:
-            qs = qs.filter(
-                Q(customer__partner_id__in=allowed) | Q(customer__partner__isnull=True)
-            )
+        from customers.scoping import partner_condition
+
+        condition = partner_condition(request.user, "customer")
+        if condition is not None:
+            qs = qs.filter(condition)
 
         return Response(
             {

@@ -1,0 +1,421 @@
+from django.db.models import Count, Q
+from django.utils import timezone
+from rest_framework import viewsets, permissions, serializers
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from .models import Ticket, TicketComment, TicketEscalation
+from .serializers import TicketSerializer, TicketCommentSerializer
+from accounts.models import User
+from accounts.permissions import section_permission, IsStaffMember, IsNOC, IsManagement
+from audit.models import AuditEvent
+from audit.serializers import AuditEventSerializer
+from customers.scoping import scope_by_customer
+
+RESOLVED_STATUSES = (Ticket.Status.RESOLVED, Ticket.Status.CLOSED)
+
+HasTicketsAccess = section_permission("tickets")
+
+
+class TicketViewSet(viewsets.ModelViewSet):
+    serializer_class = TicketSerializer
+    # Shared with the customer portal -- HasTicketsAccess passes straight
+    # through for customers (section restrictions are a staff-only
+    # concept, see accounts.permissions.user_can_access_section), so this
+    # only narrows things for staff who lack the Support Tickets section.
+    permission_classes = [permissions.IsAuthenticated, HasTicketsAccess]
+    filterset_fields = ["status", "priority", "department", "customer", "is_internal"]
+    search_fields = ["subject", "ticket_number"]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = Ticket.objects.select_related("customer", "assigned_to").all()
+        if user.is_staff_member:
+            # Partner-scoped like every other customer-linked list. Staff
+            # was a flat "return qs", so an agent restricted to one reseller
+            # saw that reseller's customers on the Customers page and then
+            # every partner's tickets here -- the customer's name and the
+            # whole comment thread the serializer nests, which is where
+            # people paste account numbers and site addresses. get_object()
+            # runs off this same queryset, so they could also reply to,
+            # reassign, close or delete a competitor's ticket.
+            #
+            # allow_null=False on the CLIENT half because a customer ticket
+            # with no customer is not a thing -- so the default's "a null
+            # customer belongs to no reseller" branch would never match a
+            # row, and if one ever could, a restricted user is not who
+            # should see it.
+            client_tickets = scope_by_customer(
+                qs.filter(is_internal=False), user, allow_null=False
+            )
+            # Internal tickets have no customer at all, so they would vanish
+            # under that rule -- which would hide a technician's "no stock"
+            # from the very people who fix it. They are scoped through the
+            # JOB instead, which is where their site actually lives, with
+            # allow_null=True so feedback on a standalone job (no customer)
+            # still reaches everyone.
+            internal_tickets = scope_by_customer(
+                qs.filter(is_internal=True), user,
+                path="conecto_internal__job__customer", allow_null=True,
+            )
+            return (client_tickets | internal_tickets).distinct()
+        customer_profile = getattr(user, "customer_profile", None)
+        if customer_profile is None:
+            return qs.none()
+        # is_internal=False is redundant and stays anyway. customer=<profile>
+        # already excludes every internal ticket, because theirs is NULL and
+        # NULL matches nothing -- that is the structural guard. This line is
+        # the one a reader sees, and it costs nothing to say out loud what
+        # the schema is quietly doing.
+        return qs.filter(customer=customer_profile, is_internal=False)
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="history",
+        # IsStaffMember is not optional here. HasTicketsAccess passes
+        # straight through for customers (see this class's permission
+        # note), so without it a customer could read their own ticket's
+        # audit trail -- who reassigned it, which agent changed the
+        # priority, and the text of internal comments that were later
+        # edited. None of that is theirs to see.
+        permission_classes=[permissions.IsAuthenticated, IsStaffMember, HasTicketsAccess],
+    )
+    def history(self, request, pk=None):
+        """Everything that happened to this ticket, for the History panel.
+
+        Mirrors audit.views.CustomerHistoryView: scoped to one record and
+        gated on the section the people who need it actually hold, rather
+        than on `configs` like the platform-wide activity log. get_object()
+        runs off get_queryset(), so partner scoping applies -- a restricted
+        agent cannot read the history of a ticket they cannot see.
+
+        Comments are matched on target_label rather than by joining to the
+        ticket's current comment rows, because a DELETED comment no longer
+        has a row to join to -- and a deleted comment is exactly the event
+        this panel exists to show. TicketComment.__str__ is
+        "Comment on <ticket>", so the ticket number is carried in the
+        label the audit row already stored.
+        """
+        ticket = self.get_object()
+        events = (
+            AuditEvent.objects.select_related("actor")
+            .filter(
+                Q(target_type="tickets.Ticket", target_id=str(ticket.pk))
+                | Q(
+                    target_type="tickets.TicketComment",
+                    target_label__startswith=f"Comment on {ticket.ticket_number}",
+                )
+            )
+            .order_by("-created_at")[:200]
+        )
+        return Response({"results": AuditEventSerializer(events, many=True).data})
+
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated, IsStaffMember, HasTicketsAccess],
+    )
+    def accept(self, request, pk=None):
+        """A support member takes ownership of an unaccepted ticket.
+
+        Rudolph: "Upon ticket creation a support member should accept the
+        ticket." Deliberately not folded into the ordinary PATCH endpoint
+        even though `accepted_by`/`accepted_at` are just two more fields
+        on the model: accepting is a specific, auditable act (it's what
+        the KPI report below counts), and a dedicated endpoint is the only
+        way to make "already accepted by someone else" a clean 409-style
+        refusal rather than a PATCH that silently overwrites who has it.
+        """
+        ticket = self.get_object()
+        if ticket.accepted_by_id and ticket.accepted_by_id != request.user.id:
+            raise serializers.ValidationError(
+                {"detail": f"Already accepted by {ticket.accepted_by.username}."}
+            )
+        if not ticket.accepted_by_id:
+            ticket.accepted_by = request.user
+            ticket.accepted_at = timezone.now()
+            ticket.save(update_fields=["accepted_by", "accepted_at"])
+        return Response(TicketSerializer(ticket, context={"request": request}).data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated, IsStaffMember, HasTicketsAccess],
+    )
+    def escalate(self, request, pk=None):
+        """The support member who accepted this ticket transfers it to
+        NOC for a second opinion.
+
+        Rudolph: "...if that member feels it should be escalated to NOC
+        he must be able to transfer the ticket to NOC." Restricted to the
+        ticket's own `accepted_by` (Admin excepted, the usual override) --
+        anyone else escalating a ticket they don't own would let one
+        agent hand off another's work without them knowing, and would
+        muddy the KPI report's per-agent counts. Refuses a second
+        escalation while one is already PENDING rather than piling up
+        duplicate requests for the same review.
+        """
+        ticket = self.get_object()
+        if not ticket.accepted_by_id:
+            raise serializers.ValidationError({"detail": "Accept this ticket before escalating it."})
+        if ticket.accepted_by_id != request.user.id and request.user.role != User.Role.ADMIN:
+            raise serializers.ValidationError({"detail": "Only the agent who accepted this ticket can escalate it."})
+        if ticket.escalations.filter(decision=TicketEscalation.Decision.PENDING).exists():
+            raise serializers.ValidationError({"detail": "Already escalated to NOC, awaiting a decision."})
+        escalation = TicketEscalation.objects.create(
+            ticket=ticket, escalated_by=request.user, reason=request.data.get("reason", ""),
+        )
+        return Response(
+            TicketSerializer(ticket, context={"request": request}).data,
+            status=201 if escalation.pk else 200,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="decide-escalation",
+        permission_classes=[permissions.IsAuthenticated, IsNOC, HasTicketsAccess],
+    )
+    def decide_escalation(self, request, pk=None):
+        """NOC's verdict on the ticket's current pending escalation.
+
+        Rudolph: "...who should be able to accept or reject if NOC feels
+        the issue is solvable by the support member." Accepting reassigns
+        the ticket to the deciding NOC member (`assigned_to`) -- NOC now
+        owns working it. Rejecting leaves the ticket exactly where it
+        was, with the original support member, and is the "solvable by
+        support" verdict; either way the escalation row itself is what
+        the KPI report checks for, so no Ticket field needs to change to
+        make "this needed NOC" show up there (see TicketEscalation's
+        docstring).
+        """
+        ticket = self.get_object()
+        pending = ticket.escalations.filter(decision=TicketEscalation.Decision.PENDING).first()
+        if not pending:
+            raise serializers.ValidationError({"detail": "No escalation is pending on this ticket."})
+        decision = request.data.get("decision")
+        if decision not in (TicketEscalation.Decision.ACCEPTED, TicketEscalation.Decision.REJECTED):
+            raise serializers.ValidationError({"decision": "Must be 'accepted' or 'rejected'."})
+        pending.decision = decision
+        pending.decided_by = request.user
+        pending.decided_at = timezone.now()
+        pending.decision_note = request.data.get("note", "")
+        pending.save(update_fields=["decision", "decided_by", "decided_at", "decision_note"])
+        if decision == TicketEscalation.Decision.ACCEPTED:
+            ticket.assigned_to = request.user
+            ticket.save(update_fields=["assigned_to"])
+        return Response(TicketSerializer(ticket, context={"request": request}).data)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="kpi-report",
+        # Feeds a yearly bonus calculation (Rudolph: "...should be part of
+        # a KPI performance report yearly to calculate yearly bonus") --
+        # Management/Admin only, same bar as everything else that touches
+        # pay (accounts.permissions.IsManagement, already used for
+        # payroll-adjacent approvals). Support staff can see their OWN
+        # counts through the ordinary ticket list/filters; this endpoint
+        # is the cross-staff comparison a manager uses to set bonuses,
+        # which is not everyone's to read.
+        permission_classes=[permissions.IsAuthenticated, IsManagement],
+    )
+    def kpi_report(self, request):
+        """Per support member, for one calendar year: tickets accepted,
+        and tickets resolved WITHOUT ever needing a NOC escalation.
+
+        Rudolph, asked directly, was explicit that the second number is
+        the one that should count as a "successful" resolution for bonus
+        purposes -- a ticket that had to go to NOC (whichever way NOC
+        decided it) doesn't count, even if it was eventually resolved.
+        `escalations__isnull=True` is exactly that: zero rows in
+        TicketEscalation for the ticket, not "the only escalation was
+        rejected" or any other reading of the decision field.
+
+        Bucketed by `accepted_at`/`resolved_at`'s own year rather than the
+        ticket's `created_at`, so a ticket opened in December and accepted
+        or resolved in January counts toward the year the work actually
+        happened in.
+        """
+        try:
+            year = int(request.query_params.get("year", timezone.now().year))
+        except ValueError:
+            raise serializers.ValidationError({"year": "Must be a whole number, e.g. 2026."})
+
+        accepted_counts = {
+            row["accepted_by"]: row["n"]
+            for row in Ticket.objects.filter(accepted_at__year=year)
+            .values("accepted_by")
+            .annotate(n=Count("id"))
+            if row["accepted_by"] is not None
+        }
+        resolved_clean_counts = {
+            row["accepted_by"]: row["n"]
+            for row in Ticket.objects.filter(
+                resolved_at__year=year, status__in=RESOLVED_STATUSES, escalations__isnull=True,
+            )
+            .values("accepted_by")
+            .annotate(n=Count("id"))
+            if row["accepted_by"] is not None
+        }
+        user_ids = set(accepted_counts) | set(resolved_clean_counts)
+        users = {u.id: u for u in User.objects.filter(id__in=user_ids)}
+        results = [
+            {
+                "user_id": uid,
+                "username": users[uid].username if uid in users else None,
+                "tickets_accepted": accepted_counts.get(uid, 0),
+                "tickets_resolved_without_escalation": resolved_clean_counts.get(uid, 0),
+            }
+            for uid in user_ids
+        ]
+        results.sort(key=lambda r: r["username"] or "")
+        return Response({"year": year, "results": results})
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if not user.is_staff_member:
+            customer_profile = getattr(user, "customer_profile", None)
+            # assigned_to and status are staff decisions. A customer could
+            # otherwise pick which staff member their ticket landed on and
+            # what state it opened in.
+            serializer.save(
+                customer=customer_profile, assigned_to=None, status=Ticket.Status.OPEN,
+                created_by=user,
+            )
+        else:
+            serializer.save(created_by=user)
+
+    def _resolved_at_kwargs(self, serializer):
+        """Stamp/clear `resolved_at` when this save is what moves the
+        ticket into or out of Resolved/Closed.
+
+        Read off `serializer.validated_data` (what this request is
+        actually changing) against `serializer.instance` (the row before
+        this save), which is the one place that still has both -- by the
+        time `serializer.save()` returns, the "before" value is gone.
+        Only touches the field on an actual transition, so patching the
+        priority on an already-resolved ticket doesn't quietly re-date its
+        resolution, and reopening one (Resolved -> Open/Pending) clears
+        the old timestamp rather than leaving a stale KPI date on a ticket
+        that isn't resolved any more.
+        """
+        if "status" not in serializer.validated_data:
+            return {}
+        new_status = serializer.validated_data["status"]
+        was_resolved = serializer.instance.status in RESOLVED_STATUSES
+        now_resolved = new_status in RESOLVED_STATUSES
+        if now_resolved and not was_resolved:
+            return {"resolved_at": timezone.now()}
+        if was_resolved and not now_resolved:
+            return {"resolved_at": None}
+        return {}
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        resolved_kwargs = self._resolved_at_kwargs(serializer)
+        if not user.is_staff_member:
+            # `customer` is writable for staff (re-filing a ticket against
+            # the right account is a real support action), and get_queryset
+            # already stops a customer reaching anybody else's ticket. But
+            # nothing stopped them PATCHing their OWN ticket onto another
+            # customer, which moved the ticket and its whole comment thread
+            # off their account and onto a stranger's.
+            serializer.save(
+                customer=serializer.instance.customer,
+                assigned_to=serializer.instance.assigned_to,
+                **resolved_kwargs,
+            )
+        elif serializer.instance.is_internal:
+            # An internal ticket may not be given a customer. The check
+            # constraint would refuse it anyway, but as an IntegrityError --
+            # a 500 with a Postgres message in it. Held here so the rule is
+            # enforced where it can be explained.
+            serializer.save(customer=None, **resolved_kwargs)
+        else:
+            serializer.save(**resolved_kwargs)
+
+
+class TicketCommentViewSet(viewsets.ModelViewSet):
+    serializer_class = TicketCommentSerializer
+    permission_classes = [permissions.IsAuthenticated, HasTicketsAccess]
+    filterset_fields = ["ticket"]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = TicketComment.objects.select_related("ticket", "author").all()
+        if not user.is_staff_member:
+            # ticket__customer__user already excludes every internal ticket
+            # -- their customer is NULL and NULL joins to nothing -- and
+            # ticket__is_internal=False says so in a line a reader can see.
+            qs = qs.filter(
+                is_internal=False, ticket__is_internal=False,
+                ticket__customer__user=user,
+            )
+            # Reading the whole non-internal thread is the point of the
+            # portal, but writing to it is not: for anything that mutates,
+            # a customer is scoped to comments they wrote themselves.
+            #
+            # Without this, the read scope doubled as the write scope, so a
+            # customer could PATCH the support agent's reply on their own
+            # ticket -- the edited text still rendering under the agent's
+            # name -- or DELETE it outright, erasing what support actually
+            # told them.
+            if self.action not in ("list", "retrieve"):
+                qs = qs.filter(author=user)
+        # Staff fell through to every comment in the system. Scoping the
+        # tickets alone would have been cosmetic: this sibling endpoint is
+        # how the thread is actually fetched, so a restricted agent could
+        # GET /api/ticket-comments/?ticket=<id> against a guessed id and
+        # read another partner's whole conversation, internal notes
+        # included, then edit or delete it. Same rule, one hop further out.
+        #
+        # A no-op for portal users -- scope_by_customer deliberately leaves
+        # non-staff alone -- so the lines above still decide what a customer
+        # sees. allow_null=False for the same reason as on the ticket list.
+        # Same split as the ticket list above, and for the same reason: an
+        # internal ticket has no customer, so a single allow_null=False rule
+        # would hide its whole thread from every partner-restricted agent.
+        client_comments = scope_by_customer(
+            qs.filter(ticket__is_internal=False), user,
+            path="ticket__customer", allow_null=False,
+        )
+        internal_comments = scope_by_customer(
+            qs.filter(ticket__is_internal=True), user,
+            path="ticket__conecto_internal__job__customer", allow_null=True,
+        )
+        return (client_comments | internal_comments).distinct()
+
+    def _customer_ticket_or_400(self, user, ticket):
+        """A customer may only attach a comment to one of their own tickets.
+
+        perform_create stamped `author` and forced is_internal=False, but
+        never checked the `ticket` FK -- and ticket ids are sequential, so
+        a customer could post into any other customer's thread by guessing
+        one. The comment then appeared in that customer's portal, which is
+        an impersonation channel (bank details "from accounts") rather than
+        just a data-integrity problem.
+        """
+        customer_profile = getattr(user, "customer_profile", None)
+        if customer_profile is None or ticket is None or ticket.customer_id != customer_profile.pk:
+            raise serializers.ValidationError({"ticket": "That ticket isn't yours."})
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        is_internal = serializer.validated_data.get("is_internal", False)
+        if not user.is_staff_member:
+            is_internal = False
+            self._customer_ticket_or_400(user, serializer.validated_data.get("ticket"))
+        serializer.save(author=user, is_internal=is_internal)
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not user.is_staff_member:
+            # perform_create forced is_internal=False; update did not, so a
+            # customer could flip their own comment to internal and hide it
+            # from the portal, or move it onto another ticket.
+            self._customer_ticket_or_400(user, serializer.validated_data.get("ticket", serializer.instance.ticket))
+            serializer.save(is_internal=False, ticket=serializer.instance.ticket)
+        else:
+            serializer.save()

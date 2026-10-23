@@ -18,6 +18,14 @@
   --tint-subtle: rgba(11, 11, 11, 0.02);
   --tint-hover: rgba(11, 11, 11, 0.05);
   --overlay-scrim: rgba(11, 11, 11, 0.4);
+  /* A warm wash for warning-toned callouts (escalations, internal notes),
+     paired with --status-warning's border -- a variable rather than the
+     literal #fff9ec it replaces, for the same reason as the two tints
+     above: a solid light color doesn't flip in dark mode, but the
+     variable text colors painted on top of it (--text-primary and
+     friends) do, so pairing them left dark-mode text unreadable on a
+     background that stayed light. */
+  --tint-warning: rgba(250, 178, 25, 0.10);
 
   --series-1: #2a78d6; /* blue */
   --series-2: #eb6834; /* orange */
@@ -60,6 +68,7 @@
   --tint-subtle: rgba(255, 255, 255, 0.03);
   --tint-hover: rgba(255, 255, 255, 0.07);
   --overlay-scrim: rgba(0, 0, 0, 0.6);
+  --tint-warning: rgba(251, 199, 82, 0.14);
 
   /* Slightly brightened so the accent colors keep enough contrast against
      dark surfaces — the hues stay recognizable, just lifted a bit. */

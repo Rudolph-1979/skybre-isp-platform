@@ -1,0 +1,799 @@
+import { useEffect, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
+import { api } from "../api/client";
+import { apiErrorMessage } from "../utils/apiError";
+import { FormField, Modal, inputClass, btnPrimary, btnSecondary } from "./Modal";
+import { PdfPreviewModal } from "./PdfPreviewModal";
+import { LOST_REASONS, shortWhen } from "./LeadBits";
+import type {
+  CoverageMethod, Lead, OnceOffItem, Partner, Product, QuoteItem, RecurringCharge, Tariff, User,
+} from "../types";
+
+/**
+ * The sales flow Rudolph drew (6 Oct 2026):
+ *   New -> Qualify -> Coverage check (Electronic LOS / Scan LOS / Fibre check)
+ *   -> Quote -> Accept (client + installation job) / Reject,
+ * with Lost possible at every step, always with a reason. The backend does
+ * the bookkeeping (sales/workflow.py); this is the screen for it.
+ */
+
+const STEPS: { key: string; label: string }[] = [
+  { key: "new", label: "New" },
+  { key: "qualified", label: "Qualified" },
+  { key: "coverage", label: "Coverage check" },
+  { key: "quoted", label: "Quote" },
+  { key: "won", label: "Accepted" },
+];
+
+const btnGood =
+  "inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50 bg-[var(--status-good)] hover:opacity-90";
+const btnBad =
+  "inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-50 text-[var(--status-critical)] ring-1 ring-[var(--status-critical)]/50 hover:bg-[var(--status-critical)]/10";
+
+function money(v: string | number) {
+  const n = typeof v === "string" ? parseFloat(v) : v;
+  return Number.isFinite(n) ? `R ${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "R 0.00";
+}
+
+function staffName(u: User) {
+  return `${u.first_name} ${u.last_name}`.trim() || u.username;
+}
+
+export function LeadStepper({ lead }: { lead: Lead }) {
+  const lostAt = lead.status === "lost" ? lead.lost_at_stage || "new" : "";
+  const current = lead.status === "lost" ? lostAt : lead.status;
+  const index = STEPS.findIndex((s) => s.key === current);
+  return (
+    <div className="mb-5 flex flex-wrap items-center gap-1">
+      {STEPS.map((step, i) => {
+        const done = i < index || lead.status === "won";
+        const now = i === index && lead.status !== "won";
+        const lost = now && lead.status === "lost";
+        const colour = lost
+          ? "var(--status-critical)"
+          : done
+            ? "var(--status-good)"
+            : now
+              ? "var(--series-1)"
+              : "var(--text-muted)";
+        return (
+          <div key={step.key} className="flex items-center gap-1">
+            {i > 0 && <span className="mx-1 h-px w-6 bg-[var(--border-hairline)]" />}
+            <span
+              className="flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold"
+              style={{
+                background: done || now ? colour : "transparent",
+                color: done || now ? "white" : colour,
+                border: done || now ? "none" : `1px solid ${colour}`,
+              }}
+            >
+              {lost ? "✗" : done ? "✓" : i + 1}
+            </span>
+            <span className="text-sm font-medium" style={{ color: now || done ? "var(--text-primary)" : colour }}>
+              {step.label}
+              {lost && <span className="ml-1 text-xs text-[var(--status-critical)]">— lost here</span>}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Card({ title, focus, faded, children, right }: {
+  title: ReactNode; focus?: boolean; faded?: boolean; children: ReactNode; right?: ReactNode;
+}) {
+  return (
+    <div
+      className={`mb-4 rounded-lg border bg-[var(--surface-1)] p-4 ${
+        focus ? "border-[var(--series-1)]" : "border-[var(--border-hairline)]"
+      } ${faded ? "opacity-60" : ""}`}
+    >
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold text-[var(--text-primary)]">{title}</h3>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function KV({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-[8rem_1fr] gap-2 py-0.5 text-sm">
+      <span className="text-[var(--text-muted)]">{label}</span>
+      <span className="text-[var(--text-primary)]">{children}</span>
+    </div>
+  );
+}
+
+export function LeadFlowPanel({
+  lead, tariffs, partners, staff, onChanged, onLost, onQualify, busy,
+}: {
+  lead: Lead;
+  tariffs: Tariff[];
+  partners: Partner[];
+  staff: User[];
+  onChanged: () => void;
+  onLost: (reason: string) => void;
+  onQualify: () => void;
+  busy: boolean;
+}) {
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+
+  async function post(action: string, data: Record<string, unknown>, ok?: (res: Record<string, unknown>) => void) {
+    setWorking(true);
+    setError("");
+    setInfo("");
+    try {
+      const res = await api.post(`/leads/${lead.id}/${action}/`, data);
+      ok?.(res.data as Record<string, unknown>);
+      onChanged();
+      return true;
+    } catch (err) {
+      setError(apiErrorMessage(err, "Couldn't save that."));
+      onChanged();
+      return false;
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  const open = lead.status !== "won" && lead.status !== "lost";
+  const coverageOk = lead.coverage_result === "pass" || lead.coverage_result === "fibre_confirmed";
+  const disabled = busy || working;
+
+  return (
+    <div>
+      {error && (
+        <p className="mb-3 rounded-md bg-[var(--status-critical)]/10 px-3 py-2 text-sm text-[var(--status-critical)]">{error}</p>
+      )}
+      {info && (
+        <p className="mb-3 rounded-md bg-[var(--status-good)]/10 px-3 py-2 text-sm text-[var(--status-good)]">{info}</p>
+      )}
+
+      {lead.status === "new" && (
+        <Card title="Qualify — are they worth pursuing?" focus>
+          <p className="mb-3 text-sm text-[var(--text-secondary)]">
+            They want the service and can pay for it? Qualify them and do a coverage check. Not a fit? Mark them lost
+            with the reason.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className={btnGood} disabled={disabled} onClick={onQualify}>✓ Qualify</button>
+            <button type="button" className={btnBad} disabled={disabled} onClick={() => onLost("not_ready")}>✗ Not a fit — mark lost…</button>
+          </div>
+        </Card>
+      )}
+
+      <CoverageCard
+        lead={lead}
+        partners={partners}
+        staff={staff}
+        disabled={disabled || !open}
+        focus={lead.status === "qualified" || lead.status === "coverage"}
+        faded={!open && !lead.coverage_method}
+        post={post}
+        onLost={onLost}
+      />
+
+      <QuoteCard
+        lead={lead}
+        tariffs={tariffs}
+        disabled={disabled}
+        enabled={open && coverageOk}
+        focus={lead.status === "quoted" || (lead.status === "coverage" && coverageOk)}
+        post={post}
+        onLost={onLost}
+        setInfo={setInfo}
+      />
+
+      {lead.status === "won" && (
+        <Card title="Accepted" focus>
+          <KV label="Client">
+            {lead.customer ? (
+              <Link className="text-[var(--series-1)] hover:underline" to={`/admin/customers/${lead.customer}`}>
+                {lead.customer_reference} — {lead.customer_name}
+              </Link>
+            ) : "—"}
+          </KV>
+          <KV label="Installation">
+            {lead.install ? (
+              <Link className="text-[var(--series-1)] hover:underline" to="/admin/scheduling">
+                {lead.install.deleted
+                  ? "job deleted"
+                  : lead.install.start
+                    ? `${shortWhen(lead.install.start)}${lead.install.technicians.length ? ` · ${lead.install.technicians.join(", ")}` : ""}`
+                    : "in the job pool, waiting to be scheduled"}
+              </Link>
+            ) : "—"}
+          </KV>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function CoverageCard({
+  lead, partners, staff, disabled, focus, faded, post, onLost,
+}: {
+  lead: Lead;
+  partners: Partner[];
+  staff: User[];
+  disabled: boolean;
+  focus: boolean;
+  faded: boolean;
+  post: (action: string, data: Record<string, unknown>) => Promise<boolean>;
+  onLost: (reason: string) => void;
+}) {
+  const [method, setMethod] = useState<CoverageMethod | "">(lead.coverage_method);
+  const [tower, setTower] = useState(lead.coverage_tower);
+  const [sector, setSector] = useState(lead.coverage_sector);
+  const [signal, setSignal] = useState(lead.coverage_signal);
+  const [notes, setNotes] = useState(lead.coverage_notes);
+  const [partner, setPartner] = useState(lead.coverage_partner ? String(lead.coverage_partner) : "");
+  const [scanAt, setScanAt] = useState("");
+  const [scanTech, setScanTech] = useState("");
+  const [editing, setEditing] = useState(false);
+
+  useEffect(() => {
+    setMethod(lead.coverage_method);
+    setTower(lead.coverage_tower);
+    setSector(lead.coverage_sector);
+    setSignal(lead.coverage_signal);
+    setNotes(lead.coverage_notes);
+    setPartner(lead.coverage_partner ? String(lead.coverage_partner) : "");
+    setEditing(false);
+  }, [lead.coverage_method, lead.coverage_result, lead.coverage_tower, lead.coverage_sector,
+      lead.coverage_signal, lead.coverage_notes, lead.coverage_partner]);
+
+  const result = lead.coverage_result;
+  const ok = result === "pass" || result === "fibre_confirmed";
+  const failed = result === "fail" || result === "fibre_unavailable";
+  const technicians = [...staff].sort((a, b) =>
+    (a.role === "technician" ? 0 : 1) - (b.role === "technician" ? 0 : 1) || staffName(a).localeCompare(staffName(b)),
+  );
+
+  const save = (r: string) =>
+    post("coverage", {
+      method, result: r, tower, sector, signal, notes,
+      coverage_partner: method === "fibre" && partner ? Number(partner) : null,
+    });
+
+  const options: { key: CoverageMethod; title: string; text: string }[] = [
+    { key: "electronic", title: "Electronic LOS", text: "Desktop check from the office (maps / LOS tool). Pass or fail." },
+    { key: "scan", title: "Scan LOS", text: "A technician scans on site — books a Site Visit job in Scheduling. Pass or fail." },
+    { key: "fibre", title: "Fibre check", text: "Is fibre at the address? Fibre confirmed (pick the network) or not available." },
+  ];
+
+  return (
+    <Card
+      title="Coverage check — how will we connect them?"
+      focus={focus}
+      faded={faded}
+      right={
+        result && !editing && lead.status !== "won" && lead.status !== "lost" ? (
+          <button type="button" className="text-xs text-[var(--series-1)] hover:underline" disabled={disabled} onClick={() => setEditing(true)}>
+            Change
+          </button>
+        ) : undefined
+      }
+    >
+      {result && !editing && method === lead.coverage_method ? (
+        <div>
+          <p className="mb-2 text-sm font-medium" style={{ color: ok ? "var(--status-good)" : "var(--status-critical)" }}>
+            {lead.coverage_method_display}: {ok ? "✓" : "✗"} {lead.coverage_result_display}
+            {lead.coverage_partner_name && result === "fibre_confirmed" ? ` on ${lead.coverage_partner_name}` : ""}
+          </p>
+          {lead.coverage_tower && <KV label="Tower">{lead.coverage_tower}</KV>}
+          {lead.coverage_sector && <KV label="Sector">{lead.coverage_sector}</KV>}
+          {lead.coverage_signal && <KV label="Signal">{lead.coverage_signal}</KV>}
+          {lead.coverage_notes && <KV label="Notes">{lead.coverage_notes}</KV>}
+          {lead.coverage_checked_at && (
+            <KV label="Checked">{shortWhen(lead.coverage_checked_at)}{lead.coverage_checked_by_name ? ` by ${lead.coverage_checked_by_name}` : ""}</KV>
+          )}
+          {failed && lead.status !== "lost" && lead.status !== "won" && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[var(--border-hairline)] pt-3">
+              <span className="text-sm text-[var(--text-secondary)]">
+                {result === "fail" ? "Fibre may still be there, or a scan may find a path." : "A wireless LOS check may still work."}
+              </span>
+              <button type="button" className={btnSecondary} disabled={disabled} onClick={() => { setMethod(result === "fail" ? "fibre" : "electronic"); setEditing(true); }}>
+                Try another check
+              </button>
+              <button type="button" className={btnBad} disabled={disabled} onClick={() => onLost(result === "fail" ? "no_los" : "no_fibre")}>
+                Mark lost: {result === "fail" ? "No line of sight" : "Fibre not available"}
+              </button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <>
+          <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            {options.map((o) => (
+              <button
+                key={o.key}
+                type="button"
+                disabled={disabled}
+                onClick={() => setMethod(o.key)}
+                className={`rounded-md border p-3 text-left text-sm transition-colors ${
+                  method === o.key
+                    ? "border-[var(--series-1)] bg-[var(--series-1)]/10"
+                    : "border-[var(--border-hairline)] hover:bg-[var(--tint-hover)]"
+                }`}
+              >
+                <b className="block text-[var(--text-primary)]">{o.title}{method === o.key ? " ✓" : ""}</b>
+                <span className="text-xs text-[var(--text-muted)]">{o.text}</span>
+              </button>
+            ))}
+          </div>
+
+          {method === "scan" && (
+            <div className="mb-3 rounded-md border border-[var(--border-hairline)] p-3">
+              {lead.scan && !lead.scan.deleted && (
+                <KV label="Scan job">
+                  {lead.scan.start
+                    ? `${shortWhen(lead.scan.start)}${lead.scan.technicians.length ? ` · ${lead.scan.technicians.join(", ")}` : ""}`
+                    : "in the job pool (no time yet)"}{" "}
+                  · <Link className="text-[var(--series-1)] hover:underline" to="/admin/scheduling">open Scheduling</Link>
+                </KV>
+              )}
+              <KV label="Address">
+                {[lead.address, lead.city].filter(Boolean).join(", ") || "—"}
+                {lead.latitude && lead.longitude ? ` · GPS ${Number(lead.latitude)}, ${Number(lead.longitude)}` : ""}
+              </KV>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_1fr_auto]">
+                <input type="datetime-local" className={inputClass} value={scanAt} onChange={(e) => setScanAt(e.target.value)} />
+                <select className={inputClass} value={scanTech} onChange={(e) => setScanTech(e.target.value)}>
+                  <option value="">Technician…</option>
+                  {technicians.map((u) => (
+                    <option key={u.id} value={u.id}>{staffName(u)}{u.role === "technician" ? "" : ` (${u.role})`}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className={btnPrimary}
+                  disabled={disabled || (!scanAt && !!lead.scan && !lead.scan.deleted)}
+                  onClick={() =>
+                    post("coverage", {
+                      method: "scan",
+                      scan_start: scanAt || null,
+                      scan_technician: scanAt && scanTech ? Number(scanTech) : null,
+                    })
+                  }
+                >
+                  {lead.scan && !lead.scan.deleted ? "Move scan" : scanAt ? "Book scan" : "Put in job pool"}
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-[var(--text-muted)]">
+                Books a Site Visit job "LOS scan — {lead.company_name || lead.full_name}". No time = it waits in the job pool.
+              </p>
+            </div>
+          )}
+
+          {method && (
+            <div className="border-t border-[var(--border-hairline)] pt-3">
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">
+                Result{method === "scan" ? " (after the visit)" : ""}
+              </p>
+              {method === "fibre" ? (
+                <FormField label="Fibre network">
+                  <select className={inputClass} value={partner} onChange={(e) => setPartner(e.target.value)}>
+                    <option value="">Pick the network (partner)…</option>
+                    {partners.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </FormField>
+              ) : (
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                  <input className={inputClass} placeholder="Tower" value={tower} onChange={(e) => setTower(e.target.value)} />
+                  <input className={inputClass} placeholder="Sector" value={sector} onChange={(e) => setSector(e.target.value)} />
+                  <input className={inputClass} placeholder="Signal, e.g. -62 dBm" value={signal} onChange={(e) => setSignal(e.target.value)} />
+                </div>
+              )}
+              <input
+                className={`${inputClass} mt-2`}
+                placeholder={method === "fibre" ? "Notes: live at the stand, ONT needed…" : "Notes: mast needed, 6 m pole, tree line to the west…"}
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+              />
+              <div className="mt-3 flex flex-wrap gap-2">
+                {method === "fibre" ? (
+                  <>
+                    <button type="button" className={btnGood} disabled={disabled || !partner} onClick={() => save("fibre_confirmed")}>
+                      ✓ Fibre confirmed — go to quote
+                    </button>
+                    <button type="button" className={btnBad} disabled={disabled} onClick={() => save("fibre_unavailable")}>
+                      ✗ Fibre not available
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button type="button" className={btnGood} disabled={disabled} onClick={() => save("pass")}>
+                      ✓ Pass — go to quote
+                    </button>
+                    <button type="button" className={btnBad} disabled={disabled} onClick={() => save("fail")}>
+                      ✗ Fail
+                    </button>
+                  </>
+                )}
+                {method === "electronic" && lead.coverage_method !== "electronic" && (
+                  <button type="button" className={btnSecondary} disabled={disabled} onClick={() => post("coverage", { method: "electronic" })}>
+                    Not done yet — just note the method
+                  </button>
+                )}
+                {editing && (
+                  <button type="button" className={btnSecondary} disabled={disabled} onClick={() => { setEditing(false); setMethod(lead.coverage_method); }}>
+                    Cancel
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+function QuoteCard({
+  lead, tariffs, disabled, enabled, focus, post, onLost, setInfo,
+}: {
+  lead: Lead;
+  tariffs: Tariff[];
+  disabled: boolean;
+  enabled: boolean;
+  focus: boolean;
+  post: (action: string, data: Record<string, unknown>, ok?: (res: Record<string, unknown>) => void) => Promise<boolean>;
+  onLost: (reason: string) => void;
+  setInfo: (text: string) => void;
+}) {
+  const hasQuote = !!lead.quote_sent_at;
+  const [editing, setEditing] = useState(false);
+  const [tariff, setTariff] = useState(lead.interested_tariff ? String(lead.interested_tariff) : "");
+  const [items, setItems] = useState<QuoteItem[]>(lead.quote_items);
+  // Monthly extras on top of the plan (Rudolph, 7 Oct 2026): every active
+  // recurring charge (Configs -> Tariffs -> Recurring Charges), or typed.
+  const [recurring, setRecurring] = useState<QuoteItem[]>(lead.quote_recurring ?? []);
+  const [charges, setCharges] = useState<RecurringCharge[]>([]);
+  const [validDays, setValidDays] = useState("14");
+  const [sendEmail, setSendEmail] = useState(!!lead.email);
+  const [showPdf, setShowPdf] = useState(false);
+  // The same list as New invoice / New quote (Configs -> Tariffs -> Once-off
+  // Items): picking one fills its name and price (excl. VAT); still editable.
+  const [catalogue, setCatalogue] = useState<OnceOffItem[]>([]);
+  // Stock items too (Inventory -> Products), at their resell price excl. VAT
+  // -- a priced line on the quote only; nothing is reserved or booked out.
+  const [stock, setStock] = useState<Product[]>([]);
+
+  useEffect(() => {
+    api
+      .get<{ results: OnceOffItem[] }>("/once-off-items/?page_size=200&is_active=true")
+      .then((res) => setCatalogue(res.data.results))
+      .catch(() => setCatalogue([]));
+    api
+      .get<{ results: RecurringCharge[] }>("/recurring-charges/?page_size=200&is_active=true&ordering=name")
+      .then((res) => setCharges(res.data.results))
+      .catch(() => setCharges([]));
+    api
+      .get<{ results: Product[] }>("/products/?page_size=500&ordering=name")
+      .then((res) => setStock(res.data.results.filter((p) => p.is_active && p.sell_price)))
+      .catch(() => setStock([]));
+  }, []);
+
+  useEffect(() => {
+    setTariff(lead.interested_tariff ? String(lead.interested_tariff) : "");
+    setItems(lead.quote_items);
+    setRecurring(lead.quote_recurring ?? []);
+    setEditing(false);
+  }, [lead.interested_tariff, lead.quote_sent_at, lead.quote_items, lead.quote_recurring]);
+
+  function addRecurring(id: string) {
+    const picked = charges.find((c) => String(c.id) === id);
+    if (picked) setRecurring([...recurring, { label: picked.name, amount: picked.price, recurring_charge: picked.id }]);
+  }
+
+  function addFromCatalogue(value: string) {
+    const [kind, id] = value.split(":");
+    if (kind === "o") {
+      const picked = catalogue.find((c) => String(c.id) === id);
+      if (picked) setItems([...items, { label: picked.name, amount: picked.price }]);
+    } else if (kind === "p") {
+      const picked = stock.find((p) => String(p.id) === id);
+      if (picked && picked.sell_price) setItems([...items, { label: picked.name, amount: picked.sell_price }]);
+    }
+  }
+
+  const fibrePartner = lead.coverage_result === "fibre_confirmed" ? lead.coverage_partner : null;
+  const plans = tariffs.filter(
+    (t) => (t.is_active || String(t.id) === tariff) && (!fibrePartner || !t.partner || t.partner === fibrePartner),
+  );
+  const totals = lead.quote_totals;
+  const showForm = enabled && (!hasQuote || editing);
+
+  const send = () =>
+    post(
+      "quote",
+      {
+        tariff: tariff ? Number(tariff) : null,
+        items: items.filter((i) => i.label.trim()),
+        recurring: recurring.filter((i) => i.label.trim()),
+        valid_days: Number(validDays) || 14,
+        send_email: sendEmail,
+      },
+      (res) => setInfo(res.emailed_to ? `Quote emailed to ${res.emailed_to}.` : "Quote saved."),
+    );
+
+  return (
+    <Card
+      title={<>Quote {hasQuote && <span className="ml-1 font-normal text-[var(--text-muted)]">{lead.quote_number}</span>}</>}
+      focus={focus}
+      faded={!enabled && !hasQuote}
+      right={
+        hasQuote ? (
+          <div className="flex gap-3 text-xs">
+            <button type="button" className="text-[var(--series-1)] hover:underline" onClick={() => setShowPdf(true)}>View PDF</button>
+            {enabled && !editing && (
+              <button type="button" className="text-[var(--series-1)] hover:underline" disabled={disabled} onClick={() => setEditing(true)}>Edit</button>
+            )}
+            {enabled && lead.email && (
+              <button
+                type="button"
+                className="text-[var(--series-1)] hover:underline"
+                disabled={disabled}
+                onClick={() => post("quote-email", {}, (res) => setInfo(`Quote emailed to ${res.emailed_to}.`))}
+              >
+                Email again
+              </button>
+            )}
+          </div>
+        ) : undefined
+      }
+    >
+      {!enabled && !hasQuote && (
+        <p className="text-sm text-[var(--text-muted)]">
+          Next, once coverage is confirmed: plan + once-off items, sent as a PDF by email. Then <b>Accept</b> creates the
+          client and an Installation job in the Job pool; <b>Reject</b> marks it lost with a reason.
+        </p>
+      )}
+
+      {hasQuote && !editing && (
+        <div className="mb-3">
+          <KV label="Plan">
+            {lead.tariff_name || "—"}
+            {(lead.quote_recurring ?? []).map((i) => ` + ${i.label} ${money(i.amount)}`).join("")} ·{" "}
+            {money(totals.monthly.incl)} /month incl. VAT
+          </KV>
+          {lead.quote_items.length > 0 && (
+            <KV label="Once-off">
+              {lead.quote_items.map((i) => `${i.label} ${money(i.amount)}`).join(" · ")} — {money(totals.once_off.incl)} incl. VAT
+            </KV>
+          )}
+          <KV label="Valid until">
+            {lead.quote_valid_until
+              ? new Date(`${lead.quote_valid_until}T00:00:00`).toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" })
+              : "—"}
+          </KV>
+          <KV label="Sent">{shortWhen(lead.quote_sent_at)}</KV>
+        </div>
+      )}
+
+      {showForm && (
+        <div className="mb-3">
+          <FormField label={fibrePartner ? `Plan (${lead.coverage_partner_name}'s plans)` : "Plan"}>
+            <select className={inputClass} value={tariff} onChange={(e) => setTariff(e.target.value)}>
+              <option value="">Choose the plan…</option>
+              {plans.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} — R {parseFloat(t.price).toFixed(0)}
+                  {t.partner_name ? ` (${t.partner_name})` : ""}
+                </option>
+              ))}
+            </select>
+          </FormField>
+          <p className="mb-1 mt-2 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">
+            Recurring charges — monthly (excl. VAT)
+          </p>
+          {recurring.map((item, i) => (
+            <div key={i} className="mb-1.5 flex gap-2">
+              <input
+                className={`${inputClass} flex-1`}
+                placeholder="e.g. IP Rental"
+                value={item.label}
+                onChange={(e) => setRecurring(recurring.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))}
+              />
+              <input
+                className={inputClass}
+                style={{ maxWidth: 120 }}
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="Amount"
+                value={item.amount}
+                onChange={(e) => setRecurring(recurring.map((x, j) => (j === i ? { ...x, amount: e.target.value } : x)))}
+              />
+              <button type="button" className="px-2 text-[var(--text-muted)] hover:text-[var(--status-critical)]" title="Remove"
+                onClick={() => setRecurring(recurring.filter((_, j) => j !== i))}>
+                ×
+              </button>
+            </div>
+          ))}
+          {recurring.length === 0 && (
+            <p className="mb-1.5 text-xs text-[var(--text-muted)]">None — the plan only. Add IP rental and the like here.</p>
+          )}
+          <div className="flex flex-wrap items-center gap-3">
+            <select className={inputClass} style={{ maxWidth: 280 }} value="" onChange={(e) => addRecurring(e.target.value)}>
+              <option value="">{charges.length ? "+ Add from the list…" : "No recurring charges yet (Configs → Tariffs)"}</option>
+              {charges.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} — R {parseFloat(c.price).toFixed(2)}/month
+                </option>
+              ))}
+            </select>
+            <button type="button" className="text-xs text-[var(--series-1)] hover:underline" onClick={() => setRecurring([...recurring, { label: "", amount: "" }])}>
+              + Type your own
+            </button>
+          </div>
+
+          <p className="mb-1 mt-4 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Once-off (excl. VAT)</p>
+          {items.map((item, i) => (
+            <div key={i} className="mb-1.5 flex gap-2">
+              <input
+                className={`${inputClass} flex-1`}
+                placeholder="e.g. Installation, 6 m pole, Router"
+                value={item.label}
+                onChange={(e) => setItems(items.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))}
+              />
+              <input
+                className={inputClass}
+                style={{ maxWidth: 120 }}
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="Amount"
+                value={item.amount}
+                onChange={(e) => setItems(items.map((x, j) => (j === i ? { ...x, amount: e.target.value } : x)))}
+              />
+              <button type="button" className="px-2 text-[var(--text-muted)] hover:text-[var(--status-critical)]" title="Remove"
+                onClick={() => setItems(items.filter((_, j) => j !== i))}>
+                ×
+              </button>
+            </div>
+          ))}
+          {items.length === 0 && (
+            <p className="mb-1.5 text-xs text-[var(--text-muted)]">None yet — add from the list or type your own.</p>
+          )}
+          <div className="flex flex-wrap items-center gap-3">
+            <select
+              className={inputClass}
+              style={{ maxWidth: 280 }}
+              value=""
+              onChange={(e) => addFromCatalogue(e.target.value)}
+            >
+              <option value="">
+                {catalogue.length || stock.length ? "+ Add from the list…" : "Nothing to pick yet (Configs → Tariffs, Inventory)"}
+              </option>
+              {catalogue.length > 0 && (
+                <optgroup label="Once-off items">
+                  {catalogue.map((c) => (
+                    <option key={`o${c.id}`} value={`o:${c.id}`}>
+                      {c.name} — R {parseFloat(c.price).toFixed(2)}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {stock.length > 0 && (
+                <optgroup label="Stock items">
+                  {stock.map((p) => (
+                    <option key={`p${p.id}`} value={`p:${p.id}`}>
+                      {p.name}{p.sku ? ` (${p.sku})` : ""} — R {parseFloat(p.sell_price ?? "0").toFixed(2)}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+            <button type="button" className="text-xs text-[var(--series-1)] hover:underline" onClick={() => setItems([...items, { label: "", amount: "" }])}>
+              + Type your own
+            </button>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
+              Valid for
+              <input className={inputClass} style={{ maxWidth: 70 }} type="number" min="1" value={validDays} onChange={(e) => setValidDays(e.target.value)} />
+              days
+            </label>
+            <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)]" title={lead.email ? "" : "This lead has no email address"}>
+              <input type="checkbox" disabled={!lead.email} checked={sendEmail && !!lead.email} onChange={(e) => setSendEmail(e.target.checked)} />
+              Email it to {lead.email || "(no email on this lead)"}
+            </label>
+          </div>
+          <div className="mt-3 flex gap-2">
+            <button type="button" className={btnPrimary} disabled={disabled || !tariff} onClick={send}>
+              {sendEmail && lead.email ? "Send quote (PDF + email)" : "Save quote"}
+            </button>
+            {editing && (
+              <button type="button" className={btnSecondary} onClick={() => setEditing(false)}>Cancel</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {hasQuote && lead.status === "quoted" && !editing && (
+        <div className="flex flex-wrap gap-2 border-t border-[var(--border-hairline)] pt-3">
+          <button
+            type="button"
+            className={btnGood}
+            disabled={disabled}
+            onClick={() => post("accept", {}, () => setInfo("Accepted — client created and an Installation job is in the Job pool."))}
+          >
+            ✓ Accepted — create client + install job
+          </button>
+          <button type="button" className={btnBad} disabled={disabled} onClick={() => onLost("quote_rejected")}>
+            ✗ Rejected…
+          </button>
+        </div>
+      )}
+
+      {showPdf && (
+        <PdfPreviewModal
+          title={`Quote ${lead.quote_number}`}
+          url={`/leads/${lead.id}/quote-pdf/`}
+          filename={`${lead.quote_number}.pdf`}
+          onClose={() => setShowPdf(false)}
+        />
+      )}
+    </Card>
+  );
+}
+
+/** Lost, at any step, always with a reason (and an optional note). */
+export function LostModal({
+  lead, initialReason, onClose, onDone,
+}: {
+  lead: Lead;
+  initialReason: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [reason, setReason] = useState(initialReason);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      await api.post(`/leads/${lead.id}/reject/`, { reason, note });
+      onDone();
+    } catch (err) {
+      setError(apiErrorMessage(err, "Couldn't mark it lost."));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="Mark this lead lost" onClose={onClose}>
+      <p className="mb-3 text-sm text-[var(--text-secondary)]">
+        Why did it go? This is the part worth knowing later — it's the difference between "our pricing is wrong" and
+        "we need a tower there". The stage it was lost at ({lead.status_display}) is kept too.
+      </p>
+      <FormField label="Reason" required>
+        <select className={inputClass} value={reason} onChange={(e) => setReason(e.target.value)}>
+          {LOST_REASONS.map((r) => (
+            <option key={r.key} value={r.key}>{r.label}</option>
+          ))}
+        </select>
+      </FormField>
+      <FormField label="Note (optional)">
+        <input className={inputClass} value={note} placeholder="e.g. went with fibre from Vumatel direct" onChange={(e) => setNote(e.target.value)} />
+      </FormField>
+      {error && <p className="mt-2 text-sm text-[var(--status-critical)]">{error}</p>}
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" className={btnSecondary} onClick={onClose}>Cancel</button>
+        <button type="button" className={btnPrimary} disabled={busy} onClick={submit}>Mark lost</button>
+      </div>
+    </Modal>
+  );
+}

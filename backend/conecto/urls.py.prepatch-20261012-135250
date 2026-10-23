@@ -1,0 +1,113 @@
+"""Mounted under /api/ by config/urls.py, so the full paths are
+
+    /api/webhooks/conecto/ticket-created/
+    /api/webhooks/conecto/ticket-replied/
+    /api/webhooks/conecto/ticket-closed/
+    /api/webhooks/conecto/client-registered/
+    /api/webhooks/conecto/job-status-changed/
+    /api/webhooks/conecto/job-checklist-completed/
+    /api/webhooks/conecto/technician-position-updated/
+    /api/webhooks/conecto/internal-ticket-created/
+    /api/webhooks/conecto/internal-ticket-replied/
+    /api/webhooks/conecto/ticket-note-added/
+
+Trailing slashes included, because Django's APPEND_SLASH redirect turns
+a POST into a GET and would silently lose the body. Conecto must call
+them exactly as written above.
+
+One read-only endpoint sits alongside those, for the Scheduling screens:
+
+    /api/technician-positions/
+
+And three that CONECTO calls on us -- the only direction that runs this way
+-- for a client watching their live speed in the app:
+
+    POST /api/conecto/bandwidth/start/
+    POST /api/conecto/bandwidth/poll/
+    POST /api/conecto/bandwidth/stop/
+    POST /api/conecto/documents/invoice-url/
+    POST /api/conecto/documents/statement-url/
+
+One of ours is deliberately open to the world, because the client's own
+phone opens it with no session:
+
+    GET  /api/public/conecto-document/<token>/
+
+Trailing slashes matter on these exactly as much as on the webhooks above,
+and for the same reason: APPEND_SLASH answers a slashless POST with a
+redirect that the caller follows as a GET, losing the body in silence.
+"""
+from django.urls import path
+
+from .job_cards_api import JobCardListView, JobCardPdfView
+from .views import (
+    ConectoDocumentView,
+    ConectoInvoiceUrlView,
+    ConectoStatementUrlView,
+    BandwidthPollView,
+    BandwidthStartView,
+    BandwidthStopView,
+    InternalTicketCreatedWebhook,
+    InternalTicketRepliedWebhook,
+    ClientRegisteredWebhook,
+    JobChecklistCompletedWebhook,
+    JobStatusChangedWebhook,
+    TicketClosedWebhook,
+    TicketCreatedWebhook,
+    ConectoQuoteUrlView,
+    ConectoVehiclesView,
+    SalesSummaryView,
+    SalesLeadsView,
+    SalesLeadView,
+    SalesLeadActionView,
+    LeadQuotePdfView,
+    VehicleFuelLogWebhook,
+    VehicleKmLogWebhook,
+    JobCardWebhook,
+    TechnicianPositionsView,
+    TechnicianPositionUpdatedWebhook,
+    TicketNoteAddedWebhook,
+    TicketRepliedWebhook,
+)
+
+urlpatterns = [
+    path("conecto/documents/invoice-url/", ConectoInvoiceUrlView.as_view()),
+    path("conecto/documents/statement-url/", ConectoStatementUrlView.as_view()),
+    path("conecto/documents/quote-url/", ConectoQuoteUrlView.as_view()),
+    path("conecto/vehicles/", ConectoVehiclesView.as_view()),
+    path("webhooks/conecto/vehicle-km-log/", VehicleKmLogWebhook.as_view()),
+    path("webhooks/conecto/job-card/", JobCardWebhook.as_view()),
+    # Staff: a client's / job's job cards, and the card as a PDF.
+    path("job-cards/", JobCardListView.as_view()),
+    path("job-cards/<int:pk>/pdf/", JobCardPdfView.as_view()),
+    path("webhooks/conecto/vehicle-fuel-log/", VehicleFuelLogWebhook.as_view()),
+    path("conecto/sales/summary/", SalesSummaryView.as_view()),
+    path("conecto/sales/leads/", SalesLeadsView.as_view()),
+    path("conecto/sales/lead/", SalesLeadView.as_view()),
+    path("conecto/sales/lead/action/", SalesLeadActionView.as_view()),
+    path("public/lead-quote/<str:token>/", LeadQuotePdfView.as_view()),
+    path("public/conecto-document/<uuid:token>/", ConectoDocumentView.as_view()),
+    path("conecto/bandwidth/start/", BandwidthStartView.as_view()),
+    path("conecto/bandwidth/poll/", BandwidthPollView.as_view()),
+    path("conecto/bandwidth/stop/", BandwidthStopView.as_view()),
+    path(
+        "webhooks/conecto/internal-ticket-created/",
+        InternalTicketCreatedWebhook.as_view(),
+    ),
+    path(
+        "webhooks/conecto/internal-ticket-replied/",
+        InternalTicketRepliedWebhook.as_view(),
+    ),
+    path("technician-positions/", TechnicianPositionsView.as_view()),
+    path("webhooks/conecto/ticket-created/", TicketCreatedWebhook.as_view()),
+    path("webhooks/conecto/ticket-replied/", TicketRepliedWebhook.as_view()),
+    path("webhooks/conecto/ticket-closed/", TicketClosedWebhook.as_view()),
+    path("webhooks/conecto/client-registered/", ClientRegisteredWebhook.as_view()),
+    path("webhooks/conecto/job-status-changed/", JobStatusChangedWebhook.as_view()),
+    path("webhooks/conecto/job-checklist-completed/", JobChecklistCompletedWebhook.as_view()),
+    path(
+        "webhooks/conecto/technician-position-updated/",
+        TechnicianPositionUpdatedWebhook.as_view(),
+    ),
+    path("webhooks/conecto/ticket-note-added/", TicketNoteAddedWebhook.as_view()),
+]

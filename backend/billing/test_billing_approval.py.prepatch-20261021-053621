@@ -1,0 +1,330 @@
+"""No invoices without an approved preview, however the run was started.
+
+WHAT WAS WRONG
+
+The Run button in Finance has required an approved preview all along, and
+refuses with a 409 naming the problem. The management command did not --
+it called the engine directly, so the nightly cron invoiced every due
+customer at 15:00 with nobody having looked at anything.
+
+At nine pilot customers that is untidy. The base moving across from the
+old system is roughly 1,500 invoices a run, and at that size an
+unreviewed or wrong run is not a tidy-up, it is a week.
+
+So the gate moved into the engine. The API keeps its own check purely so
+it can answer with a specific message; this is what actually decides, and
+a run arriving by cron, by hand, or by anything added later is gated the
+same way.
+
+WHAT IS DELIBERATELY NOT GATED
+
+Reminders, cut-off warnings and suspensions. Those chase and enforce
+debts that already exist and were already agreed. Holding them because
+nobody approved this month's invoicing would punish the customer for an
+internal process, and would quietly stop the dunning chain the moment
+somebody forgot to press a button. There is a test for that below and it
+is the one most likely to be broken by a well-meant simplification.
+
+THE OTHER FAILURE MODE
+
+A manual gate's characteristic disaster is the month where everyone
+assumed somebody else had approved it, and nothing was billed. So a
+withheld run says so on the run row AND on stderr, which is what cron
+mails. Silence is the one outcome that must not be possible.
+"""
+import datetime
+from decimal import Decimal
+from io import StringIO
+from unittest import mock
+
+from django.core.management import call_command
+from django.test import TestCase
+from django.utils import timezone
+
+from customers.models import Customer
+
+from . import recurring
+from .models import (
+    BillingPreviewSnapshot, CustomerBillingConfig, Invoice, ReminderSettings,
+    Service, SuspensionSettings, Tariff,
+)
+
+RUN_DATE = datetime.date(2026, 10, 1)
+
+
+class _TodayIsRunDate:
+    """Pin "today" to RUN_DATE for the life of each test.
+
+    The engine refuses a COMMITTED run dated in the future (it would apply
+    cancellations and tariff changes early), so a commit on 1 October only
+    works on or after 1 October. These tests were written against that date
+    and failed every day before it. Freezing the clock keeps them about the
+    approval gate rather than about the calendar, and keeps them passing
+    after 1 October too.
+    """
+
+    # Class-level: the test classes define their own setUp without super().
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        patcher = mock.patch("django.utils.timezone.localdate", return_value=RUN_DATE)
+        patcher.start()
+        cls.addClassCleanup(patcher.stop)
+
+
+class ApprovalGateTests(_TodayIsRunDate, TestCase):
+    def setUp(self):
+        self.tariff = Tariff.objects.create(
+            name="Home 100", price=Decimal("899.00"), tax_rate_pct=Decimal("15.00"),
+        )
+        self.customer = self._customer("Lucille Slabbert", "CUS-009700")
+
+    # --- fixtures ---------------------------------------------------------
+
+    def _customer(self, name, code):
+        customer = Customer.objects.create(
+            full_name=name, customer_id=code, email=f"{code.lower()}@example.com",
+            status=Customer.Status.ACTIVE,
+        )
+        Service.objects.create(
+            customer=customer, tariff=self.tariff,
+            status=Service.Status.ACTIVE, start_date=datetime.date(2026, 1, 1),
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.auto_create_invoices = True
+        config.billing_day = 1
+        config.next_billing_date = RUN_DATE
+        config.save()
+        return customer
+
+    def _approve(self, *, fingerprint=None, run_date=RUN_DATE, partner_ids=None):
+        """An approved preview for this run, with a fingerprint that really
+        matches unless one is forced."""
+        from .preview_export import project_run, projection_digest
+
+        digest = fingerprint or projection_digest(project_run(run_date))
+        return BillingPreviewSnapshot.objects.create(
+            run_date=run_date, partner_ids=sorted(partner_ids or []),
+            fingerprint=digest, counts={}, grand_total=Decimal("0"), sheets={},
+            approved_at=timezone.now(),
+        )
+
+    def _run(self, commit=True):
+        return recurring.run_recurring_billing(RUN_DATE, commit=commit)
+
+    def _invoices(self):
+        return Invoice.objects.filter(customer=self.customer).count()
+
+    # --- the gate itself --------------------------------------------------
+
+    def test_nothing_approved_is_reported_as_none(self):
+        gate = recurring.approval_for(RUN_DATE)
+
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["reason"], "none")
+
+    def test_a_matching_approval_opens_the_gate(self):
+        self._approve()
+
+        gate = recurring.approval_for(RUN_DATE)
+
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["reason"], "")
+
+    def test_an_approval_whose_data_moved_is_stale(self):
+        """The fingerprint is over the projected numbers, so a tariff or
+        service edited after sign-off invalidates it. That is the point of
+        it -- an approval has to be an approval OF something."""
+        self._approve(fingerprint="deadbeefdeadbeef")
+
+        gate = recurring.approval_for(RUN_DATE)
+
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["reason"], "stale")
+
+    def test_an_approval_already_spent_does_not_count_twice(self):
+        snapshot = self._approve()
+        self._run()
+        snapshot.refresh_from_db()
+
+        self.assertIsNotNone(snapshot.run)
+        self.assertFalse(recurring.approval_for(RUN_DATE)["ok"])
+
+    def test_an_approval_for_another_date_does_not_apply(self):
+        self._approve(run_date=datetime.date(2026, 11, 1))
+
+        self.assertFalse(recurring.approval_for(RUN_DATE)["ok"])
+
+    # --- what the run does about it ---------------------------------------
+
+    def test_a_committed_run_with_no_approval_creates_no_invoices(self):
+        """THE ONE THIS EXISTS FOR."""
+        result = self._run()
+
+        self.assertEqual(self._invoices(), 0)
+        self.assertEqual(result["counts"]["invoices_created"], 0)
+        self.assertTrue(result["invoicing_withheld"])
+
+    def test_a_committed_run_with_an_approval_invoices(self):
+        self._approve()
+
+        result = self._run()
+
+        self.assertEqual(self._invoices(), 1)
+        self.assertEqual(result["counts"]["invoices_created"], 1)
+        self.assertFalse(result["invoicing_withheld"])
+
+    def test_a_stale_approval_creates_no_invoices(self):
+        self._approve(fingerprint="deadbeefdeadbeef")
+
+        result = self._run()
+
+        self.assertEqual(self._invoices(), 0)
+        self.assertEqual(result["approval_reason"], "stale")
+
+    def test_the_run_row_says_why_nothing_was_invoiced(self):
+        """A gate nobody notices is a month of uninvoiced customers that
+        reads, from History, like a run that went fine."""
+        result = self._run()
+
+        self.assertIn("NO INVOICES", result["status_message"])
+        self.assertIn("approve", result["status_message"].lower())
+
+    def test_a_withheld_run_is_not_a_failed_run(self):
+        """It did what it was told. Marking it FAILED would train people to
+        ignore the status."""
+        result = self._run()
+
+        self.assertNotEqual(result["status"], "failed")
+
+    def test_the_customer_is_still_due_afterwards(self):
+        """Withholding must not advance next_billing_date -- otherwise a
+        month nobody approved is a month nobody ever bills."""
+        before = CustomerBillingConfig.objects.get(customer=self.customer).next_billing_date
+
+        self._run()
+
+        self.assertEqual(
+            CustomerBillingConfig.objects.get(customer=self.customer).next_billing_date, before
+        )
+
+    # --- what must keep running -------------------------------------------
+
+    def test_reminders_still_go_out_when_invoicing_is_withheld(self):
+        """THE ONE MOST LIKELY TO BE BROKEN LATER. A customer already owing
+        money is chased on schedule whether or not anybody approved this
+        month's invoicing. Gating the whole run would stop the dunning
+        chain the moment somebody forgot to press a button."""
+        settings = ReminderSettings.load()
+        settings.reminder_1_enabled = True
+        settings.save()
+
+        config = CustomerBillingConfig.objects.get(customer=self.customer)
+        config.reminder_enabled = True
+        config.reminder_1_day = -2
+        config.save()
+
+        overdue = Invoice.objects.create(
+            customer=self.customer, status=Invoice.Status.UNPAID,
+            total=Decimal("899.00"), date_due=RUN_DATE - datetime.timedelta(days=2),
+        )
+        Customer.objects.filter(pk=self.customer.pk).update(balance=Decimal("899.00"))
+
+        # last_reminder_run_date is written by the mailer's on_sent hook,
+        # which fires only once the customer's transaction commits. Inside
+        # a TestCase nothing commits unless the callbacks are run by hand.
+        with self.captureOnCommitCallbacks(execute=True):
+            result = self._run()
+
+        self.assertTrue(result["invoicing_withheld"])
+        self.assertEqual(result["counts"]["invoices_created"], 0)
+        self.assertEqual(result["counts"]["reminders_sent"], 1)
+        overdue.refresh_from_db()
+        self.assertEqual(overdue.last_reminder_run_date, RUN_DATE)
+
+    def test_suspensions_still_apply_when_invoicing_is_withheld(self):
+        suspension = SuspensionSettings.load()
+        suspension.auto_suspend_enabled = True
+        suspension.save()
+
+        config = CustomerBillingConfig.objects.get(customer=self.customer)
+        config.blocking_period_days = 4
+        config.minimum_balance = Decimal("50.00")
+        config.save()
+
+        Invoice.objects.create(
+            customer=self.customer, status=Invoice.Status.UNPAID,
+            total=Decimal("899.00"), date_due=RUN_DATE - datetime.timedelta(days=10),
+        )
+        Customer.objects.filter(pk=self.customer.pk).update(balance=Decimal("899.00"))
+
+        result = self._run()
+
+        self.assertTrue(result["invoicing_withheld"])
+        self.assertEqual(result["counts"]["suspensions_applied"], 1)
+
+    # --- the preview path -------------------------------------------------
+
+    def test_a_preview_is_not_gated(self):
+        """commit=False writes nothing, so there is nothing to approve. A
+        preview that refused to project without an approval could never be
+        approved -- you would have nothing to look at."""
+        result = self._run(commit=False)
+
+        self.assertEqual(result["counts"]["invoices_created"], 1)
+
+
+class CommandOutputTests(_TodayIsRunDate, TestCase):
+    """What cron mails, and what a person reading logs/billing.log sees."""
+
+    def setUp(self):
+        tariff = Tariff.objects.create(
+            name="Home 100", price=Decimal("899.00"), tax_rate_pct=Decimal("15.00"),
+        )
+        self.customer = Customer.objects.create(
+            full_name="Lucille Slabbert", customer_id="CUS-009800",
+            email="lucille8@example.com", status=Customer.Status.ACTIVE,
+        )
+        Service.objects.create(
+            customer=self.customer, tariff=tariff,
+            status=Service.Status.ACTIVE, start_date=datetime.date(2026, 1, 1),
+        )
+        config = CustomerBillingConfig.for_customer(self.customer)
+        config.billing_enabled = True
+        config.auto_create_invoices = True
+        config.next_billing_date = RUN_DATE
+        config.save()
+
+    def _run(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("run_recurring_billing", "--date", RUN_DATE.isoformat(),
+                     *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def test_a_withheld_commit_says_so_on_stderr(self):
+        out, err = self._run("--commit")
+
+        self.assertIn("NO INVOICES CREATED", err)
+        self.assertIn("no approved preview", err)
+        self.assertIn("0 invoice(s)", out)
+
+    def test_an_approved_commit_says_nothing_extra(self):
+        from .preview_export import project_run, projection_digest
+
+        BillingPreviewSnapshot.objects.create(
+            run_date=RUN_DATE, partner_ids=[],
+            fingerprint=projection_digest(project_run(RUN_DATE)),
+            counts={}, grand_total=Decimal("0"), sheets={}, approved_at=timezone.now(),
+        )
+
+        out, err = self._run("--commit")
+
+        self.assertNotIn("NO INVOICES CREATED", err)
+        self.assertIn("1 invoice(s)", out)
+
+    def test_a_preview_run_is_never_reported_as_withheld(self):
+        out, err = self._run()
+
+        self.assertNotIn("NO INVOICES CREATED", err)
+        self.assertIn("preview only", out)

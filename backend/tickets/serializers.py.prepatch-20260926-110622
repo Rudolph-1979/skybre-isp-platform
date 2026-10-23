@@ -1,0 +1,66 @@
+from rest_framework import serializers
+from .models import Ticket, TicketComment
+
+
+class TicketCommentSerializer(serializers.ModelSerializer):
+    # One field for "who said this", whoever they are. The screen already
+    # renders author_name, so a customer's reply arriving through the
+    # Conecto app shows their name there without the frontend changing --
+    # and external_author is exposed alongside it so the UI can mark those
+    # differently when somebody gets to it.
+    author_name = serializers.SerializerMethodField()
+
+    def get_author_name(self, obj):
+        if obj.external_author:
+            return obj.external_author
+        return obj.author.username if obj.author_id else None
+
+    class Meta:
+        model = TicketComment
+        fields = [
+            "id", "ticket", "author", "author_name", "external_author",
+            "message", "is_internal", "created_at",
+        ]
+        # external_author is read-only through the API on purpose: it is set
+        # by the Conecto webhook and nowhere else. A staff member able to
+        # write it could post a comment under a customer's name.
+        read_only_fields = ["id", "created_at", "author", "external_author"]
+
+
+class TicketSerializer(serializers.ModelSerializer):
+    comments = serializers.SerializerMethodField()
+    # default=None because customer is NULL on an internal ticket. Without
+    # it, DRF raises walking the source path and the whole list 500s the
+    # first time a technician files feedback.
+    customer_name = serializers.CharField(
+        source="customer.full_name", read_only=True, default=None
+    )
+    assigned_to_name = serializers.CharField(source="assigned_to.username", read_only=True, default=None)
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True, default=None)
+
+    class Meta:
+        model = Ticket
+        fields = [
+            "id", "ticket_number", "customer", "customer_name", "subject", "description",
+            "department", "status", "priority", "assigned_to", "assigned_to_name",
+            "created_by", "created_by_name", "created_at", "updated_at", "comments",
+            "is_internal",
+        ]
+        # is_internal is READ-ONLY, like external_author on comments and for
+        # the same reason: it is set by the webhook that receives a
+        # technician's job feedback and nowhere else. Writable, it would let
+        # a staff member flip a customer's ticket to internal -- hiding a
+        # conversation the customer was part of and, because of the check
+        # constraint, failing at the database instead in a way nobody could
+        # read.
+        read_only_fields = [
+            "id", "ticket_number", "created_by", "created_at", "updated_at",
+            "is_internal",
+        ]
+
+    def get_comments(self, obj):
+        user = self.context["request"].user if "request" in self.context else None
+        qs = obj.comments.all()
+        if not user or not user.is_staff_member:
+            qs = qs.filter(is_internal=False)
+        return TicketCommentSerializer(qs, many=True).data

@@ -1,0 +1,236 @@
+"""Two ways a date could reach further than the person typing it meant.
+
+--as-of ON THE OVERNIGHT COMMANDS. Both apply_tariff_changes and
+apply_cancellations take --as-of, documented as "pretend today is this
+date, for checking a change before it lands" / "for checking ahead". But
+both jobs match on `<=` on purpose, so that a day the cron missed still
+gets done -- and handed a date in the future, that catch-up becomes a
+fast-forward. `apply_cancellations --as-of 2027-01-01 --commit`
+terminates every service with an end date between now and then, drops
+their live sessions and marks those customers Cancelled.
+`apply_tariff_changes --as-of` next quarter applies every booked change
+early AND clears the booking, so the change cannot even be re-applied on
+the right day: it is gone and the service is on the new price.
+
+run_recurring_billing already refuses a future run_date for exactly this
+reason. The two commands it calls did not.
+
+Checking ahead still works -- that is what the flag is for. It is only
+the writing paths (--commit / not --dry-run) that refuse.
+
+A ZERO-DAY BLOCKING PERIOD. blocking_period_days is "days after payment
+is due before this customer's services are automatically suspended", and
+0 is a legitimate setting. But the overdue test is `date_due <= run_date
+- blocking_period_days`, so at 0 an invoice due TODAY already qualifies
+-- and with payment_due_days also unset or 0 the invoice raised by this
+run is due the day it is raised. The same run that invoiced the customer
+then suspended them for not having paid it, in the same pass, seconds
+apart. They were never given a chance to pay.
+"""
+import datetime
+from decimal import Decimal
+
+from django.core.management import call_command
+from django.test import TestCase
+from django.utils import timezone
+
+from billing.models import (
+    CustomerBillingConfig, Invoice, Service, SuspensionSettings, Tariff,
+)
+from billing.recurring import run_recurring_billing
+from customers.models import Customer
+
+
+class AsOfTestCase(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.next_year = self.today + datetime.timedelta(days=365)
+        self.tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240,
+        )
+        self.faster = Tariff.objects.create(
+            name="Home 100", price=Decimal("900.00"),
+            speed_download_kbps=102400, speed_upload_kbps=51200,
+        )
+        self.customer = Customer.objects.create(
+            full_name="Anna Able", email="anna@example.com", status=Customer.Status.ACTIVE,
+        )
+
+
+class CancellationsAsOfTests(AsOfTestCase):
+    def _service_ending(self, when):
+        return Service.objects.create(
+            customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90), end_date=when,
+        )
+
+    def test_a_future_as_of_refuses_to_commit(self):
+        service = self._service_ending(self.next_year)
+
+        call_command("apply_cancellations", "--as-of", self.next_year.isoformat(), "--commit")
+
+        service.refresh_from_db()
+        self.customer.refresh_from_db()
+        self.assertEqual(
+            service.status, Service.Status.ACTIVE,
+            "a service was terminated a year early",
+        )
+        self.assertEqual(self.customer.status, Customer.Status.ACTIVE)
+
+    def test_a_future_as_of_can_still_be_checked(self):
+        """The flag's documented purpose. It must keep working."""
+        service = self._service_ending(self.next_year)
+
+        call_command("apply_cancellations", "--as-of", self.next_year.isoformat())
+
+        service.refresh_from_db()
+        self.assertEqual(service.status, Service.Status.ACTIVE)
+
+    def test_todays_work_still_commits(self):
+        service = self._service_ending(self.today)
+
+        call_command("apply_cancellations", "--commit")
+
+        service.refresh_from_db()
+        self.assertEqual(service.status, Service.Status.TERMINATED)
+
+    def test_a_past_as_of_still_commits(self):
+        """Catching up a day the cron missed is the whole reason for `<=`."""
+        service = self._service_ending(self.today - datetime.timedelta(days=3))
+
+        call_command(
+            "apply_cancellations", "--as-of",
+            (self.today - datetime.timedelta(days=1)).isoformat(), "--commit",
+        )
+
+        service.refresh_from_db()
+        self.assertEqual(service.status, Service.Status.TERMINATED)
+
+
+class TariffChangesAsOfTests(AsOfTestCase):
+    def _service_switching(self, when):
+        return Service.objects.create(
+            customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90),
+            pending_tariff=self.faster, pending_tariff_date=when,
+        )
+
+    def test_a_future_as_of_does_not_apply_the_change(self):
+        service = self._service_switching(self.next_year)
+
+        call_command("apply_tariff_changes", "--as-of", self.next_year.isoformat())
+
+        service.refresh_from_db()
+        self.assertEqual(service.tariff_id, self.tariff.pk, "the plan changed a year early")
+
+    def test_a_future_as_of_does_not_destroy_the_booking(self):
+        """The worse half: applying a change clears it, so an early apply
+        does not merely happen early -- it consumes the booking, and the
+        real date arrives with nothing left to do."""
+        service = self._service_switching(self.next_year)
+
+        call_command("apply_tariff_changes", "--as-of", self.next_year.isoformat())
+
+        service.refresh_from_db()
+        self.assertEqual(service.pending_tariff_id, self.faster.pk)
+        self.assertEqual(service.pending_tariff_date, self.next_year)
+
+    def test_a_future_as_of_can_still_be_checked(self):
+        service = self._service_switching(self.next_year)
+
+        call_command(
+            "apply_tariff_changes", "--as-of", self.next_year.isoformat(), "--dry-run"
+        )
+
+        service.refresh_from_db()
+        self.assertEqual(service.tariff_id, self.tariff.pk)
+        self.assertEqual(service.pending_tariff_id, self.faster.pk)
+
+    def test_a_change_due_today_still_applies(self):
+        service = self._service_switching(self.today)
+
+        call_command("apply_tariff_changes")
+
+        service.refresh_from_db()
+        self.assertEqual(service.tariff_id, self.faster.pk)
+        self.assertIsNone(service.pending_tariff_id)
+
+
+class ZeroDayBlockingTests(TestCase):
+    """A run must not suspend a customer over the invoice it just raised."""
+
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240,
+        )
+        suspension = SuspensionSettings.load()
+        suspension.auto_suspend_enabled = True
+        suspension.save()
+
+    def _customer(self, name, balance=Decimal("0.00")):
+        customer = Customer.objects.create(
+            full_name=name, email=f"{name.split()[0].lower()}@example.com",
+            status=Customer.Status.ACTIVE, balance=balance,
+        )
+        service = Service.objects.create(
+            customer=customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=90),
+        )
+        config = CustomerBillingConfig.for_customer(customer)
+        config.billing_enabled = True
+        config.next_billing_date = self.today
+        config.payment_due_days = 0
+        config.blocking_period_days = 0
+        config.save()
+        return customer, service
+
+    def test_the_run_does_not_suspend_over_the_invoice_it_just_raised(self):
+        # An opening balance, so the "is anything owed" half of the
+        # blocking test is satisfied by history rather than by this run.
+        # Without it the customer is saved only by the in-memory balance
+        # being stale, which is not a guarantee worth resting on.
+        customer, service = self._customer("Anna Able", balance=Decimal("575.00"))
+
+        result = run_recurring_billing(self.today, commit=True)
+
+        service.refresh_from_db()
+        self.assertEqual(result["counts"]["invoices_created"], 1)
+        self.assertEqual(
+            service.status, Service.Status.ACTIVE,
+            "the customer was cut off for not paying an invoice raised seconds earlier",
+        )
+        self.assertEqual(result["counts"]["suspensions_applied"], 0)
+
+    def test_an_older_unpaid_invoice_still_suspends_at_zero_days(self):
+        """The setting still means what it says: nothing here makes a
+        zero-day blocking period stop blocking."""
+        customer, service = self._customer("Boris Bright", balance=Decimal("575.00"))
+        Invoice.objects.create(
+            customer=customer, status=Invoice.Status.UNPAID,
+            date_due=self.today - datetime.timedelta(days=1),
+            total=Decimal("575.00"),
+        )
+
+        run_recurring_billing(self.today, commit=True)
+
+        service.refresh_from_db()
+        self.assertEqual(service.status, Service.Status.SUSPENDED)
+
+    def test_an_invoice_from_an_earlier_run_still_suspends(self):
+        """Yesterday's run raised it; today's run is entitled to act on it."""
+        customer, service = self._customer("Carol Clear", balance=Decimal("575.00"))
+        yesterday = self.today - datetime.timedelta(days=1)
+        config = customer.billing_config
+        config.next_billing_date = yesterday
+        config.save()
+        run_recurring_billing(yesterday, commit=True)
+        service.refresh_from_db()
+        self.assertEqual(service.status, Service.Status.ACTIVE)
+
+        run_recurring_billing(self.today, commit=True)
+
+        service.refresh_from_db()
+        self.assertEqual(service.status, Service.Status.SUSPENDED)

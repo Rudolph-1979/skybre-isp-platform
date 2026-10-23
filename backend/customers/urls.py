@@ -1,6 +1,8 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
+from .report_views import ClientsPerPartnerView, ClientsPerTariffView, ReportClientsView, RevenueReportView
 from .views import (
-    CustomerViewSet, CustomerDeletionRequestViewSet, CustomerTaskViewSet, PartnerViewSet,
+    ClientAccountTypeViewSet, CustomerViewSet, CustomerDeletionRequestViewSet, CustomerTaskViewSet, PartnerViewSet,
 )
 
 router = DefaultRouter()
@@ -8,5 +10,16 @@ router.register("customers", CustomerViewSet, basename="customer")
 router.register("customer-deletion-requests", CustomerDeletionRequestViewSet, basename="customer-deletion-request")
 router.register("customer-tasks", CustomerTaskViewSet, basename="customer-task")
 router.register("partners", PartnerViewSet, basename="partner")
+router.register("account-types", ClientAccountTypeViewSet, basename="account-type")
 
-urlpatterns = router.urls
+urlpatterns = router.urls + [
+    # Administration -> Reports (9 Oct 2026).
+    path("reports/clients-per-partner/", ClientsPerPartnerView.as_view(), name="report-clients-per-partner"),
+    path("reports/clients-per-tariff/", ClientsPerTariffView.as_view(), name="report-clients-per-tariff"),
+    path("reports/clients-per-partner/clients/", ReportClientsView.as_view(), {"report": "partner"},
+         name="report-clients-per-partner-clients"),
+    path("reports/clients-per-tariff/clients/", ReportClientsView.as_view(), {"report": "tariff"},
+         name="report-clients-per-tariff-clients"),
+    # Administration -> Revenue charts (9 Oct 2026).
+    path("reports/revenue/<slug:chart>/", RevenueReportView.as_view(), name="report-revenue"),
+]

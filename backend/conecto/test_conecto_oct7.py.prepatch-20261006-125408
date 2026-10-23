@@ -1,0 +1,146 @@
+"""Conecto's open items, 7 Oct 2026.
+
+* Return to Pool: status "returned_to_pool" with return_reason. The job goes
+  back to our pool; Conecto has already closed the technician's copy, so we
+  must NOT cancelJob it (409) -- and rebooking schedules a fresh job.
+* ticket-replied with author_type "staff": a Skybre person answering in the
+  app, labelled as staff rather than read as the customer.
+* The test suite never reaches the real Conecto.
+
+Nothing here touches the network.
+"""
+import datetime
+from unittest.mock import patch
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from customers.models import Customer
+from scheduling.models import Job
+from tickets.models import Ticket
+
+from .models import ConectoJob, ConectoTechnician, ConectoTicket
+
+User = get_user_model()
+TOKEN = "test-shared-secret"
+URLS = {
+    "scheduleJob": "https://example.invalid/scheduleJob",
+    "cancelJob": "https://example.invalid/cancelJob",
+}
+CONFIGURED = override_settings(CONECTO_API_KEY=TOKEN, CONECTO_WEBHOOK_TOKEN=TOKEN, CONECTO_URLS=URLS)
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = ""
+        self.ok = 200 <= status_code < 300
+
+    def json(self):
+        return self._payload
+
+
+def endpoints(request):
+    return [c[0][1].rsplit("/", 1)[-1] for c in request.call_args_list]
+
+
+@CONFIGURED
+class ReturnToPoolFromConectoTests(TestCase):
+    def setUp(self):
+        self.tech = User.objects.create_user(username="christo", password="x", role="technician", first_name="Christo")
+        ConectoTechnician.objects.create(user=self.tech, technician_code="TECH-001")
+        self.customer = Customer.objects.create(full_name="Lucille", customer_id="CUS-001600", city="Kroonstad")
+        self.start = timezone.now().replace(microsecond=0) + datetime.timedelta(hours=2)
+
+    def _book(self, request, start, conecto_id):
+        request.return_value = FakeResponse(payload={"job_id": conecto_id})
+        with self.captureOnCommitCallbacks(execute=True):
+            job = Job.objects.create(customer=self.customer, title="Install", start=start,
+                                     end=start + datetime.timedelta(hours=1))
+            job.assigned_technicians.set([self.tech])
+        return job
+
+    def test_returned_job_goes_to_pool_without_a_cancel_and_rebooks_fresh(self):
+        with patch("conecto.client.requests.request") as request:
+            job = self._book(request, self.start, "cn-1")
+            self.assertEqual(endpoints(request), ["scheduleJob"])
+            request.reset_mock()
+            with self.captureOnCommitCallbacks(execute=True):
+                res = APIClient().post(
+                    "/api/webhooks/conecto/job-status-changed/",
+                    {"job_id": "cn-1", "vexar_job_id": str(job.pk), "status": "returned_to_pool",
+                     "technician_code": "TECH-001", "return_reason": "client not home",
+                     "lat": -27.65, "lng": 27.23, "duration_minutes": 12},
+                    format="json", HTTP_AUTHORIZATION=f"Bearer {TOKEN}",
+                )
+            self.assertEqual(res.status_code, 200, res.data)
+            self.assertTrue(res.data["returned_to_pool"])
+            self.assertEqual(endpoints(request), [], "no cancelJob for a copy Conecto already returned")
+            job.refresh_from_db()
+            self.assertIsNone(job.start)
+            self.assertEqual(job.return_reason, "Returned by Christo: client not home")
+            self.assertFalse(ConectoJob.objects.filter(job=job).exists())
+
+            # Office books it again -> a fresh scheduleJob, and its new id is kept.
+            request.reset_mock()
+            request.return_value = FakeResponse(payload={"job_id": "cn-2"})
+            later = self.start + datetime.timedelta(days=1)
+            with self.captureOnCommitCallbacks(execute=True):
+                job.start, job.end = later, later + datetime.timedelta(hours=1)
+                job.save()
+                job.assigned_technicians.set([self.tech])
+            self.assertIn("scheduleJob", endpoints(request))
+            self.assertNotIn("cancelJob", endpoints(request))
+            self.assertEqual(ConectoJob.objects.get(job=job).conecto_job_id, "cn-2")
+
+    def test_daily_sweep_still_cancels_a_copy_nobody_returned(self):
+        from scheduling.pool import return_to_pool
+
+        with patch("conecto.client.requests.request") as request:
+            job = self._book(request, self.start, "cn-1")
+            request.reset_mock()
+            request.return_value = FakeResponse(payload={"success": True})
+            with self.captureOnCommitCallbacks(execute=True):
+                return_to_pool(job, "Not completed — returned automatically")
+            self.assertEqual(endpoints(request), ["cancelJob"])
+
+
+@CONFIGURED
+class StaffReplyFromConectoTests(TestCase):
+    def setUp(self):
+        customer = Customer.objects.create(customer_id="CUS-001700", full_name="Jan Botha")
+        self.ticket = Ticket.objects.create(customer=customer, subject="No connection", description="x")
+        ConectoTicket.objects.create(ticket=self.ticket, conecto_ticket_id="t-1", origin=ConectoTicket.Origin.CONECTO)
+
+    def _reply(self, **extra):
+        body = {"ticket_id": "t-1", "message": "We are on it.", "author_name": "Liesl Smit"}
+        body.update(extra)
+        return APIClient().post("/api/webhooks/conecto/ticket-replied/", body, format="json",
+                                HTTP_AUTHORIZATION=f"Bearer {TOKEN}")
+
+    def test_staff_reply_is_labelled_as_staff(self):
+        res = self._reply(author_type="staff", author_role="admin", author_nickname="Lies")
+        self.assertEqual(res.status_code, 201, res.data)
+        comment = self.ticket.comments.get()
+        self.assertEqual(comment.external_author, "Liesl Smit (Skybre admin, via Conecto)")
+        self.assertFalse(comment.is_internal)
+
+    def test_customer_reply_unchanged(self):
+        self._reply(author_type="customer", author_name="Jan Botha")
+        self.assertEqual(self.ticket.comments.get().external_author, "Jan Botha")
+
+    def test_staff_reply_replay_is_stored_once(self):
+        self._reply(author_type="staff", author_role="staff")
+        res = self._reply(author_type="staff", author_role="staff")
+        self.assertTrue(res.data.get("duplicate"))
+        self.assertEqual(self.ticket.comments.count(), 1)
+
+
+class TestsNeverReachConectoTests(SimpleTestCase):
+    def test_no_key_under_the_test_runner(self):
+        self.assertEqual(settings.CONECTO_API_KEY, "")
+        self.assertTrue(all(not url for url in settings.CONECTO_URLS.values()))

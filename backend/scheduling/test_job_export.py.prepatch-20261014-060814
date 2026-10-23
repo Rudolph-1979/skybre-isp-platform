@@ -1,0 +1,59 @@
+"""Scheduling -> Export Excel (George, 14 Oct 2026)."""
+import datetime
+import io
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.utils import timezone
+from openpyxl import load_workbook
+from rest_framework.test import APIClient
+
+from customers.models import Customer
+from scheduling.models import Job
+
+User = get_user_model()
+
+
+class JobExportTests(TestCase):
+    def setUp(self):
+        self.api = APIClient()
+        self.api.force_authenticate(User.objects.create_user(username="adm", password="x", role="admin"))
+        self.a = User.objects.create_user(username="christo", password="x", role="technician", first_name="Christo")
+        self.b = User.objects.create_user(username="bertus", password="x", role="technician", first_name="Bertus")
+        self.client_ = Customer.objects.create(full_name="CCTV Central", status="active", address="1 Main Rd")
+        tz = timezone.get_current_timezone()
+
+        def at(day, hour):
+            return timezone.make_aware(datetime.datetime(2026, 10, day, hour, 0), tz)
+
+        j1 = Job.objects.create(title="Install", customer=self.client_, start=at(14, 9), end=at(14, 11))
+        j1.assigned_technicians.set([self.a, self.b])
+        j2 = Job.objects.create(title="Repair", start=at(15, 8), end=at(15, 9), location="Tower 3")
+        j2.assigned_technicians.set([self.b])
+        Job.objects.create(title="Outside range", start=at(20, 8), end=at(20, 9))
+        Job.objects.create(title="Pool job")  # unscheduled
+        # 23:30 on the 15th local: must count as the 15th, not the 16th UTC-wise.
+        Job.objects.create(title="Late", start=at(15, 23).replace(minute=30), end=at(15, 23).replace(minute=59))
+
+    def _wb(self, query):
+        res = self.api.get(f"/api/jobs/export/?{query}")
+        self.assertEqual(res.status_code, 200, getattr(res, "data", None))
+        self.assertIn("spreadsheetml", res["Content-Type"])
+        return load_workbook(io.BytesIO(res.content))
+
+    def test_range_order_and_sheets(self):
+        wb = self._wb("date_from=2026-10-14&date_to=2026-10-15")
+        self.assertEqual(wb.sheetnames, ["Jobs", "By technician", "Summary"])
+        titles = [r[7] for r in wb["Jobs"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(titles, ["Install", "Repair", "Late"])
+        first = next(wb["Jobs"].iter_rows(min_row=2, values_only=True))
+        self.assertEqual((first[2], first[3], first[4], first[5]), ("09:00", "11:00", 2.0, "Bertus, Christo"))
+        self.assertEqual(first[11], "1 Main Rd")
+        by_tech = [(r[0], r[7]) for r in wb["By technician"].iter_rows(min_row=2, values_only=True)]
+        self.assertEqual(by_tech, [("Bertus", "Install"), ("Bertus", "Repair"), ("Christo", "Install"), ("Unassigned", "Late")])
+
+    def test_technician_filter_and_validation(self):
+        wb = self._wb(f"date_from=2026-10-14&date_to=2026-10-31&technician={self.a.pk}")
+        self.assertEqual([r[7] for r in wb["Jobs"].iter_rows(min_row=2, values_only=True)], ["Install"])
+        self.assertEqual(self.api.get("/api/jobs/export/?date_from=2026-10-15&date_to=2026-10-14").status_code, 400)
+        self.assertEqual(self.api.get("/api/jobs/export/").status_code, 400)

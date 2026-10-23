@@ -1,0 +1,178 @@
+"""Administration -> Reports endpoints (9 Oct 2026). See admin_reports.py
+for how clients are counted.
+
+    GET /api/reports/clients-per-partner/?status=active,online
+    (either report: &clients=1 adds each row's client_list, for the CSV)
+    GET /api/reports/clients-per-tariff/?status=active,online&tariff=<id>,<id>,none&partner=<id>,direct
+    GET /api/reports/clients-per-partner/clients/?key=<partner id|direct>&status=...
+    GET /api/reports/clients-per-tariff/clients/?key=<tariff id|none>&status=...
+
+Staff with the Administration section only (Admin always). An empty or
+missing ?status= means every status.
+"""
+from django.http import HttpResponse
+from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.permissions import user_can_access_section
+
+from . import admin_reports
+
+
+class _AdministrationReport(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    report = ""
+
+    def _guard(self, request):
+        user = request.user
+        if not getattr(user, "is_staff_member", False):
+            return Response({"detail": "Not found."}, status=404)
+        if not user_can_access_section(user, "administration"):
+            return Response({"detail": "You don't have access to the 'administration' section."}, status=403)
+        return None
+
+    def _statuses(self, request):
+        return admin_reports.parse_statuses(request.query_params.get("status", ""))
+
+    # ?filetype=xlsx (13 Oct 2026): the report as an Excel workbook, with a
+    # Clients sheet. `filetype`, not `format` -- DRF reserves `format`.
+    def _wants_xlsx(self, request):
+        return (request.query_params.get("filetype") or "").lower() == "xlsx"
+
+    def _xlsx(self, report, column, per_tariff, stem):
+        import datetime
+
+        from .report_xlsx import build_xlsx
+
+        resp = HttpResponse(
+            build_xlsx(report, column, per_tariff),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        resp["Content-Disposition"] = f'attachment; filename="{stem}-{datetime.date.today().isoformat()}.xlsx"'
+        return resp
+
+
+class ClientsPerPartnerView(_AdministrationReport):
+    def get(self, request):
+        refused = self._guard(request)
+        if refused:
+            return refused
+        try:
+            statuses = self._statuses(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        if self._wants_xlsx(request):
+            report = admin_reports.clients_per_partner(request.user, statuses, True)
+            return self._xlsx(report, "Partner", False, "clients-per-partner")
+        with_clients = request.query_params.get("clients") in ("1", "true")
+        return Response(admin_reports.clients_per_partner(request.user, statuses, with_clients))
+
+
+class ClientsPerTariffView(_AdministrationReport):
+    def get(self, request):
+        refused = self._guard(request)
+        if refused:
+            return refused
+        try:
+            statuses = self._statuses(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        tariffs = admin_reports.parse_keys(request.query_params.get("tariff", ""))
+        try:
+            partners = admin_reports.parse_partners(request.user, request.query_params.get("partner", ""))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        if self._wants_xlsx(request):
+            report = admin_reports.clients_per_tariff(request.user, statuses, tariffs, partners, True)
+            return self._xlsx(report, "Tariff", True, "clients-per-tariff")
+        with_clients = request.query_params.get("clients") in ("1", "true")
+        return Response(admin_reports.clients_per_tariff(request.user, statuses, tariffs, partners, with_clients))
+
+
+class RevenueReportView(_AdministrationReport):
+    """GET /api/reports/revenue/<chart>/?partner=<id>,direct&period=...&month=this|last
+
+    chart: partners | mrr | top-payers | daily-payments | invoicing | payments | outstanding
+    (outstanding?method=<id|none> lists that row's clients).
+    See customers/revenue_reports.py (9 Oct 2026).
+    """
+
+    PERIODS = {
+        "mrr": ("monthly", ("daily", "weekly", "monthly", "yearly")),
+        "invoicing": ("month", ("month", "quarter", "year")),
+        "payments": ("month", ("month", "quarter", "year")),
+    }
+
+    def get(self, request, chart):
+        from . import revenue_reports as rr
+
+        refused = self._guard(request)
+        if refused:
+            return refused
+        user = request.user
+        if chart == "partners":
+            return Response({"partners": rr.partner_options(user)})
+        try:
+            keys = rr.selected_keys(user, request.query_params.get("partner", ""))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        if chart in self.PERIODS:
+            default, allowed = self.PERIODS[chart]
+            period = request.query_params.get("period") or default
+            if period not in allowed:
+                return Response({"detail": f"period must be one of {', '.join(allowed)}."}, status=400)
+            fn = {"mrr": rr.mrr_series, "invoicing": rr.invoicing_series, "payments": rr.payments_series}[chart]
+            return Response(fn(user, period, keys))
+        if chart == "outstanding":
+            # Export CSV / Excel (14 Oct 2026). `filetype`, not `format` --
+            # DRF reserves `format`.
+            filetype = (request.query_params.get("filetype") or "").lower()
+            if filetype in ("csv", "xlsx"):
+                from .outstanding_export import build_csv, build_xlsx
+
+                payload, as_of = (build_csv if filetype == "csv" else build_xlsx)(user, keys)
+                resp = HttpResponse(
+                    payload,
+                    content_type="text/csv; charset=utf-8" if filetype == "csv"
+                    else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                resp["Content-Disposition"] = f'attachment; filename="outstanding-by-payment-method-{as_of}.{filetype}"'
+                return resp
+            method = (request.query_params.get("method") or "").strip()
+            if not method:
+                return Response(rr.outstanding_by_method(user, keys))
+            if method != rr.NO_METHOD_KEY and not method.isdigit():
+                return Response({"detail": "Unknown payment method."}, status=400)
+            return Response({"method": method, "results": rr.outstanding_clients(user, keys, method)})
+        if chart in ("top-payers", "daily-payments"):
+            month = request.query_params.get("month") or "this"
+            if month not in ("this", "last"):
+                return Response({"detail": "month must be this or last."}, status=400)
+            fn = rr.top_payers if chart == "top-payers" else rr.daily_payments
+            return Response(fn(user, month, keys))
+        return Response({"detail": "Unknown chart."}, status=404)
+
+
+class ReportClientsView(_AdministrationReport):
+    """The clients behind one row of either report."""
+
+    def get(self, request, report):
+        refused = self._guard(request)
+        if refused:
+            return refused
+        try:
+            statuses = self._statuses(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        key = (request.query_params.get("key") or "").strip()
+        if not key:
+            return Response({"detail": "key is required."}, status=400)
+        try:
+            partners = admin_reports.parse_partners(request.user, request.query_params.get("partner", ""))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        return Response({
+            "key": key,
+            "results": admin_reports.clients_in_group(request.user, report, key, statuses, partners),
+        })

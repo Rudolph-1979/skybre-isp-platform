@@ -1,0 +1,53 @@
+"""Customers list Extension column next to Payment status (#194, Rudolph
+19 Oct 2026: "Add next to payment status Extension Requested or not")."""
+from datetime import timedelta
+
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from accounts.models import User
+from billing.models import CustomerBillingConfig, SuspensionExtensionRequest
+from customers.models import Customer
+
+
+class ExtensionColumnTests(TestCase):
+    def setUp(self):
+        admin = User.objects.create_user(username="boss", password="x", role="admin")
+        self.api = APIClient()
+        self.api.force_authenticate(admin)
+        today = timezone.localdate()
+        self.friday = today + timedelta(days=4)
+        self.anna = Customer.objects.create(full_name="Anna")  # pending request
+        SuspensionExtensionRequest.objects.create(customer=self.anna, extend_until=self.friday, reason="Pays Friday")
+        ben = Customer.objects.create(full_name="Ben")  # approved, in force
+        config = CustomerBillingConfig.for_customer(ben)
+        config.suspension_extended_until = today + timedelta(days=2)
+        config.save()
+        cara = Customer.objects.create(full_name="Cara")  # approved but expired + an old rejected request
+        config = CustomerBillingConfig.for_customer(cara)
+        config.suspension_extended_until = today - timedelta(days=1)
+        config.save()
+        SuspensionExtensionRequest.objects.create(customer=cara, extend_until=today, reason="x", status="rejected")
+        Customer.objects.create(full_name="Dirk")  # nothing at all
+        self.today = today
+
+    def test_listed(self):
+        res = self.api.get("/api/customers/?ordering=full_name&page_size=50")
+        self.assertEqual(res.status_code, 200)
+        rows = [(c["full_name"], c["extension_status"], c["extension_until"]) for c in res.data["results"]]
+        self.assertEqual(rows, [
+            ("Anna", "requested", self.friday.isoformat()),
+            ("Ben", "extended", (self.today + timedelta(days=2)).isoformat()),
+            ("Cara", "", None),
+            ("Dirk", "", None),
+        ])
+
+    def test_detail_too(self):
+        data = self.api.get(f"/api/customers/{self.anna.pk}/").data
+        self.assertEqual((data["extension_status"], data["extension_until"]), ("requested", self.friday.isoformat()))
+
+    def test_a_decided_request_stops_showing_as_requested(self):
+        SuspensionExtensionRequest.objects.filter(customer=self.anna).update(status="rejected")
+        data = self.api.get(f"/api/customers/{self.anna.pk}/").data
+        self.assertEqual(data["extension_status"], "")

@@ -1,17 +1,21 @@
+from datetime import date as date_cls
 from decimal import Decimal, InvalidOperation
 
+from django.core import signing
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import IsAdmin, IsStaffMember, section_permission
 from billing.serializers import PaymentSerializer
 from expenses.serializers import ExpenseSerializer
 from .csv_import import StatementFormatError, parse_statement_csv
-from .ingest import create_transaction_if_new
+from .fnb_client import CALLBACK_PATH, FNBClient, FNBClientError, redirect_uri_allowed
+from .ingest import create_transaction_if_new, find_twin
 from .models import BankAccount, BankTransaction, BankFeedSyncLog
 from .serializers import BankAccountSerializer, BankTransactionSerializer, BankFeedSyncLogSerializer
 from .sync import sync_bank_account
@@ -45,15 +49,134 @@ class BankAccountViewSet(viewsets.ModelViewSet):
         # write-only, surfaced only as the boolean api_client_secret_set.
         # Everything that mutates an account, and sync-now (which spends
         # the credentials), stays Admin-only.
-        if self.action in ("list", "retrieve"):
+        # confirm_balance sits with the read actions, not with the
+        # Admin-only ones. Recording "I looked at internet banking and it
+        # said this" is the accountant's job and carries no credentials --
+        # whereas CHANGING the opening balance moves every balance figure
+        # this account will ever show, so that stays on the ordinary
+        # update path below, Admin-only.
+        if self.action in ("list", "retrieve", "confirm_balance"):
             return [permissions.IsAuthenticated(), IsStaffMember(), HasAccountantAccess()]
         return [permissions.IsAuthenticated(), IsAdmin()]
+
+    @action(detail=True, methods=["post"], url_path="confirm-balance")
+    def confirm_balance(self, request, pk=None):
+        """Record what internet banking actually says right now.
+
+        Deliberately does not correct anything. If the figure differs from
+        the calculated balance, that difference is a real finding -- a
+        statement not imported, one imported twice, or an opening balance
+        dated wrong -- and quietly adjusting the opening balance to make
+        the two agree would erase the evidence and leave the missing
+        transactions missing.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        from django.utils import timezone
+
+        account = self.get_object()
+        raw = request.data.get("confirmed_balance")
+        if raw in (None, ""):
+            return Response(
+                {"confirmed_balance": ["Enter the balance shown by the bank."]}, status=400
+            )
+        try:
+            balance = Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"confirmed_balance": [f"{raw!r} is not an amount."]}, status=400)
+
+        account.confirmed_balance = balance
+        account.confirmed_balance_at = timezone.now()
+        account.confirmed_balance_by = request.user
+        account.save(update_fields=[
+            "confirmed_balance", "confirmed_balance_at", "confirmed_balance_by",
+        ])
+        return Response(BankAccountSerializer(account).data)
 
     @action(detail=True, methods=["post"], url_path="sync-now")
     def sync_now(self, request, pk=None):
         account = self.get_object()
         log = sync_bank_account(account, triggered_by=request.user)
         return Response(BankFeedSyncLogSerializer(log).data)
+
+    # ---- FNB connection (#185) -------------------------------------------
+    # OAuth 2.0 authorisation code, per FNB's Integration Channel pages:
+    # FNB sends an auth code to our redirect URL (the /bank-feeds/fnb-callback
+    # page, which posts it to fnb_callback below) or shows one to paste
+    # (fnb_connect). Admin-only, like every other credential on this viewset.
+
+    _STATE_SALT = "bankfeeds-fnb-state"
+
+    def _redirect_uri(self, request):
+        from django.conf import settings
+
+        # A fixed address in backend/.env wins: it is what FNB was given.
+        fixed = getattr(settings, "FNB_REDIRECT_URI", "") or ""
+        if fixed:
+            return fixed
+        uri = (request.data.get("redirect_uri") or "").strip()
+        if not redirect_uri_allowed(uri):
+            raise DRFValidationError({"redirect_uri": [
+                f"'{uri}' isn't this portal's FNB callback address ({CALLBACK_PATH} on this site)."
+            ]})
+        return uri
+
+    def _connect(self, request, account, code):
+        redirect_uri = self._redirect_uri(request)
+        try:
+            FNBClient(account).exchange_code(code, redirect_uri, user=request.user)
+        except FNBClientError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        account.refresh_from_db()
+        return Response(BankAccountSerializer(account).data)
+
+    @action(detail=True, methods=["post"], url_path="fnb-authorize")
+    def fnb_authorize(self, request, pk=None):
+        """The FNB page to send the browser to (when FNB gives one)."""
+        account = self.get_object()
+        redirect_uri = self._redirect_uri(request)
+        state = signing.dumps({"a": account.pk, "u": request.user.pk}, salt=self._STATE_SALT)
+        try:
+            url = FNBClient(account).authorize_url(redirect_uri, state)
+        except FNBClientError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        return Response({"url": url})
+
+    @action(detail=True, methods=["post"], url_path="fnb-connect")
+    def fnb_connect(self, request, pk=None):
+        """Exchange an auth code pasted from Integration Channel."""
+        return self._connect(request, self.get_object(), request.data.get("code"))
+
+    @action(detail=False, methods=["post"], url_path="fnb-callback")
+    def fnb_callback(self, request):
+        """The callback page hands over what FNB put on the redirect URL.
+        With our own `state` (Connect to FNB) the account is known and the
+        state must be ours, recent, and started by this same person; without
+        one (FNB redirected after subscribing) the page asks which account."""
+        code = request.data.get("code")
+        state = request.data.get("state")
+        if state:
+            try:
+                data = signing.loads(state, salt=self._STATE_SALT, max_age=1800)
+            except signing.BadSignature:
+                return Response({"detail": "This FNB link has expired or wasn't started here. Use Connect to FNB again."}, status=400)
+            if data.get("u") != request.user.pk:
+                return Response({"detail": "This FNB connection was started by someone else. Ask them to finish it, or start again."}, status=400)
+            account = get_object_or_404(BankAccount, pk=data.get("a"))
+        else:
+            account_id = request.data.get("account")
+            if not account_id:
+                return Response({"detail": "Choose which bank account this FNB connection is for."}, status=400)
+            account = get_object_or_404(BankAccount, pk=account_id)
+        return self._connect(request, account, code)
+
+    @action(detail=True, methods=["post"], url_path="fnb-disconnect")
+    def fnb_disconnect(self, request, pk=None):
+        account = self.get_object()
+        if account.api_base_url:
+            FNBClient(account).disconnect()
+        account.refresh_from_db()
+        return Response(BankAccountSerializer(account).data)
 
 
 class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
@@ -117,7 +240,10 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         txn.matched_supplier = None
         txn.match_method = ""
         txn.status = BankTransaction.Status.UNMATCHED
-        txn.save(update_fields=["matched_customer", "matched_supplier", "match_method", "status"])
+        # On a line paired as a duplicate (#185), unmatch means "this is
+        # NOT the same line" -- it comes back into the queue and the balance.
+        txn.duplicate_of = None
+        txn.save(update_fields=["matched_customer", "matched_supplier", "match_method", "status", "duplicate_of"])
         return Response(BankTransactionSerializer(txn).data)
 
     @action(detail=True, methods=["post"])
@@ -156,6 +282,8 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
             txn = BankTransaction.objects.select_for_update().get(pk=self.get_object().pk)
             if txn.status == BankTransaction.Status.CONFIRMED:
                 return Response({"detail": "This transaction has already been confirmed."}, status=400)
+            if txn.duplicate_of_id:
+                return Response({"detail": "This line is a duplicate of one already on file -- confirm the original instead."}, status=400)
             if txn.status == BankTransaction.Status.IGNORED:
                 return Response({"detail": "This transaction is ignored -- unmatch it first if it should be posted after all."}, status=400)
 
@@ -310,6 +438,17 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         )
         for r in rows:
             r["already_imported"] = bool(r["external_id"]) and r["external_id"] in existing_ids
+            # Already on file from the FNB API (#185): imported as a
+            # duplicate, so it isn't counted or confirmed twice.
+            r["already_from_api"] = False
+            if not r["errors"] and not r["already_imported"]:
+                try:
+                    r["already_from_api"] = find_twin(
+                        account, BankTransaction.Source.CSV_IMPORT, date_cls.fromisoformat(r["date"]),
+                        Decimal(r["amount"]), r["description"],
+                    ) is not None
+                except (InvalidOperation, ValueError, TypeError):
+                    pass
 
         valid = [r for r in rows if not r["errors"]]
         return Response(
@@ -318,6 +457,7 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
                 "valid_count": len(valid),
                 "invalid_count": len(rows) - len(valid),
                 "already_imported_count": sum(1 for r in rows if r["already_imported"]),
+                "already_from_api_count": sum(1 for r in rows if r.get("already_from_api")),
                 "rows": rows,
             }
         )
@@ -349,6 +489,7 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         customers = list(Customer.objects.exclude(customer_id="").only("id", "customer_id"))
         created_count = 0
         duplicate_count = 0
+        twinned_count = 0
         matched_count = 0
         skipped = []
         for r in rows:
@@ -367,6 +508,8 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
             )
             if created:
                 created_count += 1
+                if _txn.duplicate_of_id:
+                    twinned_count += 1
                 if matched:
                     matched_count += 1
             else:
@@ -376,6 +519,7 @@ class BankTransactionViewSet(viewsets.ReadOnlyModelViewSet):
             {
                 "created": created_count,
                 "duplicates_skipped": duplicate_count,
+                "already_from_api": twinned_count,
                 "matched": matched_count,
                 "invalid_skipped": len(skipped),
                 "skipped": skipped,

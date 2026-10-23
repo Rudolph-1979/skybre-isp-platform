@@ -1,0 +1,338 @@
+"""#186: Webfleet read-only sync -- auto-link, odometer into the existing
+history, trips into the existing Trips list, OptiDrive, and the map's
+positions."""
+from datetime import timedelta
+from decimal import Decimal
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from fleet import webfleet
+from fleet.models import OdometerReading, TripLog, Vehicle, WebfleetDay, WebfleetSpeeding, WebfleetSync
+
+User = get_user_model()
+CREDS = dict(WEBFLEET_ACCOUNT="skybre", WEBFLEET_USERNAME="vexar", WEBFLEET_PASSWORD="pw-secret", WEBFLEET_API_KEY="key-123")
+
+
+def _resp(json_data=None, headers=None, text="", status=200):
+    r = mock.Mock()
+    r.status_code = status
+    r.headers = headers or {}
+    r.text = text
+    if json_data is None:
+        r.json.side_effect = ValueError("not json")
+    else:
+        r.json.return_value = json_data
+    return r
+
+
+def _now_iso(minutes=0):
+    return (timezone.now() - timedelta(minutes=minutes)).isoformat()
+
+
+OBJECTS = [
+    {"objectno": "001", "objectname": "Hilux ABC123GP", "latitude_mdeg": -27650000, "longitude_mdeg": 27230000,
+     "pos_time": None, "postext": "Kroonstad, Cross St", "speed": "54", "course": "90", "ignition": "1",
+     "standstill": "0", "drivername": "Sam", "odometer_long": 123456789, "deleted": "false"},
+    {"objectno": "002", "objectname": "Spare tracker", "latitude_mdeg": -27600000, "longitude_mdeg": 27200000,
+     "pos_time": None, "ignition": "0", "standstill": "1", "odometer": "4500", "deleted": "false"},
+]
+VEHICLES = [{"objectno": "001", "objectname": "Hilux", "licenseplatenumber": "ABC 123 GP"},
+            {"objectno": "002", "objectname": "Spare tracker", "licenseplatenumber": ""}]
+
+
+# Fixed, like Webfleet's own timestamps, so a second sync finds the same event.
+SPEEDING_AT = timezone.localtime().replace(second=0, microsecond=0)
+TRIP_START = SPEEDING_AT - timedelta(minutes=90)
+TRIP_END = SPEEDING_AT - timedelta(minutes=60)
+
+
+def fake_get(url, params=None, auth=None, timeout=None):
+    action = params["action"]
+    if action == "showObjectReportExtern":
+        rows = [dict(o, pos_time=_now_iso(2)) for o in OBJECTS]
+        return _resp(rows)
+    if action == "showVehicleReportExtern":
+        return _resp(VEHICLES)
+    if action == "showTripReportExtern":
+        return _resp([{"tripid": "900", "objectno": "001", "start_time": TRIP_START.isoformat(), "end_time": TRIP_END.isoformat(),
+                       "start_postext": "Depot", "end_postext": "Client", "distance": "12345", "duration": "1800",
+                       "start_odometer": "123444000", "end_odometer": "123456345",
+                       "idle_time": "120", "avg_speed": "40", "max_speed": "92", "fuel_usage": "1.234",
+                       "drivername": "Sam", "tripmode": "2", "start_latitude": "-27650000", "start_longitude": "27230000",
+                       "end_latitude": "-27660000", "end_longitude": "27240000", "optidrive_indicator": "0.8"},
+                      {"tripid": "901", "objectno": "999", "start_time": _now_iso(30), "end_time": _now_iso(20), "distance": "100"}])
+    if action == "showSpeedingEvents":
+        assert params["range_pattern"] == "d0"
+        if params["objectno"] != "001":
+            return _resp(text="63, document is empty")
+        return _resp([{"objectno": "001", "start_time": SPEEDING_AT.isoformat(), "end_time": SPEEDING_AT.isoformat(), "max_speed": "131",
+                       "avg_speed": "124", "road_speedlimit": "120", "object_speedlimit": "140",
+                       "start_postext": "N1, Kroonstad", "drivername": "Sam", "duration": "60000", "distance": "2000"}])
+    if action == "getObjectKPIs":
+        assert params["kpinames"] == "optidrive"
+        d = timezone.localdate()
+        return _resp([{"objectno": params["objectno"], "year": str(d.year), "month": f"{d.month:02d}", "day": f"{d.day:02d}",
+                       "optidrive_indicator": "0.75"}])
+    return _resp(headers={"X-Webfleet-Errorcode": "55", "X-Webfleet-Errormessage": "Action is not valid"})
+
+
+@override_settings(**CREDS)
+class SyncTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.v = Vehicle.objects.create(make="Toyota", model="Hilux", year=2022, registration_number="ABC123GP")
+
+    def _sync(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get) as get:
+            ok, msg = webfleet.sync(sleep=lambda s: None)
+        return ok, msg, get
+
+    def test_full_sync(self):
+        ok, msg, get = self._sync()
+        self.assertTrue(ok, msg)
+        self.v.refresh_from_db()
+        self.assertEqual(self.v.webfleet_objectno, "001")
+        # One km reading at the END of each trip (#189), not once a day.
+        reading = OdometerReading.objects.get(vehicle=self.v)
+        self.assertEqual(reading.reading_km, 123456)
+        self.assertEqual(reading.recorded_at, TripLog.objects.get(webfleet_trip_id=900).ended_at)
+        # Logged by Webfleet, notes left for staff (#187).
+        self.assertEqual(reading.source, "webfleet")
+        self.assertEqual(reading.notes, "")
+        self.assertIsNone(reading.recorded_by)
+        # Into the existing Trips list.
+        trip = TripLog.objects.get(webfleet_trip_id=900)
+        self.assertEqual(trip.vehicle, self.v)
+        self.assertEqual((trip.start_odometer, trip.end_odometer, trip.km_driven), (123444, 123456, 12))
+        self.assertEqual(trip.notes, "Webfleet: Depot → Client")
+        self.assertEqual(trip.driver_name, "Sam")
+        self.assertTrue(trip.odometer_recorded)
+        self.assertFalse(TripLog.objects.filter(webfleet_trip_id=901).exists())  # not a linked vehicle
+        self.assertEqual(WebfleetSync.load().last_trip_id, 901)
+        self.assertEqual(WebfleetDay.objects.get(vehicle=self.v).optidrive, 0.75)
+        # Basic auth, not credentials in the URL; JSON + ISO dates asked for.
+        call = get.call_args_list[0]
+        self.assertEqual(call.kwargs["auth"], ("vexar", "pw-secret"))
+        self.assertNotIn("password", call.kwargs["params"])
+        self.assertEqual(call.kwargs["params"]["outputformat"], "json")
+
+    def test_second_run_continues_from_the_last_trip_and_skips_hourly_kpis(self):
+        self._sync()
+        _ok, _msg, get = self._sync()
+        actions = [c.kwargs["params"]["action"] for c in get.call_args_list]
+        trip_call = next(c for c in get.call_args_list if c.kwargs["params"]["action"] == "showTripReportExtern")
+        self.assertEqual(trip_call.kwargs["params"]["tripid"], 901)
+        self.assertNotIn("getObjectKPIs", actions)
+        self.assertEqual(OdometerReading.objects.filter(vehicle=self.v).count(), 1)  # same trip again: no second reading
+
+    def test_an_odometer_lower_than_the_logbook_is_not_added(self):
+        OdometerReading.objects.create(vehicle=self.v, reading_km=200000, recorded_at=timezone.now() - timedelta(days=2))
+        self._sync()
+        self.assertEqual(OdometerReading.objects.filter(vehicle=self.v).count(), 1)
+
+    def test_quota_is_reported_not_crashed(self):
+        def quota(url, params=None, **kw):
+            if params["action"] == "showTripReportExtern":
+                return _resp(headers={"X-Webfleet-Errorcode": "8011", "X-Webfleet-Errormessage": "request quota reached"})
+            return fake_get(url, params=params, **kw)
+
+        with mock.patch("fleet.webfleet.requests.get", side_effect=quota):
+            ok, msg = webfleet.sync(sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("limit", msg)
+        self.assertIn("2 object(s)", msg)  # positions still read before the quota hit
+
+    def test_bad_credentials_stop_the_run_with_a_hint(self):
+        with mock.patch("fleet.webfleet.requests.get",
+                        return_value=_resp(headers={"X-Webfleet-Errorcode": "1106", "X-Webfleet-Errormessage": "Authentication failed"})) as get:
+            ok, msg = webfleet.sync(sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("WEBFLEET_ACCOUNT", msg)
+        self.assertEqual(get.call_count, 1)
+
+    def test_no_data_is_an_empty_list(self):
+        with mock.patch("fleet.webfleet.requests.get", return_value=_resp(text="63, document is empty")):
+            self.assertEqual(webfleet.call("showTracks"), [])
+
+    def test_positions_are_cached(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get) as get:
+            webfleet.objects()
+            webfleet.objects()
+        self.assertEqual(get.call_count, 1)
+
+    def test_km_is_rounded_like_webfleet_shows_it(self):
+        # #190: Webfleet showed 95,609.0 km where Vexar had 95,608.
+        self.assertEqual(webfleet.trip_row({"end_odometer": "95608960", "start_odometer": "95552400"})["end_km"], 95609)
+        self.assertEqual(webfleet.trip_row({"end_odometer": "95552400"})["end_km"], 95552)
+        self.assertEqual(webfleet.trip_row({"end_odometer": "95425800"})["end_km"], 95426)
+        self.assertIsNone(webfleet.trip_row({})["end_km"])
+
+    def test_recheck_corrects_cut_off_readings_and_adds_missed_trips(self):
+        self._sync()
+        r = OdometerReading.objects.get(vehicle=self.v)
+        r.reading_km = 123455  # as stored before #190
+        r.save()
+        TripLog.objects.filter(webfleet_trip_id=900).delete()  # a trip replication missed
+        WebfleetSync.objects.update(last_trip_id=5000)
+        manual = OdometerReading.objects.create(vehicle=self.v, reading_km=123460, recorded_at=TRIP_END + timedelta(minutes=5), notes="Kantoor")
+        waits = []
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get) as get:
+            msg = webfleet.recheck_trips(sleep=waits.append)
+        self.assertEqual(msg, "1 missing trip(s) added, 0 odometer reading(s) added, 1 corrected")
+        patterns = [c.kwargs["params"].get("range_pattern") for c in get.call_args_list]
+        self.assertEqual(patterns, ["wf-1", "wf0"])
+        self.assertEqual(waits, [61])
+        r.refresh_from_db()
+        self.assertEqual((r.reading_km, r.source, r.notes), (123456, "webfleet", ""))
+        manual.refresh_from_db()
+        self.assertEqual((manual.reading_km, manual.notes), (123460, "Kantoor"))
+        self.assertEqual(WebfleetSync.load().last_trip_id, 5000)  # replication never goes back
+        self.assertEqual(OdometerReading.objects.filter(vehicle=self.v).count(), 2)
+
+    def test_recheck_leaves_a_reading_that_would_no_longer_fit(self):
+        self._sync()
+        r = OdometerReading.objects.get(vehicle=self.v)
+        r.reading_km = 123455
+        r.save()
+        OdometerReading.objects.create(vehicle=self.v, reading_km=123455, recorded_at=TRIP_END + timedelta(minutes=5))
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            webfleet.recheck_trips(sleep=lambda s: None)
+        r.refresh_from_db()
+        self.assertEqual(r.reading_km, 123455)
+        self.assertFalse(TripLog.objects.get(webfleet_trip_id=900).odometer_recorded)
+
+
+@override_settings(WEBFLEET_ACCOUNT="", WEBFLEET_USERNAME="", WEBFLEET_PASSWORD="", WEBFLEET_API_KEY="")
+class NotConfiguredTests(TestCase):
+    def test_everything_says_not_set_up(self):
+        self.assertFalse(webfleet.configured())
+        u = User.objects.create_user(username="boss", password="x", role="admin")
+        api = APIClient()
+        api.force_authenticate(u)
+        self.assertEqual(api.get("/api/webfleet/positions/").data, {"configured": False, "results": []})
+
+
+@override_settings(**CREDS)
+class ApiTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.v = Vehicle.objects.create(make="Toyota", model="Hilux", year=2022, registration_number="ABC123GP", webfleet_objectno="001")
+        self.admin = User.objects.create_user(username="boss", password="x", role="admin")
+        self.api = APIClient()
+        self.api.force_authenticate(self.admin)
+
+    def test_positions_for_the_map(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            r = self.api.get("/api/webfleet/positions/")
+        self.assertEqual(r.status_code, 200)
+        rows = {x["objectno"]: x for x in r.data["results"]}
+        self.assertEqual(rows["001"]["vehicle_id"], self.v.id)
+        self.assertEqual(rows["001"]["registration"], "ABC123GP")
+        self.assertIsNone(rows["002"]["vehicle_id"])
+        self.assertNotIn("pw-secret", str(r.data))
+
+    def test_positions_need_vehicles_or_scheduling(self):
+        sales = User.objects.create_user(username="s", password="x", role="sales", allowed_sections=["sales"])
+        api = APIClient()
+        api.force_authenticate(sales)
+        self.assertEqual(api.get("/api/webfleet/positions/").status_code, 403)
+        sched = User.objects.create_user(username="t", password="x", role="support", allowed_sections=["scheduling"])
+        api.force_authenticate(sched)
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            self.assertEqual(api.get("/api/webfleet/positions/").status_code, 200)
+
+    def test_vehicle_api_has_optidrive_and_the_tracker_number(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            webfleet.sync(sleep=lambda s: None)
+        r = self.api.get(f"/api/vehicles/{self.v.id}/")
+        self.assertEqual(r.data["optidrive_30d"], 0.75)
+        self.assertEqual(r.data["webfleet_objectno"], "001")
+        other = Vehicle.objects.create(make="Ford", model="Ranger", year=2020, registration_number="XYZ1GP")
+        r = self.api.patch(f"/api/vehicles/{other.id}/", {"webfleet_objectno": "001"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        r = self.api.patch(f"/api/vehicles/{other.id}/", {"webfleet_objectno": "002"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertIsNone(r.data["optidrive_30d"])
+
+    def test_webfleet_trips_show_in_the_trips_list(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            webfleet.sync(sleep=lambda s: None)
+        r = self.api.get(f"/api/trip-logs/?vehicle={self.v.id}")
+        rows = r.data["results"] if isinstance(r.data, dict) else r.data
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["notes"], "Webfleet: Depot → Client")
+
+    def test_odometer_reading_shows_logged_by_webfleet_and_notes_stay_editable(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            webfleet.sync(sleep=lambda s: None)
+        r = self.api.get(f"/api/odometer-readings/?vehicle={self.v.id}")
+        rows = r.data["results"] if isinstance(r.data, dict) else r.data
+        self.assertEqual(rows[0]["recorded_by_name"], "Webfleet")
+        self.assertEqual(rows[0]["notes"], "")
+        r = self.api.patch(f"/api/odometer-readings/{rows[0]['id']}/", {"notes": "Client site, Steynsrus"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data["recorded_by_name"], "Webfleet")
+        self.assertEqual(r.data["notes"], "Client site, Steynsrus")
+
+    def test_odometer_reading_shows_where_the_trip_started_and_stopped(self):
+        # #191: Start / Stop column.
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            webfleet.sync(sleep=lambda s: None)
+        manual = OdometerReading.objects.create(vehicle=self.v, reading_km=123500, recorded_at=timezone.now(), recorded_by=self.admin)
+        r = self.api.get(f"/api/odometer-readings/?vehicle={self.v.id}")
+        rows = {row["id"]: row for row in (r.data["results"] if isinstance(r.data, dict) else r.data)}
+        wf = next(row for row in rows.values() if row["source"] == "webfleet")
+        self.assertEqual((wf["trip_start_km"], wf["trip_start_place"]), (123444, "Depot"))
+        self.assertEqual((wf["trip_end_km"], wf["trip_end_place"]), (123456, "Client"))
+        m = rows[manual.id]
+        self.assertEqual((m["trip_start_km"], m["trip_start_place"], m["trip_end_km"], m["trip_end_place"]), (None, "", None, ""))
+        trip = TripLog.objects.get(webfleet_trip_id=900)
+        self.assertEqual((trip.start_place, trip.end_place), ("Depot", "Client"))
+
+    def test_places_copied_from_the_notes_of_earlier_trips(self):
+        import importlib
+
+        from django.apps import apps
+
+        now = timezone.now()
+        t = TripLog.objects.create(vehicle=self.v, webfleet_trip_id=77, start_odometer=1, end_odometer=2, km_driven=1,
+                                   started_at=now, ended_at=now, notes="Webfleet: Skybre, 12 Botha Street → R76, 9515, ZA")
+        odd = TripLog.objects.create(vehicle=self.v, webfleet_trip_id=78, start_odometer=1, end_odometer=2, km_driven=1,
+                                     started_at=now, ended_at=now, notes="Webfleet: Only one place")
+        importlib.import_module("fleet.migrations.0013_trip_places").places_from_notes(apps, None)
+        t.refresh_from_db()
+        odd.refresh_from_db()
+        self.assertEqual((t.start_place, t.end_place), ("Skybre, 12 Botha Street", "R76, 9515, ZA"))
+        self.assertEqual((odd.start_place, odd.end_place), ("", ""))
+        self.assertEqual(t.notes, "Webfleet: Skybre, 12 Botha Street → R76, 9515, ZA")
+
+    def test_speeding_today_for_the_dashboard_tile(self):
+        with mock.patch("fleet.webfleet.requests.get", side_effect=fake_get):
+            webfleet.sync(sleep=lambda s: None)
+            webfleet.sync(sleep=lambda s: None)  # again: no duplicate
+        self.assertEqual(WebfleetSpeeding.objects.count(), 1)
+        r = self.api.get("/api/webfleet/speeding/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["count"], 1)
+        e = r.data["results"][0]
+        self.assertEqual((e["registration"], e["max_speed_kmh"], e["limit_kmh"]), ("ABC123GP", 131, 120))
+        self.assertEqual(e["driver_name"], "Sam")
+
+    def test_backfill_adds_readings_for_earlier_trips(self):
+        from datetime import timedelta as td
+
+        from fleet.models import TripLog as T
+
+        now = timezone.now()
+        for i, km in enumerate((1000, 1050, 1100)):
+            T.objects.create(vehicle=self.v, webfleet_trip_id=10 + i, start_odometer=km - 10, end_odometer=km, km_driven=10,
+                             started_at=now - td(hours=10 - i, minutes=30), ended_at=now - td(hours=10 - i))
+        self.assertEqual(webfleet.backfill_trip_odometers(), 3)
+        self.assertEqual(webfleet.backfill_trip_odometers(), 0)  # safe to run twice
+        self.assertEqual(list(OdometerReading.objects.filter(vehicle=self.v).order_by("recorded_at").values_list("reading_km", flat=True)), [1000, 1050, 1100])
+        self.assertTrue(all(r.source == "webfleet" and r.notes == "" for r in OdometerReading.objects.filter(vehicle=self.v)))

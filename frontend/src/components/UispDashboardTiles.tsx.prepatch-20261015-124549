@@ -1,0 +1,95 @@
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { api } from "../api/client";
+import { StatCard } from "./StatCard";
+import { usePolling } from "../hooks/usePolling";
+
+export type UispOutage = {
+  id: string;
+  type: string;
+  in_progress: boolean;
+  start: string | null;
+  end: string | null;
+  duration_s: number;
+  device: { id: string; name: string; model: string };
+  site: string;
+};
+export type UispSummary = {
+  connected: boolean;
+  detail?: string;
+  devices: number;
+  devices_online: number;
+  ptp_radios: number;
+  ptp_offline: number;
+  aps: number;
+  aps_offline: number;
+  low_link: number;
+  busy: number;
+  updates: number;
+  maintenance: number;
+  outages_open: UispOutage[];
+  last_outage: UispOutage | null;
+  outages_total: number | null;
+};
+
+/** Dashboard row from UISP (14 Oct 2026). Shown only to staff with
+ *  Networking and only once UISP is connected. */
+export function UispDashboardTiles() {
+  const navigate = useNavigate();
+  const [data, setData] = useState<UispSummary | null>(null);
+  const load = () =>
+    api
+      .get<UispSummary>("/uisp/summary/")
+      .then((r) => setData(r.data))
+      .catch(() => setData(null));
+  useEffect(() => {
+    load();
+  }, []);
+  usePolling(load, 120000);
+
+  if (!data || !data.connected || data.detail) return null;
+  const open = data.outages_open.length;
+  const go = (tab: string) => () => navigate(`/admin/networking/uisp?tab=${tab}`);
+  return (
+    <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-4">
+      <StatCard
+        label="Network outages (UISP)"
+        value={open}
+        sublabel={
+          open
+            ? data.outages_open.map((o) => `${o.device.name} (${o.site})`).slice(0, 2).join(", ")
+            : data.last_outage
+              ? `Last: ${data.last_outage.device.name}`
+              : "None open"
+        }
+        accent={open ? "status-critical" : "status-good"}
+        onClick={go("outages")}
+        actionLabel="See outages"
+      />
+      <StatCard
+        label="Backhaul radios up"
+        value={`${data.ptp_radios - data.ptp_offline} / ${data.ptp_radios}`}
+        sublabel={`${data.low_link} low link potential · ${data.busy} busy`}
+        accent={data.ptp_offline ? "status-critical" : data.low_link || data.busy ? "status-warning" : "status-good"}
+        onClick={go("ptp")}
+        actionLabel="See backhaul"
+      />
+      <StatCard
+        label="Access points up"
+        value={`${data.aps - data.aps_offline} / ${data.aps}`}
+        sublabel={data.aps_offline ? `${data.aps_offline} down` : "All answering"}
+        accent={data.aps_offline ? "status-critical" : "status-good"}
+        onClick={go("ap")}
+        actionLabel="See APs"
+      />
+      <StatCard
+        label="UISP devices online"
+        value={`${data.devices_online} / ${data.devices}`}
+        sublabel={`${data.updates} firmware updates · ${data.maintenance} in maintenance`}
+        accent={data.devices_online < data.devices ? "status-warning" : "status-good"}
+        onClick={go("other")}
+        actionLabel="See network"
+      />
+    </div>
+  );
+}

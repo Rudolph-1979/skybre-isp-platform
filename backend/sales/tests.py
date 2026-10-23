@@ -246,9 +246,13 @@ class ApiTests(TestCase):
         self.client.force_authenticate(self.rep)
         res = self.client.get("/api/leads/")
         names = {row["full_name"] for row in res.data["results"]}
-        # Direct enquiries belong to nobody in particular, exactly as
-        # no-partner customers do.
-        self.assertEqual(names, {"Mine", "Direct"})
+        # Direct enquiries follow the "Direct" tick, exactly as no-partner
+        # customers do (Rudolph, 5 Oct 2026).
+        self.assertEqual(names, {"Mine"})
+        self.rep.allowed_partners = [mine.pk, 0]
+        self.rep.save()
+        res = self.client.get("/api/leads/")
+        self.assertEqual({row["full_name"] for row in res.data["results"]}, {"Mine", "Direct"})
 
     def test_the_pipeline_summary_values_leads_without_an_override(self):
         tariff = Tariff.objects.create(

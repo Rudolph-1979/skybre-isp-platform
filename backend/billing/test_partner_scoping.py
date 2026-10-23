@@ -19,8 +19,11 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from billing.models import CreditRequest, Invoice, InvoiceItem, Payment, Service, Tariff
+from billing.models import (
+    CreditRequest, Invoice, InvoiceDeletionRequest, InvoiceItem, Payment, Service, Tariff,
+)
 from customers.models import Customer, Partner
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -63,9 +66,11 @@ class BillingPartnerScopingTests(TestCase):
         self.restricted = User.objects.create_user(
             username="acme-accounts", password="pw-for-tests",
             role=User.Role.ACCOUNTS, allowed_partners=[self.acme.id],
+            allowed_sections=ALL_SECTIONS,
         )
         self.unrestricted = User.objects.create_user(
-            username="hq-accounts", password="pw-for-tests", role=User.Role.ACCOUNTS
+            username="hq-accounts", password="pw-for-tests", role=User.Role.ACCOUNTS,
+            allowed_sections=ALL_SECTIONS,
         )
         self.admin = User.objects.create_user(
             username="root", password="pw-for-tests",
@@ -96,9 +101,13 @@ class BillingPartnerScopingTests(TestCase):
         self.assertIn(self.my_invoice.id, ids)
         self.assertNotIn(self.their_invoice.id, ids)
 
-    def test_a_direct_customers_invoice_is_still_visible(self):
-        """No-partner customers aren't owned by any reseller, exactly as on
-        the customer list."""
+    def test_a_direct_customers_invoice_needs_direct_ticked(self):
+        """No-partner customers only when "Direct" is ticked for the user
+        (Rudolph, 5 Oct 2026), exactly as on the customer list."""
+        ids = self._ids("/api/invoices/?page_size=100", self.restricted)
+        self.assertNotIn(self.direct_invoice.id, ids)
+        self.restricted.allowed_partners = [*self.restricted.allowed_partners, 0]  # tick "Direct"
+        self.restricted.save(update_fields=["allowed_partners"])
         ids = self._ids("/api/invoices/?page_size=100", self.restricted)
         self.assertIn(self.direct_invoice.id, ids)
 
@@ -127,6 +136,19 @@ class BillingPartnerScopingTests(TestCase):
         )
         self.client.force_authenticate(self.restricted)
         res = self.client.get("/api/credit-requests/?page_size=100")
+        reasons = {row["reason"] for row in res.data["results"]}
+        self.assertIn("mine", reasons)
+        self.assertNotIn("theirs", reasons)
+
+    def test_invoice_deletion_requests_are_partner_scoped(self):
+        """The requests carry the invoice number, the customer's name and
+        the requester's reason. The invoices themselves were scoped; this
+        list was a flat .all(), so it was the way round that."""
+        self._deletion_request(self.their_invoice, "theirs")
+        self._deletion_request(self.my_invoice, "mine")
+        self.client.force_authenticate(self.restricted)
+        res = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        self.assertEqual(res.status_code, 200, res.data)
         reasons = {row["reason"] for row in res.data["results"]}
         self.assertIn("mine", reasons)
         self.assertNotIn("theirs", reasons)
@@ -182,6 +204,118 @@ class BillingPartnerScopingTests(TestCase):
         ids = self._ids("/api/invoices/?page_size=100", login)
         self.assertEqual(ids, {self.my_invoice.id})
 
+    # ---- deletion requests, object level -------------------------------
+
+    def _deletion_request(self, invoice, reason):
+        return InvoiceDeletionRequest.objects.create(
+            invoice=invoice, reason=reason, requested_by=self.unrestricted,
+        )
+
+    def test_another_partners_deletion_request_cannot_be_read(self):
+        req = self._deletion_request(self.their_invoice, "theirs")
+        self.client.force_authenticate(self.restricted)
+        res = self.client.get(f"/api/invoice-deletion-requests/{req.id}/")
+        self.assertEqual(res.status_code, 404)
+
+    def test_another_partners_deletion_request_cannot_be_approved(self):
+        """approve() resolves through get_object() on the same queryset, so
+        a reseller-restricted Management account could otherwise destroy a
+        competitor's quote."""
+        req = self._deletion_request(self.their_invoice, "theirs")
+        manager = User.objects.create_user(
+            username="acme-boss", password="pw-for-tests",
+            role=User.Role.MANAGEMENT, allowed_partners=[self.acme.id],
+            allowed_sections=ALL_SECTIONS,
+        )
+        self.client.force_authenticate(manager)
+        res = self.client.post(f"/api/invoice-deletion-requests/{req.id}/approve/")
+        self.assertEqual(res.status_code, 404)
+        req.refresh_from_db()
+        self.assertEqual(req.status, InvoiceDeletionRequest.Status.PENDING)
+        self.assertTrue(Invoice.objects.filter(pk=self.their_invoice.pk).exists(),
+                        "the competitor's quote must still be there")
+
+    def test_my_own_partners_deletion_request_can_still_be_approved(self):
+        quote = self._invoice(self.mine, "75.00")
+        quote.status = Invoice.Status.QUOTE
+        quote.save(update_fields=["status"])
+        req = self._deletion_request(quote, "mine")
+        manager = User.objects.create_user(
+            username="acme-boss2", password="pw-for-tests",
+            role=User.Role.MANAGEMENT, allowed_partners=[self.acme.id],
+            allowed_sections=ALL_SECTIONS,
+        )
+        self.client.force_authenticate(manager)
+        res = self.client.post(f"/api/invoice-deletion-requests/{req.id}/approve/")
+        self.assertEqual(res.status_code, 200, res.data)
+
+    def test_unrestricted_staff_see_every_partners_deletion_request(self):
+        self._deletion_request(self.their_invoice, "theirs")
+        self._deletion_request(self.my_invoice, "mine")
+        self.client.force_authenticate(self.unrestricted)
+        res = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        reasons = {row["reason"] for row in res.data["results"]}
+        self.assertEqual({"mine", "theirs"}, reasons)
+
+
+    def test_another_partners_quote_cannot_have_a_deletion_request_raised(self):
+        """The queryset covers reading and approving. CREATE resolves the
+        invoice straight from the id in the body, so a restricted user
+        could still POST against a competitor's quote -- and the 201 came
+        back carrying its number, its status and the customer's name,
+        which is precisely what the scoping was added to hide."""
+        quote = self._invoice(self.theirs, "80.00")
+        quote.status = Invoice.Status.QUOTE
+        quote.save(update_fields=["status"])
+        self.client.force_authenticate(self.restricted)
+        response = self.client.post(
+            "/api/invoice-deletion-requests/",
+            {"invoice": quote.id, "reason": "not mine to delete"}, format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertNotIn("Rival Customer", str(response.data))
+
+    def test_my_own_partners_quote_can_still_have_one_raised(self):
+        quote = self._invoice(self.mine, "80.00")
+        quote.status = Invoice.Status.QUOTE
+        quote.save(update_fields=["status"])
+        self.client.force_authenticate(self.restricted)
+        response = self.client.post(
+            "/api/invoice-deletion-requests/",
+            {"invoice": quote.id, "reason": "customer went quiet"}, format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_an_approved_requests_orphaned_row_stays_partner_scoped(self):
+        """approve() deletes the invoice, so the request's FK goes NULL --
+        but the row keeps the quote number, the customer's name and the
+        requester's reason as its audit trail. A reseller-restricted user
+        must not start seeing a competitor's once the invoice is gone, and
+        (being decided) Management could otherwise delete that trail."""
+        theirs = self._invoice(self.theirs, "80.00")
+        mine_direct = self._invoice(self.direct, "40.00")
+        gone = self._deletion_request(theirs, "theirs")
+        direct = self._deletion_request(mine_direct, "direct")
+        theirs.delete()  # what approve() does once it has been signed off
+        gone.refresh_from_db()
+        self.assertIsNone(gone.invoice_id)
+
+        # With "Direct" ticked: a no-partner customer's request shows, and
+        # the orphan (whose NULL FK reads back like "no partner") must not.
+        self.restricted.allowed_partners = [*self.restricted.allowed_partners, 0]
+        self.restricted.save(update_fields=["allowed_partners"])
+        self.client.force_authenticate(self.restricted)
+        listed = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        reasons = {row["reason"] for row in listed.data["results"]}
+        self.assertNotIn("theirs", reasons)
+        self.assertIn("direct", reasons)
+        detail = self.client.get(f"/api/invoice-deletion-requests/{gone.id}/")
+        self.assertEqual(detail.status_code, 404)
+
+        # The audit trail itself must survive for everyone else.
+        self.client.force_authenticate(self.unrestricted)
+        kept = self.client.get("/api/invoice-deletion-requests/?page_size=100")
+        self.assertIn("theirs", {row["reason"] for row in kept.data["results"]})
 
 class CreditApprovalTests(TestCase):
     """Approving a credit must credit it once.
@@ -195,7 +329,8 @@ class CreditApprovalTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.manager = User.objects.create_user(
-            username="manager1", password="pw-for-tests", role=User.Role.MANAGEMENT
+            username="manager1", password="pw-for-tests", role=User.Role.MANAGEMENT,
+            allowed_sections=ALL_SECTIONS,
         )
         self.customer = Customer.objects.create(
             full_name="Credit Cathy", email="cathy@example.com", balance=Decimal("1000.00")

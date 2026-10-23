@@ -1,15 +1,43 @@
+from django.contrib.auth.password_validation import validate_password as run_password_validators
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import User, STAFF_ROLES
 from . import two_factor
 
 
+def clean_allowed_partners(value):
+    """Real partner ids plus DIRECT (0, "direct customers"); de-duplicated."""
+    from customers.models import Partner  # local import: avoids a hard cross-app import at module load time
+    from customers.scoping import DIRECT
+
+    valid_ids = set(Partner.objects.values_list("id", flat=True)) | {DIRECT}
+    invalid = [v for v in value if v not in valid_ids]
+    if invalid:
+        raise serializers.ValidationError(f"Unknown partner id(s): {', '.join(str(v) for v in invalid)}")
+    return sorted(set(value))
+
+
+def clean_calendar_colour(value):
+    import re
+
+    value = (value or "").strip().lower()
+    if value and not re.fullmatch(r"#[0-9a-f]{6}", value):
+        raise serializers.ValidationError("Colour must look like #1a9e6e.")
+    return value
+
+
 class UserSerializer(serializers.ModelSerializer):
+    # This person's colour on the Scheduling calendar -- their own, or the
+    # automatic one (User.display_colour).
+    calendar_colour = serializers.CharField(source="display_colour", read_only=True)
+
     class Meta:
         model = User
         fields = [
             "id", "username", "email", "first_name", "last_name", "role", "phone", "is_active",
-            "allowed_sections", "allowed_partners", "visible_partners",
+            "allowed_sections", "allowed_partners", "visible_partners", "is_noc",
+            "calendar_colour", "dashboard_layout", "panel_state",
         ]
         # allowed_sections/allowed_partners are read-only here -- those are
         # only ever written through StaffPermissionsSerializer (Admin-only).
@@ -18,8 +46,15 @@ class UserSerializer(serializers.ModelSerializer):
         # serializer's validated_data), so it stays read-only here too --
         # this serializer just needs to expose the *current* user's own
         # values so the frontend can filter its nav/Customers view on
-        # login/refresh.
-        read_only_fields = ["id", "role", "allowed_sections", "allowed_partners", "visible_partners"]
+        # login/refresh. is_noc joins that list for the same reason: the
+        # ticket UI needs to know on login/refresh whether the logged-in
+        # staff member can decide an escalation, and it's only ever
+        # granted through StaffAccountsSerializer (Admin-only), same as
+        # role.
+        # dashboard_layout: same as visible_partners -- written only through
+        # MeView.patch's hand-checked path.
+        read_only_fields = ["id", "role", "allowed_sections", "allowed_partners", "visible_partners", "is_noc", "dashboard_layout",
+                            "panel_state"]
 
 
 class StaffPermissionsSerializer(serializers.ModelSerializer):
@@ -42,13 +77,7 @@ class StaffPermissionsSerializer(serializers.ModelSerializer):
         return value
 
     def validate_allowed_partners(self, value):
-        from customers.models import Partner  # local import: avoids a hard cross-app import at module load time
-
-        valid_ids = set(Partner.objects.values_list("id", flat=True))
-        invalid = [v for v in value if v not in valid_ids]
-        if invalid:
-            raise serializers.ValidationError(f"Unknown partner id(s): {', '.join(str(v) for v in invalid)}")
-        return value
+        return clean_allowed_partners(value)
 
 
 class StaffAccountsSerializer(serializers.ModelSerializer):
@@ -62,12 +91,46 @@ class StaffAccountsSerializer(serializers.ModelSerializer):
     # Write-only and optional: required to create a new account (enforced
     # in validate() below, since "required" alone would also demand it on
     # every edit) but left blank on update to leave the password unchanged.
-    password = serializers.CharField(write_only=True, required=False, min_length=8, style={"input_type": "password"})
+    # No min_length here on purpose -- length is one of the four rules in
+    # AUTH_PASSWORD_VALIDATORS, and validate() below runs all four, so
+    # stating it twice just means two numbers to disagree with each other
+    # (this said 8 while the setting said 6).
+    password = serializers.CharField(write_only=True, required=False, style={"input_type": "password"})
+
+    # Typed by the admin creating the account, not generated. Optional at
+    # this level and required in validate() below, for the same reason the
+    # password is: declaring it required here would also demand it on
+    # every PATCH, and the Users screen patches `is_active` on its own
+    # when somebody suspends or reactivates an account.
+    #
+    # The model still assigns one when this is blank. That path is for
+    # createsuperuser, management commands and tests -- everything that
+    # creates a staff account without going near this form, none of which
+    # should start failing because a form field became mandatory.
+    staff_code = serializers.CharField(required=False, max_length=20)
 
     class Meta:
         model = User
-        fields = ["id", "username", "password", "first_name", "last_name", "email", "phone", "role", "is_active"]
-        read_only_fields = ["id"]
+        fields = [
+            "id", "username", "password", "first_name", "last_name", "email",
+            "phone", "role", "is_active", "staff_code", "is_noc",
+            # Partner access, on Edit user too (Rudolph, 5 Oct 2026) -- the
+            # same field Configs -> Permissions sets. Empty = every partner;
+            # 0 = direct customers. Admin role ignores it.
+            "allowed_partners",
+            # Calendar colour (6 Oct 2026): blank = automatic; display_colour
+            # is what the calendar actually uses.
+            "calendar_colour", "display_colour",
+        ]
+        read_only_fields = ["id", "display_colour"]
+
+    display_colour = serializers.CharField(read_only=True)
+
+    def validate_allowed_partners(self, value):
+        return clean_allowed_partners(value)
+
+    def validate_calendar_colour(self, value):
+        return clean_calendar_colour(value)
 
     def validate_role(self, value):
         if value not in STAFF_ROLES:
@@ -82,16 +145,83 @@ class StaffAccountsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("This username is already taken.")
         return value
 
+    def validate_staff_code(self, value):
+        """Normalise, then insist it is nobody else's.
+
+        Upper-cased and stripped because a code is compared, never read
+        for meaning: "stf-000015" and "STF-000015" are the same code to
+        every person who looks at them and two different codes to a
+        database, and the day those diverge is the day one staff member
+        cannot register and nobody can see why.
+
+        The model's unique constraint would catch a collision too, but as
+        a 500 from a database error rather than a message against the
+        field. This is the same check, said in a place the admin can see.
+        """
+        value = (value or "").strip().upper()
+        if not value:
+            raise serializers.ValidationError("A staff code is required.")
+
+        clash = User.objects.filter(staff_code=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(
+                f"{value} is already used by another staff member."
+            )
+        return value
+
+
     def validate(self, attrs):
         # A new account needs SOMETHING to get in with: either a password set
         # here, or an email address to send an invite to. Requiring a password
         # unconditionally -- which is what this used to do -- forced the admin
         # to invent one and then get it to the person somehow, which is a
         # password chosen by the wrong person sitting somewhere it shouldn't.
+        # Required when creating, because Conecto gates app registration on
+        # it and an account made without one simply cannot be used there --
+        # a failure that surfaces days later, to the person who cannot log
+        # in, rather than here where it can be fixed in a second.
+        if self.instance is None and not attrs.get("staff_code"):
+            raise serializers.ValidationError({
+                "staff_code": "A staff code is required — the Conecto app checks it before letting them register."
+            })
+
         if self.instance is None and not attrs.get("password") and not attrs.get("email"):
             raise serializers.ValidationError({
                 "email": "Give an email address so they can be sent an invite, or set a password here."
             })
+
+        # Run AUTH_PASSWORD_VALIDATORS on a password set through here.
+        # PasswordResetConfirmView has always done this; this path never did,
+        # so the only rule reaching an admin-created staff login was the
+        # field's own length check. The other three are the ones a hurried
+        # admin actually trips: "12345678" (all numeric) and "password"
+        # (top of Django's common list) were both accepted for a login that
+        # can suspend a customer or edit an invoice, while the same two
+        # strings were refused on the public forgot-password screen.
+        password = attrs.get("password")
+        if password:
+            # An unsaved candidate carries the name/email being set, so the
+            # similarity rule has something to compare against on create,
+            # where there is no row yet -- and on edit compares against the
+            # incoming values rather than the ones being replaced.
+            def field(name):
+                # `in attrs` rather than .get(name, default): a cleared field
+                # arrives as an explicit None, which a default never replaces.
+                if name in attrs:
+                    return attrs[name] or ""
+                return getattr(self.instance, name, "") or ""
+
+            candidate = User(
+                username=field("username"), email=field("email"),
+                first_name=field("first_name"), last_name=field("last_name"),
+            )
+            try:
+                run_password_validators(password, user=candidate)
+            except DjangoValidationError as e:
+                raise serializers.ValidationError({"password": list(e.messages)})
+
         return attrs
 
     def create(self, validated_data):

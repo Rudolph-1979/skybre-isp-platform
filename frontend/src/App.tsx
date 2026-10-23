@@ -4,14 +4,17 @@ import { ViewAsProvider } from "./context/ViewAsContext";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { AdminLayout } from "./components/AdminLayout";
 import { SectionRoute } from "./components/SectionRoute";
+import { ManagementRoute } from "./components/ManagementRoute";
 import { PortalLayout } from "./components/PortalLayout";
 import { LoginPage } from "./pages/LoginPage";
 import { ForgotPasswordPage } from "./pages/ForgotPasswordPage";
 import { ResetPasswordPage } from "./pages/ResetPasswordPage";
 import { PublicUsagePage } from "./pages/PublicUsagePage";
+import { SuspendedPage } from "./pages/SuspendedPage";
 
 import { DashboardPage } from "./pages/admin/DashboardPage";
 import { SchedulingPage } from "./pages/admin/SchedulingPage";
+import { MapRoute, NetworkMapPage } from "./pages/admin/NetworkMapPage";
 import { CustomersPage } from "./pages/admin/CustomersPage";
 import { LeadsPage } from "./pages/admin/LeadsPage";
 import { LeadDetailPage } from "./pages/admin/LeadDetailPage";
@@ -26,13 +29,21 @@ import { InventoryPage } from "./pages/admin/InventoryPage";
 import { AccountSettingsPage } from "./pages/admin/AccountSettingsPage";
 import { NetworkingPage } from "./pages/admin/NetworkingPage";
 import { DeviceDetailPage } from "./pages/admin/DeviceDetailPage";
+import { NetworkUispPage } from "./pages/admin/NetworkUispPage";
 import { TicketsPage } from "./pages/admin/TicketsPage";
 import { TicketDetailPage } from "./pages/admin/TicketDetailPage";
+import { TicketKpiReportPage } from "./pages/admin/TicketKpiReportPage";
+import { SupportPage } from "./pages/admin/SupportPage";
 import { BulkEmailPage } from "./pages/admin/BulkEmailPage";
 import { AccountantPage } from "./pages/admin/AccountantPage";
+import { AdministrationPage } from "./pages/admin/AdministrationPage";
+import { ClientsReportPage } from "./pages/admin/ClientsReportPage";
+import { RevenuePage } from "./pages/admin/RevenuePage";
 import { VehiclesPage } from "./pages/admin/VehiclesPage";
 import { VehicleDetailPage } from "./pages/admin/VehicleDetailPage";
 
+import { ContractSignPage } from "./pages/ContractSignPage";
+import { FnbCallbackPage } from "./pages/FnbCallbackPage";
 import { PortalDashboard } from "./pages/portal/PortalDashboard";
 import { PortalInvoices } from "./pages/portal/PortalInvoices";
 import { PortalTickets } from "./pages/portal/PortalTickets";
@@ -52,6 +63,32 @@ export default function App() {
               credential -- see PublicUsageView on the backend for what
               that means for what this page is allowed to show. */}
           <Route path="/usage/:token" element={<PublicUsagePage />} />
+          {/* Public on purpose: a client signs their contract from an
+              emailed link, or on a staff device. The token in the path IS
+              the credential (contracts.views.PublicContractView). */}
+          <Route path="/sign/:token" element={<ContractSignPage />} />
+          {/* Public on purpose, and it has to be: this is where a
+              SUSPENDED customer is sent, and being suspended is exactly
+              the state in which they cannot log in to read why. Unlike
+              /usage/:token there is no credential in the URL either --
+              the page shows only the company's own payment details,
+              which are printed on every invoice already, plus whatever
+              reference the link carries. It looks up nothing. */}
+          <Route path="/suspension" element={<SuspendedPage />} />
+          {/* FNB Integration Channel redirect URL (#185) -- outside /admin so an
+              expired session can sign in without losing the auth code. */}
+          <Route path="/bank-feeds/fnb-callback" element={<FnbCallbackPage />} />
+          {/* The map on a separate screen (#196): no admin menus, same sign-in and rights. */}
+          <Route
+            path="/map-screen"
+            element={
+              <ProtectedRoute staffOnly loginNext="/map-screen">
+                <MapRoute>
+                  <NetworkMapPage screen />
+                </MapRoute>
+              </ProtectedRoute>
+            }
+          />
 
           <Route
             path="/admin"
@@ -63,6 +100,7 @@ export default function App() {
           >
             <Route index element={<DashboardPage />} />
             <Route path="scheduling" element={<SectionRoute section="scheduling"><SchedulingPage /></SectionRoute>} />
+            <Route path="scheduling/positions" element={<Navigate to="/admin/networking/map?focus=techs" replace />} />
             <Route path="leads" element={<SectionRoute section="sales"><LeadsPage /></SectionRoute>} />
             <Route path="leads/:id" element={<SectionRoute section="sales"><LeadDetailPage /></SectionRoute>} />
             <Route path="customers" element={<SectionRoute section="customers"><CustomersPage /></SectionRoute>} />
@@ -77,12 +115,29 @@ export default function App() {
             <Route path="account" element={<AccountSettingsPage />} />
             <Route path="networking" element={<SectionRoute section="networking"><NetworkingPage /></SectionRoute>} />
             <Route path="networking/devices/:id" element={<SectionRoute section="networking"><DeviceDetailPage /></SectionRoute>} />
+            <Route path="networking/map" element={<MapRoute><NetworkMapPage /></MapRoute>} />
+            <Route path="networking/uisp" element={<SectionRoute section="networking"><NetworkUispPage /></SectionRoute>} />
+            <Route path="support" element={<SectionRoute section="tickets"><SupportPage /></SectionRoute>} />
             <Route path="tickets" element={<SectionRoute section="tickets"><TicketsPage /></SectionRoute>} />
+            <Route
+              path="tickets/kpi-report"
+              element={
+                <SectionRoute section="tickets">
+                  <ManagementRoute>
+                    <TicketKpiReportPage />
+                  </ManagementRoute>
+                </SectionRoute>
+              }
+            />
             <Route path="tickets/:id" element={<SectionRoute section="tickets"><TicketDetailPage /></SectionRoute>} />
             <Route path="accountant" element={<SectionRoute section="accountant"><AccountantPage /></SectionRoute>} />
             <Route path="vehicles" element={<SectionRoute section="vehicles"><VehiclesPage /></SectionRoute>} />
             <Route path="vehicles/:id" element={<SectionRoute section="vehicles"><VehicleDetailPage /></SectionRoute>} />
             <Route path="bulk-email" element={<SectionRoute section="bulk_email"><BulkEmailPage /></SectionRoute>} />
+            <Route path="administration" element={<SectionRoute section="administration"><AdministrationPage /></SectionRoute>} />
+            <Route path="administration/clients-per-partner" element={<SectionRoute section="administration"><ClientsReportPage kind="partner" /></SectionRoute>} />
+            <Route path="administration/clients-per-tariff" element={<SectionRoute section="administration"><ClientsReportPage kind="tariff" /></SectionRoute>} />
+            <Route path="administration/revenue" element={<SectionRoute section="administration"><RevenuePage /></SectionRoute>} />
           </Route>
 
           <Route

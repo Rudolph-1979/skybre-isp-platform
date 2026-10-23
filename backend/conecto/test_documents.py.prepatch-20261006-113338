@@ -1,0 +1,331 @@
+"""Invoices in the client's app, and the links that open them.
+
+Two jobs, and both have a version that would be worse than not shipping.
+
+PUSHING. Only an ISSUED invoice goes out. A draft is a document nobody has
+agreed to yet -- figures still moving, possibly to be deleted -- and a
+quote is not a bill at all. Either one arriving in a customer's app is a
+demand for money that we then have to withdraw. Conecto store whatever we
+send and have no "ignore this" status, so this filter is the only thing
+standing between a draft and a customer's phone.
+
+LINKING. The URL that opens a tax invoice is a bearer credential for a
+document carrying somebody's name, address and what they owe. It expires
+in three minutes, it names exactly one document, and it is re-checked at
+fetch time -- because an invoice cancelled in the gap between minting and
+tapping is precisely the one that must not open.
+
+Nothing here renders a real PDF or touches the network.
+"""
+import datetime
+import uuid
+from decimal import Decimal
+from unittest.mock import patch
+
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from billing.models import Invoice
+from customers.models import Customer
+
+from .models import ConectoDocumentToken, ConectoInvoice
+
+TOKEN = "test-shared-secret"
+URLS = {
+    "invoiceCreated": "https://example.invalid/invoiceCreated",
+    "statementCreated": "https://example.invalid/statementCreated",
+}
+
+CONFIGURED = override_settings(
+    CONECTO_API_KEY=TOKEN, CONECTO_WEBHOOK_TOKEN=TOKEN, CONECTO_URLS=URLS,
+    CONECTO_PUBLIC_BASE_URL="https://portal.skybre.co.za",
+)
+
+INVOICE_URL = "/api/conecto/documents/invoice-url/"
+STATEMENT_URL = "/api/conecto/documents/statement-url/"
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text
+        self.ok = 200 <= status_code < 300
+
+    def json(self):
+        return self._payload
+
+
+def fake_attachment(*args, **kwargs):
+    return ("INV-000001.pdf", b"%PDF-1.4 fake", "application/pdf")
+
+
+@CONFIGURED
+class InvoicePushTests(TestCase):
+    def setUp(self):
+        self.customer = Customer.objects.create(
+            full_name="Lucille Slabbert", customer_id="CUS-008800", city="Kroonstad",
+        )
+        self.due = timezone.localdate() + datetime.timedelta(days=14)
+
+    def _invoice(self, status=Invoice.Status.UNPAID, total="499.00"):
+        with self.captureOnCommitCallbacks(execute=True):
+            return Invoice.objects.create(
+                customer=self.customer, status=status, date_due=self.due,
+                total=Decimal(total),
+            )
+
+    @patch("conecto.client.requests.request")
+    def test_an_issued_invoice_is_pushed(self, request):
+        request.return_value = FakeResponse(payload={})
+
+        invoice = self._invoice()
+
+        self.assertEqual(request.call_count, 1)
+        body = request.call_args.kwargs["json"]
+        self.assertEqual(body["client_code"], "CUS-008800")
+        self.assertEqual(body["invoice_number"], invoice.number)
+        self.assertEqual(body["amount"], 499.0)
+        self.assertEqual(body["status"], "unpaid")
+        self.assertEqual(ConectoInvoice.objects.get().pushed_number, invoice.number)
+
+    @patch("conecto.client.requests.request")
+    def test_a_draft_is_never_pushed(self, request):
+        """The one that matters. A draft is not a bill yet, and a customer
+        seeing one is a demand we then have to withdraw."""
+        self._invoice(status=Invoice.Status.DRAFT)
+
+        request.assert_not_called()
+        self.assertFalse(ConectoInvoice.objects.exists())
+
+    @patch("conecto.client.requests.request")
+    def test_a_quote_and_a_pro_forma_are_never_pushed(self, request):
+        self._invoice(status=Invoice.Status.QUOTE)
+        self._invoice(status=Invoice.Status.PROFORMA)
+
+        request.assert_not_called()
+
+    @patch("conecto.client.requests.request")
+    def test_paying_it_pushes_the_new_status(self, request):
+        request.return_value = FakeResponse(payload={})
+        invoice = self._invoice()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            invoice.status = Invoice.Status.PAID
+            invoice.save()
+
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args.kwargs["json"]["status"], "paid")
+
+    @patch("conecto.client.requests.request")
+    def test_an_unrelated_save_does_not_push_again(self, request):
+        """Invoice rows are written by the reminder job, the balance flags
+        and the recurring engine. A push per save would be a call per save,
+        and on a busy billing run that is hundreds."""
+        request.return_value = FakeResponse(payload={})
+        invoice = self._invoice()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            invoice.note = "Chased by phone."
+            invoice.save()
+
+        self.assertEqual(request.call_count, 1)
+
+    @patch("conecto.client.requests.request")
+    def test_a_cancellation_after_a_push_is_said_out_loud(self, request):
+        """Conecto's invoice schema has three statuses and none is
+        cancelled, so we cannot correct it on their side. The client is
+        looking at a bill that is no longer real, and this warning is the
+        only way anybody finds out."""
+        request.return_value = FakeResponse(payload={})
+        invoice = self._invoice()
+
+        with self.assertLogs("conecto.signals", level="WARNING") as captured:
+            with self.captureOnCommitCallbacks(execute=True):
+                invoice.status = Invoice.Status.CANCELLED
+                invoice.save()
+
+        self.assertTrue(
+            any("no cancelled/draft state" in line for line in captured.output),
+            captured.output,
+        )
+        # And nothing further was sent, because there is nothing to send.
+        self.assertEqual(request.call_count, 1)
+
+    @patch("conecto.client.requests.request")
+    def test_a_customer_with_no_client_code_is_not_pushed(self, request):
+        """Defensive rather than reachable, and blanked with an UPDATE for
+        that reason.
+
+        Customer.save() ISSUES a client code, so `customer_id=""` does not
+        survive a create() -- the row came back with a code, the invoice was
+        pushed, and this test failed on the mock rather than on the rule it
+        was meant to check. Bypassing save() is what actually produces the
+        state the guard exists for.
+
+        Worth keeping even though nothing reaches it today. Conecto key
+        every record on the client code, so an invoice pushed without one
+        attaches to nobody on their side -- success on the wire, invisible
+        in the app, exactly the failure shape as a job dispatched to a code
+        they do not recognise.
+        """
+        nameless = Customer.objects.create(full_name="No Code")
+        Customer.objects.filter(pk=nameless.pk).update(customer_id="")
+        nameless.refresh_from_db()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            Invoice.objects.create(
+                customer=nameless, status=Invoice.Status.UNPAID,
+                date_due=self.due, total=Decimal("10.00"),
+            )
+
+        request.assert_not_called()
+
+
+@CONFIGURED
+class DocumentUrlTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = Customer.objects.create(
+            full_name="Lucille Slabbert", customer_id="CUS-008801", city="Kroonstad",
+        )
+        with patch("conecto.client.requests.request", return_value=FakeResponse()):
+            with self.captureOnCommitCallbacks(execute=True):
+                self.invoice = Invoice.objects.create(
+                    customer=self.customer, status=Invoice.Status.UNPAID,
+                    date_due=timezone.localdate(), total=Decimal("120.00"),
+                )
+
+    def _post(self, path, payload, token=TOKEN):
+        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token is not None else {}
+        return self.client.post(path, payload, format="json", **headers)
+
+    # --- minting ---------------------------------------------------------
+
+    def test_an_unauthenticated_request_mints_nothing(self):
+        self.assertEqual(
+            self._post(INVOICE_URL, {"invoice_number": self.invoice.number}, token=None).status_code,
+            401,
+        )
+        self.assertEqual(ConectoDocumentToken.objects.count(), 0)
+
+    def test_a_url_is_minted_for_an_issued_invoice(self):
+        res = self._post(INVOICE_URL, {"invoice_number": self.invoice.number})
+
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        token = ConectoDocumentToken.objects.get()
+        self.assertEqual(
+            body["pdf_url"],
+            f"https://portal.skybre.co.za/api/public/conecto-document/{token.token}/",
+        )
+        self.assertEqual(body["expires_in_seconds"], 180)
+
+    def test_the_configured_base_url_wins_over_the_request(self):
+        """Behind nginx, build_absolute_uri can produce an http:// link
+        unless the proxy headers are trusted -- and that link opens a
+        customer's tax invoice."""
+        res = self._post(INVOICE_URL, {"invoice_number": self.invoice.number})
+
+        self.assertTrue(res.json()["pdf_url"].startswith("https://portal.skybre.co.za/"))
+
+    @override_settings(CONECTO_PUBLIC_BASE_URL="", SITE_URL="https://my.skybre.co.za")
+    def test_site_url_is_used_when_nothing_conecto_specific_is_set(self):
+        """The real deployment. SITE_URL is already configured and is the
+        origin customer emails link to; CONECTO_PUBLIC_BASE_URL has no
+        config() line in settings.py, so setting it in .env alone would do
+        nothing at all."""
+        res = self._post(INVOICE_URL, {"invoice_number": self.invoice.number})
+
+        self.assertTrue(res.json()["pdf_url"].startswith("https://my.skybre.co.za/"))
+
+    @override_settings(CONECTO_PUBLIC_BASE_URL="", SITE_URL="")
+    def test_with_neither_set_the_request_is_used_and_forced_to_https(self):
+        """Degrades rather than failing -- but the scheme is not left to
+        chance, because the link opens a tax invoice."""
+        res = self._post(INVOICE_URL, {"invoice_number": self.invoice.number})
+
+        self.assertTrue(res.json()["pdf_url"].startswith("https://"))
+
+    def test_a_draft_cannot_be_linked_even_by_number(self):
+        draft = Invoice.objects.create(
+            customer=self.customer, status=Invoice.Status.DRAFT,
+            date_due=timezone.localdate(), total=Decimal("5.00"),
+        )
+
+        res = self._post(INVOICE_URL, {"invoice_number": draft.number})
+
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(ConectoDocumentToken.objects.count(), 0)
+
+    def test_an_unknown_invoice_number_is_refused(self):
+        self.assertEqual(
+            self._post(INVOICE_URL, {"invoice_number": "INV-999999"}).status_code, 404
+        )
+
+    def test_a_statement_url_is_minted_for_a_client_code(self):
+        res = self._post(
+            STATEMENT_URL, {"client_code": self.customer.customer_id, "period": "2026-09"}
+        )
+
+        self.assertEqual(res.status_code, 200)
+        row = ConectoDocumentToken.objects.get()
+        self.assertEqual(row.kind, "statement")
+        self.assertEqual(row.period, "2026-09")
+
+    # --- fetching --------------------------------------------------------
+
+    def _mint(self):
+        self._post(INVOICE_URL, {"invoice_number": self.invoice.number})
+        return ConectoDocumentToken.objects.get().token
+
+    @patch("notifications.services._build_attachment", side_effect=fake_attachment)
+    def test_the_link_serves_the_pdf_with_no_session(self, build):
+        token = self._mint()
+        anonymous = APIClient()
+
+        res = anonymous.get(f"/api/public/conecto-document/{token}/")
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res["Content-Type"], "application/pdf")
+        self.assertIsNotNone(ConectoDocumentToken.objects.get().fetched_at)
+
+    @patch("notifications.services._build_attachment", side_effect=fake_attachment)
+    def test_an_expired_link_is_dead(self, build):
+        token = self._mint()
+        ConectoDocumentToken.objects.update(
+            expires_at=timezone.now() - datetime.timedelta(seconds=1)
+        )
+
+        res = APIClient().get(f"/api/public/conecto-document/{token}/")
+
+        self.assertEqual(res.status_code, 404)
+        build.assert_not_called()
+
+    @patch("notifications.services._build_attachment", side_effect=fake_attachment)
+    def test_an_invoice_cancelled_after_minting_does_not_open(self, build):
+        """Three minutes is short, and this is exactly the document that
+        would slip through it."""
+        token = self._mint()
+        Invoice.objects.filter(pk=self.invoice.pk).update(status=Invoice.Status.CANCELLED)
+
+        res = APIClient().get(f"/api/public/conecto-document/{token}/")
+
+        self.assertEqual(res.status_code, 404)
+        build.assert_not_called()
+
+    def test_an_unknown_token_is_a_404(self):
+        res = APIClient().get(f"/api/public/conecto-document/{uuid.uuid4()}/")
+
+        self.assertEqual(res.status_code, 404)
+
+    @patch("notifications.services._build_attachment", side_effect=fake_attachment)
+    def test_deleting_the_row_revokes_the_link(self, build):
+        """The whole reason these are stored tokens rather than signatures."""
+        token = self._mint()
+        ConectoDocumentToken.objects.all().delete()
+
+        self.assertEqual(
+            APIClient().get(f"/api/public/conecto-document/{token}/").status_code, 404
+        )

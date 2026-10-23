@@ -19,7 +19,7 @@ class EmailLogSerializer(serializers.ModelSerializer):
         model = EmailLog
         fields = [
             "id", "customer", "customer_name", "template_key", "template_name",
-            "recipient_email", "subject", "status", "error_message",
+            "recipient_email", "cc_email", "subject", "status", "error_message",
             "sent_by", "sent_by_name", "batch_id", "created_at",
         ]
         read_only_fields = fields

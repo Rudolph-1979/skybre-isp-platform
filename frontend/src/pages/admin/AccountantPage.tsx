@@ -3,6 +3,7 @@ import { api } from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
+import { Pager } from "../../components/Pager";
 import { Table, THead, TH, TR, TD } from "../../components/Table";
 import { StatusBadge } from "../../components/StatusBadge";
 import { SearchableSelect, type SearchableOption } from "../../components/SearchableSelect";
@@ -29,8 +30,12 @@ import {
   type Supplier,
   type StaffProfile,
   type User,
+  type Account,
   type VatReturnResult,
 } from "../../types";
+import { apiErrorMessage } from "../../utils/apiError";
+import { formatIsoDate, formatIsoDateTime } from "../../utils/billingTerms";
+import { ReversePaymentModal } from "../../components/ReversePaymentModal";
 
 // Everything here lives under one "Accountant" nav item -- VAT Returns,
 // Expenses, and Bank Feeds are the reason this page exists; Attendance/
@@ -41,7 +46,7 @@ import {
 // confirming a transaction started being able to create an Expense (a
 // debit) as well as a Payment (a credit) -- both outcomes are Accountant
 // concerns first.
-type Tab = "vat-returns" | "expenses" | "bank-feeds" | "attendance" | "leave" | "employees" | "payroll";
+type Tab = "vat-returns" | "expenses" | "chart" | "bank-feeds" | "attendance" | "leave" | "employees" | "payroll";
 type NewAction = { label: string; onClick: () => void } | null;
 
 const PAY_TYPE_LABEL: Record<PayType, string> = {
@@ -61,37 +66,29 @@ const LEAVE_BALANCE_FIELD: Record<LeaveType, "annual_leave_balance" | "sick_leav
   family_responsibility: "family_responsibility_leave_balance",
 };
 
-// Pulls the first useful message out of a DRF error body, falling back to
-// `fallback`. The guard against a string body matters: an nginx/gunicorn
-// 500 or 502 returns HTML, and Object.values("<!DOCTYPE html>...") spreads
-// it into single characters -- so the old inline version of this rendered
-// an error banner containing exactly "<" instead of the fallback text.
-function apiErrorMessage(err: unknown, fallback: string): string {
-  const data = (err as { response?: { data?: unknown } })?.response?.data;
-  if (!data || typeof data !== "object") return fallback;
-  const detail = (data as { detail?: unknown }).detail;
-  if (typeof detail === "string") return detail;
-  const first = Object.values(data as Record<string, unknown>).flat()[0];
-  return typeof first === "string" ? first : fallback;
-}
 
 function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
 }
 
 function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString();
+  return formatIsoDate(iso);
 }
 
 export function AccountantPage() {
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
-  const [tab, setTab] = useState<Tab>("vat-returns");
+  // ?tab= deep link (e.g. from the FNB callback page, #185).
+  const [tab, setTab] = useState<Tab>(() => {
+    const t = new URLSearchParams(window.location.search).get("tab");
+    return t === "bank-feeds" || t === "expenses" || t === "chart" ? t : "vat-returns";
+  });
   const [newAction, setNewAction] = useState<NewAction>(null);
   const [attendanceVersion, setAttendanceVersion] = useState(0);
 
   const TABS: { key: Tab; label: string }[] = [
     { key: "vat-returns", label: "VAT Returns" },
+    { key: "chart", label: "Chart of Accounts" },
     { key: "expenses", label: "Expenses" },
     { key: "bank-feeds", label: "Bank Feeds" },
     { key: "attendance", label: "Attendance Register" },
@@ -139,6 +136,7 @@ export function AccountantPage() {
       </div>
       {tab === "vat-returns" && <VatReturnsTab onRegisterNewAction={setNewAction} />}
       {tab === "expenses" && <ExpensesTab onRegisterNewAction={setNewAction} />}
+      {tab === "chart" && <ChartOfAccountsTab onRegisterNewAction={setNewAction} />}
       {tab === "bank-feeds" && <BankFeedsTab onRegisterNewAction={setNewAction} isAdmin={isAdmin} />}
       {tab === "attendance" && (
         <AttendanceTab isAdmin={isAdmin} onRegisterNewAction={setNewAction} refreshSignal={attendanceVersion} />
@@ -192,7 +190,10 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
   const [result, setResult] = useState<VatReturnResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [downloading, setDownloading] = useState(false);
+  // Which download is in flight, not merely whether one is: there are
+  // three buttons now, and a single boolean would grey out all three and
+  // say "Downloading…" on the one you didn't press.
+  const [downloading, setDownloading] = useState("");
 
   useEffect(() => {
     onRegisterNewAction(null);
@@ -217,21 +218,25 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
     setPeriod((p) => (p.index === 5 ? { year: p.year + 1, index: 0 } : { year: p.year, index: p.index + 1 }));
   }
 
-  async function handleDownloadPdf() {
-    setDownloading(true);
+  /** Pull a file down and hand it to the browser.
+   *
+   * The anchor is attached to the document before clicking and the object
+   * URL is revoked on the next tick, not in the same task. Revoking
+   * immediately, on a detached anchor, is the fragile form of this
+   * pattern -- Firefox needs the node connected to dispatch the click,
+   * and Safari can invalidate the URL before the download starts. That
+   * reasoning was written for the PDF button and applies identically to
+   * the spreadsheets, which is why there is now one function instead of
+   * three copies of it.
+   */
+  async function downloadFile(kind: string, path: string, filename: string, mime: string) {
+    setDownloading(kind);
     try {
-      const { start, end } = periodBounds(year, index);
-      const res = await api.get(`/vat-return/pdf/?period_start=${start}&period_end=${end}`, { responseType: "blob" });
-      // Keep the application/pdf type, attach the anchor to the document
-      // before clicking, and revoke on the next tick. Revoking in the
-      // same task as click() on a detached anchor is the fragile form of
-      // this pattern -- Firefox needs the node connected to dispatch the
-      // click, and Safari can invalidate the URL before the download
-      // starts.
-      const url = window.URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }));
+      const res = await api.get(path, { responseType: "blob" });
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: mime }));
       const link = document.createElement("a");
       link.href = url;
-      link.download = `VAT-Return-${start}-to-${end}.pdf`;
+      link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -239,8 +244,44 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
     } catch {
       alert("Could not download the VAT report — please try again.");
     } finally {
-      setDownloading(false);
+      setDownloading("");
     }
+  }
+
+  function handleDownloadPdf() {
+    const { start, end } = periodBounds(year, index);
+    return downloadFile(
+      "pdf",
+      `/vat-return/pdf/?period_start=${start}&period_end=${end}`,
+      `VAT-Return-${start}-to-${end}.pdf`,
+      "application/pdf",
+    );
+  }
+
+  /** The workbook carries the summary AND the documents behind it on
+   * separate sheets. The CSV is one section per file -- summary here,
+   * since that is the part anyone keys into eFiling; the detail sections
+   * are on the same endpoint with &section=output / input / warnings for
+   * anyone scripting against it.
+   *
+   * The parameter is `filetype`, not `format`: DRF reserves `format` for
+   * content negotiation and 404s the request before the view runs. */
+  async function handleDownloadSheet(format: "xlsx" | "csv") {
+    const { start, end } = periodBounds(year, index);
+    if (format === "xlsx") {
+      return downloadFile(
+        "xlsx",
+        `/vat-return/export/?period_start=${start}&period_end=${end}&filetype=xlsx`,
+        `VAT-Return-${start}-to-${end}.xlsx`,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+    }
+    return downloadFile(
+      "csv",
+      `/vat-return/export/?period_start=${start}&period_end=${end}&filetype=csv&section=summary`,
+      `VAT-Return-${start}-to-${end}-summary.csv`,
+      "text/csv",
+    );
   }
 
   const { start, end } = periodBounds(year, index);
@@ -251,9 +292,9 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
         Output VAT is calculated from real invoices issued in this period (invoice/accrual basis) — not just
         payments received. Input VAT comes from two places: the <strong>Expenses</strong> tab (rent, bandwidth,
         fuel…) and <strong>stock receipts</strong> in Stock/Inventory (equipment bought for stock) — so an
-        equipment invoice should be captured in one place only. Approved credit notes are shown for information
-        only; they aren't automatically netted against Output VAT since credit requests don't record a VAT rate of
-        their own. Double-check everything here against your own records before submitting to SARS.
+        equipment invoice should be captured in one place only. An approved credit becomes a zero-rated credit note,
+        included in the period it was issued; only old credits approved before credit notes existed are listed
+        separately, for information. Double-check everything here against your own records before submitting to SARS.
       </p>
 
       <div className="mb-4 flex flex-wrap items-center gap-3">
@@ -262,8 +303,18 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
           {VAT_PERIODS[index].label} {year} <span className="text-[var(--text-muted)]">({start} to {end})</span>
         </div>
         <button type="button" className={btnSecondary} onClick={goNext}>Next period ›</button>
-        <button type="button" className={btnPrimary} disabled={downloading || loading || !!error} onClick={handleDownloadPdf}>
-          {downloading ? "Downloading…" : "Download PDF"}
+        <button type="button" className={btnPrimary} disabled={!!downloading || loading || !!error} onClick={handleDownloadPdf}>
+          {downloading === "pdf" ? "Downloading…" : "Download PDF"}
+        </button>
+        {/* Excel first: it is the one that gets read and emailed on, and
+            it carries the invoices and supplier invoices behind each
+            figure on their own sheets. The CSV is the summary only --
+            what you would import somewhere else. */}
+        <button type="button" className={btnSecondary} disabled={!!downloading || loading || !!error} onClick={() => handleDownloadSheet("xlsx")}>
+          {downloading === "xlsx" ? "Exporting…" : "Export Excel"}
+        </button>
+        <button type="button" className={btnSecondary} disabled={!!downloading || loading || !!error} onClick={() => handleDownloadSheet("csv")}>
+          {downloading === "csv" ? "Exporting…" : "Export CSV"}
         </button>
       </div>
 
@@ -398,6 +449,230 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
 }
 
 // ---------------------------------------------------------------------------
+// Chart of accounts.
+//
+// A chart, not a ledger: nothing here posts a debit against a credit, so
+// there is no trial balance and this screen deliberately does not imply
+// one. See backend ledger/models.py.
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_TYPES: { value: string; label: string }[] = [
+  { value: "asset", label: "Asset" },
+  { value: "liability", label: "Liability" },
+  { value: "equity", label: "Equity" },
+  { value: "income", label: "Income" },
+  { value: "expense", label: "Expense" },
+];
+
+function ChartOfAccountsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const { items, loading, refetch } = useApiList<Account>("/chart-accounts/?page_size=300&ordering=code");
+  const [showModal, setShowModal] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [form, setForm] = useState({ code: "", name: "", type: "expense", description: "", is_active: true });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [rowError, setRowError] = useState("");
+
+  useEffect(() => {
+    onRegisterNewAction({
+      label: "+ New account",
+      onClick: () => {
+        setEditingId(null);
+        setForm({ code: "", name: "", type: "expense", description: "", is_active: true });
+        setError("");
+        setShowModal(true);
+      },
+    });
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openEdit(account: Account) {
+    setEditingId(account.id);
+    setForm({
+      code: account.code, name: account.name, type: account.type,
+      description: account.description, is_active: account.is_active,
+    });
+    setError("");
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      if (editingId === null) {
+        await api.post("/chart-accounts/", form);
+      } else {
+        await api.patch(`/chart-accounts/${editingId}/`, form);
+      }
+      setShowModal(false);
+      refetch();
+    } catch (err) {
+      setError(apiErrorMessage(err, "Could not save this account."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete(account: Account) {
+    setRowError("");
+    try {
+      await api.delete(`/chart-accounts/${account.id}/`);
+      refetch();
+    } catch (err) {
+      // The backend's refusals explain themselves -- how many expenses
+      // are on it, or that it is one the platform relies on. Surfaced
+      // verbatim rather than replaced with "could not delete".
+      setRowError(apiErrorMessage(err, "Could not delete this account."));
+    }
+  }
+
+  return (
+    <div>
+      <p className="mb-3 max-w-3xl text-sm text-[var(--text-secondary)]">
+        The accounts this business's money is described in terms of. Suppliers and expenses point at them, so
+        "what did we spend on bandwidth this year" stops being a search over a text field. This is a chart,
+        not a ledger — nothing here posts double entries yet, so it does not produce a trial balance.
+      </p>
+      <p className="mb-4 max-w-3xl text-xs text-[var(--text-muted)]">
+        Accounts marked <strong>System</strong> are ones the platform itself looks up — the VAT account is
+        "where VAT goes", not "account 2100". Rename and renumber them freely to match your accountant's own
+        chart; they just cannot be deleted.
+      </p>
+
+      {rowError && <p className="mb-3 text-sm text-[var(--status-critical)]">{rowError}</p>}
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Code</TH>
+              <TH>Name</TH>
+              <TH>Type</TH>
+              <TH>Expenses on it</TH>
+              <TH>Status</TH>
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((a) => (
+              <TR key={a.id}>
+                <TD className="font-medium tabular-nums">{a.code}</TD>
+                <TD>
+                  {a.name}
+                  {a.is_system && (
+                    <span className="ml-2 rounded-full border border-[var(--border-hairline)] px-2 py-0.5 text-xs text-[var(--text-muted)]">
+                      System
+                    </span>
+                  )}
+                  {a.description && (
+                    <p className="text-xs text-[var(--text-muted)]">{a.description}</p>
+                  )}
+                </TD>
+                <TD className="text-[var(--text-secondary)]">{a.type_display}</TD>
+                <TD className="tabular-nums">{a.in_use_count}</TD>
+                <TD><StatusBadge status={a.is_active ? "active" : "inactive"} /></TD>
+                <TD>
+                  <div className="flex gap-2">
+                    <button type="button" className={btnSecondary} onClick={() => openEdit(a)}>
+                      Edit
+                    </button>
+                    {/* Offered only where it can succeed. A Delete button
+                        that always explains why it will not work is worse
+                        than no button. */}
+                    {!a.is_system && a.in_use_count === 0 && (
+                      <button
+                        type="button"
+                        className="rounded-md border border-[var(--status-critical)] px-4 py-2 text-sm font-medium text-[var(--status-critical)] hover:bg-[var(--tint-hover)]"
+                        onClick={() => handleDelete(a)}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </TD>
+              </TR>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal
+          title={editingId === null ? "New account" : `Edit ${form.code} — ${form.name}`}
+          onClose={() => setShowModal(false)}
+        >
+          <form onSubmit={handleSubmit}>
+            <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+              <FormField label="Code">
+                <input
+                  className={inputClass}
+                  required
+                  value={form.code}
+                  onChange={(e) => setForm({ ...form, code: e.target.value })}
+                  placeholder="e.g. 6000"
+                />
+              </FormField>
+              <FormField label="Type">
+                <select
+                  className={inputClass}
+                  value={form.type}
+                  onChange={(e) => setForm({ ...form, type: e.target.value })}
+                >
+                  {ACCOUNT_TYPES.map((t) => (
+                    <option key={t.value} value={t.value}>{t.label}</option>
+                  ))}
+                </select>
+              </FormField>
+            </div>
+            <FormField label="Name">
+              <input
+                className={inputClass}
+                required
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </FormField>
+            <FormField label="Description (optional)">
+              <input
+                className={inputClass}
+                value={form.description}
+                onChange={(e) => setForm({ ...form, description: e.target.value })}
+              />
+            </FormField>
+            <label className="mb-3 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={form.is_active}
+                onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+              />
+              <span>Active (offered in the pickers)</span>
+            </label>
+            <p className="mb-3 text-xs text-[var(--text-muted)]">
+              Switching an account off hides it from the pickers without touching the expenses already filed
+              against it — which is what you want instead of deleting one that has been used.
+            </p>
+            {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={saving} className={btnPrimary}>
+                {saving ? "Saving…" : editingId === null ? "Create account" : "Save changes"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Expenses -- the Input VAT side of the VAT Returns report above. See
 // backend expenses.models.Expense for why this exists (there was no
 // expense/purchase tracking anywhere in this codebase before it).
@@ -405,6 +680,7 @@ function VatReturnsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: 
 
 const EMPTY_EXPENSE_FORM = {
   supplier: "",
+  account: "",
   supplier_name: "",
   category: "other" as ExpenseCategory,
   description: "",
@@ -413,11 +689,24 @@ const EMPTY_EXPENSE_FORM = {
   amount_excl_vat: "",
   vat_rate_pct: "15",
   notes: "",
+  vehicle: "",
 };
 
 function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const { items, loading, refetch } = useApiList<Expense>("/expenses/?page_size=200&ordering=-date");
   const { items: suppliers } = useApiList<Supplier>("/suppliers/?page_size=200&ordering=name");
+  const { items: accounts } = useApiList<Account>(
+    "/chart-accounts/?page_size=200&type=expense&is_active=true&ordering=code"
+  );
+  // The Vehicle dropdown (13 Oct 2026), served by the expenses API so it
+  // works without the Vehicles section.
+  const [vehicleChoices, setVehicleChoices] = useState<{ id: number; label: string }[]>([]);
+  useEffect(() => {
+    api
+      .get<{ id: number; label: string }[]>("/expenses/vehicle-choices/")
+      .then((res) => setVehicleChoices(res.data))
+      .catch(() => setVehicleChoices([]));
+  }, []);
   const [showModal, setShowModal] = useState(false);
   const [editing, setEditing] = useState<Expense | null>(null);
   const [form, setForm] = useState(EMPTY_EXPENSE_FORM);
@@ -425,6 +714,18 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [deleteError, setDeleteError] = useState("");
+
+  // What the server will stamp on if the form leaves the account blank --
+  // read off the chosen supplier, which carries its category's account.
+  // Shown, not applied: the authoritative decision is the serializer's,
+  // and a form that silently pre-selected it would be a second copy of
+  // that rule free to drift.
+  const suggestedAccount = (() => {
+    if (!form.supplier) return null;
+    const supplier = suppliers.find((s) => String(s.id) === form.supplier);
+    if (!supplier?.default_account) return null;
+    return accounts.find((a) => a.id === supplier.default_account) ?? null;
+  })();
 
   useEffect(() => {
     onRegisterNewAction({
@@ -445,6 +746,10 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
     setEditing(expense);
     setForm({
       supplier: expense.supplier ? String(expense.supplier) : "",
+      // The account this expense was stamped with at capture. Carried
+      // through so editing does not silently blank it -- the form would
+      // then post an empty account and move the expense off the chart.
+      account: expense.account ? String(expense.account) : "",
       supplier_name: expense.supplier_name,
       category: expense.category,
       description: expense.description,
@@ -453,6 +758,7 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       amount_excl_vat: expense.amount_excl_vat,
       vat_rate_pct: expense.vat_rate_pct,
       notes: expense.notes,
+      vehicle: expense.vehicle ? String(expense.vehicle) : "",
     });
     setAttachment(null);
     setError("");
@@ -479,6 +785,12 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
       fd.append("amount_excl_vat", form.amount_excl_vat);
       fd.append("vat_rate_pct", form.vat_rate_pct);
       fd.append("notes", form.notes);
+      // Always sent, so a vehicle link can be cleared ("" = none).
+      fd.append("vehicle", form.vehicle);
+      // The Account dropdown was never sent, so picking one did nothing.
+      // Sent only when chosen: blank leaves the server to use the
+      // supplier's default account.
+      if (form.account) fd.append("account", form.account);
       if (attachment) fd.append("attachment", attachment);
       if (editing) {
         await api.patch(`/expenses/${editing.id}/`, fd, { headers: { "Content-Type": "multipart/form-data" } });
@@ -549,6 +861,11 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 <TD>{EXPENSE_CATEGORY_LABELS[expense.category]}</TD>
                 <TD>
                   {expense.description}
+                  {expense.vehicle_label && (
+                    <span className="ml-2 text-xs text-[var(--text-muted)]" title="Counts toward this vehicle's running cost">
+                      · {expense.vehicle_label}
+                    </span>
+                  )}
                   {expense.from_bank_feed && (
                     <span className="ml-2 text-xs text-[var(--text-muted)]" title="Created from a confirmed Bank Feeds transaction">
                       via bank feed
@@ -612,17 +929,92 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 />
               </FormField>
             )}
+            <FormField label="Account">
+              <select
+                className={inputClass}
+                value={form.account}
+                onChange={(e) => setForm({ ...form, account: e.target.value })}
+              >
+                <option value="">
+                  {suggestedAccount ? `Use the supplier's — ${suggestedAccount.name}` : "No account"}
+                </option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.code} — {a.name}
+                  </option>
+                ))}
+              </select>
+            </FormField>
+            {/* The blank option is not "none" when a supplier's category
+                has an account: the server fills it in. Saying so is the
+                difference between a helpful default and a field that
+                mysteriously populates itself after saving. */}
+            {suggestedAccount && !form.account && (
+              <p className="mb-3 -mt-2 text-xs text-[var(--text-muted)]">
+                Left as it is, this will be filed against{" "}
+                <strong className="text-[var(--text-secondary)]">
+                  {suggestedAccount.code} — {suggestedAccount.name}
+                </strong>
+                , from this supplier's category. Pick another to override it just for this expense.
+              </p>
+            )}
             <FormField label="Category">
               <select
                 className={inputClass}
                 value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value as ExpenseCategory })}
+                onChange={(e) => {
+                  // Picking Salaries zeroes the VAT rate. Wages carry no
+                  // VAT, and the rate defaults to 15 -- so the whole wage
+                  // bill was one unchanged field away from claiming input
+                  // VAT that was never charged. The backend refuses it
+                  // either way; this stops the form walking staff into
+                  // the error. Same reasoning as the bank-feed confirm
+                  // modal below, which declines to default a rate at all.
+                  //
+                  // Moving OFF Salaries puts the default back, because that 0
+                  // was ours and not the clerk's. It used to latch: the
+                  // serializer's own error tells them to refile a payroll
+                  // bureau's invoice under Professional fees, and that fee
+                  // DOES carry VAT -- dragging the 0 across with them booked
+                  // it at 0% and quietly gave up input VAT we can claim.
+                  const category = e.target.value as ExpenseCategory;
+                  setForm({
+                    ...form,
+                    category,
+                    vat_rate_pct:
+                      category === "salaries"
+                        ? "0"
+                        : form.category === "salaries"
+                          ? EMPTY_EXPENSE_FORM.vat_rate_pct
+                          : form.vat_rate_pct,
+                  });
+                }}
               >
                 {Object.entries(EXPENSE_CATEGORY_LABELS).map(([v, l]) => (
                   <option key={v} value={v}>{l}</option>
                 ))}
               </select>
             </FormField>
+            <FormField label="Vehicle (optional)">
+              <select
+                className={inputClass}
+                value={form.vehicle}
+                onChange={(e) => setForm({ ...form, vehicle: e.target.value })}
+              >
+                <option value="">Not for a vehicle</option>
+                {vehicleChoices.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label}
+                  </option>
+                ))}
+              </select>
+            </FormField>
+            {form.vehicle && (
+              <p className="mb-3 -mt-2 text-xs text-[var(--text-muted)]">
+                Shows on the vehicle's page and counts toward its running cost per km (excl. VAT). Use it for
+                services, repairs, tyres and parts, not fuel: fill-ups are counted from the vehicle's fuel log.
+              </p>
+            )}
             <FormField label="Description">
               <input
                 className={inputClass}
@@ -716,13 +1108,16 @@ function ExpensesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
 // identically regardless of which source a transaction came from.
 // ---------------------------------------------------------------------------
 
-type BankFeedsSubTab = "review" | "accounts" | "history";
+type BankFeedsSubTab = "review" | "mapping" | "accounts" | "history";
 
 function BankFeedsTab({ onRegisterNewAction, isAdmin }: { onRegisterNewAction: (action: NewAction) => void; isAdmin: boolean }) {
-  const [subTab, setSubTab] = useState<BankFeedsSubTab>("review");
+  const [subTab, setSubTab] = useState<BankFeedsSubTab>(() =>
+    isAdmin && new URLSearchParams(window.location.search).get("sub") === "accounts" ? "accounts" : "review",
+  );
 
   const SUB_TABS: { key: BankFeedsSubTab; label: string }[] = [
     { key: "review", label: "Review" },
+    { key: "mapping", label: "Manual mapping" },
     ...(isAdmin ? [{ key: "accounts" as BankFeedsSubTab, label: "Accounts" }] : []),
     { key: "history", label: "History" },
   ];
@@ -745,6 +1140,7 @@ function BankFeedsTab({ onRegisterNewAction, isAdmin }: { onRegisterNewAction: (
         ))}
       </div>
       {subTab === "review" && <BankFeedsReviewSubTab onRegisterNewAction={onRegisterNewAction} />}
+      {subTab === "mapping" && <BankFeedsMappingSubTab onRegisterNewAction={onRegisterNewAction} />}
       {subTab === "accounts" && isAdmin && <BankFeedsAccountsSubTab onRegisterNewAction={onRegisterNewAction} />}
       {subTab === "history" && <BankFeedsHistorySubTab onRegisterNewAction={onRegisterNewAction} />}
     </div>
@@ -756,7 +1152,84 @@ function BankFeedsTab({ onRegisterNewAction, isAdmin }: { onRegisterNewAction: (
 const EMPTY_BANK_ACCOUNT_FORM = {
   name: "", account_number: "", branch_code: "", is_active: true,
   api_base_url: "", api_client_id: "", api_client_secret: "",
+  api_token_url: "", api_authorize_url: "", api_scope: "", api_account_id: "",
+  api_client_auth: "post" as BankAccount["api_client_auth"],
+  api_grant: "authorization_code" as BankAccount["api_grant"],
+  opening_balance: "", opening_balance_date: "",
 };
+
+/** Where FNB sends the auth code (#185): this portal's callback page,
+ * unless backend/.env fixes a different exact URL. Give FNB this exact
+ * address when applying on Integration Channel. */
+function fnbRedirectUri(acc?: BankAccount | null) {
+  return acc?.fnb_redirect_uri || `${window.location.origin}/bank-feeds/fnb-callback`;
+}
+
+const CONNECTION_LABEL: Record<BankAccount["connection_status"], string> = {
+  csv_only: "CSV import only",
+  not_connected: "Not connected to FNB yet",
+  connected: "Connected to FNB",
+  reconnect: "Reconnect needed",
+};
+
+/** Rands, grouped, two decimals. An em dash for "no figure" -- an account
+ * with no opening date genuinely has no balance, and showing R0.00 for it
+ * would be a confident lie about an account that might hold anything. */
+function rand(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === "") return "—";
+  const amount = Number(value);
+  if (Number.isNaN(amount)) return "—";
+  return `R${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** The balance cell: what the platform works out, and how far that is
+ * from what the bank last said.
+ *
+ * The variance is the point of the column. A matching balance is quiet
+ * reassurance; a mismatch means a statement has not been imported, has
+ * been imported twice, or the opening balance is dated wrong -- and each
+ * of those is a real thing somebody has to go and fix. So a non-zero
+ * variance is shown in full, with its sign, rather than rounded away or
+ * hidden behind a tick.
+ */
+function balanceCell(acc: BankAccount) {
+  if (acc.current_balance === null) {
+    return (
+      <TD className="text-[var(--text-muted)]">
+        No opening balance set
+      </TD>
+    );
+  }
+  const variance = acc.balance_variance === null ? null : Number(acc.balance_variance);
+  const agrees = variance !== null && Math.abs(variance) < 0.005;
+  return (
+    <TD>
+      <span className="font-medium tabular-nums text-[var(--text-primary)]">{rand(acc.current_balance)}</span>
+      {acc.confirmed_balance_at && (
+        <p
+          className={`text-xs ${agrees ? "text-[var(--status-good)]" : "text-[var(--status-critical)]"}`}
+        >
+          {agrees ? (
+            <>Agreed with the bank on {formatDate(acc.confirmed_balance_at)}</>
+          ) : (
+            <>
+              {rand(Math.abs(variance as number))} {(variance as number) > 0 ? "more than" : "less than"} the
+              bank said on {formatDate(acc.confirmed_balance_at)}
+            </>
+          )}
+        </p>
+      )}
+      {!acc.confirmed_balance_at && (
+        <p className="text-xs text-[var(--text-muted)]">Never checked against the bank</p>
+      )}
+      {acc.bank_balance !== null && acc.bank_balance_at && (
+        <p className="text-xs text-[var(--text-secondary)]">
+          FNB said {rand(acc.bank_balance)} at {formatIsoDateTime(acc.bank_balance_at)}
+        </p>
+      )}
+    </TD>
+  );
+}
 
 function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const { items, loading, refetch } = useApiList<BankAccount>("/bank-accounts/?page_size=50&ordering=name");
@@ -766,6 +1239,40 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [syncingId, setSyncingId] = useState<number | null>(null);
+  const [syncError, setSyncError] = useState("");
+  const [confirming, setConfirming] = useState<BankAccount | null>(null);
+  const [confirmValue, setConfirmValue] = useState("");
+  const [confirmSaving, setConfirmSaving] = useState(false);
+  const [confirmError, setConfirmError] = useState("");
+  // FNB connection dialog (#185).
+  const [connecting, setConnecting] = useState<BankAccount | null>(null);
+  const [authCode, setAuthCode] = useState("");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectError, setConnectError] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  async function connectAction(path: string, body: Record<string, unknown> = {}) {
+    if (!connecting) return;
+    setConnectBusy(true);
+    setConnectError("");
+    try {
+      const res = await api.post<BankAccount & { url?: string }>(`/bank-accounts/${connecting.id}/${path}/`, {
+        redirect_uri: fnbRedirectUri(connecting),
+        ...body,
+      });
+      if (path === "fnb-authorize" && res.data.url) {
+        window.location.assign(res.data.url);
+        return;
+      }
+      setConnecting(res.data);
+      setAuthCode("");
+      refetch();
+    } catch (err) {
+      setConnectError(apiErrorMessage(err, "FNB didn't accept that."));
+    } finally {
+      setConnectBusy(false);
+    }
+  }
 
   useEffect(() => {
     onRegisterNewAction({
@@ -786,6 +1293,10 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
     setForm({
       name: acc.name, account_number: acc.account_number, branch_code: acc.branch_code, is_active: acc.is_active,
       api_base_url: acc.api_base_url, api_client_id: acc.api_client_id, api_client_secret: "",
+      api_token_url: acc.api_token_url ?? "", api_authorize_url: acc.api_authorize_url ?? "",
+      api_scope: acc.api_scope ?? "", api_account_id: acc.api_account_id ?? "",
+      api_client_auth: acc.api_client_auth ?? "post", api_grant: acc.api_grant ?? "authorization_code",
+      opening_balance: acc.opening_balance ?? "", opening_balance_date: acc.opening_balance_date ?? "",
     });
     setError("");
     setShowModal(true);
@@ -798,6 +1309,12 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
     try {
       const payload: Record<string, unknown> = { ...form };
       if (!form.api_client_secret) delete payload.api_client_secret;
+      // Blank date means null, not "". An empty string reaches the API as
+      // an invalid date rather than as "nobody has set one", and the
+      // account would refuse to save with a message about date format
+      // when the real answer is that the field is simply not filled in.
+      payload.opening_balance_date = form.opening_balance_date || null;
+      payload.opening_balance = form.opening_balance === "" ? "0.00" : form.opening_balance;
       if (editing) {
         await api.patch(`/bank-accounts/${editing.id}/`, payload);
       } else {
@@ -817,6 +1334,11 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
     try {
       await api.post(`/bank-accounts/${id}/sync-now/`);
       refetch();
+    } catch (err) {
+      // The FNB client's errors are the whole point of this button --
+      // they now name the status, the URL, the redirect chain and the
+      // bank's own response body. Swallowing them made it useless.
+      setSyncError(apiErrorMessage(err, "Could not sync this account."));
     } finally {
       setSyncingId(null);
     }
@@ -824,10 +1346,17 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
 
   return (
     <div>
+      {syncError && (
+        <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+          {syncError}
+        </p>
+      )}
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        Up to a handful of FNB accounts to read incoming payments from. Direct API access from FNB isn't confirmed
-        yet — leave "API base URL" blank and use CSV import on the Review tab in the meantime; "Sync now" only works
-        once that's filled in.
+        Up to a handful of FNB accounts to read incoming payments from. Until FNB approves API access (Online Banking
+        Enterprise → Integration Channel → Transaction History API), leave "API base URL" blank and use CSV import on
+        the Review tab. Once FNB sends the client ID, secret and their spec, fill in the API fields, then use
+        "Connect" to link the account. Give FNB this redirect URL when applying:{" "}
+        <code className="rounded bg-[var(--tint-subtle)] px-1 text-xs">{fnbRedirectUri()}</code>
       </p>
 
       {loading ? (
@@ -838,6 +1367,7 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
             <tr>
               <TH>Name</TH>
               <TH>Account number</TH>
+              <TH>Balance</TH>
               <TH>Status</TH>
               <TH>API connection</TH>
               <TH>Last sync</TH>
@@ -849,12 +1379,39 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
               <TR key={acc.id}>
                 <TD className="font-medium">{acc.name}</TD>
                 <TD className="text-[var(--text-secondary)]">{acc.account_number || "—"}</TD>
+                {balanceCell(acc)}
                 <TD><StatusBadge status={acc.is_active ? "active" : "inactive"} /></TD>
-                <TD className="text-[var(--text-secondary)]">{acc.api_base_url ? "Configured" : "Not configured (CSV import only)"}</TD>
+                <TD className="text-[var(--text-secondary)]">
+                  <span
+                    className={
+                      acc.connection_status === "reconnect"
+                        ? "text-[var(--status-critical)]"
+                        : acc.connection_status === "connected"
+                          ? "text-[var(--status-good)]"
+                          : ""
+                    }
+                  >
+                    {CONNECTION_LABEL[acc.connection_status] ?? acc.connection_status}
+                  </span>
+                  {acc.connection_status !== "csv_only" && (
+                    <button
+                      type="button"
+                      className="ml-2 text-xs text-[var(--series-1)] hover:underline"
+                      onClick={() => {
+                        setConnecting(acc);
+                        setAuthCode("");
+                        setConnectError("");
+                        setCopied(false);
+                      }}
+                    >
+                      {acc.connection_status === "connected" ? "Manage" : "Connect"}
+                    </button>
+                  )}
+                </TD>
                 <TD className="text-[var(--text-secondary)]">
                   {acc.last_synced_at ? (
                     <>
-                      {new Date(acc.last_synced_at).toLocaleString()}
+                      {formatIsoDateTime(acc.last_synced_at)}
                       {acc.last_sync_status === "failed" && (
                         <span className="ml-2 text-[var(--status-critical)]" title={acc.last_sync_message}>failed</span>
                       )}
@@ -863,6 +1420,17 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
                 </TD>
                 <TD>
                   <div className="flex gap-2">
+                    <button
+                      type="button"
+                      className={btnSecondary}
+                      onClick={() => {
+                        setConfirming(acc);
+                        setConfirmValue(acc.confirmed_balance ?? "");
+                        setConfirmError("");
+                      }}
+                    >
+                      Check balance
+                    </button>
                     <button type="button" className={btnSecondary} disabled={syncingId === acc.id} onClick={() => handleSyncNow(acc.id)}>
                       {syncingId === acc.id ? "Syncing…" : "Sync now"}
                     </button>
@@ -876,6 +1444,142 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
             {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No bank accounts configured yet.</TD></TR>}
           </tbody>
         </Table>
+      )}
+
+      {confirming && (
+        <Modal title={`Check balance — ${confirming.name}`} onClose={() => setConfirming(null)}>
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setConfirmSaving(true);
+              setConfirmError("");
+              try {
+                await api.post(`/bank-accounts/${confirming.id}/confirm-balance/`, {
+                  confirmed_balance: confirmValue,
+                });
+                setConfirming(null);
+                refetch();
+              } catch (err) {
+                setConfirmError(apiErrorMessage(err, "Could not record that balance."));
+              } finally {
+                setConfirmSaving(false);
+              }
+            }}
+          >
+            <p className="mb-3 text-sm text-[var(--text-secondary)]">
+              This platform calculates{" "}
+              <strong className="text-[var(--text-primary)]">{rand(confirming.current_balance)}</strong> for
+              this account. Type what internet banking actually shows.
+            </p>
+            {/* Said plainly, because the instinct on seeing a mismatch is to
+                "fix" the opening balance until the two agree -- which hides
+                the missing transactions instead of finding them. */}
+            <p className="mb-3 text-xs text-[var(--text-muted)]">
+              Nothing is adjusted by this. If the two differ, that difference is the finding: a statement
+              not imported, one imported twice, or an opening balance dated wrong. The gap stays on screen
+              until the underlying transactions are right.
+            </p>
+            <FormField label="Balance shown by the bank">
+              <input
+                type="number"
+                step="0.01"
+                required
+                autoFocus
+                className={inputClass}
+                value={confirmValue}
+                onChange={(e) => setConfirmValue(e.target.value)}
+              />
+            </FormField>
+            {confirmError && <p className="mb-3 text-sm text-[var(--status-critical)]">{confirmError}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setConfirming(null)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={confirmSaving} className={btnPrimary}>
+                {confirmSaving ? "Saving…" : "Record this balance"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {connecting && (
+        <Modal title={`FNB connection — ${connecting.name}`} onClose={() => setConnecting(null)}>
+          <p className="mb-2 text-sm">
+            Status:{" "}
+            <strong className={connecting.connection_status === "reconnect" ? "text-[var(--status-critical)]" : ""}>
+              {CONNECTION_LABEL[connecting.connection_status]}
+            </strong>
+            {connecting.api_connected_at && (
+              <span className="text-[var(--text-muted)]">
+                {" "}
+                · since {formatIsoDateTime(connecting.api_connected_at)}
+                {connecting.api_connected_by_name ? ` by ${connecting.api_connected_by_name}` : ""}
+              </span>
+            )}
+          </p>
+          {connecting.api_grant === "client_credentials" ? (
+            <p className="mb-3 text-sm text-[var(--text-secondary)]">
+              This account uses the client ID and secret only — there is nothing to connect. Press "Sync now" to test it.
+            </p>
+          ) : (
+            <>
+              <p className="mb-2 text-xs text-[var(--text-muted)]">
+                FNB connects with an auth code. Give FNB this exact redirect URL on Integration Channel; after you approve
+                the connection there, FNB sends you back to it and the account is linked. If FNB shows you an auth code
+                instead, paste it below.
+              </p>
+              <div className="mb-3 flex items-center gap-2">
+                <code className="flex-1 truncate rounded bg-[var(--tint-subtle)] px-2 py-1 text-xs">{fnbRedirectUri(connecting)}</code>
+                <button
+                  type="button"
+                  className={btnSecondary}
+                  onClick={() => {
+                    navigator.clipboard?.writeText(fnbRedirectUri(connecting)).then(() => setCopied(true)).catch(() => {});
+                  }}
+                >
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              {connecting.api_authorize_url && (
+                <button type="button" className={`${btnPrimary} mb-3`} disabled={connectBusy} onClick={() => connectAction("fnb-authorize")}>
+                  Connect to FNB
+                </button>
+              )}
+              <FormField label="Auth code from FNB">
+                <input className={inputClass} value={authCode} onChange={(e) => setAuthCode(e.target.value)} autoComplete="off" />
+              </FormField>
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={connectBusy || !authCode.trim()}
+                onClick={() => connectAction("fnb-connect", { code: authCode.trim() })}
+              >
+                {connectBusy ? "Connecting…" : "Connect with this code"}
+              </button>
+            </>
+          )}
+          {connectError && <p className="mt-3 text-sm text-[var(--status-critical)]">{connectError}</p>}
+          <div className="mt-4 flex justify-between gap-2">
+            {connecting.connection_status === "connected" || connecting.connection_status === "reconnect" ? (
+              <button
+                type="button"
+                className={btnSecondary}
+                disabled={connectBusy}
+                onClick={() => {
+                  if (window.confirm("Disconnect this account from FNB? Syncing stops until it is connected again.")) connectAction("fnb-disconnect");
+                }}
+              >
+                Disconnect
+              </button>
+            ) : (
+              <span />
+            )}
+            <button type="button" className={btnPrimary} onClick={() => setConnecting(null)}>
+              Done
+            </button>
+          </div>
+        </Modal>
       )}
 
       {showModal && (
@@ -892,6 +1596,35 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
                 <input className={inputClass} placeholder="e.g. 250655" value={form.branch_code} onChange={(e) => setForm({ ...form, branch_code: e.target.value })} />
               </FormField>
             </div>
+            <div className="my-4 border-t border-[var(--border-hairline)]" />
+            <p className="mb-3 text-xs text-[var(--text-muted)]">
+              The balance this account held <strong>immediately before</strong> the first transaction on
+              the feed, and the date that was true. Everything imported on or after that date is added to
+              it. Get the date wrong and a month of transactions gets added to a balance that already
+              included them — so if you are unsure, use the closing balance of the statement before your
+              first import, dated the day after it. Leave both blank and no balance is shown at all.
+            </p>
+            <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+              <FormField label="Opening balance">
+                <input
+                  type="number"
+                  step="0.01"
+                  className={inputClass}
+                  placeholder="0.00"
+                  value={form.opening_balance}
+                  onChange={(e) => setForm({ ...form, opening_balance: e.target.value })}
+                />
+              </FormField>
+              <FormField label="Opening balance date">
+                <input
+                  type="date"
+                  className={inputClass}
+                  value={form.opening_balance_date}
+                  onChange={(e) => setForm({ ...form, opening_balance_date: e.target.value })}
+                />
+              </FormField>
+            </div>
+
             <label className="mb-4 flex items-center gap-2 text-sm">
               <input type="checkbox" checked={form.is_active} onChange={(e) => setForm({ ...form, is_active: e.target.checked })} />
               <span>Active (included in the hourly sync)</span>
@@ -899,7 +1632,9 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
 
             <div className="my-4 border-t border-[var(--border-hairline)]" />
             <p className="mb-3 text-xs text-[var(--text-muted)]">
-              Only needed once FNB confirms direct API access for this account — leave blank to rely on CSV import.
+              Only needed once FNB approves API access for this account — leave blank to rely on CSV import. The values
+              come from FNB (Integration Channel and their API spec). Changing the base URL, token URL, client ID or
+              connection type disconnects the account.
             </p>
             <FormField label="API base URL">
               <input className={inputClass} placeholder="https://…" value={form.api_base_url} onChange={(e) => setForm({ ...form, api_base_url: e.target.value })} />
@@ -923,6 +1658,43 @@ function BankFeedsAccountsSubTab({ onRegisterNewAction }: { onRegisterNewAction:
                 name="bank-api-client-secret"
               />
             </FormField>
+            <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+              <FormField label="Connection type">
+                <select
+                  className={inputClass}
+                  value={form.api_grant}
+                  onChange={(e) => setForm({ ...form, api_grant: e.target.value as BankAccount["api_grant"] })}
+                >
+                  <option value="authorization_code">Auth code (FNB Integration Channel)</option>
+                  <option value="client_credentials">Client ID + secret only</option>
+                </select>
+              </FormField>
+              <FormField label="Client authentication">
+                <select
+                  className={inputClass}
+                  value={form.api_client_auth}
+                  onChange={(e) => setForm({ ...form, api_client_auth: e.target.value as BankAccount["api_client_auth"] })}
+                >
+                  <option value="post">ID + secret in the request</option>
+                  <option value="basic">ID + secret as HTTP Basic</option>
+                  <option value="jwt">JWT signed with the secret</option>
+                </select>
+              </FormField>
+            </div>
+            <FormField label="Token URL (blank = API base URL + /oauth/token)">
+              <input className={inputClass} placeholder="https://…" value={form.api_token_url} onChange={(e) => setForm({ ...form, api_token_url: e.target.value })} />
+            </FormField>
+            <FormField label="Authorisation URL (optional — enables the Connect to FNB button)">
+              <input className={inputClass} placeholder="https://…" value={form.api_authorize_url} onChange={(e) => setForm({ ...form, api_authorize_url: e.target.value })} />
+            </FormField>
+            <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+              <FormField label="Scope (if FNB names one)">
+                <input className={inputClass} value={form.api_scope} onChange={(e) => setForm({ ...form, api_scope: e.target.value })} />
+              </FormField>
+              <FormField label="FNB account ID (blank = account number)">
+                <input className={inputClass} value={form.api_account_id} onChange={(e) => setForm({ ...form, api_account_id: e.target.value })} />
+              </FormField>
+            </div>
 
             {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
 
@@ -951,10 +1723,24 @@ const BANK_STATUS_FILTERS: { key: BankTransactionStatus | ""; label: string }[] 
   { key: "", label: "All" },
 ];
 
+const REVIEW_PAGE_SIZE = 50;
+
 function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const [statusFilter, setStatusFilter] = useState<BankTransactionStatus | "">("unmatched");
-  const { items, loading, refetch } = useApiList<BankTransaction>(
-    `/bank-transactions/?page_size=100&ordering=-date${statusFilter ? `&status=${statusFilter}` : ""}`
+  // Paginated. This was a flat page_size=100 with no pager: one imported
+  // FNB statement for 1,592 EFT payers routinely leaves more than 100
+  // credits unmatched, and everything past the newest 100 could never be
+  // allocated to a customer -- so that money sat unapplied while those
+  // customers stayed overdue, with nothing on screen saying the queue was
+  // longer than the page.
+  const [page, setPage] = useState(1);
+  useEffect(() => {
+    setPage(1);
+  }, [statusFilter]);
+  const { items, count, loading, refetch } = useApiList<BankTransaction>(
+    `/bank-transactions/?page_size=${REVIEW_PAGE_SIZE}&page=${page}&ordering=-date${
+      statusFilter ? `&status=${statusFilter}` : ""
+    }`
   );
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -967,6 +1753,10 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
   const [customersTruncated, setCustomersTruncated] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [expenseModalTxn, setExpenseModalTxn] = useState<BankTransaction | null>(null);
+  const [reversingTxn, setReversingTxn] = useState<BankTransaction | null>(null);
+  const { user } = useAuth();
+  // Mirrors the backend gate on /payments/<id>/reverse/ -- cosmetic only.
+  const canReverse = user?.role === "admin" || user?.role === "accounts" || user?.role === "management";
 
   // Each of these backs a dropdown on the review rows. They used to be
   // bare .then() chains, so a 403 (or any failure) left the dropdown
@@ -1000,7 +1790,7 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
     api.get<{ results: BankAccount[] }>("/bank-accounts/?page_size=50&ordering=name")
       .then((res) => setAccounts(res.data.results))
       .catch(() => setLoadError("Could not load the bank account list — importing a statement won't work until that's fixed."));
-    api.get<{ results: Customer[]; count: number }>("/customers/?page_size=1000&ordering=full_name")
+    api.get<{ results: Customer[]; count: number }>("/customers/picker/")
       .then((res) => {
         setCustomers(res.data.results);
         // The picker searches the list it was given, so a truncated list would
@@ -1071,6 +1861,17 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
   // confirmed the transaction a moment ago, which the backend rejects
   // with a 400 explaining why. They used to swallow that silently, so
   // the row simply didn't change and the user had no idea why.
+  /** After a statement import, the transactions AND the balances have
+   * both moved. refetch() alone reloaded the queue and left the balance
+   * beside it showing a figure from before the import -- two numbers on
+   * one screen disagreeing, which is how a balance stops being trusted. */
+  function handleImported() {
+    refetch();
+    api.get<{ results: BankAccount[] }>("/bank-accounts/?page_size=50&ordering=name")
+      .then((res) => setAccounts(res.data.results))
+      .catch(() => {});
+  }
+
   async function handleIgnore(txn: BankTransaction) {
     setBusyId(txn.id);
     setRowError((prev) => ({ ...prev, [txn.id]: "" }));
@@ -1099,13 +1900,73 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
     }
   }
 
+  const activeAccounts = accounts.filter((acc) => acc.is_active);
+  const anyUnplaceable = activeAccounts.some((acc) => acc.current_balance === null);
+
   return (
     <div>
-      <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        Bank transactions matched by reference where possible — a credit (money in) to a customer by the reference
-        number in the description, a debit (money out) to a supplier by name. Nothing becomes a real Payment or
-        Expense (or changes any balance) until you click Confirm.
-      </p>
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-4">
+        <p className="max-w-3xl text-sm text-[var(--text-secondary)]">
+          Bank transactions matched by reference where possible — a credit (money in) to a customer by the reference
+          number in the description, a debit (money out) to a supplier by name. Nothing becomes a real Payment or
+          Expense (or changes any balance) until you click Confirm.
+        </p>
+
+        {/* The balance, per account, beside the statement it is derived
+            from. Per account rather than one total on purpose: when the
+            figure disagrees with the bank, "which account" is the first
+            question, and a single total cannot answer it.
+
+            It does not move when you Confirm a row. Confirming creates a
+            Payment or an Expense; it does not change the bank line, and the
+            balance follows the bank lines. That is correct and worth
+            knowing before it looks like a bug. */}
+        {activeAccounts.length > 0 && (
+          <div className="shrink-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] px-4 py-3 shadow-sm">
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
+              Bank balance
+            </p>
+            <ul className="space-y-2">
+              {activeAccounts.map((acc) => {
+                const variance = acc.balance_variance === null ? null : Number(acc.balance_variance);
+                const agrees = variance !== null && Math.abs(variance) < 0.005;
+                return (
+                  <li key={acc.id} className="min-w-[15rem]">
+                    <div className="flex items-baseline justify-between gap-6 text-sm">
+                      <span className="text-[var(--text-secondary)]">{acc.name}</span>
+                      <span className="font-semibold tabular-nums text-[var(--text-primary)]">
+                        {acc.current_balance === null ? "—" : rand(acc.current_balance)}
+                      </span>
+                    </div>
+                    {acc.current_balance === null ? (
+                      <p className="text-xs text-[var(--text-muted)]">No opening balance set</p>
+                    ) : acc.confirmed_balance_at ? (
+                      <p className={`text-xs ${agrees ? "text-[var(--status-good)]" : "text-[var(--status-critical)]"}`}>
+                        {agrees ? (
+                          <>Agreed with the bank on {formatDate(acc.confirmed_balance_at)}</>
+                        ) : (
+                          <>
+                            {rand(Math.abs(variance as number))}{" "}
+                            {(variance as number) > 0 ? "more than" : "less than"} the bank on{" "}
+                            {formatDate(acc.confirmed_balance_at)}
+                          </>
+                        )}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-[var(--text-muted)]">Never checked against the bank</p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+            {anyUnplaceable && (
+              <p className="mt-2 max-w-[15rem] text-xs text-[var(--text-muted)]">
+                A balance needs an opening figure and the date it was true — set those on the Accounts tab.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
 
       {loadError && (
         <p className="mb-3 rounded-md border border-[var(--status-critical)] px-3 py-2 text-sm text-[var(--status-critical)]">
@@ -1129,6 +1990,7 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
+        <>
         <Table>
           <THead>
             <tr>
@@ -1146,9 +2008,19 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
               const isCredit = parseFloat(txn.amount) > 0;
               return (
                 <TR key={txn.id}>
-                  <TD>{txn.date}</TD>
+                  <TD>{formatDate(txn.date)}</TD>
                   <TD className="text-[var(--text-secondary)]">{txn.account_name}</TD>
-                  <TD className="max-w-xs truncate"><span title={txn.description}>{txn.description}</span></TD>
+                  <TD className="max-w-xs">
+                    <span className="block truncate" title={txn.description}>{txn.description}</span>
+                    {txn.reference && <span className="block truncate text-xs text-[var(--text-muted)]">Ref: {txn.reference}</span>}
+                    {txn.duplicate_of && (
+                      // Same line already on file from the other source (#185):
+                      // kept, but out of the balance and never confirmed.
+                      <span className="mt-0.5 inline-block rounded bg-[var(--tint-subtle)] px-1.5 text-xs text-[var(--text-secondary)]">
+                        Duplicate of {txn.duplicate_of_source === "api" ? "an FNB line" : "a CSV line"}
+                      </span>
+                    )}
+                  </TD>
                   <TD className={`tabular-nums ${!isCredit ? "text-[var(--text-muted)]" : ""}`}>
                     R {parseFloat(txn.amount).toFixed(2)}
                   </TD>
@@ -1164,8 +2036,13 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
                         placeholder="Select customer…"
                         emptyLabel="Clear customer"
                         hint={
+                          // The guard stays even though /customers/picker/ is
+                          // unpaginated and count always equals results.length
+                          // now: if anyone ever paginates it, this is the only
+                          // thing that would tell a user why a customer who
+                          // exists "isn't there".
                           customersTruncated
-                            ? "Search by name or payment reference. Only the first 1000 customers are loaded here — if someone is missing, set their payment reference on the Customers page so future imports match them automatically."
+                            ? "Search by name or payment reference. Not every customer is loaded here — if someone is missing, set their payment reference on the Customers page so future imports match them automatically."
                             : "Search by name or payment reference."
                         }
                       />
@@ -1224,6 +2101,22 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
                           </button>
                         </>
                       )}
+                      {txn.duplicate_of && (
+                        <button
+                          type="button"
+                          className={btnSecondary}
+                          disabled={busyId === txn.id}
+                          title="Put this line back in the queue and the balance as a separate transaction"
+                          onClick={() => handleUnmatch(txn)}
+                        >
+                          Not a duplicate
+                        </button>
+                      )}
+                      {txn.status === "confirmed" && isCredit && txn.created_payment && canReverse && (
+                        <button type="button" className={btnSecondary} onClick={() => setReversingTxn(txn)}>
+                          Reverse payment…
+                        </button>
+                      )}
                     </div>
                     {rowError[txn.id] && <p className="mt-1 text-xs text-[var(--status-critical)]">{rowError[txn.id]}</p>}
                   </TD>
@@ -1233,10 +2126,12 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
             {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No transactions in this filter.</TD></TR>}
           </tbody>
         </Table>
+        <Pager page={page} pageSize={REVIEW_PAGE_SIZE} count={count} shown={items.length} onPageChange={setPage} label="transactions" />
+        </>
       )}
 
       {showImport && (
-        <BankStatementImportModal accounts={accounts} onClose={() => setShowImport(false)} onImported={refetch} />
+        <BankStatementImportModal accounts={accounts} onClose={() => setShowImport(false)} onImported={handleImported} />
       )}
 
       {expenseModalTxn && (
@@ -1250,11 +2145,385 @@ function BankFeedsReviewSubTab({ onRegisterNewAction }: { onRegisterNewAction: (
           }}
         />
       )}
+
+      {reversingTxn && reversingTxn.created_payment && (
+        <ReversePaymentModal
+          paymentId={reversingTxn.created_payment}
+          customerName={reversingTxn.matched_customer_name || "this customer"}
+          amount={reversingTxn.amount}
+          date={formatDate(reversingTxn.date)}
+          onClose={() => setReversingTxn(null)}
+          onReversed={refetch}
+        />
+      )}
     </div>
   );
 }
 
 // --- Confirm-as-expense modal (debit transactions only) ---------------------
+
+// ---------------------------------------------------------------------------
+// Manual mapping -- the workspace for money that arrived without a usable
+// reference. Reference-matching (bankfeeds/matching.py) answers "who paid"
+// only when the customer's own CUS- reference appears in the narration; the
+// common case here is someone paying with their name, or nothing at all.
+//
+// Two jobs on one screen, because they are one job to the person doing it:
+// assign the customer, and say which invoices the money settles. The second
+// half is what was missing entirely -- confirming a transaction posts a
+// customer and no invoice, so the balance went right while every invoice
+// stayed UNPAID.
+//
+// Deliberately shows the customer's balance next to their open invoices: a
+// customer already in credit is the tell that this EFT has been captured
+// once already, which is the mistake this screen is most likely to make.
+// ---------------------------------------------------------------------------
+
+type OpenInvoice = {
+  id: number;
+  number: string;
+  status: string;
+  date_due: string;
+  total: string;
+  paid_amount: string;
+  balance_due: string;
+};
+
+type AllocationSummary = {
+  payment: number;
+  amount: string;
+  allocated: string;
+  unallocated: string;
+  allocations: { id: number; invoice: number; invoice_number: string; amount: string }[];
+};
+
+// The longest run of letters in a bank narration is nearly always the payer's
+// surname ("FNB APP PAYMENT J BOTHA" -> "PAYMENT" loses to "BOTHA" only on a
+// tie-break, so ignore the handful of words every narration carries).
+const NARRATION_NOISE = new Set([
+  "PAYMENT", "PAYMENTS", "TRANSFER", "TRF", "EFT", "DEPOSIT", "CASH", "ABSA", "FNB",
+  "NEDBANK", "CAPITEC", "STANDARD", "BANK", "APP", "IB", "INTERNET", "IMMEDIATE",
+  "SEND", "MONEY", "CREDIT", "REF", "REFERENCE", "FROM", "INT",
+]);
+
+function guessPayerName(description: string): string {
+  const words = (description || "")
+    .toUpperCase()
+    .split(/[^A-Z]+/)
+    .filter((w) => w.length >= 3 && !NARRATION_NOISE.has(w));
+  if (!words.length) return "";
+  return words.reduce((longest, w) => (w.length > longest.length ? w : longest), "");
+}
+
+function BankFeedsMappingSubTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const [txns, setTxns] = useState<BankTransaction[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
+  const [active, setActive] = useState<BankTransaction | null>(null);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [customerId, setCustomerId] = useState("");
+  const [customerBalance, setCustomerBalance] = useState("");
+  const [invoices, setInvoices] = useState<OpenInvoice[]>([]);
+  const [amounts, setAmounts] = useState<Record<number, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    onRegisterNewAction(null);
+  }, [onRegisterNewAction]);
+
+  function refetch() {
+    setLoading(true);
+    setLoadError("");
+    Promise.all([
+      api.get<{ results: BankTransaction[] }>("/bank-transactions/?status=unmatched&page_size=100&ordering=-date"),
+      api.get<{ results: BankTransaction[] }>("/bank-transactions/?status=matched&page_size=100&ordering=-date"),
+    ])
+      .then(([unmatched, matched]) => {
+        const all = [...unmatched.data.results, ...matched.data.results]
+          // Credits only: a debit is an expense, handled in the Review tab.
+          .filter((t) => Number(t.amount) > 0)
+          .sort((a, b) => (a.date < b.date ? 1 : -1));
+        setTxns(all);
+      })
+      .catch(() => setLoadError("Could not load the unallocated transactions."))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    refetch();
+    api
+      .get<{ results: Customer[] }>("/customers/picker/")
+      .then((res) => setCustomers(res.data.results))
+      .catch(() => setCustomers([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openMapping(txn: BankTransaction) {
+    setActive(txn);
+    setError("");
+    setNotice("");
+    setAmounts({});
+    setInvoices([]);
+    setCustomerBalance("");
+    setCustomerId(txn.matched_customer ? String(txn.matched_customer) : "");
+  }
+
+  useEffect(() => {
+    if (!customerId) {
+      setInvoices([]);
+      setCustomerBalance("");
+      return;
+    }
+    api
+      .get<{ balance: string; invoices: OpenInvoice[] }>(`/payments/open-invoices/?customer=${customerId}`)
+      .then((res) => {
+        setInvoices(res.data.invoices);
+        setCustomerBalance(res.data.balance);
+        setAmounts({});
+      })
+      .catch(() => {
+        setInvoices([]);
+        setError("Could not load that customer's open invoices.");
+      });
+  }, [customerId]);
+
+  const allocated = useMemo(
+    () => Object.values(amounts).reduce((sum, v) => sum + (Number(v) || 0), 0),
+    [amounts],
+  );
+  const paymentAmount = Number(active?.amount ?? 0);
+  const remainder = Math.round((paymentAmount - allocated) * 100) / 100;
+
+  function fillOldestFirst() {
+    let left = paymentAmount;
+    const next: Record<number, string> = {};
+    for (const inv of invoices) {
+      if (left <= 0) break;
+      const take = Math.min(left, Number(inv.balance_due));
+      if (take > 0) {
+        next[inv.id] = take.toFixed(2);
+        left = Math.round((left - take) * 100) / 100;
+      }
+    }
+    setAmounts(next);
+    setError("");
+  }
+
+  async function handleSave() {
+    if (!active || !customerId) return;
+    setSaving(true);
+    setError("");
+    try {
+      // The transaction may already have become a Payment (matched and
+      // confirmed earlier, just never allocated) -- in that case skip
+      // straight to the mapping rather than confirming it twice.
+      let paymentId = active.created_payment ?? null;
+      if (!paymentId) {
+        const res = await api.post<BankTransaction>(`/bank-transactions/${active.id}/confirm/`, {
+          customer: Number(customerId),
+        });
+        paymentId = res.data.created_payment ?? null;
+      }
+      if (!paymentId) {
+        setError("The transaction was confirmed but no payment came back — check the Review tab.");
+        return;
+      }
+      const lines = invoices
+        .map((inv) => ({ invoice: inv.id, amount: amounts[inv.id] }))
+        .filter((line) => line.amount && Number(line.amount) > 0);
+      if (lines.length) {
+        const res = await api.post<AllocationSummary>(`/payments/${paymentId}/allocations/`, {
+          replace: true,
+          allocations: lines,
+        });
+        setNotice(
+          `Mapped R${res.data.allocated} across ${res.data.allocations.length} invoice(s); ` +
+            `R${res.data.unallocated} left as account credit.`,
+        );
+      } else {
+        setNotice("Assigned to the customer as account credit — no invoice allocated.");
+      }
+      setActive(null);
+      refetch();
+    } catch (err) {
+      setError(apiErrorMessage(err, "Could not save this mapping."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const customerOptions: SearchableOption[] = customers.map((c) => ({
+    value: String(c.id),
+    label: c.customer_id ? `${c.full_name} (${c.customer_id})` : c.full_name,
+    // So typing a surname, a reference or an email all find them -- the
+    // three things a bank narration might carry.
+    searchText: [c.full_name, c.customer_id, c.email].filter(Boolean).join(" "),
+  }));
+
+  return (
+    <div>
+      <p className="mb-4 max-w-3xl text-sm text-[var(--text-secondary)]">
+        Money that arrived without a reference the system could match — someone paying by name, or with
+        nothing in the narration at all. Assign the customer, then say which invoices it settles. Anything
+        you don't allocate stays on the account as credit.
+      </p>
+
+      {loadError && <p className="mb-2 text-sm text-[var(--status-critical)]">{loadError}</p>}
+      {notice && <p className="mb-2 text-sm text-[var(--text-secondary)]">{notice}</p>}
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : txns.length === 0 ? (
+        <p className="text-[var(--text-muted)]">Nothing waiting to be mapped.</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Date</TH>
+              <TH>Description</TH>
+              <TH>Amount</TH>
+              <TH>Suggested</TH>
+              <TH>Status</TH>
+              <TH />
+            </tr>
+          </THead>
+          <tbody>
+            {txns.map((txn) => (
+              <TR key={txn.id}>
+                <TD>{formatDate(txn.date)}</TD>
+                <TD>
+                  <span className="block max-w-md truncate" title={txn.description}>
+                    {txn.description}
+                  </span>
+                </TD>
+                <TD>R{txn.amount}</TD>
+                <TD>{txn.matched_customer_name || <span className="text-[var(--text-muted)]">—</span>}</TD>
+                <TD>
+                  <StatusBadge status={txn.status === "matched" ? "active" : "pending"} />
+                </TD>
+                <TD>
+                  <button type="button" className={btnSecondary} onClick={() => openMapping(txn)}>
+                    Map…
+                  </button>
+                </TD>
+              </TR>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {active && (
+        <Modal onClose={() => setActive(null)} title="Map this payment">
+          <div className="mb-3 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] p-3 text-sm">
+            <p className="font-medium">R{active.amount} · {formatDate(active.date)}</p>
+            <p className="text-[var(--text-muted)]">{active.description}</p>
+          </div>
+
+          <FormField label="Customer">
+            <SearchableSelect
+              options={customerOptions}
+              value={customerId}
+              onChange={setCustomerId}
+              placeholder={
+                guessPayerName(active.description)
+                  ? `Search — try "${guessPayerName(active.description)}"`
+                  : "Search by name or reference"
+              }
+            />
+          </FormField>
+
+          {customerId && (
+            <>
+              <p className="mb-2 text-sm text-[var(--text-secondary)]">
+                Account balance: <strong>R{customerBalance}</strong>
+                {Number(customerBalance) < 0 && (
+                  <span className="ml-2 text-[var(--status-critical)]">
+                    already in credit — check this EFT hasn't been captured before
+                  </span>
+                )}
+              </p>
+
+              {invoices.length === 0 ? (
+                <p className="mb-3 text-sm text-[var(--text-muted)]">
+                  No open invoices. Saving will put the full amount on the account as credit.
+                </p>
+              ) : (
+                <>
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-sm font-semibold">Open invoices</span>
+                    <button type="button" className={btnSecondary} onClick={fillOldestFirst}>
+                      Fill oldest first
+                    </button>
+                  </div>
+                  <Table>
+                    <THead>
+                      <tr>
+                        <TH>Invoice</TH>
+                        <TH>Due</TH>
+                        <TH>Outstanding</TH>
+                        <TH>Allocate</TH>
+                      </tr>
+                    </THead>
+                    <tbody>
+                      {invoices.map((inv) => (
+                        <TR key={inv.id}>
+                          <TD>{inv.number}</TD>
+                          <TD>{formatDate(inv.date_due)}</TD>
+                          <TD>R{inv.balance_due}</TD>
+                          <TD>
+                            <input
+                              className={inputClass}
+                              inputMode="decimal"
+                              value={amounts[inv.id] ?? ""}
+                              placeholder="0.00"
+                              onChange={(e) =>
+                                setAmounts((prev) => ({ ...prev, [inv.id]: e.target.value }))
+                              }
+                            />
+                          </TD>
+                        </TR>
+                      ))}
+                    </tbody>
+                  </Table>
+                </>
+              )}
+
+              <p className="mt-3 text-sm">
+                Allocated <strong>R{allocated.toFixed(2)}</strong> of R{active.amount} ·{" "}
+                {remainder < 0 ? (
+                  <span className="text-[var(--status-critical)]">
+                    over-allocated by R{Math.abs(remainder).toFixed(2)}
+                  </span>
+                ) : (
+                  <>R{remainder.toFixed(2)} to account credit</>
+                )}
+              </p>
+            </>
+          )}
+
+          {error && <p className="mt-2 text-sm text-[var(--status-critical)]">{error}</p>}
+
+          <div className="mt-4 flex justify-end gap-2">
+            <button type="button" className={btnSecondary} onClick={() => setActive(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className={btnPrimary}
+              disabled={saving || !customerId || remainder < 0}
+              onClick={handleSave}
+            >
+              {saving ? "Saving…" : "Save mapping"}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
 
 function ConfirmExpenseModal({
   txn, selectedSupplierId, onClose, onConfirmed,
@@ -1313,7 +2582,7 @@ function ConfirmExpenseModal({
   return (
     <Modal title="Confirm as expense" onClose={onClose}>
       <p className="mb-3 text-sm text-[var(--text-secondary)]">
-        {txn.date} — {txn.description} — R {totalInclVat.toFixed(2)} (total paid, VAT-inclusive)
+        {formatDate(txn.date)} — {txn.description} — R {totalInclVat.toFixed(2)} (total paid, VAT-inclusive)
       </p>
       <form onSubmit={handleSubmit}>
         {!hasKnownSupplier && (
@@ -1481,6 +2750,9 @@ function BankStatementImportModal({
                 {preview.total_rows} row{preview.total_rows === 1 ? "" : "s"} found —{" "}
                 <span className="text-[var(--status-good)]">{importableCount} new row{importableCount === 1 ? "" : "s"} to import</span>
                 {preview.already_imported_count > 0 && <>, {preview.already_imported_count} already imported</>}
+                {(preview.already_from_api_count ?? 0) > 0 && (
+                  <>, {preview.already_from_api_count} already in from FNB (kept as duplicates, not counted twice)</>
+                )}
                 {preview.invalid_count > 0 && (
                   <>, <span className="text-[var(--status-critical)]">{preview.invalid_count} with problems</span></>
                 )}
@@ -1518,6 +2790,7 @@ function BankStatementImportModal({
             <span className="font-medium text-[var(--status-good)]">{result.created} imported</span>
             {result.matched > 0 && <>, {result.matched} auto-matched</>}
             {result.duplicates_skipped > 0 && <>, {result.duplicates_skipped} already-imported duplicates skipped</>}
+            {(result.already_from_api ?? 0) > 0 && <>, {result.already_from_api} already in from FNB (marked duplicate)</>}
             {result.invalid_skipped > 0 && (
               <span className="text-[var(--status-critical)]">, {result.invalid_skipped} skipped (see below)</span>
             )}
@@ -1582,7 +2855,7 @@ function BankFeedsHistorySubTab({ onRegisterNewAction }: { onRegisterNewAction: 
                 <TD>{log.transactions_new}</TD>
                 <TD>{log.transactions_matched}</TD>
                 <TD>{log.triggered_by_name ?? "Scheduled sync"}</TD>
-                <TD>{new Date(log.created_at).toLocaleString()}</TD>
+                <TD>{formatIsoDateTime(log.created_at)}</TD>
               </TR>
             ))}
             {items.length === 0 && <TR><TD className="text-[var(--text-muted)]">No syncs logged yet.</TD></TR>}
@@ -1762,7 +3035,7 @@ function AttendanceTab({
   }
 
   async function handleDelete(record: AttendanceRecord) {
-    if (!confirm(`Delete this attendance record for ${record.staff_name} on ${record.date}?`)) return;
+    if (!confirm(`Delete this attendance record for ${record.staff_name} on ${formatDate(record.date)}?`)) return;
     await api.delete(`/attendance/${record.id}/`);
     refetch();
   }
@@ -2780,6 +4053,10 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<PayrollRun | null>(null);
   const [busyAction, setBusyAction] = useState(false);
+  // Recalculate/Finalize/Delete happen outside the modal, where the
+  // existing `error` state is never rendered -- so their failures had
+  // nowhere to appear at all.
+  const [actionError, setActionError] = useState("");
   const [payslipPreview, setPayslipPreview] = useState<{ url: string; title: string; filename: string } | null>(null);
   // The line being edited: PAYE and the other typed-in figures.
   const [editingLine, setEditingLine] = useState<PayrollRunLine | null>(null);
@@ -2842,6 +4119,24 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
     }
   }
 
+  async function handleRemoveLine(line: PayrollRunLine) {
+    // Recalculate keeps a leaver's line on purpose now, so this is the only
+    // way to take somebody off a draft: the technician who resigned before
+    // the period started but was still marked active when it was generated.
+    // Refetch the run rather than the line -- the run totals move with it.
+    if (!confirm(`Remove ${line.staff_name} from this payroll run? They won't be paid on it.`)) return;
+    setActionError("");
+    try {
+      await api.delete(`/payroll-run-lines/${line.id}/`);
+      const res = await api.get<PayrollRun>(`/payroll-runs/${selected?.id}/`);
+      setSelected(res.data);
+      refetch();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setActionError(detail || "Could not remove that line.");
+    }
+  }
+
   useEffect(() => {
     onRegisterNewAction({
       label: "+ New payroll run",
@@ -2886,6 +4181,8 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       const res = await api.post<PayrollRun>(`/payroll-runs/${run.id}/recalculate/`);
       setSelected(res.data);
       refetch();
+    } catch (err) {
+      setActionError(apiErrorMessage(err, "Could not recalculate this payroll run."));
     } finally {
       setBusyAction(false);
     }
@@ -2898,6 +4195,10 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
       const res = await api.post<PayrollRun>(`/payroll-runs/${run.id}/finalize/`);
       setSelected(res.data);
       refetch();
+    } catch (err) {
+      // A rejected Finalize used to leave the run showing "draft" with no
+      // explanation at all.
+      setActionError(apiErrorMessage(err, "Could not finalize this payroll run."));
     } finally {
       setBusyAction(false);
     }
@@ -2927,6 +4228,11 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
 
   return (
     <div>
+      {actionError && (
+        <p className="mb-3 rounded-md border border-[var(--status-critical)] bg-[var(--tint-subtle)] p-2 text-sm text-[var(--status-critical)]">
+          {actionError}
+        </p>
+      )}
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -3103,6 +4409,14 @@ function PayrollTab({ onRegisterNewAction }: { onRegisterNewAction: (action: New
                           onClick={() => openLineEdit(line)}
                         >
                           Edit
+                        </button>
+                      )}
+                      {selected.status === "draft" && (
+                        <button
+                          className="text-xs text-[var(--status-critical)] hover:underline"
+                          onClick={() => handleRemoveLine(line)}
+                        >
+                          Remove
                         </button>
                       )}
                       <button

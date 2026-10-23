@@ -43,6 +43,7 @@ from billing.models import Service, Tariff
 from network.models import IPAddress, IPPool
 from .clients_conf import write_clients_conf_spool
 from .models import RadCheck, RadReply, RadiusNasClient
+from .models import RadiusNasClientAudit
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,35 @@ def _mikrotik_rate_limit(service):
     from .speeds import effective_speeds
 
     return effective_speeds(service).rate_limit
+
+
+def record_rate_limit(username, rate_limit):
+    """Write a rate limit into radreply, where the NEXT login reads it.
+
+    A CoA moves the queue on the session that is up right now and nothing
+    else. radreply is what FreeRADIUS hands back at login, so until this
+    row moves too, one router reboot puts the customer straight back on
+    the rate they had before -- an off-peak boost silently lost, or, far
+    worse, a line shaped for fair use running at full speed again for the
+    rest of the month. And because the CoA had already recorded
+    last_pushed_rate_limit, the scheduled run then reported "already
+    correct" and never sent it a second time.
+
+    Only touches a row that already exists. A service with no reply rows
+    is one _sync_service_radius_rows deliberately wrote nothing for -- no
+    password yet, or an outright Reject -- and a lone reply row would not
+    help it. Returns the number of rows moved, so callers can tell the
+    difference between "delivered" and "there was nothing there".
+    """
+    if not username:
+        return 0
+    # exclude(value=...) so a row that already says this is not rewritten.
+    # The scheduled job passes every offline line through here on every
+    # tick, and without this each one would be pointlessly UPDATEd twelve
+    # times an hour for as long as a speed window is open.
+    return RadReply.objects.filter(
+        username=username, attribute="Mikrotik-Rate-Limit"
+    ).exclude(value=rate_limit).update(value=rate_limit)
 
 
 def _allocate_network_ip(service):
@@ -298,7 +328,7 @@ def _resolve_framed_ip(service):
     return _allocate_network_ip(service)
 
 
-def sync_service_radius(service):
+def sync_service_radius(service, push_to_session=True):
     """The single source of truth for what a Service's RADIUS rows should
     look like right now. Always deletes-and-recreates rather than patching
     individual rows in place -- simpler to reason about and stays correct
@@ -332,8 +362,20 @@ def sync_service_radius(service):
     # it must not sit between the delete and the recreate.
     rate_limit = _mikrotik_rate_limit(service)
 
+    # What FreeRADIUS would answer for this username right now, read BEFORE
+    # the rows are replaced. Compared with the answer afterwards, this is
+    # what decides whether a session already running has been left holding
+    # terms that no longer apply -- see _push_answer_change_to_live_session
+    # for the three ways that went wrong, and why "status changed" was the
+    # wrong trigger for it.
+    answer_before = _radius_answer(username)
+
     with transaction.atomic():
         _sync_service_radius_rows(service, username, rate_limit)
+
+    answer_after = _radius_answer(username)
+    if push_to_session and answer_after != answer_before:
+        _push_answer_change_to_live_session(service, answer_before, answer_after)
 
 
 def _sync_service_radius_rows(service, username, rate_limit):
@@ -429,6 +471,11 @@ def _service_pre_save_capture_old_state(sender, instance, **kwargs):
 
 @receiver(post_save, sender=Service)
 def _service_post_save_sync_radius(sender, instance, created, **kwargs):
+    # `created` is deliberately not stashed on the instance for the RADIUS
+    # push to read later. It was, and it was wrong: the attribute outlives
+    # the save, so an instance that was created and is then given an address
+    # still reported itself brand new. _push_answer_change_to_live_session
+    # asks the database whether a session exists instead.
     old_username = getattr(instance, "_old_radius_username", None)
     if old_username and old_username != instance.radius_username:
         _clear_radius_entries(old_username)
@@ -510,6 +557,12 @@ def _service_post_delete_clear_radius(sender, instance, **kwargs):
     ids = getattr(instance, "_ip_address_ids_to_free", [])
     if ids:
         IPAddress.objects.filter(id__in=ids).update(status=IPAddress.Status.FREE, assigned_service=None)
+    # Clearing the rows takes away the credentials for the NEXT login. An
+    # established session is not re-checked against anything, so without the
+    # drop below a deleted customer stays online -- and worse, the addresses
+    # just freed above go back into circulation while a live session is
+    # still using one.
+    _drop_session_after_delete(instance)
 
 
 # The only Tariff fields Mikrotik-Rate-Limit is derived from --
@@ -651,3 +704,237 @@ def _nas_client_post_save_spool(sender, instance, created, **kwargs):
 @receiver(post_delete, sender=RadiusNasClient)
 def _nas_client_post_delete_spool(sender, instance, **kwargs):
     _spool_clients_conf(f"RadiusNasClient deleted: {instance.shortname}")
+
+
+# ---------------------------------------------------------------------------
+# RADIUS Clients -> audit trail
+# ---------------------------------------------------------------------------
+# See RadiusNasClientAudit's docstring for why this exists at all.
+#
+# Written from signals rather than from the viewset so that a change made
+# by a management command, a migration or a shell session is recorded too.
+# Those are exactly the changes nobody remembers making, and on
+# 2026-09-20 the inability to rule them out cost hours.
+
+_NAS_AUDIT_FIELDS = (
+    "name", "ip_address", "shortname", "secret", "realm", "description", "is_active",
+)
+
+
+@receiver(pre_save, sender=RadiusNasClient)
+def _nas_client_capture_before(sender, instance, **kwargs):
+    """Stash the pre-save values so post_save can report what moved.
+
+    Read back from the database rather than from the instance: by the
+    time post_save runs the instance holds only the new values, so the
+    comparison has to be against what the row still contained a moment
+    ago.
+    """
+    if not instance.pk:
+        instance._audit_before = None
+        return
+    instance._audit_before = (
+        sender.objects.filter(pk=instance.pk).values(*_NAS_AUDIT_FIELDS).first()
+    )
+
+
+def _nas_audit_actor(instance):
+    """Who to record. `changed_by` is set by the API on save; `_changed_by`
+    is set on the instance for deletes, where the stored changed_by names
+    the last person to SAVE the row rather than the one removing it."""
+    return getattr(instance, "_changed_by", None) or getattr(instance, "changed_by", None)
+
+
+@receiver(post_save, sender=RadiusNasClient)
+def _nas_client_audit_save(sender, instance, created, **kwargs):
+    before = getattr(instance, "_audit_before", None)
+    changed = []
+    if not created and before is not None:
+        changed = [f for f in _NAS_AUDIT_FIELDS if before.get(f) != getattr(instance, f)]
+        if not changed:
+            # A save that moved nothing of substance is noise in a table
+            # whose whole value is being readable during an outage.
+            return
+    RadiusNasClientAudit.objects.create(
+        client=instance,
+        client_pk=instance.pk,
+        shortname=instance.shortname,
+        action=(
+            RadiusNasClientAudit.Action.CREATED if created
+            else RadiusNasClientAudit.Action.UPDATED
+        ),
+        changed_fields=changed,
+        changed_by=_nas_audit_actor(instance),
+    )
+
+
+@receiver(post_delete, sender=RadiusNasClient)
+def _nas_client_audit_delete(sender, instance, **kwargs):
+    RadiusNasClientAudit.objects.create(
+        client=None,
+        client_pk=instance.pk,
+        shortname=instance.shortname,
+        action=RadiusNasClientAudit.Action.DELETED,
+        changed_fields=[],
+        changed_by=getattr(instance, "_changed_by", None),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Making a changed RADIUS answer reach the session that is already running.
+#
+# RADIUS is consulted at LOGIN and never again, and network.signals only
+# kicks a session when Service.status or Service.tariff changes -- it
+# deliberately ignores an unchanged re-save. But an IP reassignment does not
+# go through Service.save() at all: assign_specific_customer_ip and
+# release_customer_ip rewrite the Framed-IP-Address reply row directly. So
+# changing a customer's address left the session running on the old one, with
+# three consequences, all observed:
+#
+#   * the customer is not on the address the platform believes they are on;
+#   * the OLD address is marked FREE and can be handed to a DIFFERENT
+#     customer while the first one is still using it -- one reassignment
+#     taking two lines down;
+#   * a re-auth inside the reallocation window can get an Access-Accept with
+#     no Framed-IP-Address, and the router then falls back to its own local
+#     pool. Same failure shape as the walled-garden bug: an Accept without an
+#     address is worse than a reject.
+#
+# The rule below is therefore not "if status changed" but "if the answer
+# changed": compare what FreeRADIUS would hand out before and after the sync,
+# and push it to the live session when it differs. An unchanged re-save still
+# produces no router traffic, which is the property network.signals was
+# protecting when it compared old and new.
+# ---------------------------------------------------------------------------
+
+def _radius_answer(username):
+    """What FreeRADIUS would answer for this username right now, reduced to
+    the two things a live session cares about: whether it is refused, and
+    which address it is handed. The rate limit is deliberately NOT in here --
+    that is CoA's job and does not need the customer dropped."""
+    reject = RadCheck.objects.filter(
+        username=username, attribute="Auth-Type", value="Reject"
+    ).exists()
+    framed = (
+        RadReply.objects.filter(username=username, attribute="Framed-IP-Address")
+        .values_list("value", flat=True)
+        .first()
+    )
+    return (reject, framed)
+
+
+def _push_answer_change_to_live_session(service, before, after):
+    """Drop the live session because the answer it was granted no longer
+    matches the answer it would get now.
+
+    Skipped when the status changed in this save: network.signals'
+    _service_post_save already schedules enforcement for that, and two
+    pushes for one change is a wasted router round trip -- and a second
+    RadiusAction row that makes the log harder to read, not easier.
+
+    Goes through enforcement.apply_change rather than
+    disconnect_service_sessions directly, for the reason the tariff handler
+    gives: apply_change tries the RADIUS path first, falls back to the
+    RouterOS API, and records the outcome in RadiusAction either way. "It
+    didn't reach the router" and "there was no session to reach" look
+    identical from the outside and have completely different fixes.
+    """
+    if not service.pk:
+        return
+
+    # There is deliberately no _radius_created check here any more. v7 had
+    # one and the suite caught what is wrong with it: `created` is stashed on
+    # the model instance by post_save, and that instance outlives the save.
+    # A service created and then given an address through the SAME object
+    # still looked brand new, so its push was dropped -- and that is exactly
+    # the shape of the reassignment this whole patch exists to deliver.
+    #
+    # The question it was trying to answer is asked below instead, of the
+    # database, where it cannot go stale: is there a session running under
+    # the old answer? If nobody is connected, the new rows are simply what
+    # they get at their next login -- and a brand-new service falls out for
+    # free, because it has no session either.
+    #
+    # Checked HERE rather than left to apply_change (which handles it, and
+    # records "no live session" for the audit trail) because scheduling it
+    # anyway costs a thread, a router round trip and a RadiusAction row per
+    # save for every offline customer.
+    from .enforcement import find_live_session
+
+    if find_live_session(service.radius_username) is None:
+        return
+
+    old_status = getattr(service, "_old_status", None)
+    if old_status is not None and old_status != service.status:
+        return
+
+    reject_after, ip_after = after
+    if not reject_after and ip_after is None:
+        # Accepted, with no address. Dropping a working session into THIS
+        # answer is the one case where kicking makes things worse: the client
+        # re-authenticates, FreeRADIUS says yes with no Framed-IP-Address, and
+        # the router falls back to its own local PPP pool -- the exact failure
+        # this whole fix exists to prevent.
+        #
+        # It is reached legitimately mid-update: ServiceSerializer.update()
+        # releases the old address on a pool change, saves (which syncs, with
+        # nothing assigned yet), and only then attaches the new address and
+        # syncs again. Kicking on that first sync would put the customer on the
+        # router's pool for the second or two before the real address lands.
+        #
+        # An ACTIVE service that STAYS in this state is a misconfiguration --
+        # pool mode with nothing picked, or an exhausted pool -- and the honest
+        # response to that is the warning _allocate_customer_ip already logs,
+        # not a disconnect.
+        logger.info(
+            "Not dropping service %s's session: the new answer accepts with no "
+            "Framed-IP-Address, which would land them on the router's own pool. "
+            "Waiting for an address to be assigned.",
+            service.pk,
+        )
+        return
+
+    from network.signals import _after_commit_in_background
+
+    _after_commit_in_background(
+        "push changed RADIUS answer for service %s to its live session (%s -> %s)"
+        % (service.pk, before, after),
+        lambda: _apply_answer_change(service),
+    )
+
+
+def _apply_answer_change(service):
+    # Imported at call time: enforcement reaches back into network, and
+    # network imports this module during app-ready.
+    from .enforcement import apply_change
+
+    return apply_change(service, "address")
+
+
+def _drop_session_after_delete(service):
+    """A deleted service's rows are gone, so nothing will authenticate under
+    that username again -- but an established session is not re-checked
+    against anything, so without this the customer stays online after being
+    deleted. On a stable link that is days.
+
+    It also matters for the address, not just the customer: _service_post_
+    delete_clear_radius frees the IPAddress rows in the same breath, so the
+    address goes back into circulation while a live session is still using
+    it. The next customer allocated it gets a duplicate.
+
+    Calls disconnect_service_sessions directly rather than
+    enforcement.apply_change, deliberately: apply_change records a
+    RadiusAction with a FK to this service, and the row it would point at
+    has just been deleted.
+    """
+    username = (service.radius_username or "").strip()
+    if not username:
+        return
+
+    from network.router_sync import disconnect_service_sessions
+    from network.signals import _after_commit_in_background
+
+    _after_commit_in_background(
+        "drop live session for deleted service %s (%s)" % (service.pk or "?", username),
+        lambda: disconnect_service_sessions(service),
+    )

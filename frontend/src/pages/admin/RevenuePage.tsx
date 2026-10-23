@@ -1,0 +1,751 @@
+import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import {
+  Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
+} from "recharts";
+import { api } from "../../api/client";
+import { PageHeader } from "../../components/PageHeader";
+import { MultiSelect } from "../../components/MultiSelect";
+import { btnSecondary, filterSelectClass } from "../../components/Modal";
+import { palette } from "../../palette";
+
+/**
+ * Administration -> Revenue (9 Oct 2026): six charts, each with its own
+ * period toggle and partner filter. The numbers come from
+ * customers/revenue_reports.py, which documents how each is worked out.
+ */
+
+type PartnerOption = { key: string; name: string };
+
+const AXIS = { fontSize: 11, fill: palette.textMuted };
+
+function rands(value: string | number, decimals = 2) {
+  return `R ${Number(value).toLocaleString("en-ZA", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
+}
+
+function compactRands(value: number) {
+  const v = Math.abs(value);
+  const trim = (n: number, d: number) => n.toFixed(d).replace(/\.0+$/, "");
+  if (v >= 1_000_000) return `R ${trim(value / 1_000_000, 2)}m`;
+  if (v >= 10_000) return `R ${trim(value / 1_000, 0)}k`;
+  if (v >= 1_000) return `R ${trim(value / 1_000, 1)}k`;
+  return `R ${Math.round(value)}`;
+}
+
+/** Legend in series order (Recharts' own sorts by key). */
+function SeriesLegend({ items }: { items: { label: string; color: string }[] }) {
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[var(--text-secondary)]">
+      {items.map((i) => (
+        <span key={i.label} className="inline-flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-sm" style={{ background: i.color }} />
+          {i.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function useReport<T>(url: string) {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<T>(url)
+      .then((res) => {
+        if (!cancelled) {
+          setData(res.data);
+          setError("");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setError("Couldn't load this chart.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+  return { data, error };
+}
+
+function query(params: Record<string, string>) {
+  return Object.entries(params)
+    .filter(([, v]) => v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join("&");
+}
+
+function Toggle<T extends string>({ value, options, onChange }: { value: T; options: [T, string][]; onChange: (v: T) => void }) {
+  return (
+    <div className="inline-flex overflow-hidden rounded-md border border-[var(--border-hairline)]">
+      {options.map(([key, label]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => onChange(key)}
+          className={`px-2.5 py-1 text-xs font-medium transition-colors ${
+            value === key
+              ? "bg-[var(--series-1)] text-white"
+              : "text-[var(--text-secondary)] hover:bg-[var(--tint-hover)]"
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Card({
+  title,
+  subtitle,
+  controls,
+  partners,
+  selected,
+  onPartners,
+  table,
+  children,
+}: {
+  title: string;
+  subtitle?: ReactNode;
+  controls: ReactNode;
+  partners: PartnerOption[];
+  selected: string[];
+  onPartners: (next: string[]) => void;
+  table: ReactNode;
+  children: ReactNode;
+}) {
+  const [showTable, setShowTable] = useState(false);
+  return (
+    <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4 shadow-sm">
+      <div className="mb-1 flex flex-wrap items-start justify-between gap-2">
+        <h2 className="text-sm font-semibold text-[var(--text-primary)]">{title}</h2>
+        {controls}
+      </div>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <MultiSelect
+          options={partners.map((p) => ({ value: p.key, label: p.name }))}
+          selected={selected}
+          onChange={(next) => onPartners(next.map(String))}
+          allLabel="All partners"
+          nounPlural="partners"
+          buttonClassName={filterSelectClass}
+        />
+        <button
+          type="button"
+          className="ml-auto text-xs text-[var(--series-1)] hover:underline"
+          onClick={() => setShowTable((v) => !v)}
+        >
+          {showTable ? "Show chart" : "Show table"}
+        </button>
+      </div>
+      {subtitle && <p className="mb-2 text-xs text-[var(--text-muted)]">{subtitle}</p>}
+      {showTable ? <div className="max-h-[280px] overflow-auto">{table}</div> : children}
+    </div>
+  );
+}
+
+function SimpleTable({ head, rows }: { head: string[]; rows: (string | number)[][] }) {
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="border-b border-[var(--border-hairline)] text-left text-[var(--text-muted)]">
+          {head.map((h, i) => (
+            <th key={h} className={`py-1.5 pr-3 font-semibold ${i > 0 ? "text-right" : ""}`}>{h}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r, i) => (
+          <tr key={i} className="border-b border-[var(--border-hairline)] last:border-0">
+            {r.map((c, j) => (
+              <td key={j} className={`py-1.5 pr-3 ${j > 0 ? "text-right tabular-nums" : ""}`}>{c}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function State({ error, loading }: { error: string; loading: boolean }) {
+  if (error) return <p className="text-sm text-[var(--status-critical)]">{error}</p>;
+  if (loading) return <p className="text-sm text-[var(--text-muted)]">Loading…</p>;
+  return null;
+}
+
+const tooltipStyle = { fontSize: 12, borderRadius: 8 };
+const cursorFill = { fill: palette.gridline, fillOpacity: 0.35 };
+
+// --- MRR / ARPU -----------------------------------------------------------
+
+type MrrPoint = { label: string; date: string; mrr: string; clients: number; arpu: string; estimated: boolean };
+type MrrPeriod = "daily" | "weekly" | "monthly" | "yearly";
+const MRR_PERIODS: [MrrPeriod, string][] = [["daily", "Daily"], ["weekly", "Weekly"], ["monthly", "Monthly"], ["yearly", "Yearly"]];
+
+function TrendCard({ kind, partners }: { kind: "mrr" | "arpu"; partners: PartnerOption[] }) {
+  const [period, setPeriod] = useState<MrrPeriod>(kind === "mrr" ? "monthly" : "daily");
+  const [selected, setSelected] = useState<string[]>([]);
+  const { data, error } = useReport<{ points: MrrPoint[] }>(
+    `/reports/revenue/mrr/?${query({ period, partner: selected.join(",") })}`
+  );
+  const points = data?.points ?? [];
+  // Estimated points draw dashed; the first exact point joins the dashed run
+  // so the line doesn't break where the estimate ends.
+  const firstExact = points.findIndex((p) => !p.estimated);
+  const rows = points.map((p, i) => {
+    const value = Number(kind === "mrr" ? p.mrr : p.arpu);
+    return {
+      label: p.label,
+      exact: p.estimated ? null : value,
+      estimate: p.estimated || i === firstExact ? value : null,
+      clients: p.clients,
+      estimated: p.estimated,
+    };
+  });
+  const anyEstimated = points.some((p) => p.estimated);
+  return (
+    <Card
+      title={kind === "mrr" ? "Monthly recurring revenue" : "Average revenue per user"}
+      subtitle={
+        <>
+          {kind === "mrr" ? "Tariff price of active lines, excl. VAT." : "MRR ÷ paying clients, excl. VAT."}
+          {anyEstimated && " Dashed = estimated from service start/end dates at today's prices; solid = recorded."}
+        </>
+      }
+      controls={<Toggle value={period} options={MRR_PERIODS} onChange={setPeriod} />}
+      partners={partners}
+      selected={selected}
+      onPartners={setSelected}
+      table={
+        <SimpleTable
+          head={["Period", kind === "mrr" ? "MRR" : "ARPU", "Paying clients", "Source"]}
+          rows={points.map((p) => [p.label, rands(kind === "mrr" ? p.mrr : p.arpu), p.clients, p.estimated ? "Estimate" : "Recorded"])}
+        />
+      }
+    >
+      {!data ? (
+        <State error={error} loading />
+      ) : (
+        <ResponsiveContainer width="100%" height={260}>
+          <LineChart data={rows} margin={{ top: 8, right: 12, left: 8, bottom: 0 }}>
+            <CartesianGrid stroke={palette.gridline} vertical={false} />
+            <XAxis dataKey="label" tick={AXIS} axisLine={{ stroke: palette.gridline }} tickLine={false} minTickGap={16} />
+            <YAxis tick={AXIS} axisLine={false} tickLine={false} width={58} tickFormatter={compactRands} domain={["auto", "auto"]} />
+            <Tooltip
+              contentStyle={tooltipStyle}
+              formatter={(v, name) => [rands(Number(v)), name === "estimate" ? "Estimated" : "Recorded"]}
+              labelFormatter={(l, payload) => {
+                const p = payload?.[0]?.payload as { clients?: number } | undefined;
+                return p?.clients !== undefined ? `${l} · ${p.clients} paying clients` : String(l);
+              }}
+            />
+            <Line dataKey="estimate" stroke={palette.series1} strokeWidth={2} strokeDasharray="5 4" dot={false}
+              connectNulls={false} isAnimationActive={false} activeDot={{ r: 4 }} />
+            <Line dataKey="exact" stroke={palette.series1} strokeWidth={2} dot={{ r: 3 }} connectNulls={false}
+              isAnimationActive={false} activeDot={{ r: 5 }} />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
+    </Card>
+  );
+}
+
+// --- this month / last month ----------------------------------------------
+
+type Month = "this" | "last";
+const MONTHS: [Month, string][] = [["this", "This month"], ["last", "Last month"]];
+
+type TopPayers = {
+  total: string;
+  payers: number;
+  rows: { customer: number; name: string; customer_ref: string; amount: string }[];
+  others: { payers: number; amount: string };
+};
+
+function TopPayersCard({ partners }: { partners: PartnerOption[] }) {
+  const [month, setMonth] = useState<Month>("this");
+  const [selected, setSelected] = useState<string[]>([]);
+  const { data, error } = useReport<TopPayers>(`/reports/revenue/top-payers/?${query({ month, partner: selected.join(",") })}`);
+  const navigate = useNavigate();
+  const rows = (data?.rows ?? []).map((r) => ({ ...r, value: Number(r.amount) }));
+  return (
+    <Card
+      title="Top 10 payers"
+      subtitle={
+        data && (
+          <>
+            {rands(data.total)} from {data.payers} payer{data.payers === 1 ? "" : "s"}
+            {data.others.payers > 0 && ` · everyone else: ${rands(data.others.amount)} from ${data.others.payers}`}
+          </>
+        )
+      }
+      controls={<Toggle value={month} options={MONTHS} onChange={setMonth} />}
+      partners={partners}
+      selected={selected}
+      onPartners={setSelected}
+      table={
+        <SimpleTable
+          head={["Client", "Paid"]}
+          rows={[...(data?.rows ?? []).map((r) => [r.name, rands(r.amount)]),
+            ...(data && data.others.payers > 0 ? [[`Everyone else (${data.others.payers})`, rands(data.others.amount)]] : [])]}
+        />
+      }
+    >
+      {!data ? (
+        <State error={error} loading />
+      ) : rows.length === 0 ? (
+        <p className="py-10 text-center text-sm text-[var(--text-muted)]">No payments yet this period.</p>
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={Math.max(120, rows.length * 26 + 24)}>
+            <BarChart data={rows} layout="vertical" margin={{ top: 0, right: 64, left: 0, bottom: 0 }} barCategoryGap={4}>
+              <CartesianGrid stroke={palette.gridline} horizontal={false} />
+              <XAxis type="number" tick={AXIS} axisLine={false} tickLine={false} tickFormatter={compactRands} />
+              <YAxis type="category" dataKey="name" tick={AXIS} axisLine={false} tickLine={false} width={150} />
+              <Tooltip contentStyle={tooltipStyle} cursor={cursorFill} formatter={(v) => [rands(Number(v)), "Paid"]} />
+              <Bar dataKey="value" fill={palette.series1} radius={[0, 4, 4, 0]} maxBarSize={18} cursor="pointer"
+                onClick={(entry) => {
+                  const id = (entry as { payload?: { customer?: number } })?.payload?.customer;
+                  if (id) navigate(`/admin/customers/${id}`);
+                }}
+                label={{ position: "right", fontSize: 11, fill: palette.textSecondary, formatter: (v: unknown) => compactRands(Number(v)) }} />
+            </BarChart>
+          </ResponsiveContainer>
+          <p className="mt-1 text-xs text-[var(--text-muted)]">Click a bar to open the client.</p>
+        </>
+      )}
+    </Card>
+  );
+}
+
+type DailyPayments = { total: string; days: { day: number; date: string; amount: string; payments: number }[] };
+
+function DailyPaymentsCard({ partners }: { partners: PartnerOption[] }) {
+  const [month, setMonth] = useState<Month>("this");
+  const [selected, setSelected] = useState<string[]>([]);
+  const { data, error } = useReport<DailyPayments>(`/reports/revenue/daily-payments/?${query({ month, partner: selected.join(",") })}`);
+  const rows = (data?.days ?? []).map((d) => ({ ...d, value: Number(d.amount) }));
+  return (
+    <Card
+      title="Daily payments"
+      subtitle={data && `${rands(data.total)} received`}
+      controls={<Toggle value={month} options={MONTHS} onChange={setMonth} />}
+      partners={partners}
+      selected={selected}
+      onPartners={setSelected}
+      table={<SimpleTable head={["Day", "Received", "Payments"]} rows={(data?.days ?? []).map((d) => [d.date, rands(d.amount), d.payments])} />}
+    >
+      {!data ? (
+        <State error={error} loading />
+      ) : (
+        <ResponsiveContainer width="100%" height={260}>
+          <BarChart data={rows} margin={{ top: 8, right: 8, left: 8, bottom: 0 }} barCategoryGap="20%">
+            <CartesianGrid stroke={palette.gridline} vertical={false} />
+            <XAxis dataKey="day" tick={AXIS} axisLine={{ stroke: palette.gridline }} tickLine={false} interval={0} />
+            <YAxis tick={AXIS} axisLine={false} tickLine={false} width={58} tickFormatter={compactRands} />
+            <Tooltip
+              contentStyle={tooltipStyle}
+              cursor={cursorFill}
+              formatter={(v) => [rands(Number(v)), "Received"]}
+              labelFormatter={(_l, payload) => {
+                const p = payload?.[0]?.payload as { date?: string; payments?: number } | undefined;
+                return p?.date ? `${p.date.split("-").reverse().join("/")} · ${p.payments} payment${p.payments === 1 ? "" : "s"}` : "";
+              }}
+            />
+            <Bar dataKey="value" fill={palette.series1} radius={[4, 4, 0, 0]} maxBarSize={18} />
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+    </Card>
+  );
+}
+
+// --- month / quarter / year -------------------------------------------------
+
+type Bucket = "month" | "quarter" | "year";
+const BUCKETS: [Bucket, string][] = [["month", "Month"], ["quarter", "Quarter"], ["year", "Year"]];
+
+type InvoicingRow = {
+  label: string; invoices: number; invoiced: string; paid: string; unpaid: string;
+  on_time: string; late: string; paid_unknown: string;
+};
+
+const INVOICE_SERIES = [
+  { key: "paid", label: "Paid", stack: "status", color: palette.series1 },
+  { key: "unpaid", label: "Unpaid", stack: "status", color: palette.series2 },
+  { key: "on_time", label: "Paid on time", stack: "when", color: palette.series3 },
+  { key: "late", label: "Paid late", stack: "when", color: palette.series4 },
+  { key: "paid_unknown", label: "Paid, date not recorded", stack: "when", color: palette.textMuted },
+] as const;
+
+function InvoicingCard({ partners }: { partners: PartnerOption[] }) {
+  const [period, setPeriod] = useState<Bucket>("month");
+  const [selected, setSelected] = useState<string[]>([]);
+  const { data, error } = useReport<{ rows: InvoicingRow[] }>(`/reports/revenue/invoicing/?${query({ period, partner: selected.join(",") })}`);
+  const rows = (data?.rows ?? []).map((r) => ({
+    label: r.label,
+    ...Object.fromEntries(INVOICE_SERIES.map((s) => [s.key, Number(r[s.key])])),
+  }));
+  const hasUnknown = (data?.rows ?? []).some((r) => Number(r.paid_unknown) > 0);
+  const series = INVOICE_SERIES.filter((s) => s.key !== "paid_unknown" || hasUnknown);
+  return (
+    <Card
+      title="Invoicing for period (incl. VAT)"
+      subtitle="Left bar: what was invoiced, paid vs still owed. Right bar: the paid part, settled by the due date or after."
+      controls={<Toggle value={period} options={BUCKETS} onChange={setPeriod} />}
+      partners={partners}
+      selected={selected}
+      onPartners={setSelected}
+      table={
+        <SimpleTable
+          head={["Period", "Invoices", "Invoiced", "Paid", "Unpaid", "On time", "Late", "Date not recorded"]}
+          rows={(data?.rows ?? []).map((r) => [r.label, r.invoices, rands(r.invoiced), rands(r.paid), rands(r.unpaid),
+            rands(r.on_time), rands(r.late), rands(r.paid_unknown)])}
+        />
+      }
+    >
+      {!data ? (
+        <State error={error} loading />
+      ) : (
+        <ResponsiveContainer width="100%" height={280}>
+          <BarChart data={rows} margin={{ top: 8, right: 8, left: 8, bottom: 0 }} barGap={2} barCategoryGap="24%">
+            <CartesianGrid stroke={palette.gridline} vertical={false} />
+            <XAxis dataKey="label" tick={AXIS} axisLine={{ stroke: palette.gridline }} tickLine={false} minTickGap={8} />
+            <YAxis tick={AXIS} axisLine={false} tickLine={false} width={58} tickFormatter={compactRands} />
+            <Tooltip contentStyle={tooltipStyle} cursor={cursorFill}
+              formatter={(v, name) => [rands(Number(v)), INVOICE_SERIES.find((s) => s.key === name)?.label ?? String(name)]} />
+            {series.map((s) => (
+              <Bar key={s.key} dataKey={s.key} stackId={s.stack} fill={s.color} maxBarSize={18} stroke="var(--surface-1)" strokeWidth={1} />
+            ))}
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      {data && <SeriesLegend items={series.map((s) => ({ label: s.label, color: s.color }))} />}
+    </Card>
+  );
+}
+
+type PaymentsSeries = { methods: { key: string; label: string }[]; rows: (Record<string, string | number> & { label: string; total: string })[] };
+
+// Fixed colour per method -- colour follows the method, whatever is hidden.
+const METHOD_COLORS: Record<string, string> = {
+  bank_transfer: palette.series1,
+  cash: palette.series2,
+  card: palette.series3,
+  mobile_money: palette.series4,
+  manual: palette.series5,
+};
+
+function PaymentsCard({ partners }: { partners: PartnerOption[] }) {
+  const [period, setPeriod] = useState<Bucket>("month");
+  const [selected, setSelected] = useState<string[]>([]);
+  const { data, error } = useReport<PaymentsSeries>(`/reports/revenue/payments/?${query({ period, partner: selected.join(",") })}`);
+  const methods = (data?.methods ?? []).filter((m) => (data?.rows ?? []).some((r) => Number(r[m.key]) > 0));
+  const rows = (data?.rows ?? []).map((r) => ({ label: r.label, ...Object.fromEntries(methods.map((m) => [m.key, Number(r[m.key])])) }));
+  const labelOf = (k: string) => data?.methods.find((m) => m.key === k)?.label ?? k;
+  return (
+    <Card
+      title="Payments for period (incl. VAT)"
+      subtitle="Money received, by how it was paid."
+      controls={<Toggle value={period} options={BUCKETS} onChange={setPeriod} />}
+      partners={partners}
+      selected={selected}
+      onPartners={setSelected}
+      table={
+        <SimpleTable
+          head={["Period", ...methods.map((m) => m.label), "Total"]}
+          rows={(data?.rows ?? []).map((r) => [r.label, ...methods.map((m) => rands(r[m.key] as string)), rands(r.total)])}
+        />
+      }
+    >
+      {!data ? (
+        <State error={error} loading />
+      ) : methods.length === 0 ? (
+        <p className="py-10 text-center text-sm text-[var(--text-muted)]">No payments in this range.</p>
+      ) : (
+        <ResponsiveContainer width="100%" height={280}>
+          <BarChart data={rows} margin={{ top: 8, right: 8, left: 8, bottom: 0 }} barCategoryGap="24%">
+            <CartesianGrid stroke={palette.gridline} vertical={false} />
+            <XAxis dataKey="label" tick={AXIS} axisLine={{ stroke: palette.gridline }} tickLine={false} minTickGap={8} />
+            <YAxis tick={AXIS} axisLine={false} tickLine={false} width={58} tickFormatter={compactRands} />
+            <Tooltip contentStyle={tooltipStyle} cursor={cursorFill} formatter={(v, name) => [rands(Number(v)), labelOf(String(name))]} />
+            {methods.map((m) => (
+              <Bar key={m.key} dataKey={m.key} stackId="m" fill={METHOD_COLORS[m.key] ?? palette.series6} maxBarSize={28}
+                stroke="var(--surface-1)" strokeWidth={1} />
+            ))}
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      {data && methods.length > 0 && (
+        <SeriesLegend items={methods.map((m) => ({ label: m.label, color: METHOD_COLORS[m.key] ?? palette.series6 }))} />
+      )}
+    </Card>
+  );
+}
+
+// --- outstanding & overdue by payment method (12 Oct 2026) -------------------
+
+type OutstandingRow = { key: string; name: string; clients: number; outstanding: string; overdue: string };
+type Outstanding = { as_of: string; rows: OutstandingRow[]; total: { clients: number; outstanding: string; overdue: string } };
+type OwingClient = { id: number; full_name: string; customer_ref: string; outstanding: string; overdue: string; invoices: number };
+
+const NOT_DUE_COLOR = palette.series1;
+const OVERDUE_COLOR = palette.series2;
+
+function pct(part: number, whole: number) {
+  return whole > 0 ? Math.round((part / whole) * 100) : 0;
+}
+
+function OutstandingCard({ partners }: { partners: PartnerOption[] }) {
+  const [selected, setSelected] = useState<string[]>([]);
+  const partnerQuery = query({ partner: selected.join(",") });
+  const { data, error } = useReport<Outstanding>(`/reports/revenue/outstanding/?${partnerQuery}`);
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [clients, setClients] = useState<OwingClient[] | null>(null);
+  // Export CSV / Excel (George, 14 Oct 2026): totals per payment method plus
+  // every client owing, with the partner filter on screen.
+  const [exporting, setExporting] = useState<"" | "csv" | "xlsx">("");
+  const [exportError, setExportError] = useState("");
+
+  async function exportFile(filetype: "csv" | "xlsx") {
+    setExporting(filetype);
+    setExportError("");
+    try {
+      const res = await api.get(`/reports/revenue/outstanding/?${query({ partner: selected.join(","), filetype })}`, {
+        responseType: "blob",
+      });
+      const url = URL.createObjectURL(
+        new Blob([res.data], {
+          type: filetype === "csv" ? "text/csv" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        })
+      );
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `outstanding-by-payment-method-${data?.as_of ?? new Date().toISOString().slice(0, 10)}.${filetype}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch {
+      setExportError("Couldn't export.");
+    } finally {
+      setExporting("");
+    }
+  }
+
+  useEffect(() => {
+    setOpenKey(null);
+  }, [partnerQuery]);
+
+  function toggle(key: string) {
+    if (openKey === key) {
+      setOpenKey(null);
+      return;
+    }
+    setOpenKey(key);
+    setClients(null);
+    api
+      .get<{ results: OwingClient[] }>(`/reports/revenue/outstanding/?${query({ partner: selected.join(","), method: key })}`)
+      .then((res) => setClients(res.data.results))
+      .catch(() => setClients([]));
+  }
+
+  const rows = data?.rows ?? [];
+  const max = Math.max(1, ...rows.map((r) => Number(r.outstanding)));
+  const totalOut = Number(data?.total.outstanding ?? 0);
+  const totalOver = Number(data?.total.overdue ?? 0);
+  const stat = (label: string, value: string, tone?: string) => (
+    <div className="flex flex-col gap-1 rounded-md border border-[var(--border-hairline)] px-3 py-2.5">
+      <span className="text-xs text-[var(--text-muted)]">{label}</span>
+      <span className="text-lg font-semibold tabular-nums" style={tone ? { color: tone } : undefined}>{value}</span>
+    </div>
+  );
+
+  return (
+    <div className="xl:col-span-2">
+      <Card
+        title="Outstanding & overdue by payment method"
+        controls={
+          <div className="flex items-center gap-2">
+            {exportError && <span className="text-xs text-[var(--status-critical)]">{exportError}</span>}
+            <button
+              type="button"
+              className="rounded-md border border-[var(--border-hairline)] px-2.5 py-1 text-xs font-medium hover:bg-[var(--tint-hover)] disabled:opacity-50"
+              disabled={!data || !!exporting}
+              onClick={() => exportFile("csv")}
+            >
+              {exporting === "csv" ? "Exporting…" : "Export CSV"}
+            </button>
+            <button
+              type="button"
+              className="rounded-md border border-[var(--border-hairline)] px-2.5 py-1 text-xs font-medium hover:bg-[var(--tint-hover)] disabled:opacity-50"
+              disabled={!data || !!exporting}
+              onClick={() => exportFile("xlsx")}
+            >
+              {exporting === "xlsx" ? "Exporting…" : "Export Excel"}
+            </button>
+          </div>
+        }
+        subtitle={
+          <>
+            Open invoices incl. VAT, grouped by each client's payment method, as at today. Overdue = past its due
+            date and still owed — the same rule as Finance → Invoices, where the age filters are.
+          </>
+        }
+        partners={partners}
+        selected={selected}
+        onPartners={setSelected}
+        table={
+          <SimpleTable
+            head={["Payment method", "Clients", "Outstanding", "Overdue", "Share overdue"]}
+            rows={[
+              ...rows.map((r) => [r.name, r.clients, rands(r.outstanding), rands(r.overdue),
+                `${pct(Number(r.overdue), Number(r.outstanding))}%`]),
+              ...(data ? [["Total", data.total.clients, rands(data.total.outstanding), rands(data.total.overdue),
+                `${pct(totalOver, totalOut)}%`]] : []),
+            ]}
+          />
+        }
+      >
+        {!data ? (
+          <State error={error} loading />
+        ) : rows.length === 0 ? (
+          <p className="py-10 text-center text-sm text-[var(--text-muted)]">Nobody owes anything right now.</p>
+        ) : (
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {stat("Outstanding", rands(data.total.outstanding))}
+              {stat("Overdue", rands(data.total.overdue), "var(--status-critical)")}
+              {stat("Share overdue", `${pct(totalOver, totalOut)}%`)}
+              {stat("Clients owing", String(data.total.clients))}
+            </div>
+            <SeriesLegend items={[{ label: "Not yet due", color: NOT_DUE_COLOR }, { label: "Overdue", color: OVERDUE_COLOR }]} />
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-[var(--border-hairline)] text-left text-xs uppercase tracking-wide text-[var(--text-muted)]">
+                    <th className="py-2 pr-3 font-semibold">Payment method</th>
+                    <th className="px-3 py-2 text-right font-semibold">Clients</th>
+                    <th className="px-3 py-2 text-right font-semibold">Outstanding</th>
+                    <th className="px-3 py-2 text-right font-semibold">Overdue</th>
+                    <th className="py-2 pl-4 font-semibold" style={{ width: "34%" }}>Split</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => {
+                    const out = Number(r.outstanding);
+                    const over = Number(r.overdue);
+                    const open = openKey === r.key;
+                    return (
+                      <Fragment key={r.key}>
+                        <tr
+                          className={`cursor-pointer border-b border-[var(--border-hairline)] hover:bg-[var(--tint-subtle)] ${open ? "bg-[var(--tint-subtle)]" : ""}`}
+                          onClick={() => toggle(r.key)}
+                        >
+                          <td className="py-2.5 pr-3">
+                            <button type="button" className="font-medium text-[var(--series-1)] hover:underline" aria-expanded={open}>
+                              <span className="mr-1.5 inline-block w-3 text-xs text-[var(--text-muted)]">{open ? "▾" : "▸"}</span>
+                              {r.name}
+                            </button>
+                          </td>
+                          <td className="px-3 py-2.5 text-right tabular-nums">{r.clients}</td>
+                          <td className="px-3 py-2.5 text-right tabular-nums">{rands(r.outstanding)}</td>
+                          <td className="px-3 py-2.5 text-right font-medium tabular-nums text-[var(--status-critical)]">{rands(r.overdue)}</td>
+                          <td className="py-2.5 pl-4">
+                            <div className="flex items-center gap-2">
+                              <div
+                                role="img"
+                                aria-label={`${r.name}: ${rands(out - over)} not yet due, ${rands(over)} overdue`}
+                                className="flex h-2.5 flex-1 gap-[2px] overflow-hidden rounded bg-[var(--tint-subtle)]"
+                              >
+                                <div style={{ width: `${((out - over) / max) * 100}%`, background: NOT_DUE_COLOR }} />
+                                <div style={{ width: `${(over / max) * 100}%`, background: OVERDUE_COLOR }} />
+                              </div>
+                              <span className="w-9 text-right text-xs tabular-nums text-[var(--text-secondary)]">{pct(over, out)}%</span>
+                            </div>
+                          </td>
+                        </tr>
+                        {open && (
+                          <tr className="border-b border-[var(--border-hairline)] bg-[var(--surface-2)]">
+                            <td colSpan={5} className="px-4 py-3">
+                              {clients === null ? (
+                                <p className="text-sm text-[var(--text-muted)]">Loading clients…</p>
+                              ) : clients.length === 0 ? (
+                                <p className="text-sm text-[var(--text-muted)]">No clients.</p>
+                              ) : (
+                                <table className="w-full text-sm">
+                                  <tbody>
+                                    {clients.map((c) => (
+                                      <tr key={c.id} className="border-b border-[var(--border-hairline)] last:border-0">
+                                        <td className="py-1.5 pr-4">
+                                          <Link to={`/admin/customers/${c.id}`} className="font-medium text-[var(--series-1)] hover:underline">
+                                            {c.full_name}
+                                          </Link>
+                                          <span className="ml-2 text-xs text-[var(--text-muted)]">{c.customer_ref}</span>
+                                        </td>
+                                        <td className="py-1.5 pr-4 text-xs text-[var(--text-muted)]">
+                                          {c.invoices} open invoice{c.invoices === 1 ? "" : "s"}
+                                        </td>
+                                        <td className="py-1.5 pr-4 text-right tabular-nums">{rands(c.outstanding)}</td>
+                                        <td className="py-1.5 text-right tabular-nums text-[var(--status-critical)]">
+                                          {Number(c.overdue) > 0 ? `${rands(c.overdue)} overdue` : "Not yet due"}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                  <tr className="font-semibold">
+                    <td className="py-2.5 pr-3">Total</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{data.total.clients}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{rands(data.total.outstanding)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-[var(--status-critical)]">{rands(data.total.overdue)}</td>
+                    <td className="py-2.5 pl-4 text-xs text-[var(--text-secondary)]">{pct(totalOver, totalOut)}% overdue</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// --- page --------------------------------------------------------------------
+
+export function RevenuePage() {
+  const [partners, setPartners] = useState<PartnerOption[]>([]);
+  useEffect(() => {
+    api
+      .get<{ partners: PartnerOption[] }>("/reports/revenue/partners/")
+      .then((res) => setPartners(res.data.partners))
+      .catch(() => setPartners([]));
+  }, []);
+  return (
+    <div>
+      <PageHeader
+        title="Revenue"
+        subtitle="Recurring revenue, payments and invoicing over time."
+        actions={<Link to="/admin/administration" className={btnSecondary}>All reports</Link>}
+      />
+      <div className="grid gap-4 xl:grid-cols-2">
+        <TrendCard kind="mrr" partners={partners} />
+        <TrendCard kind="arpu" partners={partners} />
+        <TopPayersCard partners={partners} />
+        <DailyPaymentsCard partners={partners} />
+        <InvoicingCard partners={partners} />
+        <PaymentsCard partners={partners} />
+        <OutstandingCard partners={partners} />
+      </div>
+    </div>
+  );
+}

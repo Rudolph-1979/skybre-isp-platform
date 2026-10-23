@@ -1,0 +1,76 @@
+"""Network (UISP) API (14 Oct 2026). Networking section; read-only.
+
+GET /api/uisp/summary/   counts for the Dashboard tiles and the page header
+GET /api/uisp/devices/   every device (?kind=ptp|ap|station|router|switch|other)
+GET /api/uisp/sites/     the site tree, with this platform's active lines per site
+GET /api/uisp/outages/   recent outages (?count=, max 200)
+"""
+from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.permissions import IsStaffMember, section_permission
+
+from . import uisp
+
+PERMS = [permissions.IsAuthenticated, IsStaffMember, section_permission("networking")]
+
+
+def _answer(fn):
+    if not uisp.configured():
+        return Response({"connected": False, "detail": "UISP isn't connected yet."}, status=200)
+    try:
+        return Response({"connected": True, **fn()})
+    except uisp.UispError as exc:
+        return Response({"connected": True, "detail": str(exc)}, status=502)
+
+
+class UispSummaryView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        return _answer(uisp.summary)
+
+
+class UispDevicesView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        kind = request.query_params.get("kind")
+
+        def fetch():
+            rows = uisp.devices()
+            if kind:
+                rows = [r for r in rows if r["kind"] in kind.split(",")]
+            return {"results": sorted(rows, key=lambda r: r["name"].lower())}
+
+        return _answer(fetch)
+
+
+class UispSitesView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        def fetch():
+            clients = uisp.clients_per_site_name()
+            offline = {}
+            for d in uisp.devices():
+                if d["site"] and not d["online"]:
+                    offline[d["site"]["id"]] = offline.get(d["site"]["id"], 0) + 1
+            rows = []
+            for s in uisp.sites():
+                rows.append({**s, "clients": clients.get(s["name"].lower()), "devices_offline": offline.get(s["id"], 0)})
+            return {"results": rows}
+
+        return _answer(fetch)
+
+
+class UispOutagesView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        try:
+            count = max(1, min(int(request.query_params.get("count", "50")), 200))
+        except ValueError:
+            count = 50
+        return _answer(lambda: uisp.outages(count=count))

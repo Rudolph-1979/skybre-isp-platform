@@ -53,6 +53,23 @@ if not DEBUG:
             "real origins in CORS_ALLOWED_ORIGINS, e.g. CORS_ALLOWED_ORIGINS=https://portal.skybre.co.za"
         )
 
+# The container's own healthcheck curls http://localhost:8000/api/health/,
+# which sends `Host: localhost` -- and Django answers a Host outside
+# ALLOWED_HOSTS with 400, whatever the view says. So with a correctly
+# locked-down ALLOWED_HOSTS the healthcheck would fail permanently, the
+# backend would never be reported healthy, and because the frontend now
+# waits on that condition, nothing would start at all.
+#
+# Appended AFTER the guard above, so it can still refuse a wildcard: this
+# adds two specific loopback names, it does not re-open the setting. They
+# are safe to allow -- host nginx forwards the real Host header, so a
+# reset link or absolute URL built from a request is still derived from
+# the real domain, and nothing outside this container can reach it as
+# `localhost` in the first place.
+for _probe_host in ("localhost", "127.0.0.1"):
+    if _probe_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_probe_host)
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -81,6 +98,14 @@ INSTALLED_APPS = [
     "expenses",
     "audit",
     "sales",
+    "conecto",
+    # Digital contract signing (6 Oct 2026).
+    "contracts",
+    # The chart of accounts. Its own app rather than a corner of expenses:
+    # invoices, bank accounts and VAT all describe themselves in terms of
+    # accounts too, and burying the chart inside one consumer makes that
+    # one special.
+    "ledger",
 ]
 
 MIDDLEWARE = [
@@ -130,7 +155,11 @@ AUTH_USER_MODEL = "accounts.User"
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 6}},
+    # 10, not Django's default 8 and not the 6 this used to be: these are
+    # staff logins into a platform that can cut off a customer's internet
+    # and move money, reachable from the public internet, and six
+    # characters is inside brute-force range for a leaked hash.
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 10}},
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
@@ -192,7 +221,51 @@ REST_FRAMEWORK = {
     # their own page never notices.
     "DEFAULT_THROTTLE_RATES": {
         "public_usage": "60/min",
+        "public_payment_details": "30/min",
     },
+}
+
+# --- Conecto subscriber app ------------------------------------------------
+#
+# The integration is OFF until CONECTO_API_KEY is set. That default is
+# deliberate: a staging copy or a developer's laptop inherits this code,
+# and neither should start posting real customer records at a production
+# Firebase project because it happened to have the app installed.
+#
+# Conecto gives each of its functions its own Cloud Run URL rather than one
+# base with paths, so they are configured individually.
+CONECTO_API_KEY = config("CONECTO_API_KEY", default="")
+# What Conecto must present on its three webhooks to us. Falls back to
+# CONECTO_API_KEY so one shared secret works, but can be set separately so
+# the two directions can be rotated independently.
+CONECTO_WEBHOOK_TOKEN = config("CONECTO_WEBHOOK_TOKEN", default="")
+# Short on purpose: outbound calls run inside a request a staff member is
+# waiting on.
+CONECTO_TIMEOUT_SECONDS = config("CONECTO_TIMEOUT_SECONDS", default=6, cast=int)
+# Per-IP limit on the webhooks. They are reachable by anyone, so a wrong
+# token must not be cheap to retry in bulk.
+CONECTO_WEBHOOK_RATE = config("CONECTO_WEBHOOK_RATE", default="120/min")
+# Dispatch jobs against the staff code this platform issues, rather than
+# only against a technicianCode set by hand in Conecto's admin screen.
+# Off until Conecto supported staff codes on scheduleJob (2026-09-21);
+# sending one before that would have created jobs attached to nobody.
+CONECTO_DISPATCH_BY_STAFF_CODE = config(
+    "CONECTO_DISPATCH_BY_STAFF_CODE", default=False, cast=bool
+)
+# Return to Pool needs a reason (George, 14 Oct 2026: the technician must
+# say why the vehicle has to go back to the client). A return without one
+# is refused with 400 code "return_reason_required" and the job stays
+# booked. Set false in backend/.env to accept reasonless returns again.
+CONECTO_RETURN_REASON_REQUIRED = config("CONECTO_RETURN_REASON_REQUIRED", default=True, cast=bool)
+RETURN_REASON_MIN_LENGTH = 5
+CONECTO_URLS = {
+    "health": config("CONECTO_URL_HEALTH", default=""),
+    "registerClientCode": config("CONECTO_URL_REGISTER_CLIENT_CODE", default=""),
+    "createTicket": config("CONECTO_URL_CREATE_TICKET", default=""),
+    "updateTicket": config("CONECTO_URL_UPDATE_TICKET", default=""),
+    "sendAlert": config("CONECTO_URL_SEND_ALERT", default=""),
+    "registerTown": config("CONECTO_URL_REGISTER_TOWN", default=""),
+    "registerStaffCode": config("CONECTO_URL_REGISTER_STAFF_CODE", default=""),
 }
 
 SIMPLE_JWT = {
@@ -232,6 +305,42 @@ SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", default=False, cast=bool)
 # exactly where you most want to run it before trusting a deploy.
 if "test" in sys.argv:
     SECURE_SSL_REDIRECT = False
+    # And never reach the real Conecto. Run on the production box, the
+    # suite inherited .env's CONECTO_API_KEY, and every test that made a
+    # staff user, a customer or a ticket pushed it to Conecto's live app --
+    # admin codes like STF-001080 with no name, CUS-000001 tickets (Conecto,
+    # 7 Oct 2026). Tests that exercise the integration set their own key and
+    # fake URLs with override_settings.
+    CONECTO_API_KEY = ""
+    CONECTO_WEBHOOK_TOKEN = ""
+    CONECTO_URLS = {key: "" for key in CONECTO_URLS}
+
+# The container healthcheck is the one caller that cannot speak HTTPS.
+#
+# It runs INSIDE the backend container -- `curl -fsS
+# http://localhost:8000/api/health/` -- so it never passes through the
+# host nginx that terminates TLS, and therefore never carries the
+# X-Forwarded-Proto header SECURE_PROXY_SSL_HEADER looks for. With
+# SECURE_SSL_REDIRECT=True (which the VPS .env sets, correctly)
+# SecurityMiddleware answers it with a 301 to the https:// URL before the
+# view runs.
+#
+# That does not fail the healthcheck, which is what makes it worth a
+# comment: `curl -f` fails on 4xx/5xx only, so a 301 exits 0 and the
+# container is reported healthy. What is lost is everything the check was
+# for -- /api/health/ opens a database cursor and answers 503 if it
+# cannot, and none of that ever runs. A backend that is listening but
+# cannot see Postgres reads as healthy, the frontend's
+# `condition: service_healthy` gate opens on it, and the deploy looks
+# clean while every page 500s.
+#
+# Exempting the path restores the real check. It is safe to serve over
+# plain HTTP: the response is {"status": "ok"} and nothing else, and the
+# port is published on 127.0.0.1 only, so nothing off the box can reach
+# it. The pattern is anchored, so it exempts this one path and not, say,
+# /api/health/../customers/.
+SECURE_REDIRECT_EXEMPT = [r"^api/health/$"]
+
 SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool)
 CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
 if config("BEHIND_HTTPS_PROXY", default=False, cast=bool):
@@ -257,5 +366,48 @@ EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
 DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="Skybre <no-reply@skybre.co.za>")
 COMPANY_NAME = config("COMPANY_NAME", default="Skybre")
 # Base URL for links inside emails (e.g. the customer portal login link
-# in the welcome email) — set to the real public site once DNS/HTTPS is live.
+# in the welcome email). Conecto's PDF links use CONECTO_PUBLIC_BASE_URL below.
 SITE_URL = config("SITE_URL", default="https://skybre.co.za")
+# FNB Integration Channel redirect URL (#185). Blank = this portal's own
+# address + /bank-feeds/fnb-callback, as opened in the browser. Set it only
+# if FNB was given a different exact URL.
+FNB_REDIRECT_URI = config("FNB_REDIRECT_URI", default="")
+# Where the invoice/statement PDF links handed to Conecto point. The public
+# document view lives on the portal host; skybre.co.za is the marketing
+# site and 404s the same path (Conecto, 7 Oct 2026). Host's own figures for
+# the Dashboard's System status card: see SYSTEM_* below.
+CONECTO_PUBLIC_BASE_URL = config("CONECTO_PUBLIC_BASE_URL", default="https://portal.skybre.co.za")
+
+# --- UISP (Ubiquiti network management), read-only (14 Oct 2026) ---------
+# Network (UISP) page and Dashboard tiles. UISP_URL like https://102.23.151.230
+# (no /nms); UISP_TOKEN is the read-only API token of UISP's "Vexar" user.
+# UISP on a bare IP has a self-signed certificate, so TLS verification is
+# off unless UISP_VERIFY_TLS=true. Empty URL/token = the page says
+# "not connected".
+UISP_URL = config("UISP_URL", default="").rstrip("/")
+UISP_TOKEN = config("UISP_TOKEN", default="")
+UISP_VERIFY_TLS = config("UISP_VERIFY_TLS", default=False, cast=bool)
+
+# --- Mapbox satellite on Networking -> Map (#180) -----------------------------
+# A PUBLIC token (pk....): it is sent to the browser. Restrict it in the
+# Mapbox account to https://portal.skybre.co.za. Empty = no Satellite switch.
+MAPBOX_TOKEN = config("MAPBOX_TOKEN", default="")
+
+# --- Webfleet (vehicle tracking), read-only (#186, 16 Oct 2026) ---------------
+# WEBFLEET.connect: a Webfleet user with the WEBFLEET.connect interface right,
+# the account name, and an API key (Webfleet support -> Integration -> API key
+# request). All four blank = no Webfleet anywhere in Vexar.
+WEBFLEET_ACCOUNT = config("WEBFLEET_ACCOUNT", default="")
+WEBFLEET_USERNAME = config("WEBFLEET_USERNAME", default="")
+WEBFLEET_PASSWORD = config("WEBFLEET_PASSWORD", default="")
+WEBFLEET_API_KEY = config("WEBFLEET_API_KEY", default="")
+
+# --- Dashboard "System status" card (7 Oct 2026) ---------------------------
+# Where the host's backups can be seen from inside the backend container
+# (mount them read-only in docker-compose). The newest dump in
+# SYSTEM_BACKUP_DIR is "Last database backup"; SYSTEM_REMOTE_BACKUP_STAMP is a
+# file the backup script touches after a good off-site copy. Missing = the
+# card says "not connected yet". See config/system_status.py.
+SYSTEM_BACKUP_DIR = config("SYSTEM_BACKUP_DIR", default="/backups")
+SYSTEM_REMOTE_BACKUP_STAMP = config("SYSTEM_REMOTE_BACKUP_STAMP", default="/backups/.remote-backup-ok")
+SYSTEM_DISK_PATH = config("SYSTEM_DISK_PATH", default="/")

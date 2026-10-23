@@ -1,0 +1,1731 @@
+from decimal import Decimal
+
+from django.db import transaction
+from django.db.models import Count, Q, Sum
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from rest_framework import viewsets, permissions, status
+from rest_framework.decorators import action
+from rest_framework.exceptions import MethodNotAllowed, PermissionDenied, ValidationError
+from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
+
+from .models import (
+    Tariff, Service, Invoice, Payment, CreditRequest, InvoiceDeletionRequest,
+    SuspensionExtensionRequest,
+    PaymentMethod, BillingDefaults, ReminderSettings, SuspensionSettings, CustomerBillingConfig,
+    RecurringBillingRun, RecurringCharge, CustomerRecurringCharge,
+)
+from .serializers import (
+    TariffSerializer, ServiceSerializer, InvoiceSerializer,
+    InvoiceCreateSerializer, PaymentSerializer, CreditRequestSerializer,
+    InvoiceDeletionRequestSerializer, SuspensionExtensionRequestSerializer,
+    PaymentMethodSerializer, BillingDefaultsSerializer, ReminderSettingsSerializer,
+    SuspensionSettingsSerializer, CustomerBillingConfigSerializer, RecurringBillingRunSerializer,
+    RecurringChargeSerializer, CustomerRecurringChargeSerializer,
+)
+from accounts.permissions import (
+    IsAccounts, IsAccountsOrManagement, IsAdmin, IsManagement, IsStaffMember, section_permission,
+)
+from config.csv_import import CSVImportMixin
+from network import mikrotik
+from .filters import InvoiceFilter
+from .models import PaymentTermsMixin
+from .recurring import blocking_candidate_services
+
+HasServicesAccess = section_permission("services")
+HasFinanceAccess = section_permission("finance")
+HasConfigsAccess = section_permission("configs")
+
+
+class TariffViewSet(CSVImportMixin, viewsets.ModelViewSet):
+    serializer_class = TariffSerializer
+    # Counted in SQL rather than per row: the tariff list shows how many
+    # services each plan carries, and doing that with .services.count() would
+    # be one extra query per tariff.
+    # order_by is explicit because annotate() drops the model's Meta ordering,
+    # and an unordered queryset makes pagination non-deterministic.
+    queryset = Tariff.objects.annotate(
+        service_count=Count("services", distinct=True),
+        active_service_count=Count(
+            "services", filter=Q(services__status=Service.Status.ACTIVE), distinct=True
+        ),
+    ).order_by("name")
+    filterset_fields = ["service_type", "is_active", "partner"]
+    search_fields = ["name"]
+    ordering_fields = [
+        "name", "service_type", "price", "billing_period",
+        "speed_download_kbps", "tax_rate_pct", "is_active", "created_at",
+    ]
+
+    def get_queryset(self):
+        """?for_customer=<id> narrows the list to plans that customer may
+        actually be put on.
+
+        The rule lives on the model (Tariff.available_to) and is applied
+        here as its queryset equivalent, so the dropdown offers exactly
+        what ServiceSerializer will accept. Expressed as a filter rather
+        than by calling available_to() per row because this feeds a
+        dropdown on a page with hundreds of tariffs.
+
+        A tariff with NO partner is included for everyone, and a customer
+        with NO partner sees everything -- "empty means unrestricted", the
+        same convention as allowed_partners and visible_partners.
+
+        An unknown customer id is ignored rather than returning nothing:
+        the alternative is an empty dropdown with no explanation, and the
+        serializer still refuses anything genuinely mismatched.
+        """
+        qs = super().get_queryset()
+        for_customer = self.request.query_params.get("for_customer")
+        if not for_customer:
+            return qs
+        from customers.models import Customer
+
+        row = (
+            Customer.objects.filter(pk=for_customer)
+            .values_list("partner_id", "pending_partner_id")
+            .first()
+        )
+        partner_id, pending_partner_id = row if row else (None, None)
+        if partner_id is None:
+            # Either no such customer, or a direct customer with no partner.
+            # Both mean "do not narrow".
+            return qs
+        allowed = Q(partner_id=partner_id) | Q(partner__isnull=True)
+        if pending_partner_id:
+            # Booked to move partner (package #20): that partner's plans too,
+            # for a service or plan change starting on/after the move --
+            # ServiceSerializer enforces the date.
+            allowed |= Q(partner_id=pending_partner_id)
+        return qs.filter(allowed)
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a tariff, but only when nothing depends on it.
+
+        Service.tariff is PROTECT, so without this the delete surfaces as a
+        raw ProtectedError -- a 500, with no indication of which customers are
+        in the way. And Service.pending_tariff is SET_NULL, which is worse
+        than an error: deleting a tariff somebody has a change booked onto
+        would silently null the tariff and leave the DATE behind, producing
+        exactly the half-a-booking state the serializer refuses to let staff
+        create.
+
+        Deactivating is usually what's wanted anyway -- it takes the plan off
+        the new-service dropdown while leaving every invoice that references
+        it intact -- so the refusal says so.
+        """
+        tariff = self.get_object()
+
+        in_use = tariff.services.count()
+        booked = tariff.pending_services.count()
+        if in_use or booked:
+            parts = []
+            if in_use:
+                parts.append(f"{in_use} service{'s are' if in_use != 1 else ' is'} on it")
+            if booked:
+                parts.append(f"{booked} service{'s have' if booked != 1 else ' has'} a change booked onto it")
+            return Response(
+                {
+                    "detail": (
+                        f"Can't delete '{tariff.name}' — {' and '.join(parts)}. "
+                        "Move those services to another plan first, or untick Active to take it "
+                        "off the new-service list while leaving existing services and invoices alone."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    import_model = Tariff
+    import_fields = {
+        "name": {"required": True},
+        "service_type": {
+            "default": Tariff.ServiceType.INTERNET,
+            "choices": Tariff.ServiceType.values,
+        },
+        "price": {"required": True, "type": "decimal"},
+        "billing_period": {
+            "default": Tariff.BillingPeriod.MONTHLY,
+            "choices": Tariff.BillingPeriod.values,
+        },
+        "speed_download_kbps": {"type": "int", "default": None},
+        "speed_upload_kbps": {"type": "int", "default": None},
+        "data_cap_gb": {"type": "int", "default": None},
+        "tax_rate_pct": {"type": "decimal", "default": Decimal("0")},
+        "is_active": {"type": "bool", "default": True},
+        "description": {"default": ""},
+    }
+
+    def get_permissions(self):
+        # list/retrieve stay open to any staff member regardless of
+        # Configs access -- Finance and Services both need to browse
+        # tariffs to build invoice/quote line items and service plans.
+        # Only actually creating/editing/deleting/importing tariffs
+        # requires the Configs section itself.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasConfigsAccess()]
+
+
+class RecurringChargeViewSet(viewsets.ModelViewSet):
+    """The catalog of standard recurring add-ons (IP Rental, Domain Rental,
+    etc) staff can opt a service onto -- lives on its own tab of the
+    Tariffs page (Rudolph, 30 Sep), same section/permission shape as
+    Tariffs itself since it is the same kind of decision: what gets
+    charged, and how much.
+    """
+
+    serializer_class = RecurringChargeSerializer
+    queryset = RecurringCharge.objects.annotate(
+        client_count=Count("customer_links__customer", distinct=True)
+    ).order_by("name")
+    filterset_fields = ["is_active", "partner"]
+    search_fields = ["name"]
+    ordering_fields = ["name", "price", "is_active", "created_at"]
+
+    def get_queryset(self):
+        """?for_customer=<id> narrows the list to charges that customer may
+        actually be opted onto -- same reasoning, and the same query
+        shape, as TariffViewSet.get_queryset above: the picker offers
+        exactly what ServiceSerializer will accept."""
+        qs = super().get_queryset()
+        for_customer = self.request.query_params.get("for_customer")
+        if not for_customer:
+            return qs
+        from customers.models import Customer
+
+        row = Customer.objects.filter(pk=for_customer).values_list("partner_id", "pending_partner_id").first()
+        partner_id, pending_partner_id = row if row else (None, None)
+        if partner_id is None:
+            return qs
+        allowed = Q(partner_id=partner_id) | Q(partner__isnull=True)
+        if pending_partner_id:
+            allowed |= Q(partner_id=pending_partner_id)
+        return qs.filter(allowed)
+
+    def destroy(self, request, *args, **kwargs):
+        """Refuse to delete a charge any client still carries (current or
+        ended -- their history points at it) -- same reasoning as
+        TariffViewSet.destroy. Untick Active to take it off the picker
+        instead."""
+        charge = self.get_object()
+        in_use = charge.customer_links.values("customer").distinct().count()
+        if in_use:
+            return Response(
+                {
+                    "detail": (
+                        f"Can't delete '{charge.name}' — {in_use} client{'s have' if in_use != 1 else ' has'} "
+                        "it. Remove it from those clients first, or untick Active to take it "
+                        "off the list without touching who's already carrying it."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    def get_permissions(self):
+        # Same split as TariffViewSet: browsing (the Service edit picker,
+        # for any staff editing a service) stays open; only managing the
+        # catalog itself requires Configs.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasConfigsAccess()]
+
+
+class ScopedByCustomerMixin:
+    """Customers see only their own records; staff see only the partners
+    they are allowed to.
+
+    The partner half used to be missing here, and only here. Every other
+    app applies it -- customers, sales, network, radiusauth, audit,
+    bankfeeds, and UpcomingBlocksView further down this very file, whose
+    docstring spells out that a reseller-scoped staff member "must not
+    learn the names of customers outside their partners".
+
+    So a staff member restricted to one reseller correctly saw only that
+    reseller's customers on the Customers page, and then every partner's
+    invoices, payments and services on the Finance page -- with customer
+    names and totals, and, because get_object() uses the same queryset, a
+    working PATCH and DELETE on a competitor's invoices.
+
+    `customer_path` is the lookup from `model` to customers.Customer, so
+    the same rule can be expressed for a model related to a customer
+    directly or through another hop.
+    """
+
+    def get_base_queryset(self, model, related_name="customer", customer_path=None):
+        from customers.views import scope_customers_to_user
+        from customers.models import Customer
+
+        user = self.request.user
+        qs = model.objects.all()
+        if user.is_staff_member:
+            allowed = getattr(user, "allowed_partners", None) or []
+            if not allowed or user.role == user.Role.ADMIN:
+                return qs
+            visible = scope_customers_to_user(Customer.objects.all(), user)
+            return qs.filter(**{f"{customer_path or related_name}__in": visible})
+        customer_profile = getattr(user, "customer_profile", None)
+        if customer_profile is None:
+            return qs.none()
+        return qs.filter(**{related_name: customer_profile})
+
+
+class CustomerRecurringChargeViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
+    """A client's own recurring charges (domain, email, hosting, IP
+    rental) -- GET/POST /customer-recurring-charges/?customer=<id>. Same
+    partner scoping and same staff permission as services."""
+
+    serializer_class = CustomerRecurringChargeSerializer
+    filterset_fields = ["customer", "charge"]
+
+    def get_queryset(self):
+        return self.get_base_queryset(CustomerRecurringCharge).select_related("charge", "customer")
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), HasServicesAccess()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasServicesAccess()]
+
+
+class ServiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
+    serializer_class = ServiceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filterset_fields = ["status", "customer"]
+    # DRF's OrderingFilter only accepts real queryset lookups as values for
+    # ?ordering= (a (field, label) tuple's second item is just a display
+    # label, NOT an alias) — so these are Django's actual related-field
+    # lookup paths, and the frontend must send exactly these strings.
+    ordering_fields = [
+        "customer__full_name",
+        "tariff__name",
+        "tariff__price",
+        "status",
+        "start_date",
+        "end_date",
+        "created_at",
+    ]
+
+    def get_queryset(self):
+        from django.db.models import Prefetch
+
+        from radiusauth.models import RadiusAction
+
+        return (
+            self.get_base_queryset(Service)
+            .select_related("tariff", "customer")
+            # Only the newest enforcement attempt is shown per service, but a
+            # Prefetch queryset can't be sliced, so the ordering is set here
+            # and the serializer takes the first. Without this it is one query
+            # per service on a page whose whole job is listing them.
+            .prefetch_related(
+                Prefetch(
+                    "radius_actions",
+                    queryset=RadiusAction.objects.order_by("-created_at"),
+                    to_attr="recent_radius_actions",
+                )
+            )
+        )
+
+    def get_permissions(self):
+        # HasServicesAccess passes straight through for customers (section
+        # restrictions are staff-only) so this only narrows list/retrieve
+        # for staff who lack the Services section, without touching what
+        # customers can see of their own services in the portal.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), HasServicesAccess()]
+        if self.action == "live_bandwidth":
+            return [permissions.IsAuthenticated(), HasServicesAccess()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasServicesAccess()]
+
+    @action(detail=True, methods=["get"], url_path="live-bandwidth")
+    def live_bandwidth(self, request, pk=None):
+        """Live download/upload speed for this one service, read from its
+        managed Simple Queue on its device (see network.mikrotik's
+        get_service_live_bandwidth). Meant to be polled by a customer's
+        Service/Customer detail page ONLY while a staff member actually has
+        it open -- the frontend is responsible for stopping the polling
+        interval on unmount so this stops being called the moment nobody's
+        watching. A per-device lock (network.mikrotik.get_device_lock)
+        makes sure concurrent polls for the same device's customers queue
+        onto one RouterOS connection at a time rather than each opening
+        their own."""
+        service = self.get_object()
+        if not service.device_id:
+            return Response({"detail": "This service isn't assigned to a router."}, status=400)
+        device = service.device
+        if not device.api_enabled:
+            return Response({"detail": "This service's router doesn't have the Mikrotik API enabled."}, status=400)
+
+        lock = mikrotik.get_device_lock(device.id)
+        with lock:
+            try:
+                result = mikrotik.get_service_live_bandwidth(device, service.id)
+            except mikrotik.MikrotikError as exc:
+                return Response({"detail": str(exc)}, status=502)
+
+        if result is None:
+            return Response(
+                {"detail": "No live queue found for this service yet -- enable Shaper on its router and sync shaper queues."},
+                status=404,
+            )
+        return Response(result)
+
+
+class InvoiceViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    filterset_class = InvoiceFilter
+    ordering_fields = [
+        "number",
+        "customer__full_name",
+        "status",
+        "date_created",
+        "date_due",
+        "subtotal",
+        "tax_total",
+        "total",
+        "paid_amount",
+    ]
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return InvoiceCreateSerializer
+        return InvoiceSerializer
+
+    def get_queryset(self):
+        return self.get_base_queryset(Invoice).prefetch_related("items").select_related("customer")
+
+    def get_permissions(self):
+        # HasFinanceAccess passes straight through for customers (section
+        # restrictions are staff-only) so this only narrows list/retrieve
+        # for staff who lack the Finance section, without touching what
+        # customers can see of their own invoices in the portal.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+
+    # --- Export what is on screen ----------------------------------------
+    #
+    # Runs the SAME filter_queryset the list does, so the file contains
+    # exactly what the page is showing -- every matching document, not the
+    # hundred currently rendered. An export that quietly disagrees with the
+    # screen above it is worse than no export, because nobody re-checks a
+    # spreadsheet against the UI.
+    #
+    # Server-side rather than built in the browser for the same reason:
+    # once two years of history is imported for the whole book, the browser
+    # only ever holds one page of it.
+    #
+    # Amounts are written as plain numbers, no "R" and no thousands
+    # separator, because this is going into a spreadsheet to be worked on.
+    # Excl/VAT/Incl are all three present: `total` is the VAT-INCLUSIVE
+    # figure and the one most people want, with the split beside it for
+    # whoever is doing the VAT return.
+    @action(detail=False, methods=["get"], url_path="export-csv")
+    def export_csv(self, request):
+        import csv as _csv
+        from django.http import StreamingHttpResponse
+
+        queryset = self.filter_queryset(self.get_queryset()).order_by(
+            request.query_params.get("ordering") or "-date_created"
+        )
+
+        class _Echo:
+            """Write-only file-like, so rows stream instead of being built
+            into one string in memory."""
+
+            def write(self, value):
+                return value
+
+        writer = _csv.writer(_Echo())
+        columns = [
+            "Number", "Customer", "Reference", "Document date", "Due date", "Status",
+            "Excl VAT", "VAT", "Incl VAT", "Paid", "Balance",
+        ]
+
+        def rows():
+            yield writer.writerow(columns)
+            for invoice in queryset.iterator(chunk_size=500):
+                balance = (invoice.total or 0) - (invoice.paid_amount or 0)
+                yield writer.writerow([
+                    invoice.number,
+                    invoice.customer.full_name if invoice.customer_id else "",
+                    invoice.customer.customer_id if invoice.customer_id else "",
+                    invoice.date_issued or invoice.date_created or "",
+                    invoice.date_due or "",
+                    invoice.get_status_display(),
+                    invoice.subtotal,
+                    invoice.tax_total,
+                    invoice.total,
+                    invoice.paid_amount,
+                    balance,
+                ])
+
+        stamp = timezone.localdate().isoformat()
+        response = StreamingHttpResponse(rows(), content_type="text/csv")
+        response["Content-Disposition"] = f'attachment; filename="invoices_{stamp}.csv"'
+        return response
+
+    @action(detail=True, methods=["post"], url_path="convert-to-proforma")
+    def convert_to_proforma(self, request, pk=None):
+        """Quote -> Pro Forma. One-directional -- see Invoice.convert_to_proforma()."""
+        invoice = self.get_object()
+        try:
+            invoice.convert_to_proforma()
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(InvoiceSerializer(invoice, context=self.get_serializer_context()).data)
+
+    @action(detail=True, methods=["post"], url_path="convert-to-invoice")
+    def convert_to_invoice(self, request, pk=None):
+        """Quote -> Invoice or Pro Forma -> Invoice -- see Invoice.convert_to_invoice()."""
+        invoice = self.get_object()
+        try:
+            invoice.convert_to_invoice()
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(InvoiceSerializer(invoice, context=self.get_serializer_context()).data)
+
+    def destroy(self, request, *args, **kwargs):
+        # Quotes and pro forma invoices need Management approval to delete
+        # -- same trust tier as deleting a Customer. The only path is
+        # InvoiceDeletionRequestViewSet.approve, which only Management/
+        # Admin can call. See that viewset below. Real invoices
+        # (draft/unpaid/paid/overdue/cancelled) are untouched by this --
+        # still directly deletable by staff with Finance access, same as
+        # before this feature.
+        instance = self.get_object()
+        if instance.status in Invoice.PRE_INVOICE_STATUSES:
+            raise MethodNotAllowed(
+                "DELETE",
+                detail=(
+                    "Quotes and pro forma invoices can't be deleted directly -- submit a deletion request "
+                    "(POST /invoice-deletion-requests/) for Management to approve."
+                ),
+            )
+        # An invoice with money against it cannot be deleted. Payment.invoice
+        # is SET_NULL, so the payment rows survive the delete with their
+        # credit still applied to the balance -- while releasing the
+        # invoice's debit removes the other side of it. The customer is
+        # left in credit by whatever they paid, with no invoice on file to
+        # explain it: exactly the phantom-credit state this whole change
+        # set out to eliminate, and it flips
+        # blocking_candidate_services' `balance <= minimum_balance` test
+        # so the line can never be suspended again.
+        #
+        # Refusing is deliberate rather than unwinding the payments
+        # automatically. Whether that money is a refund owed, a credit to
+        # carry, or a capture against the wrong invoice is a finance
+        # decision, and reversing a real receipt silently is not this
+        # endpoint's call to make. Payments are now reversible on their
+        # own (see Payment.reverse_ledger_effect), so the route is:
+        # reverse the payments, then delete.
+        paid = instance.payments.count()
+        if paid:
+            total_paid = instance.payments.aggregate(total=Sum("amount"))["total"] or 0
+            raise ValidationError({
+                "detail": (
+                    f"{instance.number} has {paid} payment{'s' if paid != 1 else ''} against it "
+                    f"totalling {total_paid}. Deleting it would leave that money on the customer's "
+                    "account as credit with no invoice to explain it. Reverse the payment"
+                    f"{'s' if paid != 1 else ''} on the Finance page first, then delete the invoice."
+                )
+            })
+
+        # Take the invoice's debit back off the customer's balance before
+        # the row goes. Deleting an invoice used to leave the debit behind
+        # with nothing left to explain it, so the customer was chased for
+        # -- and eventually suspended over -- money no invoice claimed.
+        # One transaction, so the balance and the row move together.
+        with transaction.atomic():
+            instance.release_balance_debit()
+            return super().destroy(request, *args, **kwargs)
+
+
+class InvoiceDeletionRequestViewSet(viewsets.ModelViewSet):
+    """The only path by which a Quote or Pro Forma Invoice actually gets
+    deleted -- see InvoiceViewSet.destroy above. Any staff member with
+    Finance access can submit one; only Management (or Admin) can approve
+    or reject it. Mirrors customers.CustomerDeletionRequestViewSet."""
+
+    serializer_class = InvoiceDeletionRequestSerializer
+    filterset_fields = ["invoice", "status"]
+
+    def get_queryset(self):
+        # Scoped through the invoice to its customer, the same rule
+        # ScopedByCustomerMixin applies to the invoices themselves. This
+        # was a flat .all(): the requests carry the invoice number, the
+        # customer's name and the requester's reason, so a
+        # reseller-restricted Management account could read another
+        # partner's pending deletions -- and, since approve()/reject()
+        # resolve through get_object() on this same queryset, approve the
+        # destruction of a competitor's quote. The invoices themselves
+        # were already scoped, so this was the one way round it.
+        #
+        # allow_null=False: a request whose invoice has gone (the FK is
+        # nullable, and approve() handles that case) has no customer to
+        # scope by, so a restricted user should not see it.
+        from customers.scoping import scope_by_customer
+
+        return scope_by_customer(
+            InvoiceDeletionRequest.objects.select_related(
+                "invoice", "invoice__customer", "requested_by", "decided_by"
+            ).all(),
+            self.request.user,
+            path="invoice__customer",
+            allow_null=False,
+        )
+
+    def get_permissions(self):
+        if self.action in ("approve", "reject"):
+            return [permissions.IsAuthenticated(), IsManagement(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+
+    def perform_create(self, serializer):
+        serializer.save(requested_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        # "Withdrawing" your own still-pending request -- once decided,
+        # it's a permanent record (same convention as CustomerDeletionRequest).
+        user = self.request.user
+        if instance.status != InvoiceDeletionRequest.Status.PENDING and user.role not in (
+            user.Role.MANAGEMENT, user.Role.ADMIN,
+        ):
+            raise MethodNotAllowed(
+                "DELETE", detail="This request has already been decided and can no longer be withdrawn."
+            )
+        instance.delete()
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        deletion_request = self.get_object()
+        if deletion_request.status != InvoiceDeletionRequest.Status.PENDING:
+            return Response({"detail": "This request has already been decided."}, status=400)
+        invoice = deletion_request.invoice
+        if invoice is None:
+            return Response({"detail": "This quote/pro forma invoice no longer exists."}, status=400)
+
+        deletion_request.status = InvoiceDeletionRequest.Status.APPROVED
+        deletion_request.decided_by = request.user
+        deletion_request.decided_at = timezone.now()
+        deletion_request.save(update_fields=["status", "decided_by", "decided_at"])
+
+        # A quote/pro forma carries no balance debit, so this is a no-op
+        # today -- called anyway so the invariant "nothing is deleted
+        # without releasing its debit" holds at every delete site rather
+        # than depending on which statuses reach this one.
+        invoice.release_balance_debit()
+        invoice.delete()
+
+        return Response(InvoiceDeletionRequestSerializer(deletion_request).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        deletion_request = self.get_object()
+        if deletion_request.status != InvoiceDeletionRequest.Status.PENDING:
+            return Response({"detail": "This request has already been decided."}, status=400)
+        deletion_request.status = InvoiceDeletionRequest.Status.REJECTED
+        deletion_request.decision_note = request.data.get("decision_note", "")
+        deletion_request.decided_by = request.user
+        deletion_request.decided_at = timezone.now()
+        deletion_request.save(update_fields=["status", "decision_note", "decided_by", "decided_at"])
+        return Response(InvoiceDeletionRequestSerializer(deletion_request).data)
+
+
+class SuspensionExtensionRequestViewSet(viewsets.ModelViewSet):
+    """A request to pause suspension and the reminder/warning chasers for
+    a customer until a given date -- same trust tier as CreditRequest and
+    InvoiceDeletionRequest: any staff member with Finance access can
+    submit one, only Management (or Admin) can approve or reject it.
+    Approving writes CustomerBillingConfig.suspension_extended_until,
+    which billing.recurring checks in three places -- see that module."""
+
+    serializer_class = SuspensionExtensionRequestSerializer
+    filterset_fields = ["customer", "status"]
+
+    def get_queryset(self):
+        from customers.models import Customer
+        from customers.views import scope_customers_to_user
+
+        qs = SuspensionExtensionRequest.objects.select_related("customer", "requested_by", "decided_by").all()
+        user = self.request.user
+        allowed = getattr(user, "allowed_partners", None) or []
+        if not allowed or user.role == user.Role.ADMIN:
+            return qs
+        return qs.filter(customer__in=scope_customers_to_user(Customer.objects.all(), user))
+
+    def get_permissions(self):
+        if self.action in ("approve", "reject"):
+            return [permissions.IsAuthenticated(), IsManagement(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+
+    def perform_create(self, serializer):
+        serializer.save(requested_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        # "Withdrawing" your own still-pending request -- once decided,
+        # it's a permanent record (same convention as InvoiceDeletionRequest).
+        user = self.request.user
+        if instance.status != SuspensionExtensionRequest.Status.PENDING and user.role not in (
+            user.Role.MANAGEMENT, user.Role.ADMIN,
+        ):
+            raise MethodNotAllowed(
+                "DELETE", detail="This request has already been decided and can no longer be withdrawn."
+            )
+        instance.delete()
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Locked and re-read inside the transaction, same double-click
+        guard as CreditRequest.approve -- two Approve clicks on the same
+        request must write the config once, not twice."""
+        with transaction.atomic():
+            ext = SuspensionExtensionRequest.objects.select_for_update().get(pk=self.get_object().pk)
+            if ext.status != SuspensionExtensionRequest.Status.PENDING:
+                return Response({"detail": "This request has already been decided."}, status=400)
+
+            config = CustomerBillingConfig.for_customer(ext.customer)
+            config.suspension_extended_until = ext.extend_until
+            config.save(update_fields=["suspension_extended_until"])
+
+            ext.status = SuspensionExtensionRequest.Status.APPROVED
+            ext.decided_by = request.user
+            ext.decided_at = timezone.now()
+            ext.save(update_fields=["status", "decided_by", "decided_at"])
+
+        ext.refresh_from_db()
+        return Response(SuspensionExtensionRequestSerializer(ext).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        ext = self.get_object()
+        if ext.status != SuspensionExtensionRequest.Status.PENDING:
+            return Response({"detail": "This request has already been decided."}, status=400)
+        ext.status = SuspensionExtensionRequest.Status.REJECTED
+        ext.decision_note = request.data.get("decision_note", "")
+        ext.decided_by = request.user
+        ext.decided_at = timezone.now()
+        ext.save(update_fields=["status", "decision_note", "decided_by", "decided_at"])
+        return Response(SuspensionExtensionRequestSerializer(ext).data)
+
+
+class PaymentMethodViewSet(viewsets.ModelViewSet):
+    """Config-managed lookup of payment conventions (see PaymentMethod's
+    docstring) -- any staff with Finance access can view them (needed for
+    the billing-config dropdowns), but only Admin can add/edit/remove one,
+    same trust tier as Email/OVPN settings."""
+
+    serializer_class = PaymentMethodSerializer
+    queryset = PaymentMethod.objects.all()
+    filterset_fields = ["is_active"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsAdmin(), HasFinanceAccess()]
+
+    @action(detail=True, methods=["post"], url_path="apply-to-existing")
+    def apply_to_existing(self, request, pk=None):
+        """Copy this method's terms onto every customer already on it.
+
+        POST {"commit": false} previews; {"commit": true} writes.
+
+        The preview exists because this endpoint can suspend people.
+        Shortening blocking_period_days and applying it doesn't fail or
+        warn -- it just means the next billing run, which is minutes away,
+        finds customers who are now past their (new, shorter) grace period
+        and cuts them off. "340 customers updated" tells you nothing about
+        that. So both passes run the real
+        recurring.blocking_candidate_services against each customer,
+        before and after the new terms, and report who crosses from safe
+        to blocked.
+
+        The preview pass mutates each config in memory and never saves it,
+        so a preview cannot write anything even if it raises partway.
+        """
+        method = self.get_object()
+        commit = bool(request.data.get("commit"))
+        run_date = timezone.localdate()
+
+        configs = (
+            CustomerBillingConfig.objects
+            .filter(payment_method=method)
+            .select_related("customer")
+        )
+
+        affected, newly_blocked = 0, []
+        for config in configs:
+            customer = config.customer
+            was_blocked = bool(blocking_candidate_services(customer, config, run_date))
+
+            for field in PaymentTermsMixin.TERMS_FIELDS:
+                setattr(config, field, getattr(method, field))
+
+            now_blocked = blocking_candidate_services(customer, config, run_date)
+            affected += 1
+            if now_blocked and not was_blocked:
+                newly_blocked.append({
+                    "customer_id": customer.pk,
+                    "customer": customer.full_name,
+                    "reference": customer.customer_id,
+                    "services": len(now_blocked),
+                })
+
+            if commit:
+                config.save()
+
+        return Response({
+            "committed": commit,
+            "customers": affected,
+            "newly_blocked": newly_blocked,
+            # blocking_candidate_services deliberately ignores the global
+            # master switch, so say plainly whether any of this would
+            # actually happen. "12 customers would be blocked" reads very
+            # differently when auto-suspension is switched off entirely.
+            "auto_suspend_enabled": SuspensionSettings.load().auto_suspend_enabled,
+        })
+
+
+class BillingDefaultsView(APIView):
+    """Admin-only: the org-wide recurring-billing template, edited from
+    Configs -> Billing Defaults. GET/PATCH against the singleton row (see
+    BillingDefaults.load()) -- same convention as EmailSettingsView/
+    OvpnSettingsView. See apply_to_existing below for the bulk-copy action."""
+
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        return Response(BillingDefaultsSerializer(BillingDefaults.load(), context={"request": request}).data)
+
+    def patch(self, request):
+        serializer = BillingDefaultsSerializer(
+            BillingDefaults.load(), data=request.data, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class PublicPaymentDetailsView(APIView):
+    """Who to pay, and how. No login -- and that is the whole point.
+
+    This feeds the /suspension page. A suspended PPPoE customer is inside
+    the walled garden: DNS plus the portal host, nothing else. They have
+    no session, and cannot get one, because "your account is unpaid" is
+    not a state you can authenticate your way out of. So the page that
+    tells them where to pay has to be readable with no credential at all.
+
+    WHAT IT RETURNS IS A CLOSED LIST, written out field by field rather
+    than through a serializer over BillingDefaults. That model is a
+    singleton holding both the company's payment details AND the
+    platform's billing behaviour -- blocking_period_days,
+    minimum_balance, payment_due_days, the SARS VAT registration. A
+    ModelSerializer here, or a `fields = "__all__"`, would publish the
+    thresholds at which Skybre cuts customers off to anyone who typed the
+    URL. Adding a field to BillingDefaults must not silently add it here,
+    so the keys are enumerated and a test asserts the set.
+
+    The bank account number IS published by this. That is a deliberate
+    call: it is already printed on every invoice and statement the
+    platform emails, and a payment page that hides the account number
+    would have no reason to exist. If that trade stops being acceptable,
+    clearing the banking fields in Configs -> Billing Defaults makes this
+    return blanks and the page degrades to "contact accounts".
+
+    Throttled by scope rather than left open: it is a cheap endpoint but
+    an unauthenticated one, and there is no reason for a single client to
+    fetch the same three constants more than a few times a minute.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "public_payment_details"
+
+    def get(self, request):
+        from notifications.email_settings import get_email_config
+
+        d = BillingDefaults.load()
+        return Response({
+            # The registered name is what appears on the bank's side as
+            # the beneficiary, so it is the one a customer checks against
+            # before releasing a payment. Falls back to the email
+            # settings' brand name so the page is never unbranded.
+            "company_name": d.company_legal_name or get_email_config()["company_name"],
+            "phone": d.company_phone,
+            "email": d.company_email,
+            "bank_name": d.bank_name,
+            "bank_account_number": d.bank_account_number,
+            "bank_branch_code": d.bank_branch_code,
+        })
+
+
+class ApplyBillingDefaultsView(APIView):
+    """"Apply to existing customers" -- copies every SHARED_FIELDS value
+    from BillingDefaults onto every customer who already has a
+    CustomerBillingConfig row. Deliberately never touches billing_enabled
+    (see both models' docstrings) and never creates new config rows for
+    customers who've never touched theirs -- those get seeded from
+    whatever the defaults are at the moment they're first opened, via
+    CustomerBillingConfig.for_customer()."""
+
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def post(self, request):
+        defaults = BillingDefaults.load()
+        updated = 0
+        for config in CustomerBillingConfig.objects.all():
+            config.apply_defaults(defaults)
+            updated += 1
+        return Response({"updated": updated})
+
+
+class ReminderSettingsView(APIView):
+    """Admin-only: global reminder kill-switches, edited from Configs ->
+    Reminders. See ReminderSettings' docstring for why these can't be
+    overridden per customer."""
+
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        return Response(ReminderSettingsSerializer(ReminderSettings.load()).data)
+
+    def patch(self, request):
+        serializer = ReminderSettingsSerializer(ReminderSettings.load(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class SuspensionSettingsView(APIView):
+    """The platform-wide auto-suspension master switch, edited from Configs
+    -> Billing -> Auto-suspension. See SuspensionSettings' docstring for
+    why this can't be overridden per customer. GET is available to any
+    staff with Finance access (so Finance -> Recurring Billing can show
+    whether a Run would actually suspend anyone before staff click Run);
+    only Admin can flip the switch itself, same trust tier as Billing
+    Defaults / Reminder Settings."""
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsAdmin()]
+
+    def get(self, request):
+        return Response(SuspensionSettingsSerializer(SuspensionSettings.load()).data)
+
+    def patch(self, request):
+        serializer = SuspensionSettingsSerializer(SuspensionSettings.load(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class CustomerBillingConfigView(APIView):
+    """Per-customer recurring-billing configuration -- reached from that
+    customer's own detail page. Lazily created (seeded from
+    BillingDefaults) the first time it's fetched, same convention as
+    CustomerBillingConfig.for_customer(). Any staff with Finance access can
+    view/edit it -- not further restricted, same trust tier as editing a
+    customer's Services or Invoices."""
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasFinanceAccess]
+
+    def get_object(self, customer_id):
+        from customers.models import Customer
+        customer = get_object_or_404(Customer, pk=customer_id)
+        return CustomerBillingConfig.for_customer(customer)
+
+    def get(self, request, customer_id):
+        return Response(CustomerBillingConfigSerializer(self.get_object(customer_id)).data)
+
+    def patch(self, request, customer_id):
+        config = self.get_object(customer_id)
+        serializer = CustomerBillingConfigSerializer(config, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class RecurringBillingRunViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only History list for Finance -> Recurring Billing -- rows are
+    only ever created by RecurringBillingViewSet.run below (see
+    billing.recurring.run_recurring_billing)."""
+
+    serializer_class = RecurringBillingRunSerializer
+    queryset = RecurringBillingRun.objects.prefetch_related("partners").select_related("triggered_by").all()
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasFinanceAccess]
+    filterset_fields = ["status"]
+
+
+class RecurringBillingViewSet(viewsets.ViewSet):
+    """Preview/Run actions for the recurring-billing engine -- Finance ->
+    Recurring Billing's Preview/Run buttons. See
+    billing.recurring.run_recurring_billing for the actual logic; this is
+    just the thin HTTP wrapper around it."""
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasFinanceAccess]
+
+    def _parse_args(self, request):
+        from datetime import date as date_cls
+        run_date_str = request.data.get("date")
+        if not run_date_str:
+            raise ValueError("A date is required.")
+        run_date = date_cls.fromisoformat(run_date_str)
+        partner_ids = request.data.get("partners") or []
+        return run_date, [int(p) for p in partner_ids]
+
+    @action(detail=False, methods=["post"])
+    def preview(self, request):
+        """Projects the run, saves it as a reviewable snapshot, and returns
+        the counts plus that snapshot. Writes a BillingPreviewSnapshot row
+        and nothing else -- no invoice, no email, no RecurringBillingRun.
+
+        The engine is also asked for its own counts and any disagreement is
+        reported rather than swallowed: a preview finance cannot trust is
+        worse than no preview, so a mismatch shows up in the UI instead of
+        only in a test.
+        """
+        from .models import BillingPreviewSnapshot
+        from .preview_export import build_csvs, project_run, projection_digest
+        from .recurring import run_recurring_billing
+        from .serializers import BillingPreviewSnapshotSerializer
+
+        try:
+            run_date, partner_ids = self._parse_args(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+
+        projection = project_run(run_date, partner_ids=partner_ids or None)
+        engine_counts = run_recurring_billing(run_date, partner_ids=partner_ids or None, commit=False)["counts"]
+
+        snapshot = BillingPreviewSnapshot.objects.create(
+            run_date=run_date,
+            partner_ids=sorted(partner_ids or []),
+            fingerprint=projection_digest(projection),
+            engine=projection["engine"],
+            counts=projection["counts"],
+            grand_total=projection["grand_total"],
+            sheets=build_csvs(projection),
+            generated_by=request.user if request.user.is_authenticated else None,
+        )
+        body = {
+            "counts": projection["counts"],
+            "snapshot": BillingPreviewSnapshotSerializer(snapshot, context={"request": request}).data,
+        }
+        if engine_counts != projection["counts"]:
+            body["mismatch"] = {"engine": engine_counts, "preview": projection["counts"]}
+        return Response(body)
+
+    @action(detail=False, methods=["get"])
+    def previews(self, request):
+        """Recent snapshots, newest first -- the approval queue.
+
+        This exists because the review is not usually done by whoever
+        clicked Preview: one person generates it, another opens this list,
+        downloads the bundle and approves. Without it, a preview would only
+        be reachable by the browser tab that created it.
+
+        ?date=YYYY-MM-DD narrows to one billing date; ?pending=1 to the ones
+        still waiting on someone.
+        """
+        from .models import BillingPreviewSnapshot
+        from .serializers import BillingPreviewSnapshotSerializer
+
+        queryset = BillingPreviewSnapshot.objects.select_related(
+            "generated_by", "approved_by", "run"
+        ).all()
+        date_str = request.query_params.get("date")
+        if date_str:
+            from datetime import date as date_cls
+            try:
+                queryset = queryset.filter(run_date=date_cls.fromisoformat(date_str))
+            except ValueError:
+                return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
+        if request.query_params.get("pending"):
+            queryset = queryset.filter(approved_at__isnull=True)
+        serializer = BillingPreviewSnapshotSerializer(
+            queryset[:20], many=True, context={"request": request}
+        )
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"])
+    def export(self, request, pk=None):
+        """The reviewed bundle for one snapshot, in whichever of three
+        formats the caller asked for -- ?output=zip (default, the CSV
+        bundle), html (a single printable page, opened inline rather than
+        downloaded, so the frontend can pop it straight into a new tab) or
+        xlsx (a single workbook, one tab per sheet). All three read the
+        exact bytes that were reviewed (see preview_export's module note on
+        why HTML/xlsx are built from the stored CSV text, never a fresh
+        projection).
+
+        The query param is named ?output=, not ?format= -- DRF reserves
+        `format` for its own content-negotiation (a `?format=` it doesn't
+        recognise as a registered renderer, such as html/xlsx, makes DRF
+        itself 404 the request before this view ever runs)."""
+        from django.http import HttpResponse
+        from django.shortcuts import get_object_or_404
+
+        from .models import BillingPreviewSnapshot
+        from .preview_export import (
+            build_html_from_snapshot, build_xlsx_from_snapshot, build_zip_from_snapshot,
+        )
+
+        snapshot = get_object_or_404(BillingPreviewSnapshot, pk=pk)
+        fmt = (request.query_params.get("output") or "zip").lower()
+
+        if fmt == "html":
+            filename, text = build_html_from_snapshot(snapshot)
+            response = HttpResponse(text, content_type="text/html; charset=utf-8")
+            response["Content-Disposition"] = 'inline; filename="%s"' % filename
+            return response
+
+        if fmt == "xlsx":
+            filename, blob = build_xlsx_from_snapshot(snapshot)
+            response = HttpResponse(
+                blob,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            response["Content-Disposition"] = 'attachment; filename="%s"' % filename
+            response["Content-Length"] = str(len(blob))
+            return response
+
+        if fmt != "zip":
+            return Response({"detail": "output must be one of: zip, html, xlsx."}, status=400)
+
+        filename, blob = build_zip_from_snapshot(snapshot)
+        response = HttpResponse(blob, content_type="application/zip")
+        response["Content-Disposition"] = 'attachment; filename="%s"' % filename
+        response["Content-Length"] = str(len(blob))
+        return response
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Signs off one snapshot so Run will accept it.
+
+        Anyone with finance access can approve, including whoever generated
+        it -- a two-person rule would stop a one-person finance team from
+        billing at all. Both names are recorded in the snapshot and in the
+        bundle's manifest, so the trail is there if you later want to
+        require they differ (one condition, in this method).
+        """
+        from django.shortcuts import get_object_or_404
+        from django.utils import timezone as dj_timezone
+
+        from .models import BillingPreviewSnapshot
+        from .serializers import BillingPreviewSnapshotSerializer
+
+        snapshot = get_object_or_404(BillingPreviewSnapshot, pk=pk)
+        if snapshot.is_spent:
+            return Response(
+                {"detail": "This preview has already been used for a billing run."}, status=409
+            )
+        if not snapshot.is_approved:
+            snapshot.approved_at = dj_timezone.now()
+            snapshot.approved_by = request.user if request.user.is_authenticated else None
+            snapshot.save(update_fields=["approved_at", "approved_by"])
+        return Response(BillingPreviewSnapshotSerializer(snapshot, context={"request": request}).data)
+
+    def destroy(self, request, pk=None):
+        """Throw away a preview nobody has approved. DELETE /recurring-billing/<id>/
+
+        The approval queue fills up with attempts -- a wrong date, a partner
+        scope picked by mistake, a re-preview after a tariff was corrected --
+        and every one of them sits there looking like something waiting for a
+        decision. Being able to clear the ones that are not is what keeps the
+        list meaning "these need approving".
+
+        UNAPPROVED ONLY, and that is the whole safety argument. An approved
+        snapshot is a decision somebody signed off; deleting it would let one
+        person silently undo another's approval with nothing anywhere to say
+        it happened. A spent one is the audit trail of a run that really
+        billed customers, which the model's own docstring says is kept
+        deliberately. Both refuse with 409 and say why, rather than 403 --
+        the caller has the right to be here, the object is in the wrong
+        state.
+
+        The row goes for good, including its stored CSV bundle. That is what
+        was asked for, and it is defensible precisely because of the line
+        above: nothing being deleted here was ever approved or acted on.
+        """
+        from django.shortcuts import get_object_or_404
+
+        from .models import BillingPreviewSnapshot
+
+        snapshot = get_object_or_404(BillingPreviewSnapshot, pk=pk)
+        if snapshot.is_spent:
+            return Response(
+                {"detail": "This preview was used for a billing run and is part of its record."},
+                status=409,
+            )
+        if snapshot.is_approved:
+            return Response(
+                {"detail": "This preview has been approved. Only previews still awaiting "
+                           "approval can be deleted."},
+                status=409,
+            )
+        snapshot.delete()
+        return Response(status=204)
+
+    @action(detail=False, methods=["post"])
+    def run(self, request):
+        """Commits a run -- but only what an approved preview accounted for.
+
+        Two refusals, both 409 and both explaining themselves, because the
+        alternative is a run whose invoices nobody signed off:
+          * no approved snapshot for this date and partner scope
+          * the approved snapshot's fingerprint no longer matches what this
+            run would do, i.e. the data moved after approval
+        """
+        from django.utils import timezone as dj_timezone
+
+        from .models import BillingPreviewSnapshot
+        from .preview_export import project_run, projection_digest
+        from .recurring import RecurringBillingBusy, run_recurring_billing
+        from .serializers import RecurringBillingRunSerializer
+
+        try:
+            run_date, partner_ids = self._parse_args(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+
+        # A future run date is refused here, BEFORE the approval lookup, and
+        # the order is the point. run_recurring_billing raises on it too --
+        # that is the authoritative rule and the management-command path needs
+        # it -- but reaching it meant the approval check answered first, so
+        # previewing a date a month out and pressing Run reported "no approved
+        # preview" instead of the actual problem. The cheaper, more specific
+        # rejection should win.
+        if run_date > dj_timezone.localdate():
+            return Response(
+                {"detail": "%s is in the future, so this run is refused before the approval "
+                           "lookup: a committed run applies every cancellation and tariff "
+                           "change dated up to its run date, which would terminate services "
+                           "and change plans early. Use a date up to %s."
+                           % (run_date.isoformat(), dj_timezone.localdate().isoformat())},
+                status=400,
+            )
+
+        scope = sorted(partner_ids or [])
+        scope_label = ", ".join(str(p) for p in scope) if scope else "all partners"
+        approved = (
+            BillingPreviewSnapshot.objects.filter(
+                run_date=run_date, partner_ids=scope, approved_at__isnull=False, run__isnull=True
+            )
+            .order_by("-approved_at")
+            .first()
+        )
+        if approved is None:
+            return Response(
+                {"detail": "No approved preview for %s (%s). Preview it, have it approved, then run."
+                           % (run_date.isoformat(), scope_label)},
+                status=409,
+            )
+
+        current = projection_digest(project_run(run_date, partner_ids=partner_ids or None))
+        if current != approved.fingerprint:
+            return Response(
+                {"detail": "The approved preview (%s) no longer matches what this run would do (%s) — "
+                           "something changed since it was approved. Preview and approve again."
+                           % (approved.fingerprint, current)},
+                status=409,
+            )
+
+        try:
+            result = run_recurring_billing(
+                run_date, partner_ids=partner_ids or None, commit=True, triggered_by=request.user
+            )
+        except ValueError as exc:
+            # A future run date. See run_recurring_billing.
+            return Response({"detail": str(exc)}, status=400)
+        except RecurringBillingBusy as exc:
+            # 409, not 500: the request is well-formed, the server is just
+            # already doing this. A second Run click is the ordinary way to
+            # get here, so it needs to read as "wait", not "error".
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        # Spend the approval on the run it authorised, so History and the
+        # sign-off that allowed it can be read together.
+        approved.run = result["run"]
+        approved.save(update_fields=["run"])
+        return Response(RecurringBillingRunSerializer(result["run"]).data)
+
+    @action(detail=False, methods=["post"], url_path="run-early")
+    def run_early(self, request):
+        """Issue the invoices for a billing date still to come, dated that
+        date -- the Splynx way (preview ~24th, approve, issue). Invoices
+        only; see billing.recurring._run_early for what it does and does
+        not do. Needs the same approved preview as Run, and spends it."""
+        from .recurring import EarlyInvoicingRefused, RecurringBillingBusy, run_recurring_billing
+        from .serializers import RecurringBillingRunSerializer
+
+        try:
+            run_date, partner_ids = self._parse_args(request)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        try:
+            result = run_recurring_billing(
+                run_date, partner_ids=partner_ids or None, commit=True,
+                triggered_by=request.user, early=True,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        except (EarlyInvoicingRefused, RecurringBillingBusy) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(RecurringBillingRunSerializer(result["run"]).data)
+
+
+class PaymentViewSet(ScopedByCustomerMixin, viewsets.ModelViewSet):
+    serializer_class = PaymentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filterset_fields = ["method", "customer", "invoice"]
+    ordering_fields = [
+        "date",
+        "customer__full_name",
+        "amount",
+        "method",
+        "received_by__username",
+    ]
+
+    def get_queryset(self):
+        # allocations prefetched for PaymentSerializer's allocated/unallocated
+        # figures: one extra query for the page instead of two per row.
+        return (
+            self.get_base_queryset(Payment)
+            .select_related("customer", "invoice")
+            .prefetch_related("allocations")
+        )
+
+    def get_permissions(self):
+        # HasFinanceAccess passes straight through for customers (section
+        # restrictions are staff-only) so this only narrows list/retrieve
+        # for staff who lack the Finance section, without touching what
+        # customers can see of their own payments in the portal.
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated(), HasFinanceAccess()]
+        if self.action in ("destroy", "reverse"):
+            # Taking money back off a customer is a finance decision:
+            # Accounts, Management and Admin. Plain delete gets the same gate
+            # as reverse so the Reverse button is not the only thing
+            # standing between other staff roles and the API.
+            return [permissions.IsAuthenticated(), IsAccountsOrManagement(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsStaffMember(), HasFinanceAccess()]
+
+    def perform_destroy(self, instance):
+        # Deleting a payment has to put the ledger back where it was --
+        # see Payment.reverse_ledger_effect for what used to happen
+        # instead. Both writes and the delete go in one transaction so a
+        # failure can't leave the balance reversed with the payment still
+        # on file, or vice versa.
+        with transaction.atomic():
+            instance.reverse_ledger_effect()
+            instance.delete()
+
+    @action(detail=True, methods=["post"])
+    def reverse(self, request, pk=None):
+        """Take a payment back off the customer it was recorded against,
+        with a reason. Body: {"reason": "..."}.
+
+        The same ledger reversal as delete (Payment.reverse_ledger_effect:
+        balance back up, allocations and any direct invoice credit
+        undone), in one transaction, plus two things delete does not do:
+        the reason is required and goes onto the audit row, and the
+        response says whether a bank-feed transaction went back to the
+        review queue -- bankfeeds.signals reverts it to MATCHED, still on
+        the old customer, so staff reassign and confirm it there.
+
+        The payment row is locked and re-read inside the transaction, so a
+        double-click or two people reversing at once gets one reversal and
+        a 404, never the balance credited back twice.
+        """
+        from audit.context import deletion_detail
+
+        reason = str(request.data.get("reason") or "").strip()
+        if len(reason) < 5:
+            return Response(
+                {"detail": "Give a reason for reversing this payment (at least 5 characters)."},
+                status=400,
+            )
+
+        payment = self.get_object()
+        with transaction.atomic():
+            locked = Payment.objects.select_for_update().filter(pk=payment.pk).first()
+            if locked is None:
+                return Response({"detail": "This payment has already been reversed."}, status=404)
+            txn = getattr(locked, "bank_transaction", None)
+            txn_id = txn.pk if txn is not None else None
+            customer_name = locked.customer.full_name if locked.customer_id else ""
+            amount = str(locked.amount)
+            detail = f"Payment reversed (R {amount} from {customer_name}). Reason: {reason}"
+            with deletion_detail(detail):
+                locked.reverse_ledger_effect()
+                locked.delete()
+
+        return Response({
+            "reversed": int(pk),
+            "customer_name": customer_name,
+            "amount": amount,
+            "bank_transaction": txn_id,
+        })
+
+    @action(detail=False, methods=["get"], url_path="open-invoices")
+    def open_invoices(self, request):
+        """One customer's invoices with money still outstanding, oldest due
+        first -- what the manual mapping screen lists to allocate against.
+
+        Excludes quotes, pro formas, cancelled and draft invoices for the
+        same reasons PaymentSerializer.validate refuses a payment against
+        them: they are not debts.
+        """
+        from customers.models import Customer
+
+        from .allocation import open_invoices as open_invoices_for
+
+        customer_id = request.query_params.get("customer")
+        if not customer_id:
+            return Response({"detail": "A customer is required."}, status=400)
+        try:
+            customer = Customer.objects.get(pk=int(customer_id))
+        except (ValueError, Customer.DoesNotExist):
+            return Response({"detail": "No such customer."}, status=404)
+
+        rows = [
+            {
+                "id": inv.pk,
+                "number": inv.number,
+                "status": inv.status,
+                "date_due": inv.date_due,
+                "total": str(inv.total),
+                "paid_amount": str(inv.paid_amount),
+                "balance_due": str(inv.balance_due),
+            }
+            for inv in open_invoices_for(customer)
+        ]
+        return Response({"customer": customer.pk, "balance": str(customer.balance), "invoices": rows})
+
+    @action(detail=True, methods=["get", "post", "delete"])
+    def allocations(self, request, pk=None):
+        """Read, set or clear which invoices this payment settles.
+
+        POST body:
+          {"allocations": [{"invoice": 12, "amount": "435.85"}, ...]}
+          {"auto": true}      -- fill oldest due first with what's left
+          {"replace": true}   -- clear existing allocations first
+
+        DELETE clears them all. Every path leaves Customer.balance alone:
+        allocation only distributes money the payment already credited.
+        """
+        from .allocation import (
+            AllocationError, allocate, auto_allocate, reverse_allocations, summarise,
+        )
+
+        payment = self.get_object()
+
+        if request.method == "GET":
+            return Response(summarise(payment))
+
+        if request.method == "DELETE":
+            with transaction.atomic():
+                reverse_allocations(payment)
+            return Response(summarise(payment))
+
+        try:
+            with transaction.atomic():
+                if request.data.get("replace"):
+                    reverse_allocations(payment)
+                if request.data.get("auto"):
+                    auto_allocate(payment, user=request.user)
+                else:
+                    lines = request.data.get("allocations") or []
+                    if not isinstance(lines, list):
+                        return Response({"detail": "allocations must be a list."}, status=400)
+                    pairs = []
+                    for line in lines:
+                        try:
+                            pairs.append((line["invoice"], line["amount"]))
+                        except (TypeError, KeyError):
+                            return Response(
+                                {"detail": "Each allocation needs an invoice and an amount."},
+                                status=400,
+                            )
+                    if pairs:
+                        allocate(payment, pairs, user=request.user)
+        except AllocationError as exc:
+            # 400 with the message as written: these are things the person
+            # doing the mapping can fix (too much allocated, wrong
+            # customer's invoice, nothing owed on it), not server faults.
+            return Response({"detail": str(exc)}, status=400)
+
+        payment.refresh_from_db()
+        return Response(summarise(payment))
+
+
+class CreditRequestViewSet(viewsets.ModelViewSet):
+    """Credit requests are a shared finance queue for Accounts/Management
+    (and Admin) -- not scoped per-user like Leave requests, since it's a
+    team workflow rather than personal HR data. Only Accounts can submit
+    one; only Management can decide it."""
+
+    serializer_class = CreditRequestSerializer
+    queryset = CreditRequest.objects.select_related("customer", "requested_by", "decided_by").all()
+    filterset_fields = ["customer", "status"]
+
+    def get_queryset(self):
+        # Partner-scoped like everything else that names a customer; a
+        # credit request carries the customer's name and the amount.
+        from customers.models import Customer
+        from customers.views import scope_customers_to_user
+
+        qs = super().get_queryset()
+        user = self.request.user
+        allowed = getattr(user, "allowed_partners", None) or []
+        if not allowed or user.role == user.Role.ADMIN:
+            return qs
+        return qs.filter(customer__in=scope_customers_to_user(Customer.objects.all(), user))
+
+    def get_permissions(self):
+        if self.action in ("approve", "reject"):
+            return [permissions.IsAuthenticated(), IsManagement(), HasFinanceAccess()]
+        if self.action == "create":
+            return [permissions.IsAuthenticated(), IsAccounts(), HasFinanceAccess()]
+        return [permissions.IsAuthenticated(), IsAccountsOrManagement(), HasFinanceAccess()]
+
+    def perform_create(self, serializer):
+        serializer.save(requested_by=self.request.user)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        user = self.request.user
+        if instance.status != CreditRequest.Status.PENDING and user.role not in (
+            user.Role.MANAGEMENT, user.Role.ADMIN,
+        ):
+            raise PermissionDenied("This credit request has already been decided and can no longer be edited.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if instance.status != CreditRequest.Status.PENDING and user.role not in (
+            user.Role.MANAGEMENT, user.Role.ADMIN,
+        ):
+            raise PermissionDenied("This credit request has already been decided and can no longer be withdrawn.")
+        instance.delete()
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Credit the customer, once.
+
+        This used to read the request, check it was Pending, write the
+        balance and then write the decision -- four steps in autocommit
+        with no row lock. Two Approve clicks 50 ms apart both passed the
+        Pending check and both credited, so a R200 credit on a R1,000
+        balance left R600. And if the decision save failed after the
+        balance write, the customer kept the credit with the request still
+        Pending, ready to be approved again.
+
+        The request row is now locked for the duration and re-read inside
+        the lock, so the second click finds it Approved and stops -- and
+        the balance write uses F() rather than a read-modify-write, which
+        is what let a concurrent payment lose a credit (or vice versa).
+        bankfeeds.confirm() has used select_for_update for exactly this
+        "double-clicked button could post the same money twice" hazard all
+        along.
+
+        Also creates the visible line item on the customer's Invoices tab
+        (see CreditRequest.create_credit_note_invoice) -- inside the same
+        atomic block, so an approval can never leave the balance moved
+        with no invoice to show for it, or vice versa.
+        """
+        from django.db.models import F
+
+        from customers.models import Customer
+
+        with transaction.atomic():
+            credit = CreditRequest.objects.select_for_update().get(pk=self.get_object().pk)
+            if credit.status != CreditRequest.Status.PENDING:
+                return Response({"detail": "This request has already been decided."}, status=400)
+
+            Customer.objects.filter(pk=credit.customer_id).update(
+                balance=F("balance") - credit.amount
+            )
+            credit.status = CreditRequest.Status.APPROVED
+            credit.decided_by = request.user
+            credit.decided_at = timezone.now()
+            credit.create_credit_note_invoice()
+            credit.save(update_fields=["status", "decided_by", "decided_at", "credit_note"])
+
+            # A credit can clear what got the customer suspended, exactly as
+            # a payment can -- run the same reconnect check the Payment
+            # signal runs (billing.reactivation.reconnect_customer), after
+            # commit so it sees the new balance and settled invoice. Before
+            # this, an approved credit left a customer off until the next
+            # payment or the daily sweep, even with nothing left overdue.
+            customer_id, credit_pk = credit.customer_id, credit.pk
+
+            def _reconnect():
+                import logging
+
+                from .reactivation import reconnect_customer
+
+                try:
+                    reconnect_customer(customer_id, reason=f"credit #{credit_pk}")
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Reconnection check after credit %s for customer %s failed",
+                        credit_pk, customer_id,
+                    )
+
+            transaction.on_commit(_reconnect)
+
+        credit.refresh_from_db()
+        return Response(CreditRequestSerializer(credit).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        credit = self.get_object()
+        if credit.status != CreditRequest.Status.PENDING:
+            return Response({"detail": "This request has already been decided."}, status=400)
+        credit.status = CreditRequest.Status.REJECTED
+        credit.decision_note = request.data.get("decision_note", "")
+        credit.decided_by = request.user
+        credit.decided_at = timezone.now()
+        credit.save(update_fields=["status", "decision_note", "decided_by", "decided_at"])
+        return Response(CreditRequestSerializer(credit).data)
+
+
+class UpcomingBlocksView(APIView):
+    """GET /api/upcoming-blocks/?days=7
+
+    Customers heading for an auto-suspension -- the dashboard's "Blocking
+    tomorrow" tile and its drill-down list.
+
+    The headline figure is TOMORROW (`count_tomorrow`); `results` covers the
+    whole horizon so there is a chase window rather than a same-day surprise,
+    with each customer's own block date and how many days away it is.
+
+    Deliberately reports `auto_suspend_enabled` rather than being gated on
+    it. The master switch (Configs -> Billing -> Auto-suspension) is off by
+    default, and a panel that returned zero while it was off would be useless
+    precisely when it matters most -- these are customers worth chasing
+    whether or not the automation will actually cut them off. The frontend
+    says plainly which it is.
+
+    Uses billing.recurring.blocking_candidate_services' own predicate (via
+    upcoming_blocks), so this cannot disagree with what a real billing run
+    would do.
+
+    Respects the same partner-visibility restriction as CustomerViewSet (see
+    User.allowed_partners): a reseller-scoped staff member must not learn the
+    names of customers outside their partners just because those customers
+    turn up on a dashboard aggregate.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasFinanceAccess]
+
+    def get(self, request):
+        from datetime import timedelta
+
+        from django.db.models import Q as _Q
+
+        from customers.models import Customer
+        from .recurring import upcoming_blocks
+
+        try:
+            days = int(request.query_params.get("days", 7))
+        except (TypeError, ValueError):
+            return Response({"detail": "days must be a whole number."}, status=400)
+        days = max(1, min(days, 60))
+
+        # Mirror CustomerViewSet.get_queryset's partner scoping.
+        user = request.user
+        visible = Customer.objects.all()
+        allowed = getattr(user, "allowed_partners", None) or []
+        if allowed and user.role != user.Role.ADMIN:
+            visible = visible.filter(_Q(partner_id__in=allowed) | _Q(partner__isnull=True))
+
+        tomorrow = timezone.localdate() + timedelta(days=1)
+        results = upcoming_blocks(tomorrow, horizon_days=days, customers=visible)
+        suspension_settings = SuspensionSettings.load()
+
+        return Response({
+            "from_date": tomorrow,
+            "horizon_days": days,
+            "auto_suspend_enabled": suspension_settings.auto_suspend_enabled,
+            "count_tomorrow": sum(1 for r in results if r["days_until"] == 0),
+            "count_horizon": len(results),
+            "results": results,
+        })
+
+
+class FinanceDashboardView(ScopedByCustomerMixin, APIView):
+    """GET /api/finance-dashboard/?partner=<id>
+
+    Every figure on Finance -> Dashboard in one request. One call rather
+    than eight, because each panel needs the same partner scoping applied
+    the same way, and eight endpoints is eight chances for one of them to
+    apply it slightly differently.
+
+    Staff only, and Finance-section only. Partner visibility comes from
+    ScopedByCustomerMixin, the same rule the Invoices and Payments tabs
+    use -- a reseller-scoped staff member sees dashboard totals covering
+    exactly the customers whose invoices they can already open, and no
+    others. `?partner=` narrows further WITHIN what they may see; it can
+    never widen it.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, HasFinanceAccess]
+
+    def get(self, request):
+        from .dashboard import FinanceDashboard
+
+        invoices = self.get_base_queryset(Invoice)
+        payments = self.get_base_queryset(Payment)
+        credits = self.get_base_queryset(CreditRequest)
+        services = self.get_base_queryset(Service)
+
+        # One partner or several: ?partner=1&partner=2 and ?partner=1,2 both
+        # work, because a caller hand-building the URL will reach for one or
+        # the other and neither is wrong.
+        #
+        # NO partners given means ALL of them -- the same "empty means
+        # unrestricted" convention as User.allowed_partners and
+        # Device.visible_partners. It also means the filter cannot be used to
+        # arrive at "nothing selected, nothing shown", which reads as broken.
+        raw = request.query_params.getlist("partner")
+        partner_ids = []
+        for value in raw:
+            for part in str(value).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    partner_ids.append(int(part))
+                except ValueError:
+                    return Response({"detail": "partner must be a whole number."}, status=400)
+
+        if partner_ids:
+            # Applied ON TOP of the scoped querysets above, never instead of
+            # them, so asking for a partner you can't see returns nothing
+            # rather than that partner's numbers.
+            invoices = invoices.filter(customer__partner_id__in=partner_ids)
+            payments = payments.filter(customer__partner_id__in=partner_ids)
+            credits = credits.filter(customer__partner_id__in=partner_ids)
+            services = services.filter(customer__partner_id__in=partner_ids)
+
+        # Unrecognised values fall back to the default rather than erroring:
+        # the period only widens or narrows a date window, so a typo showing
+        # the month is a harmless outcome, and the response says which period
+        # was actually used.
+        period = (request.query_params.get("period") or "").strip().lower()
+
+        data = FinanceDashboard(
+            invoices=invoices,
+            payments=payments,
+            credits=credits,
+            services=services,
+            period=period,
+        ).as_dict()
+        data["partners"] = partner_ids
+        return Response(data)

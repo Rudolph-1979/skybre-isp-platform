@@ -15,13 +15,17 @@ class ExpenseSerializer(serializers.ModelSerializer):
     vat_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     amount_incl_vat = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     supplier_display_name = serializers.SerializerMethodField()
+    account_code = serializers.CharField(source="account.code", read_only=True, default=None)
+    account_name = serializers.CharField(source="account.name", read_only=True, default=None)
     created_by_name = serializers.SerializerMethodField()
     from_bank_feed = serializers.SerializerMethodField()
+    vehicle_label = serializers.CharField(source="vehicle.registration_number", read_only=True, default=None)
 
     class Meta:
         model = Expense
         fields = [
-            "id", "supplier", "supplier_name", "supplier_display_name", "category", "description",
+            "id", "supplier", "supplier_name", "supplier_display_name", "category",
+            "account", "account_code", "account_name", "vehicle", "vehicle_label", "description",
             "invoice_number", "date", "amount_excl_vat", "vat_rate_pct", "vat_amount", "amount_incl_vat",
             "attachment", "notes", "created_by", "created_by_name", "from_bank_feed", "created_at", "updated_at",
         ]
@@ -49,6 +53,11 @@ class ExpenseSerializer(serializers.ModelSerializer):
         if hasattr(data, "get") and data.get("supplier", "__absent__") in ("", None):
             data = data.copy()
             data["supplier"] = None
+        # Same for the vehicle (13 Oct 2026): "" from the form's blank
+        # option means "not for a vehicle", and must be able to clear one.
+        if hasattr(data, "get") and data.get("vehicle", "__absent__") in ("", None):
+            data = data.copy()
+            data["vehicle"] = None
         return super().to_internal_value(data)
 
     def validate(self, attrs):
@@ -58,6 +67,60 @@ class ExpenseSerializer(serializers.ModelSerializer):
         supplier = attrs.get("supplier", getattr(self.instance, "supplier", None))
         if supplier is not None:
             attrs["supplier_name"] = ""
+
+        # Stamp the account from the supplier's category, but only when
+        # this request did not name one and there isn't one already.
+        #
+        # Server-side, so the figure does not depend on the form having
+        # got it right, and ONLY on the way in -- re-deriving it on every
+        # save would mean re-categorising a supplier silently moved every
+        # expense ever captured from them, including ones inside VAT
+        # periods that have already been filed.
+        if "account" not in attrs and getattr(self.instance, "account_id", None) is None:
+            category = getattr(supplier, "category", None)
+            default_account = getattr(category, "default_account", None)
+            if default_account is not None:
+                attrs["account"] = default_account
+
+        # Wages carry no VAT. There is no tax invoice behind a salary and
+        # no input tax to claim, but vat_rate_pct defaults to 15 for every
+        # category, so capturing a payroll run on the Expenses tab and
+        # leaving the rate alone claimed 15% input VAT on the whole wage
+        # bill -- easily the largest single cost here -- and understated
+        # the VAT payable on the return by that much.
+        #
+        # The bank-feed side of this already refuses to guess a rate at
+        # all, and its message names this exact case: "use 0 for a
+        # purchase that carries no VAT (salaries, transfers, loan
+        # repayments)". This is the manual side agreeing with it.
+        # Only judge what this request actually writes. Enforcing it on every
+        # save meant an expense captured at 15% before this rule existed
+        # could not be edited AT ALL -- correcting its description came back
+        # 400 about a VAT rate the request never mentioned.
+        touches_vat = "category" in attrs or "vat_rate_pct" in attrs
+        if not touches_vat and self.instance is not None:
+            return attrs
+
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        # The rate has a MODEL DEFAULT of 15, so an omitted key on create is
+        # not "no rate" -- it is 15, which is the single most likely way to
+        # book a payroll run: fill the form in, never touch the VAT field.
+        # Reading attrs alone missed exactly that case, which is the case
+        # this guard exists for.
+        if "vat_rate_pct" in attrs:
+            rate = attrs["vat_rate_pct"]
+        elif self.instance is not None:
+            rate = self.instance.vat_rate_pct
+        else:
+            rate = Expense._meta.get_field("vat_rate_pct").get_default()
+        if category == Expense.Category.SALARIES and rate:
+            raise serializers.ValidationError({
+                "vat_rate_pct": (
+                    "Salaries carry no VAT, so no input VAT can be claimed on them -- set the "
+                    "rate to 0. If this is a payroll bureau's own invoice, that is a "
+                    "professional fee and does carry VAT: file it under Professional fees."
+                )
+            })
         return attrs
 
     def get_from_bank_feed(self, obj):

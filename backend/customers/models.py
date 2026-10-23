@@ -2,6 +2,7 @@ import datetime
 import uuid
 
 from django.conf import settings
+from django.contrib.postgres.fields import ArrayField
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
@@ -35,6 +36,31 @@ class Partner(models.Model):
         return self.name
 
 
+class ClientAccountType(models.Model):
+    """The options for Customer.account_type -- Paying, Sponsor, Deal,
+    Staff, and whatever else staff add (Rudolph, 6 Oct 2026). A label, not
+    a billing rule.
+
+    `key` is fixed once created, so renaming relabels every client on it.
+    "paying" is the default for new clients and can't be removed. A type in
+    use can't be deleted -- switch it off instead.
+    """
+
+    key = models.SlugField(max_length=30, unique=True)
+    name = models.CharField(max_length=40, unique=True)
+    # Ask "why?" when this type is picked (Sponsor, Deal). Paying doesn't.
+    needs_reason = models.BooleanField(default=True)
+    colour = models.CharField(max_length=7, default="#7652d6", help_text="Badge colour, #rrggbb.")
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=100)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Customer(models.Model):
     class CustomerType(models.TextChoices):
         INDIVIDUAL = "individual", "Individual"
@@ -43,6 +69,9 @@ class Customer(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "New"
         ACTIVE = "active", "Active"
+        # Installed and connected (Rudolph, 6 Oct 2026). Treated like Active
+        # everywhere Active matters (LIVE_STATUSES).
+        ONLINE = "online", "Online"
         SUSPENDED = "suspended", "Suspended"
         # Written off: they owe money we have stopped expecting to collect.
         # Distinct from Suspended (temporary, they can pay and come back) and
@@ -54,6 +83,8 @@ class Customer(models.Model):
     # Statuses that mean the customer should NOT be connected. Named once, so
     # nothing has to remember to add a new one to four separate checks.
     OFF_STATUSES = ("suspended", "bad_debt", "inactive")
+    #: Statuses that count as a live, paying-and-connected client.
+    LIVE_STATUSES = ("active", "online")
 
     class Category(models.TextChoices):
         RESIDENTIAL = "residential", "Residential"
@@ -102,10 +133,41 @@ class Customer(models.Model):
     full_name = models.CharField(max_length=255)
     company_name = models.CharField(max_length=255, blank=True)
     email = models.EmailField(blank=True)
+    # Where invoices, statements, reminders, suspension notices and receipts
+    # go, with `email` copied in (Rudolph, 1 Oct). Blank = billing mail goes
+    # to `email`, as before. See notifications.services.billing_recipients.
+    billing_email = models.EmailField(
+        blank=True,
+        help_text="Billing documents go here, with the main email in CC. Blank = main email.",
+    )
     phone = models.CharField(max_length=32, blank=True)
-    address = models.CharField(max_length=255, blank=True)
+    # Contact person for business customers -- the owner or manager to
+    # chase when the line has a problem, distinct from the account holder.
+    contact_person = models.CharField(max_length=255, blank=True, default="")
+    contact_person_phone = models.CharField(max_length=32, blank=True, default="")
+    contact_person_email = models.EmailField(blank=True, default="")
+    # Secondary contact for residential customers -- a trusted person to
+    # reach when the primary contact is not answering.
+    secondary_contact_name = models.CharField(max_length=255, blank=True, default="")
+    secondary_contact_phone = models.CharField(max_length=32, blank=True, default="")
+    address = models.CharField(max_length=255, blank=True, help_text="Street number and name.")
+    # Between the street line and the city on a tax invoice, which is how a
+    # South African address reads: street, area, city, code. Kept as one
+    # free-text field rather than separate complex/unit columns because what
+    # is being captured varies -- "9A Cabanas Flats", "Erf 412", a farm name --
+    # and splitting it would force staff to decide which box an address
+    # belongs in, which is how half of them end up in the wrong one.
+    complex_or_area = models.CharField(
+        max_length=255, blank=True,
+        help_text="Complex, estate or residential area, e.g. 9A Cabanas Flats.",
+    )
     city = models.CharField(max_length=100, blank=True)
     zip_code = models.CharField(max_length=20, blank=True)
+    # GPS for the main address (Rudolph, 5 Oct 2026): farm clients often
+    # have no street address at all. Both or neither. A service on "same as
+    # the client's main address" uses these too.
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     # Printed on the customer's side of a tax invoice. Both are optional --
     # an individual residential customer usually has neither, which is why
     # the invoice prints the labels with nothing after them rather than
@@ -118,6 +180,27 @@ class Customer(models.Model):
         max_length=32, blank=True, help_text="The customer's own VAT registration number, if they have one.",
     )
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.NEW)
+
+    # Paying / Sponsor / Deal (Rudolph, 6 Oct 2026: "Some clients are
+    # sponsor, deals or paying clients. I need a colomn to show and select
+    # this with a reason as to why this customer has discount"). A label
+    # with its reason, so anyone looking at a cheap or free account can see
+    # why. It does not change billing by itself -- the money side stays
+    # on each service's discount.
+    #
+    # The list is editable (ClientAccountType, 6 Oct 2026: "Add a option to
+    # add more options, one in mind is Staff"); this stores the type's key.
+    # The constants below are the built-in ones, kept as names.
+    class AccountType(models.TextChoices):
+        PAYING = "paying", "Paying"
+        SPONSOR = "sponsor", "Sponsor"
+        DEAL = "deal", "Deal"
+
+    account_type = models.CharField(max_length=30, default=AccountType.PAYING)
+    account_type_reason = models.CharField(
+        max_length=255, blank=True,
+        help_text="Why this client has this account type, when the type asks for a reason.",
+    )
     balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     assigned_staff = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -135,7 +218,27 @@ class Customer(models.Model):
         related_name="customers",
         help_text="Reseller partner this customer belongs to, if any. Blank = a direct (non-partner) customer.",
     )
+    # A move to another partner booked for a date (package #20). Applied by
+    # billing.scheduled_changes on that morning; until then `partner` is the
+    # one in force. Set both or neither.
+    pending_partner = models.ForeignKey(
+        Partner,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Partner this customer moves to on pending_partner_date.",
+    )
+    pending_partner_date = models.DateField(
+        null=True, blank=True,
+        help_text="The day the customer moves to pending_partner.",
+    )
     notes = models.TextField(blank=True)
+    # Free-typed equipment at the client -- router, PtP radio, CPE, logins
+    # (Rudolph 20 Oct 2026: "Add a tile to add router details of ptp or
+    # something" / "Clean Typeable information tile"). Staff only: never
+    # returned to the client's own portal login (CustomerSerializer).
+    equipment_details = models.TextField(blank=True)
     # The date this customer actually became a customer, as opposed to the
     # date their row was created in THIS system. Those differ for anyone
     # migrated from another platform: created_at is auto_now_add, so a bulk
@@ -212,8 +315,28 @@ class Customer(models.Model):
             return False
         # .update() rather than .save(): updated_at is auto_now, and an
         # automatic expiry is not an edit anybody made to this customer.
-        Customer.objects.filter(pk=self.pk).update(live_bandwidth_public=False)
+        #
+        # last_viewed_at is cleared along with the flag, and that is the
+        # whole fix for the switch appearing broken. It used to be left at
+        # its old value, while CustomerViewSet.perform_update only starts
+        # the idle clock `if live_bandwidth_public and not
+        # live_bandwidth_last_viewed_at`. So the SECOND time staff turned
+        # the switch on, the clock was never restarted, the stale timestamp
+        # was already well past the timeout, and the very next read of the
+        # flag -- the retrieve() immediately after the PATCH -- expired it
+        # again. The toggle bounced straight back to Off with no
+        # explanation, permanently, for every customer it had ever been
+        # used on, and the field is read-only in the serializer so there
+        # was no way to clear it from the API either.
+        #
+        # Clearing it also makes the `last is None` branch above the
+        # correct landing place next time: "no record of a view" really is
+        # the state a freshly re-enabled grant is in.
+        Customer.objects.filter(pk=self.pk).update(
+            live_bandwidth_public=False, live_bandwidth_last_viewed_at=None
+        )
         self.live_bandwidth_public = False
+        self.live_bandwidth_last_viewed_at = None
         return True
 
     def touch_live_bandwidth_view(self, now=None):
@@ -340,6 +463,35 @@ class CustomerDeletionRequest(models.Model):
 
     def __str__(self):
         return f"Delete {self.customer_display_name or self.customer_display_id} ({self.status})"
+
+
+class RevenueSnapshot(models.Model):
+    """MRR as it stood on one day, for one partner (9 Oct 2026) -- the
+    exact history behind Administration -> Revenue. One row per day per
+    partner key: the partner of each line (Service.partner, else the
+    client's), 0 for Direct. `client_ids` are the paying clients counted,
+    so ARPU over several partners divides by DISTINCT clients.
+
+    Written by `manage.py snapshot_revenue` (nightly) and refreshed for
+    today whenever the report is opened. Days with no row are estimated
+    from service start/end dates instead (customers/revenue_reports.py).
+    """
+
+    date = models.DateField()
+    partner_key = models.IntegerField(help_text="Partner id, or 0 for Direct.")
+    mrr = models.DecimalField(max_digits=12, decimal_places=2)
+    services = models.PositiveIntegerField(default=0)
+    client_ids = ArrayField(models.IntegerField(), default=list, blank=True)
+    taken_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["date", "partner_key"], name="unique_revenue_snapshot_day_partner"),
+        ]
+        indexes = [models.Index(fields=["date"])]
+
+    def __str__(self):
+        return f"{self.date} partner {self.partner_key}: R{self.mrr}"
 
 
 class CustomerTask(models.Model):

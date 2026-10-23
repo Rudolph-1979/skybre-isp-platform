@@ -1,0 +1,51 @@
+"""Customer -> Services -> Preview invoice (George, 13 Oct 2026)."""
+from decimal import Decimal
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from billing.models import CustomerBillingConfig, Invoice, Service, Tariff
+from customers.models import Customer
+
+User = get_user_model()
+
+
+class InvoicePreviewTests(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tariff = Tariff.objects.create(name="SCF 20 Mbps", price=Decimal("399.00"), tax_rate_pct=Decimal("15"))
+        self.customer = Customer.objects.create(full_name="Preview Client", customer_id="CUS-009002",
+                                                status=Customer.Status.ACTIVE)
+        config = CustomerBillingConfig.for_customer(self.customer)
+        config.next_billing_date = self.today
+        config.save()
+        Service.objects.create(customer=self.customer, tariff=self.tariff, status=Service.Status.ACTIVE,
+                               start_date="2026-01-01", discount_type="amount", discount_value=Decimal("100.00"))
+        self.api = APIClient()
+        self.api.force_authenticate(User.objects.create_user(username="adm", password="pw-for-tests-123", role="admin"))
+
+    def test_preview_lines_and_total_and_nothing_saved(self):
+        res = self.api.get(f"/api/customer-billing-config/{self.customer.pk}/invoice-preview/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["date"], self.today.isoformat())
+        self.assertEqual([l["unit_price"] for l in res.data["lines"]], ["399.00", "-100.00"])
+        self.assertEqual(res.data["total"], "343.85")   # (399 - 100) * 1.15
+        self.assertFalse(Invoice.objects.filter(customer=self.customer).exists())
+
+    def test_date_before_start_bills_nothing_and_bad_date_refused(self):
+        res = self.api.get(f"/api/customer-billing-config/{self.customer.pk}/invoice-preview/?date=2025-01-01")
+        self.assertEqual(res.data["lines"], [])
+        res = self.api.get(f"/api/customer-billing-config/{self.customer.pk}/invoice-preview/?date=nope")
+        self.assertEqual(res.status_code, 400)
+
+    def test_rand_up_is_one_line_with_an_office_note(self):
+        svc = Service.objects.get(customer=self.customer)
+        svc.discount_type = "surcharge"
+        svc.discount_value = Decimal("121.87")
+        svc.save()
+        res = self.api.get(f"/api/customer-billing-config/{self.customer.pk}/invoice-preview/")
+        self.assertEqual([l["unit_price"] for l in res.data["lines"]], ["520.87"])
+        self.assertIn("R121.87", res.data["lines"][0]["office_note"])
+        self.assertNotIn("Special pricing", res.data["lines"][0]["description"])

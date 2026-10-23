@@ -1,0 +1,948 @@
+Splynx client,Vexar client,Name,Service login,Plan,Service id,Splynx start,Vexar start
+SMF294,SMF294,Hennenman Car Wash,smf_hnm_hennenman_car_wash,MTD 20 Mbps,1390,01/11/2024,20/10/2026
+SMF294,SMF294,Hennenman Car Wash,smf_hnm_dawid_wiid,MTD 50 Mbps,1391,01/11/2024,20/10/2026
+SMF241,SMF241,Rushoff,smf_hnm_rushof,MTD 250 Mbps,1527,01/10/2026,20/10/2026
+SMF127,SMF127,Refine Developers,smf_hnm_anton_strydom,MTD 20 Mbps,1493,01/11/2024,20/10/2026
+SMF418,SMF418,Amo Hardware,smf_hnm_amo_hardware,MTD 20 Mbps,1198,01/08/2025,19/10/2026
+SMF393,SMF393,Slim Uiltjies,smf_hnm_slim_uiltjies,MTD 20 Mbps,1668,01/11/2024,20/10/2026
+SMF393,SMF393,Slim Uiltjies,smf_hnm_bets_els,MTD 50 Mbps,1669,01/11/2024,20/10/2026
+SMF095,SMF095,BC Blasting,smf_hnm_debbie_cordier,MTD 20 Mbps,1554,01/11/2024,20/10/2026
+SMF368,SMF368,Deon Serfontein Fabriek,smf_hnm_deon_serfontein,MTD 50 Mbps,1511,01/11/2024,20/10/2026
+SMF036,SMF036,Sincot Trading (PTY) LTD,smf_hnm_sincot_trading,MTD 250 Mbps,1712,25/08/2026,21/10/2026
+SMF340,SMF340,GC Scrapmetals,smf_hnm_gc_scrapmetals,MTD 20 Mbps,1466,01/11/2024,20/10/2026
+SBF2134,SBF2134,Jordaan.biz Trust,svf_krd_jan_jordaan,Vuma BF 500/200 Mbps,1054,01/11/2024,16/10/2026
+SMF313,SMF313,Business Accounting Network,smf_hnm_bus_acc_network,MTD 20 Mbps,1463,01/11/2024,20/10/2026
+SMF313,SMF313,Business Accounting Network,bup_smf_bus_acc_network,MTD WB,1460,01/11/2024,20/10/2026
+SMF313,SMF313,Business Accounting Network,smf_hnm_bernadette_wilding,MTD 20 Mbps,1461,01/11/2025,20/10/2026
+SMF059,SMF059,Candyland,smf_hnm_candyland,MTD 20 Mbps,1656,01/11/2024,20/10/2026
+SMF059,SMF059,Candyland,smf_hnm_kashif_nawaz,MTD 20 Mbps,1655,01/11/2024,20/10/2026
+SMF058,SMF058,Attitude,smf_hnm_attitude,MTD 20 Mbps,1295,01/11/2024,20/10/2026
+SMF058,SMF058,Attitude,smf_hnm_marisca_kidson,MTD 20 Mbps,1296,01/11/2024,20/10/2026
+SMF047,SMF047,Artistia194CC t/a Montana Interiors,smf_hnm_koos_slabbert,MTD 20 Mbps,75,01/11/2024,06/10/2026
+SMF047,SMF047,Artistia194CC t/a Montana Interiors,smf_hnm_montana_interiors,MTD 100 Mbps,76,01/11/2024,06/10/2026
+SMF047,SMF047,Artistia194CC t/a Montana Interiors,smf_hnm_jaco_slabbert,MTD 100 Mbps,77,01/11/2024,06/10/2026
+SMF047,SMF047,Artistia194CC t/a Montana Interiors,bup_smf_montana_interiors,MTD WB,78,01/11/2024,06/10/2026
+SMF047,SMF047,Artistia194CC t/a Montana Interiors,smf_hnm_montanna_guesthouse,MTD 20 Mbps,79,29/05/2025,06/10/2026
+SMF307,SMF307,Hennew,smf_hnm_hennew,MTD 20 Mbps,1621,01/11/2024,20/10/2026
+SMF307,SMF307,Hennew,bup_smf_hennew,MTD WB,1623,01/11/2024,20/10/2026
+SMF335,SMF335,Blue Diamond Purified Water,smf_hnm_blue_d_p_water,MTD 100 Mbps,1595,01/11/2024,20/10/2026
+SMF317,SMF317,Badenhorst Prokureurs,smf_hnm_badenhorst_prok,MTD 20 Mbps,1510,01/11/2024,20/10/2026
+SMF317,SMF317,Badenhorst Prokureurs,hnm_willem_bardenhorst,Skybre Wireless 6 Mbps,1508,01/11/2024,20/10/2026
+SMF302,SMF302,S&S Onderdele,smf_hnm_ss_onderdele,MTD 20 Mbps,1284,01/11/2024,20/10/2026
+SMF302,SMF302,S&S Onderdele,smf_hnm_pieter_smit,MTD 20 Mbps,1286,01/09/2025,20/10/2026
+SMF291,SMF291,Smith Eiendomme,smf_hnm_rita_smith,MTD 20 Mbps,1384,01/11/2024,20/10/2026
+SMF291,SMF291,Smith Eiendomme,smf_hnm_smith_eiendomme,MTD 20 Mbps,1386,01/01/2026,20/10/2026
+SMF306,SMF306,Savanna,smf_hnm_savanna,MTD 20 Mbps,1592,01/11/2024,20/10/2026
+SMF306,SMF306,Savanna,smf_hnm_ljg_naude,MTD 20 Mbps,1594,09/12/2024,20/10/2026
+SMF180,SMF180,HM&E Workshop,smf_hnm_hme_workshop,MTD 20 Mbps,1598,01/11/2024,20/10/2026
+SMF180,SMF180,HM&E Workshop,smf_hnm_sanet_van_heusden,MTD 20 Mbps,1597,01/11/2024,20/10/2026
+SMF120,SMF120,Tia Hattingh Dienste Pty Ltd,smf_hnm_tia_hattingh_dienste,MTD 50 Mbps,1564,01/11/2024,20/10/2026
+SMF120,SMF120,Tia Hattingh Dienste Pty Ltd,smf_hnm_tia_hattingh,MTD 20 Mbps,1565,01/11/2024,20/10/2026
+SMF255,SMF255,Expectra 679 (Pty) Ltd,smf_hnm_tiaan_slabbert,MTD 50 Mbps,1634,01/11/2024,20/10/2026
+SMF011,SMF011,Hanterra BK,smf_hnm_willie_lineveldt,MTD 20 Mbps,1368,01/11/2024,20/10/2026
+SMF011,SMF011,Hanterra BK,smf_hnm_willie_lingeveldt_2,MTD 20 Mbps,1369,01/08/2026,20/10/2026
+SMF287,SMF287,Hub Hardware,smf_hnm_hub_hardware,MTD 20 Mbps,1325,01/11/2024,20/10/2026
+SMF284,SMF284,Mangaung Milling,smf_hnm_mangaung_milling,MTD 20 Mbps,1620,01/12/2025,20/10/2026
+SBF2080,SBF2080,Gideon Forster,svf_krd_gideon_forster,Vuma 30/30,1082,01/11/2024,19/10/2026
+SMF427,SMF427,Tholie Afonso,smf_hnm_tholie_afonso_1,MTD 20 Mbps,1428,01/11/2024,20/10/2026
+SMF427,SMF427,Tholie Afonso,smf_hnm_tholie_afonso,MTD 20 Mbps,1429,01/11/2024,20/10/2026
+SMF312,SMF312,Renmar007 Pty Ltd,smf_hnm_renmar007,MTD 20 Mbps,1630,01/11/2024,20/10/2026
+SMF312,SMF312,Renmar007 Pty Ltd,hnm_spar,Skybre Wireless 10 Mbps,1633,01/11/2024,20/10/2026
+SMF312,SMF312,Renmar007 Pty Ltd,smf_hnm_renier_slabbert,MTD 50 Mbps,1631,01/12/2024,20/10/2026
+SVF2122,SVF2122,Gert Johannes Pretorius,svf_krd_gert_pretorius,Vuma 30/30,1083,01/11/2024,19/10/2026
+SVF2122,SVF2122,Gert Johannes Pretorius,bup_svf_gert_pretorius,Vuma WB,1084,01/11/2024,19/10/2026
+SVF2122,SVF2122,Gert Johannes Pretorius,krd_crown_glass,Skybre Wireless 4 Mbps,1085,23/10/2024,19/10/2026
+SVF2180,SVF2180,Scotts Plumbing,svf_krd_robert_scott,Vuma 30/30,989,01/11/2024,16/10/2026
+SVF2180,SVF2180,Scotts Plumbing,bup_krd_roberts_scotts,Vuma WB,990,09/05/2025,16/10/2026
+SVF2128,SVF2128,QTC Civils,svf_krd_qtc_civils,Vuma 50/50,1019,01/11/2024,16/10/2026
+SVF2128,SVF2128,QTC Civils,bup_svf_qtc_civils,Vuma WB,1021,01/12/2024,16/10/2026
+SVF2136,SVF2136,Fresh Stop,svf_krd_trek_in_freshstop,Vuma 100/100,1088,01/11/2024,19/10/2026
+SVF2094,SVF2094,Tanya Oosthuizen,svf_krd_tanya_oosthuizen,Vuma 50/50,980,01/11/2024,16/10/2026
+SVF2094,SVF2094,Tanya Oosthuizen,bup_krd_tanya_oosthuizen,Vuma WB,981,22/05/2026,16/10/2026
+SVF2143,SVF2143,Linda Daffue,svf_krd_linda_daffue,Vuma 50/50,1051,01/01/2025,16/10/2026
+SBF1021,SBF1021,Johannes De Jager,svf_krd_johannes_de_jager,Vuma BF 100/100 Mbps,1055,01/11/2024,16/10/2026
+SMF174,SMF174,John Hattingh,smf_hnm_john_hattingh,MTD 20 Mbps,1307,01/11/2024,20/10/2026
+SBF1008,SBF1008,John Samuels,svf_krd_john_samuels,Vuma BF 100/100 Mbps,1056,01/11/2024,16/10/2026
+SMF089,SMF089,Joseph Lisele,smf_hnm_joseph_lisele,MTD 20 Mbps,1334,02/02/2026,20/10/2026
+SMF146,SMF146,Josias Tsoeu,smf_hnm_josias_tsoeu,MTD 20 Mbps,1533,01/11/2024,20/10/2026
+SMF001,SMF001,Anso Kuhn,smf_hnm_juan_kuhn,MTD 50 Mbps,1741,05/10/2026,21/10/2026
+SBF1016,SBF1016,Juanita Machin,svf_krd_juanita_machin,Vuma BF 100/100 Mbps,1050,01/11/2024,16/10/2026
+SBF2022,SBF2022,Julius Opperman,svf_krd_julius_opperman,Vuma BF 200/200 Mbps,1049,01/11/2024,16/10/2026
+SMF042,SMF042,Karien Spreeuw,smf_hnm_karien_spreeuw,MTD 50 Mbps,1601,01/02/2026,20/10/2026
+SVF2142,SVF2142,Karin Steenkamp,svf_krd_karin_steenkamp,Vuma BF 50/25,1044,03/07/2026,16/10/2026
+SMF452,SMF452,Karin Swanepoel,smf_hnm_karin_swanepoel,MTD 20 Mbps,1757,01/11/2024,21/10/2026
+SMF482,SMF482,Kiewiet Van Der Westhuizen,smf_hnm_kiewiet_vd_westh,MTD 20 Mbps,1263,18/05/2026,19/10/2026
+SMF206,SMF206,Kita Steyn,smf_hnm_kita_steyn,MTD 20 Mbps,1562,01/11/2024,20/10/2026
+SMF323,SMF323,Koos Strydom,smf_hnm_koos_strydom,MTD 50 Mbps,1456,01/11/2024,20/10/2026
+SMF486,SMF486,Kutu Chepape,smf_hnm_kutu_chepape,MTD 20 Mbps,1188,06/02/2025,19/10/2026
+SBF1391,SBF1391,Lappies Labuschagne,svf_krd_lappies_labuschagne,Vuma BF 100/100 Mbps,1043,01/11/2024,16/10/2026
+SMF072,SMF072,Lario Van Der Walt,smf_hnm_lario_van_der_walt,MTD 20 Mbps,1465,01/11/2024,20/10/2026
+SMF440,SMF440,Laura Melville,smf_hnm_laura_melville,MTD 20 Mbps,1173,01/11/2024,19/10/2026
+SMF066,SMF066,Lawrence Myburgh,smf_hnm_lawrence_myburgh,MTD 100 Mbps,1572,01/11/2024,20/10/2026
+SMF489,SMF489,Leander Hillebrand,smf_hnm_leander_hillbrand,MTD 100 Mbps,1354,02/10/2026,20/10/2026
+SVF2248,SVF2248,Lelanie Vermaak,svf_krd_lelanie_vermaak,Vuma BF 50/25,1020,06/08/2026,16/10/2026
+SVF2177,SVF2177,Lene De Villiers,svf_krd_lene_de_villiers,Vuma 30/30,1017,01/11/2024,16/10/2026
+SBF1914,SBF1914,Liefie Geldenhuys,svf_krd_liefie_geldenhuys,Vuma BF 100/100 Mbps,1016,01/11/2024,16/10/2026
+SBF1914,SBF1914,Liefie Geldenhuys,bup_svf_liefie_geldenhuys,Vuma WB,1015,01/11/2024,16/10/2026
+SBF1090,SBF1090,Liezel Schoeman,svf_krd_liezel_schoeman,Vuma BF 100/100 Mbps,1014,01/11/2024,16/10/2026
+SMF025,SMF025,Lilanie Kruger,smf_hnm_lilanie_kruger,MTD 50 Mbps,1451,01/11/2024,20/10/2026
+SMF008,SMF008,Bridgitte Alberts,smf_hnm_liza_alberts,MTD 50 Mbps,1435,01/03/2025,20/10/2026
+SMF093,SMF093,Liza Reid,smf_hnm_liza_reid,MTD 20 Mbps,1240,01/11/2024,19/10/2026
+SMF157,SMF157,Lizel Snooke,smf_hnm_lizel_snooke,MTD 50 Mbps,1203,01/11/2024,19/10/2026
+SMF131,SMF131,Lorraine Reyneke,smf_hnm_lorraine_reyneke,MTD 50 Mbps,1205,01/11/2024,19/10/2026
+SMF131,SMF131,Lorraine Reyneke,smf_hnm_manie_reyneke,MTD 20 Mbps,1206,18/12/2025,19/10/2026
+SMF131,SMF131,Lorraine Reyneke,smf_hnm_klein_begin,MTD 20 Mbps,1207,21/05/2026,19/10/2026
+SMF193,SMF193,Louis Nagel,smf_hnm_louis_nagel,MTD 20 Mbps,1673,01/11/2024,20/10/2026
+SMF030,SMF030,Lourens Strauss,smf_hnm_lourens_strauss,MTD 50 Mbps,1670,01/11/2024,20/10/2026
+SMF424,SMF424,Lucas Roodt,smf_hnm_dr_lucas_roodt,MTD 20 Mbps,1292,01/11/2024,20/10/2026
+SMF447,SMF447,Lucille Delport,smf_hnm_lucille_delport,MTD 20 Mbps,1599,01/11/2024,20/10/2026
+SMF211,SMF211,Lukas Van Wyk,smf_hnm_lukas_van_wyk,MTD 50 Mbps,1169,01/06/2026,19/10/2026
+SMF293,SMF293,Madeline Schwenk,smf_hnm_madeline_schwenk,MTD 20 Mbps,1627,01/11/2024,20/10/2026
+SMF438,SMF438,Madisemelo Tsolanku,smf_hnm_madisemelo_tsolanku,MTD 20 Mbps,1177,16/01/2026,19/10/2026
+SMF118,SMF118,Magda Lategan,smf_hnm_magda_lategan,MTD 20 Mbps,1268,01/11/2024,20/10/2026
+SMF415,SMF415,Magdalene Grobler,smf_hnm_magdalene_grobler,MTD 50 Mbps,1364,01/11/2025,20/10/2026
+SMF122,SMF122,Maletsatsi Mokhethea,smf_hnm_maletsatsi_mokhethea,MTD 20 Mbps,1170,01/11/2024,19/10/2026
+SMF337,SMF337,Mandy Weir,smf_hnm_mandy_weir,MTD 20 Mbps,1181,01/11/2024,19/10/2026
+SMF217,SMF217,Marchan Senekal,smf_hnm_marchan_senekal,MTD 20 Mbps,1153,01/11/2024,19/10/2026
+SBF2114,SBF2114,Margeret Prinsloo,svf_krd_margeret_prinsloo,Vuma BF 100/100 Mbps,1039,01/11/2024,16/10/2026
+SMF026,SMF026,Mariaan Erasmus,smf_hnm_mariaan_erasmus,MTD 20 Mbps,1232,12/01/2026,19/10/2026
+SMF094,SMF094,Mariaan Snyman,smf_hnm_mariaan_snyman,MTD 20 Mbps,1697,01/11/2024,21/10/2026
+SMF395,SMF395,Marie Schlebusch,smf_hnm_marie_schlebusch,MTD 20 Mbps,1442,01/11/2024,20/10/2026
+SMF462,SMF462,Marike Nienaber,smf_hnm_marike_nienaber,MTD 50 Mbps,1640,01/08/2025,20/10/2026
+SMF419,SMF419,Marina Smit,smf_hnm_marina_smit,MTD 20 Mbps,1641,01/11/2024,20/10/2026
+SMF280,SMF280,Marinda Strydom,smf_hnm_marinda_strydom,MTD 20 Mbps,1278,01/11/2024,20/10/2026
+SMF409,SMF409,Marisca Van Der Westhuizen,smf_hnm_marisca_vd_westhuizen,MTD 20 Mbps,1280,01/11/2024,20/10/2026
+SMF116,SMF116,Marius Van Dyk,smf_hnm_marius_van_dyk,MTD 20 Mbps,1252,01/11/2024,19/10/2026
+SMF240,SMF240,Marline Kotze,smf_hnm_marline_kotze,MTD 20 Mbps,1355,01/11/2024,20/10/2026
+SMF140,SMF140,Marlize Van Der Berg,smf_hnm_marlize_van_der_berg,MTD 20 Mbps,1624,01/11/2024,20/10/2026
+SMF412,SMF412,Melanie Piontek,smf_hnm_melanie_piontek,MTD 20 Mbps,1543,01/11/2024,20/10/2026
+SMF175,SMF175,Melanie Pretorius,smf_hnm_melanie_pretorius,MTD 50 Mbps,1294,01/11/2024,20/10/2026
+SMF103,SMF103,Melanie Stroebel,smf_hnm_melanie_stroebel,MTD 50 Mbps,1273,01/11/2024,20/10/2026
+SBF1267,SBF1267,Michelle Terblanche,svf_krd_michelle_terblanche,Vuma 100/100,1037,01/11/2024,16/10/2026
+SMF436,SMF436,Mina Muller,smf_hnm_mina_muller,MTD 20 Mbps,1151,01/11/2024,19/10/2026
+SMF371,SMF371,Mmapontsho Mabote,smf_hnm_mmapontsho_mabote,MTD 10 Mbps,1195,01/11/2024,19/10/2026
+SMF264,SMF264,Mmatieho Lehola,smf_hnm_mmatieho_lehola,MTD 20 Mbps,1360,01/11/2024,20/10/2026
+SMF475,SMF475,Mohammad Sumon,smf_hnm_mohammad_sumon,MTD 20 Mbps,1161,01/11/2024,19/10/2026
+SMF233,SMF233,Mojao Tladi,smf_hnm_mojao_tladi,MTD 20 Mbps,1576,01/11/2024,20/10/2026
+SMF350,SMF350,Mokhosi Stoki,smf_hnm_mokhosi_stoki,MTD 20 Mbps,1596,01/07/2025,20/10/2026
+SMF467,SMF467,Montshiua Morake,smf_hnm_montshiua_morake,MTD 20 Mbps,1266,01/11/2024,19/10/2026
+SMF123,SMF123,Morakane Kotsamere,smf_hnm_morakane_kotsamere,MTD 20 Mbps,1176,01/11/2024,19/10/2026
+SBF1347,SBF1347,Morne Joubert,svf_krd_morne_joubert,Vuma BF 100/100 Mbps,1034,01/11/2024,16/10/2026
+SBF1347,SBF1347,Morne Joubert,bup_svf_morne_joubert,Vuma WB,1035,01/11/2024,16/10/2026
+SMF422,SMF422,Nthateng Kareli,smf_hnm_mpho_kareli,MTD 20 Mbps,1649,01/11/2024,20/10/2026
+SMF203,SMF203,Natascha Baker,smf_hnm_natascha_baker,MTD 100 Mbps,1233,01/11/2024,19/10/2026
+SMF109,SMF109,Marnus Muller,smf_hnm_natasha_muller,MTD 50 Mbps,1700,01/11/2024,21/10/2026
+SMF265,SMF265,Neels Van Zyl,smf_hnm_neels_van_zyl,MTD 20 Mbps,1513,01/11/2024,20/10/2026
+SMF006,SMF006,Nehanja Van Staden,smf_hnm_nehanja_van_staden,MTD 20 Mbps,1393,01/11/2024,20/10/2026
+SMF315,SMF315,Nico Els,smf_hnm_nico_els,MTD 100 Mbps,1346,01/11/2024,20/10/2026
+SBF2025,SBF2025,Nico Myburgh,svf_krd_nico_myburgh,Vuma BF 200/200 Mbps,1033,01/11/2024,16/10/2026
+SMF145,SMF145,Nico Pieterse,smf_hnm_nico_pieterse,MTD 50 Mbps,1204,01/11/2024,19/10/2026
+SMF191,SMF191,Nico Venter,smf_hnm_nico_venter,MTD 20 Mbps,1362,01/11/2024,20/10/2026
+SMF020,SMF020,Nicolene Pretorius,smf_hnm_nicolene_pretorius,MTD 50 Mbps,1650,01/05/2026,20/10/2026
+SMF465,SMF465,Hendrik Hoffman,smf_hnm_niel_hoffman,MTD 20 Mbps,1714,09/01/2025,21/10/2026
+SMF279,SMF279,Nombulelo Karedi,smf_hnm_nombulelo_karedi,MTD 20 Mbps,1637,01/11/2024,20/10/2026
+SMF106,SMF106,Odette Slabbert,smf_hnm_odette_slabbert,MTD 50 Mbps,1549,01/11/2024,20/10/2026
+SBF2054,SBF2054,Dirk Brand,svf_krd_dirk_brand,Vuma BF 200/200 Mbps,1124,01/11/2024,19/10/2026
+SMF063,SMF063,Divan Wiid,smf_hnm_divan_wiid,MTD 50 Mbps,1253,01/11/2024,19/10/2026
+SMF075,SMF075,DP Prinsloo,dp_prinsloo,MTD 20 Mbps,1695,01/05/2026,20/10/2026
+SMF297,SMF297,Dr Graham Webber,smf_hnm_graham_webber,MTD 20 Mbps,1425,01/11/2024,20/10/2026
+SVF2047,SVF2047,Dreyrene Wissekerke,svf_krd_dreyrene_wissekerke,Vuma 30/30,1123,01/11/2024,19/10/2026
+SMF124,SMF124,Drika Louw,smf_hnm_drika_louw,MTD 50 Mbps,1409,01/11/2024,20/10/2026
+SMF214,SMF214,Drika Louw Snr,smf_hnm_drika_louw_snr,MTD 20 Mbps,1502,01/11/2024,20/10/2026
+SBF1621,SBF1621,Eddie Mccabe,svf_krd_eddie_mccabe,Vuma BF 100/100 Mbps,1121,01/11/2024,19/10/2026
+SMF382,SMF382,Elaine Munnik,smf_hnm_elaine_munnik,MTD 20 Mbps,1405,01/11/2024,20/10/2026
+SMF147,SMF147,Elanie Marx,smf_hnm_elanie_marx,MTD 20 Mbps,1672,01/11/2024,20/10/2026
+SMF303,SMF303,Elize Jackel,smf_hnm_elize_jackel,MTD 20 Mbps,1653,01/11/2024,20/10/2026
+SMF027,SMF027,Elizma De Beer,smf_hnm_elizma_de_beer,MTD 20 Mbps,1541,01/11/2024,20/10/2026
+SMF182,SMF182,Elma Cambell,smf_hnm_elma_cambell,MTD 20 Mbps,1359,01/11/2024,20/10/2026
+SMF474,SMF474,Elmar Wepener,smf_hnm_elmar_wepener,MTD 20 Mbps,1309,01/11/2024,20/10/2026
+SMF423,SMF423,Elne Pieterse,smf_hnm_elne_pieterse,MTD 20 Mbps,1277,01/11/2024,20/10/2026
+SMF061,SMF061,Eloise Venter,smf_hnm_eloise_venter,MTD 20 Mbps,1476,01/11/2024,20/10/2026
+SMF188,SMF188,Elsa Mostert,smf_hnm_elsa_mostert,MTD 20 Mbps,1182,01/07/2025,19/10/2026
+SMF236,SMF236,Elsabe Coulson,smf_hnm_elsabe_coulson,MTD 20 Mbps,1581,01/11/2024,20/10/2026
+SMF483,SMF483,Elsie Van Niekerk,smf_hnm_elsie_van_niekerk,MTD 20 Mbps,1569,01/11/2024,20/10/2026
+SMF410,SMF410,Elzette Pienaar,smf_hnm_elzette_pienaar,MTD 20 Mbps,1477,01/11/2024,20/10/2026
+SMF216,SMF216,Ernest Beyneveldt,smf_hnm_ernest_beyneveldt,MTD 20 Mbps,1166,01/07/2025,19/10/2026
+SMF139,SMF139,Ernst Kleinhans,smf_hnm_ernst_kleinhans,MTD 50 Mbps,1401,01/11/2024,20/10/2026
+SMF139,SMF139,Ernst Kleinhans,smf_hnm_nathan_kleinhans,MTD 50 Mbps,1402,20/06/2025,20/10/2026
+SMF451,SMF451,Esau Xuma,smf_hnm_esau_xuma,MTD 20 Mbps,1344,01/11/2024,20/10/2026
+SMF183,SMF183,Esmarelda Pienaar,smf_hnm_esmarelda_pienaar,MTD 50 Mbps,1281,01/11/2024,20/10/2026
+SMF013,SMF013,Esmerelda Myburgh,smf_hnm_esmerelda_myburgh,MTD 20 Mbps,1556,01/11/2024,20/10/2026
+SMF200,SMF200,Charl Bruce Cartwright,smf_hnm_estelle_botes,MTD 20 Mbps,1199,01/11/2024,19/10/2026
+SMF477,SMF477,Estelle Pretorius,smf_hnm_estelle_pretorius,MTD 20 Mbps,1548,01/11/2024,20/10/2026
+SMF031,SMF031,Etna Visser,smf_hnm_etna_visser,MTD 50 Mbps,1520,01/11/2024,20/10/2026
+SMF176,SMF176,Fanie Delport,smf_hnm_fanie_delport,MTD 50 Mbps,1664,01/11/2024,20/10/2026
+SMF370,SMF370,FM Venter,smf_hnm_fm_venter,MTD 20 Mbps,1517,01/11/2024,20/10/2026
+SMF092,SMF092,Francois Van Lingen,smf_hnm_francois_van_lingen,MTD 20 Mbps,1736,01/11/2024,21/10/2026
+SMF173,SMF173,Frans Kruger,smf_hnm_frans_kruger,MTD 20 Mbps,1212,01/11/2024,19/10/2026
+SBF1444,SBF1444,Franswa Lourens,svf_krd_franswa_lourens,Vuma BF 100/100 Mbps,1090,01/11/2024,19/10/2026
+SMF104,SMF104,Frikkie Ferreira,smf_hnm_frikkie_ferreira,MTD 20 Mbps,1380,01/11/2024,20/10/2026
+SBF1018,SBF1018,Frikkie Uys,svf_krd_frikkie_uys,Vuma BF 100/100 Mbps,1087,01/11/2024,19/10/2026
+SMF221,SMF221,Gawie Nel,smf_hnm_gawie_nel,MTD 50 Mbps,1577,01/11/2024,20/10/2026
+SMF288,SMF288,George Ferreira,smf_hnm_george_ferreira,MTD 20 Mbps,1349,01/11/2024,20/10/2026
+SMF239,SMF239,Gerda Thompson,smf_hnm_gerda_thompson,MTD 20 Mbps,1578,01/11/2024,20/10/2026
+SMF002,SMF002,Gert Botes,smf_hnm_gert_botes,MTD 50 Mbps,1426,01/12/2024,20/10/2026
+SMF285,SMF285,Gert Labuschagne,smf_hnm_gert_labuschagne,MTD 50 Mbps,1321,01/11/2024,20/10/2026
+SVF2154,SVF2154,Glen Archer,svf_krd_glen_archer,Vuma 30/30,1081,01/11/2024,19/10/2026
+SMF428,SMF428,Gloria Smith,smf_hnm_gloria_smith,MTD 20 Mbps,1242,01/11/2024,19/10/2026
+SVF2165,SVF2165,Graham Beukes,svf_krd_graham_beukes,Vuma 30/30,1080,01/08/2025,19/10/2026
+SBF1737,SBF1737,Gunter Nel,svf_krd_gunter_nel,Vuma BF 100/100 Mbps,1079,01/11/2024,19/10/2026
+SMF010,SMF010,Hannetjie Pretorius,smf_hnm_hannetjie_pretorius,MTD 20 Mbps,1665,01/07/2025,20/10/2026
+SBF1003,SBF1003,Hans Kleyngeld,svf_krd_hans_kleyngeld,Vuma 100/100,1078,01/11/2024,19/10/2026
+SBF1024,SBF1024,Hansie Vakansie,svf_krd_hansie_vakansie,Vuma BF 100/100 Mbps,1077,01/11/2024,19/10/2026
+SBF1017,SBF1017,Heinrich Horn,svf_krd_heinrich_horn,Vuma BF 500/200 Mbps,1076,01/11/2024,19/10/2026
+SMF244,SMF244,Heinz Dotzler,smf_hnm_heinz_dotzler,MTD 20 Mbps,1269,01/11/2024,20/10/2026
+SVF2178,SVF2178,Hendra Barnard,svf_krd_hendra_barnard,Vuma 30/30,1075,01/11/2024,19/10/2026
+SMF210,SMF210,Hendrik Botha,smf_hnm_hendrik_botha,MTD 20 Mbps,1361,01/10/2026,20/10/2026
+SMF305,SMF305,Hennie Swanepoel,smf_hnm_hennie_swanepoel,MTD 20 Mbps,1497,01/11/2024,20/10/2026
+SMF126,SMF126,Herman Louw,smf_hnm_herman_louw,MTD 50 Mbps,1575,01/11/2024,20/10/2026
+SMF277,SMF277,Hesmalene Reeves,smf_hnm_hesmalene_reeves,MTD 20 Mbps,1647,01/11/2024,20/10/2026
+SMF360,SMF360,Ian Louw,smf_hnm_ian_louw,MTD 20 Mbps,1423,01/11/2024,20/10/2026
+SBF2040,SBF2040,Jaco Cotton,svf_krd_jaco_cotton,Vuma BF 100/100 Mbps,1072,01/11/2024,19/10/2026
+SMF249,SMF249,Jacobus Blumenthal,smf_hnm_jacobus_blumenthal,MTD 20 Mbps,1357,01/11/2024,20/10/2026
+SMF261,SMF261,Jacobus Odendaal,smf_hnm_jacobus_odendaal,MTD 250 Mbps,1330,01/11/2024,20/10/2026
+SMF377,SMF377,Jacolese Beets,smf_hnm_jacolese_beets,MTD 20 Mbps,1571,01/11/2024,20/10/2026
+SMF314,SMF314,Jacques Bosman,smf_hnm_jacques_bosman,MTD 20 Mbps,1320,01/11/2024,20/10/2026
+SMF185,SMF185,Jacques Du Preez,smf_hnm_jacques_du_preez,MTD 20 Mbps,1382,01/11/2024,20/10/2026
+SMF100,SMF100,Jakkie Nell,smf_hnm_jakkie_nell,MTD 20 Mbps,1383,01/11/2024,20/10/2026
+SMF235,SMF235,Jakkie Smith,smf_hnm_jakkie_smith,MTD 50 Mbps,1175,01/11/2024,19/10/2026
+SMF457,SMF457,James Baba,smf_hnm_james_baba,MTD 20 Mbps,1378,01/11/2024,20/10/2026
+SMF050,SMF050,Jan Cronje,smf_hnm_jan_cronje,MTD 50 Mbps,1452,01/11/2024,20/10/2026
+SMF341,SMF341,Jan Meintjies,smf_hnm_jan_meintjies,MTD 20 Mbps,1398,07/05/2026,20/10/2026
+SMF443,SMF443,Jan Swanepoel,smf_hnm_jan_swanepoel,MTD 20 Mbps,1255,01/11/2024,19/10/2026
+SMF018,SMF018,Jannie Jacobs,smf_hnm_jannie_jacobs,MTD 20 Mbps,1593,01/11/2024,20/10/2026
+SMF007,SMF007,Jassie Naude,smf_hnm_jassie_naude,MTD 20 Mbps,1446,01/11/2024,20/10/2026
+SMF387,SMF387,JC Oosthuizen,smf_hnm_jc_oosthuizen,MTD 50 Mbps,1522,01/05/2025,20/10/2026
+SVF2146,SVF2146,Joey Luus,svf_krd_joey_luus,Vuma BF 50/25,1061,20/07/2026,16/10/2026
+SMF181,SMF181,Joey Van Zyl,smf_hnm_joey_van_zyl,MTD 20 Mbps,1652,01/04/2025,20/10/2026
+SMF172,SMF172,Johan Basson,smf_hnm_johan_basson,MTD 50 Mbps,1681,13/04/2026,20/10/2026
+SMF119,SMF119,Johan Boshoff,smf_hnm_johan_boshoff,MTD 50 Mbps,1197,01/11/2024,19/10/2026
+SMF149,SMF149,Johan Coetzer,smf_hnm_johan_coetzer,MTD 20 Mbps,1490,01/11/2024,20/10/2026
+SBF2017,SBF2017,Johan Fourie,svf_krd_johan_fourie,Vuma BF 500/200 Mbps,1062,01/11/2024,19/10/2026
+SMF003,SMF003,Johan Hughes,smf_hnm_johan_hughes,MTD 50 Mbps,1299,01/03/2026,20/10/2026
+SMF003,SMF003,Johan Hughes,smf_hnm_johan_hughes_woonstel,MTD 50 Mbps,1300,01/03/2026,20/10/2026
+SMF019,SMF019,Johan Theron,smf_hnm_johan_theron,MTD 20 Mbps,1323,01/11/2024,20/10/2026
+SMF380,SMF380,Johan Van Der Bergh,smf_hnm_johan_vd_bergh,MTD 20 Mbps,1570,01/11/2024,20/10/2026
+SMF074,SMF074,Johan Van Vuuren,smf_hnm_johan_van_vuuren,MTD 20 Mbps,1491,01/11/2024,20/10/2026
+SVF2003,SVF2003,Johanne Venter,svf_krd_johanne_viljoen,Vuma 100/100,1058,01/11/2024,16/10/2026
+SBF1023,SBF1023,Paul Roos,svf_krd_paul_roos,Vuma 100/100,1027,01/11/2024,16/10/2026
+SMF484,SMF484,Peter Booyens,smf_hnm_peter_booyens,MTD 20 Mbps,1762,01/11/2024,21/10/2026
+SMF351,SMF351,Petrus Tlali,smf_hnm_petrus_tladi,MTD 20 Mbps,1675,01/11/2024,20/10/2026
+SMF464,SMF464,Petrus Van Wyk,smf_hnm_petrus_van_wyk,MTD 20 Mbps,1519,01/11/2024,20/10/2026
+SMF327,SMF327,Philip Botha,smf_hnm_philip_botha,MTD 50 Mbps,1604,01/11/2024,20/10/2026
+SMF327,SMF327,Philip Botha,bup_smf_philip_botha,MTD WB,1610,01/11/2024,20/10/2026
+SMF134,SMF134,Phillip Khetsi,smf_hnm_phillip_khetsi,MTD 20 Mbps,1568,19/12/2025,20/10/2026
+SMF476,SMF476,Phindiwe Ntshoko,smf_hnm_phindiwe_ntshoko,MTD 20 Mbps,1335,01/11/2024,20/10/2026
+SMF160,SMF160,Pierre Viljoen,smf_hnm_pierre_viljoen,MTD 20 Mbps,1311,01/11/2024,20/10/2026
+SMF152,SMF152,Piet Groenewald,smf_hnm_piet_groenewald,MTD 50 Mbps,1397,01/11/2024,20/10/2026
+SMF032,SMF032,Piet Venter,smf_hnm_piet_venter,MTD 20 Mbps,1411,01/11/2024,20/10/2026
+SMF143,SMF143,Pieter Cronje,smf_hnm_pieter_cronje,MTD 20 Mbps,1227,01/11/2024,19/10/2026
+SMF414,SMF414,Pieter Du Plooy,smf_hnm_pieter_du_plooy,MTD 20 Mbps,1345,01/11/2024,20/10/2026
+SMF088,SMF088,Pieter Fourie,smf_hnm_pieter_fourie,MTD 20 Mbps,1514,01/11/2024,20/10/2026
+SBF1002,SBF1002,Pieter Koen,svf_krd_pieter_koen,Vuma 100/100,1025,01/11/2024,16/10/2026
+SMF151,SMF151,Pieter Minnaar,smf_hnm_pieter_minnaar,MTD 20 Mbps,1498,01/11/2024,20/10/2026
+SVF2121,SVF2121,Priscilla Puley,svf_krd_priscilla_puley,Vuma 30/30,1022,01/11/2024,16/10/2026
+SMF426,SMF426,Puleng Sikosana,smf_hnm_puleng_sikosana,MTD 10 Mbps,1413,01/11/2024,20/10/2026
+SMF163,SMF163,Ravick Van Rensburg,smf_hnm_ravick_van_rensburg,MTD 100 Mbps,1614,01/09/2025,20/10/2026
+SMF102,SMF102,Rene Delport,smf_hnm_rene_delport,MTD 20 Mbps,1501,01/11/2024,20/10/2026
+SBF2034,SBF2034,Riaan Raath,svf_krd_riaan_raath,Vuma BF 100/100 Mbps,1003,01/01/2025,16/10/2026
+SBF2034,SBF2034,Riaan Raath,krd_riaan_raath,Skybre Wireless 8 Mbps,1004,01/01/2025,16/10/2026
+SBF2005,SBF2005,Richard Ranft,svf_krd_richard_ranft,Vuma BF 100/100 Mbps,1002,01/11/2024,16/10/2026
+SMF202,SMF202,Rika Myburgh,smf_hnm_rika_myburgh,MTD 20 Mbps,1303,01/11/2024,20/10/2026
+SMF295,SMF295,Rina Beukes,smf_hnm_rina_beukes,MTD 20 Mbps,1230,01/11/2024,19/10/2026
+SMF310,SMF310,Ronel Van Staden,smf_hnm_ronel_van_staden,MTD 50 Mbps,1661,01/04/2025,20/10/2026
+SMF379,SMF379,Rose-Marie Crear,smf_hnm_rose_marie_crear,MTD 20 Mbps,1676,01/11/2024,20/10/2026
+SMF004,SMF004,Rouan Hawkins,smf_hnm_rouan_hawkins,MTD 20 Mbps,1229,01/09/2026,19/10/2026
+SBF1682,SBF1682,Rubin Botha,svf_krd_rubin_botha,Vuma BF 200/200 Mbps,995,01/11/2024,16/10/2026
+SBF1226,SBF1226,Rudie Bosch,svf_krd_rudie_bosch,Vuma BF 100/100 Mbps,994,01/11/2024,16/10/2026
+SBF1121,SBF1121,RW Van Niekerk,svf_krd_rw_van_niekerk,Vuma BF 100/100 Mbps,992,01/11/2024,16/10/2026
+SBF1121,SBF1121,RW Van Niekerk,krd_rossouw_van_niekerk,Skybre Wireless 8 Mbps,993,01/09/2026,16/10/2026
+SMF453,SMF453,Sabie Ligojane,smf_hnm_sabie_ligojane,MTD 20 Mbps,1688,01/11/2024,20/10/2026
+SMF318,SMF318,Samuel Mohlomi,smf_hnm_samuel_mohlomi,MTD 10 Mbps,1579,01/11/2024,20/10/2026
+SMF278,SMF278,Samuel Molefi,smf_hnm_samuel_molefi,MTD 20 Mbps,1381,01/11/2024,20/10/2026
+SMF362,SMF362,Samuel Pitsi,smf_hnm_samuel_pitsi,MTD 20 Mbps,1365,01/11/2024,20/10/2026
+SMF325,SMF325,Sandile Peake,smf_hnm_sandile_peake,MTD 20 Mbps,1503,01/11/2024,20/10/2026
+SMF363,SMF363,Sannette Van Wyk,smf_hnm_sannette_van_wyk,MTD 20 Mbps,1690,01/11/2024,20/10/2026
+SMF301,SMF301,Santa Engelbrecht,smf_hnm_santa_engelbrecht,MTD 20 Mbps,1358,01/11/2024,20/10/2026
+SMF096,SMF096,Schalk Van Heerden,smf_hnm_schalk_van_heerden,MTD 20 Mbps,1459,01/11/2024,20/10/2026
+SMF421,SMF421,Puleng Matlabe,smf_hnm_seipati_matlabe,MTD 20 Mbps,1250,07/03/2025,19/10/2026
+SMF205,SMF205,Sello Abraham,smf_hnm_sello_abraham,MTD 20 Mbps,1481,01/11/2024,20/10/2026
+SMF205,SMF205,Sello Abraham,smf_hnm_sello_abraham_2,MTD 20 Mbps,1483,01/12/2024,20/10/2026
+SMF234,SMF234,Sephiri Matankole,smf_hnm_sephiri_matankole,MTD 20 Mbps,1400,01/11/2024,20/10/2026
+SVF2169,SVF2169,Shannon Compton,svf_krd_shannon_compton,Vuma 30/30,988,01/11/2024,16/10/2026
+SVF2173,SVF2173,Sherona Williams,svf_krd_sherona_williams,Vuma 30/30,986,01/01/2026,16/10/2026
+SMF009,SMF009,Simone Du Plooy,smf_hnm_simone_du_plooy,MTD 250 Mbps,1343,01/10/2025,20/10/2026
+SMF281,SMF281,Sjaan Janse van Rensburg,smf_hnm_sjaan_janse_van_rensburg,MTD 20 Mbps,1371,01/11/2024,20/10/2026
+SMF396,SMF396,Soennette Herbst,smf_hnm_soennette_herbst,MTD 20 Mbps,1162,01/11/2024,19/10/2026
+SMF383,SMF383,Sophia Mateba,smf_hnm_sophia_mateba,MTD 10 Mbps,1163,01/11/2024,19/10/2026
+SMF022,SMF022,Stefan Pretorius,smf_hnm_stefan_pretorius,MTD 20 Mbps,1373,01/11/2024,20/10/2026
+SMF225,SMF225,Suranda Willers,smf_hnm_suranda_willers,MTD 20 Mbps,1248,01/11/2024,19/10/2026
+SMF158,SMF158,Suska Meintjies,smf_hnm_suska_meintjies,MTD 20 Mbps,1696,01/11/2024,21/10/2026
+SMF052,SMF052,Suzaan Van Den Bergh,smf_hnm_suzaan_van_den_bergh,MTD 50 Mbps,1692,01/11/2024,20/10/2026
+SMF052,SMF052,Suzaan Van Den Bergh,bup_smf_suzaan_vd_bergh,MTD WB,1691,01/11/2024,20/10/2026
+SMF220,SMF220,Tanya Powell,smf_hnm_tanya_powell,MTD 20 Mbps,1221,01/05/2026,19/10/2026
+SVF2168,SVF2168,Themba Sithole,svf_krd_themba_sithole,Vuma 30/30,977,01/11/2024,16/10/2026
+SVF2168,SVF2168,Themba Sithole,bup_svf_themba_sithole,Vuma WB,978,01/11/2024,16/10/2026
+SVF2175,SVF2175,Theo Moller,svf_krd_theo_moller,Vuma 30/30,976,01/11/2024,16/10/2026
+SMF144,SMF144,Thereza Pretorius,smf_hnm_thereza_pretorius,MTD 250 Mbps,1315,01/02/2026,20/10/2026
+SMF167,SMF167,Thinus Claassen,smf_hnm_thinus_claassen,MTD 20 Mbps,1585,09/09/2025,20/10/2026
+SMF024,SMF024,Thys Van Rooyen,smf_hnm_thys_van_rooyen,MTD 50 Mbps,1660,01/11/2024,20/10/2026
+SMF187,SMF187,Tinkie Maree,smf_hnm_tinkie_maree,MTD 20 Mbps,1683,01/11/2024,20/10/2026
+SBF1132,SBF1132,Tjaart Swart,svf_krd_tjaart_swart,Vuma BF 100/100 Mbps,974,01/11/2024,16/10/2026
+SMF192,SMF192,Tracey Powell,smf_hnm_tracey_powell,MTD 20 Mbps,1468,01/11/2024,20/10/2026
+SMF361,SMF361,Tracy Ferreira,smf_hnm_tracy_ferreira,MTD 20 Mbps,1351,01/11/2024,20/10/2026
+SMF359,SMF359,Tseleng Sojne,smf_hnm_tseleng_sojne,MTD 20 Mbps,1332,01/11/2024,20/10/2026
+SMF215,SMF215,Tubatsi Radebe,smf_hnm_tubatsi_radebe,MTD 20 Mbps,1387,01/11/2024,20/10/2026
+SBF1344,SBF1344,Veronica Lourens,svf_krd_veronica_lourens,Vuma BF 100/100 Mbps,969,01/11/2024,16/10/2026
+SBF1344,SBF1344,Veronica Lourens,bup_krd_veronica_lourens,Vuma WB,970,01/11/2024,16/10/2026
+SMF207,SMF207,Veronica Van Der Walt,smf_hnm_veronica_van_der_walt,MTD 20 Mbps,1434,01/11/2024,20/10/2026
+SMF401,SMF401,Whana Van Der Walt,smf_hnm_whana_vd_walt,MTD 50 Mbps,1494,01/11/2024,20/10/2026
+SCF0036,SCF0036,Willem Dreyer,svf_krd_willem_dreyer,Vuma 30/30,968,01/11/2024,16/10/2026
+SMF169,SMF169,Willem Esterhuizen,smf_hnm_willem_esterhuizen,MTD 50 Mbps,1421,01/03/2026,20/10/2026
+SMF322,SMF322,Willem Terblanche,smf_hnm_willem_terblanche,MTD 20 Mbps,1546,01/11/2024,20/10/2026
+SBF2132,SBF2132,Willie Werth,svf_krd_willie_werth,Vuma BF 100/100 Mbps,967,01/11/2024,16/10/2026
+SVF2184,SVF2184,Wilma Zandberg,svf_krd_wilma_zandberg,Vuma 30/30,966,01/11/2024,16/10/2026
+SMF441,SMF441,Wilmi Van Rooyen,smf_hnm_wilmi_van_rooyen,MTD 20 Mbps,1626,01/11/2024,20/10/2026
+SMF129,SMF129,Wimpie Marais,smf_hnm_wimpie_marais,MTD 20 Mbps,1215,01/11/2024,19/10/2026
+SMF472,SMF472,Mmatseleng Josephine Mogorosi,smf_hnm_zachia_mogorosi,MTD 20 Mbps,1761,01/11/2024,21/10/2026
+SMF252,SMF252,Zanel Van Der Walt,smf_hnm_zanel_van_der_walt,MTD 20 Mbps,1366,01/11/2024,20/10/2026
+SMF237,SMF237,Zanelle Meyer,smf_hnm_zanelle_meyer,MTD 20 Mbps,1666,01/11/2024,20/10/2026
+SMF445,SMF445,Zinith Litabe,smf_hnm_zinith_litabe,MTD 20 Mbps,1667,01/11/2024,20/10/2026
+SMF331,SMF331,Abigail Shilote,smf_hnm_abigail_shilote,MTD 20 Mbps,1550,01/11/2024,20/10/2026
+SMF346,SMF346,Abram Mofokeng,smf_hnm_abram_mofokeng,MTD 20 Mbps,1499,01/11/2024,20/10/2026
+SMF218,SMF218,Adele Von Plaster,smf_hnm_adele_von_plaster,MTD 20 Mbps,1415,01/11/2024,20/10/2026
+SBF1010,SBF1010,Adriaan Meintjes,svf_krd_adriaan_meintjies,Vuma BF 100/100 Mbps,1147,01/11/2024,19/10/2026
+SMF161,SMF161,Adronel Knox,smf_hnm_adronel_knox,MTD 20 Mbps,1247,01/11/2024,19/10/2026
+SMF308,SMF308,Aliceson Cupido,smf_hnm_aliceson_cupido,MTD 50 Mbps,1638,01/11/2024,20/10/2026
+SVF2117,SVF2117,Allisha De Ridder,svf_krd_allisha_van_wyk,Vuma 30/30,1149,01/11/2024,19/10/2026
+SMF165,SMF165,Alwyn Schlebusch,smf_hnm_alwyn_schlebusch,MTD 20 Mbps,1444,01/11/2024,20/10/2026
+SMF023,SMF023,Alwyn Verster,smf_hnm_alwyn_verster,MTD 50 Mbps,1314,01/11/2024,20/10/2026
+SMF289,SMF289,Amanda Stephenson,smf_hnm_amanda_stephensen,MTD 50 Mbps,1547,01/01/2025,20/10/2026
+SMF450,SMF450,Amica Buonadonna,smf_hnm_amica_buonadonna,MTD 20 Mbps,1422,01/07/2026,20/10/2026
+SVF2147,SVF2147,Andre Du Toit,svf_krd_andre_du_toit,Vuma 30/30,1150,01/11/2024,19/10/2026
+SMF040,SMF040,Andre Van Aswegen,smf_hnm_andre_van_aswegen,MTD 20 Mbps,1158,01/11/2024,19/10/2026
+SMF223,SMF223,Andre Van Der Walt,smf_hnm_andre_van_der_walt,MTD 20 Mbps,1555,01/11/2024,20/10/2026
+SMF148,SMF148,Andre Van Tonder,smf_hnm_andre_van_tonder,MTD 20 Mbps,1414,01/11/2024,20/10/2026
+SMF038,SMF038,Ansie Claasens,smf_hnm_annetjie_claasen,MTD 50 Mbps,1412,01/03/2025,20/10/2026
+SMF246,SMF246,Andries Venter,smf_hnm_andries_venter,MTD 20 Mbps,1427,01/11/2024,20/10/2026
+SMF138,SMF138,Christo Du Toit,smf_hnm_anet_eksteen,MTD 20 Mbps,1537,01/11/2024,20/10/2026
+SBF2021,SBF2021,Anita Saunders,svf_krd_anita_saunders,Vuma BF 500/200 Mbps,1148,01/11/2024,19/10/2026
+SMF132,SMF132,Anja Oehley,smf_hnm_anja_oehley,MTD 100 Mbps,1635,01/11/2024,20/10/2026
+SMF455,SMF455,Annamarie Marais,smf_hnm_annamarie_marais,MTD 20 Mbps,1185,01/11/2024,19/10/2026
+SMF369,SMF369,Annarie Lerm,smf_hnm_annarie_lerm,MTD 20 Mbps,1535,01/11/2024,20/10/2026
+SVF2114,SVF2114,Annelize Erasmus,svf_jhb_annelize_erasmus,Vuma 50/50,1141,01/11/2024,19/10/2026
+SMF164,SMF164,Annette Du Plooy,smf_hnm_annette_du_plooy,MTD 20 Mbps,1200,01/11/2024,19/10/2026
+SR2531,SR2531,Arno Kleynhans,hnm_arno_kleynhans,Skybre Wireless 4 Mbps,1356,29/07/2026,20/10/2026
+SMF397,SMF397,Ashley Nell,smf_hnm_ashley_nell,MTD 50 Mbps,1178,01/11/2024,19/10/2026
+SMF479,SMF479,Babalwa Van Der Merwe,smf_hnm_babalwa_van_der_merwe,MTD 50 Mbps,1642,01/11/2024,20/10/2026
+SMF367,SMF367,Baby Ramabodu,smf_hnm_baby_ramabodu,MTD 10 Mbps,1687,01/11/2024,20/10/2026
+SVF2245,SVF2245,Barend Steenkamp,svf_jhb_barend_steenkamp,Vuma BF 100/50,1172,03/08/2026,19/10/2026
+SMF448,SMF448,Barend Viljoen,,MTD 100 Mbps,1328,01/11/2024,20/10/2026
+SMF108,SMF108,Beatrix Kuhn,smf_hnm_beatrix_kuhn,MTD 20 Mbps,1521,01/11/2024,20/10/2026
+SMF130,SMF130,Beth Pretorius,smf_hnm_beth_pretorius,MTD 20 Mbps,1174,01/11/2024,19/10/2026
+SMF248,SMF248,Bettie Theunissen,smf_hnm_bettie_theunissen,MTD 20 Mbps,1613,01/11/2024,20/10/2026
+SMF356,SMF356,Betty Mboya,smf_hnm_betty_mboya,MTD 20 Mbps,1327,01/11/2024,20/10/2026
+SVF2116,SVF2116,Bianca Van Zyl,svf_krd_bianca_van_zyl,Vuma 30/30,1117,01/11/2024,19/10/2026
+SMF425,SMF425,Breshton Batloung,smf_hnm_breshton_batloung,MTD 10 Mbps,1454,01/11/2024,20/10/2026
+SMF170,SMF170,Brian Kotze,smf_hnm_brian_kotze,MTD 100 Mbps,1583,01/11/2024,20/10/2026
+SMF459,SMF459,Carla Haasbroek,smf_hnm_carla_haasbroek,MTD 20 Mbps,1674,01/11/2024,20/10/2026
+SMF204,SMF204,Cathy Melville,smf_hnm_cathy_melville,MTD 20 Mbps,1396,01/11/2024,20/10/2026
+SMF343,SMF343,Catrien Clayton,smf_hnm_catrien_clayton,MTD 100 Mbps,1270,01/11/2024,20/10/2026
+SMF037,SMF037,Chandre Jordan,smf_hnm_chandre_jordaan,MTD 50 Mbps,1447,05/11/2024,20/10/2026
+SMF229,SMF229,Chanel Van Wyk,smf_hnm_chanel_van_wyk,MTD 20 Mbps,1288,01/11/2024,20/10/2026
+SBF1844,SBF1844,Chantal Jonck,svf_krd_chantal_jonck,Vuma BF 100/100 Mbps,1140,01/11/2024,19/10/2026
+SBF2059,SBF2059,Chantel Leach,Skybre-PPP-Teraco-JHB,Vuma BF 500/200 Mbps,1139,01/11/2024,19/10/2026
+SMF394,SMF394,Chantelle Westraad,smf_hnm_chantelle_westraad,MTD 20 Mbps,1338,01/08/2025,20/10/2026
+SMF135,SMF135,Charlene Nel,smf_hnm_charlene_nel,MTD 20 Mbps,1424,01/11/2024,20/10/2026
+SVF2163,SVF2163,Charlie Crafford,svf_krd_charlie_crafford,Vuma 30/30,1137,01/11/2024,19/10/2026
+SMF141,SMF141,Charlie Deale,smf_hnm_charlie_deale,MTD 20 Mbps,1317,01/11/2024,20/10/2026
+SMF091,SMF091,Charmaine Langston,smf_hnm_charmaine_langston,MTD 20 Mbps,1420,01/11/2024,20/10/2026
+SMF496,SMF496,Charmaine Schoeman,smf_hnm_charmaine_schoeman,MTD 20 Mbps,1588,01/11/2024,20/10/2026
+SMF446,SMF446,Chris Badenhorst,smf_hnm_chris_badenhorst,MTD 20 Mbps,1282,01/11/2024,20/10/2026
+SMF034,SMF034,Chris Du Randt,smf_hnm_chris_du_randt,MTD 50 Mbps,1304,01/11/2024,20/10/2026
+SMF098,SMF098,Chris Louw,smf_hnm_chris_louw,MTD 20 Mbps,1322,01/11/2024,20/10/2026
+SMF344,SMF344,NG Kerk Hennenman,smf_hnm_chris_vd_linde,MTD 50 Mbps,1326,22/05/2025,20/10/2026
+SMF227,SMF227,Christa Human,smf_hnm_christa_human,MTD 20 Mbps,1283,01/11/2024,20/10/2026
+SMF324,SMF324,Christa Nolan,smf_hnm_christa_nolan,MTD 20 Mbps,1587,01/11/2024,20/10/2026
+SBF1562,SBF1562,Christi Mc Neil,svf_krd_christi_mc_neil,Vuma BF 500/200 Mbps,1134,01/11/2024,19/10/2026
+SMF189,SMF189,Christiaan Strydom,smf_hnm_christiaan_strydom,MTD 50 Mbps,1534,01/07/2025,20/10/2026
+SMF245,SMF245,Christiena Pitout,smf_hnm_christiena_pitout,MTD 20 Mbps,1605,01/11/2024,20/10/2026
+SMF113,SMF113,Stefanus Vorster,smf_hnm_christine_jvr,MTD 20 Mbps,1152,01/11/2024,19/10/2026
+SMF086,SMF086,Christine Petitt,smf_hnm_christine_petitt,MTD 20 Mbps,1417,01/11/2024,20/10/2026
+SMF266,SMF266,Christo Van Der Merwe,smf_hnm_christo_van_der_merwe,MTD 20 Mbps,1186,22/08/2025,19/10/2026
+SVF2153,SVF2153,Cindy Boshoff,svf_krd_cindy_boshoff,Vuma 30/30,1132,01/11/2024,19/10/2026
+SMF332,SMF332,Ciska Nel,smf_hnm_ciska_nel,MTD 20 Mbps,1165,01/11/2024,19/10/2026
+SMF212,SMF212,Johanna Venter,smf_hnm_cobus_venter,MTD 20 Mbps,1704,01/11/2024,21/10/2026
+SMF282,SMF282,Corne Koekemoer,smf_hnm_corne_koekemoer,MTD 20 Mbps,1584,01/11/2024,20/10/2026
+SMF232,SMF232,Dandre Van Den Heever,smf_hnm_dandre_van_den_heever,MTD 20 Mbps,1192,01/12/2025,19/10/2026
+SMF178,SMF178,Daniel Mkwanazi,smf_hnm_daniel_mkwanazi,MTD 20 Mbps,1395,01/11/2024,20/10/2026
+SMF420,SMF420,Daniel Pule,smf_hnm_daniel_pule,MTD 10 Mbps,1686,01/11/2024,20/10/2026
+SMF372,SMF372,Daniel Radebe,smf_hnm_daniel_radebe,MTD 10 Mbps,1285,01/11/2024,20/10/2026
+SMF039,SMF039,DynaDrive Power Solutions (PTY) Ltd,smf_hnm_danny_du_plessis_snr,MTD 50 Mbps,1370,14/01/2025,20/10/2026
+SMF260,SMF260,David Van Der Merwe,smf_hnm_david_van_der_merwe,MTD 20 Mbps,1455,01/08/2026,20/10/2026
+SMF276,SMF276,Dawid Van Zyl,smf_hnm_dawid_van_zyl,MTD 20 Mbps,1348,01/11/2024,20/10/2026
+SMF442,SMF442,Dazel Nel,smf_hnm_dazel_nel,MTD 20 Mbps,1297,01/11/2024,20/10/2026
+SMF470,SMF470,Derick Pretorius,smf_hnm_derick_pretorius,MTD 20 Mbps,1622,01/11/2024,20/10/2026
+SMF049,SMF049,Desmond Hudson,smf_hnm_desmond_hudson,MTD 20 Mbps,1419,01/11/2024,20/10/2026
+SMF056,SMF056,Desmond Thysse,SMF056,MTD 250 Mbps,1662,01/11/2024,20/10/2026
+SVF2164,SVF2164,Dian Pieters,svf_krd_dian_pieters,Vuma 100/100,1125,01/06/2026,19/10/2026
+SMF060,SMF060,Dicky Van Reenen,smf_hnm_dicky_van_reenen,MTD 250 Mbps,1157,01/11/2024,19/10/2026
+SVF2113,SVF2113,Yolande Schmidt,svf_krd_yolande_schmidt,Vuma 50/50,964,03/07/2025,16/10/2026
+SVF2112,SVF2112,Blackhawk Defence Solutions,svf_krd_nick_muller,Vuma BF 200/200 Mbps,1110,01/07/2025,19/10/2026
+SVF2112,SVF2112,Blackhawk Defence Solutions,svf_krd_nic_muller,Vuma BF 500/200 Mbps,1109,01/07/2025,19/10/2026
+SVF2112,SVF2112,Blackhawk Defence Solutions,svf_krd_jim_mofokeng,Vuma BF 100/100 Mbps,1107,01/07/2025,19/10/2026
+SVF2112,SVF2112,Blackhawk Defence Solutions,svf_krd_blackhawk,Vuma 100/100,1105,27/03/2026,19/10/2026
+SVF2112,SVF2112,Blackhawk Defence Solutions,bup_svf_nick_muller_backup,Vuma WB,1104,01/07/2026,19/10/2026
+SVF2112,SVF2112,Blackhawk Defence Solutions,svf_krd_blackhawk_2,Vuma 30/30,1106,28/08/2026,19/10/2026
+SBF1898,SBF1898,Smile Savers,svf_krd_smile_savers,Vuma BF 100/100 Mbps,984,01/11/2024,16/10/2026
+SBF1898,SBF1898,Smile Savers,bup_svf_smile_savers,Vuma WB,985,24/10/2024,16/10/2026
+DUP1003,DUP1003,Annelie Fouche,svf_krd_annelie_fouche,Vuma DUP 100/100,1142,01/11/2024,19/10/2026
+DUP1003,DUP1003,Annelie Fouche,bup_svf_annelie_fouche,Vuma WB,1143,24/10/2024,19/10/2026
+DUP1003,DUP1003,Annelie Fouche,svf_krd_annelie_fouche_2,Vuma 30/30,1144,01/03/2025,19/10/2026
+DUP1003,DUP1003,Annelie Fouche,bup_svf_prestige_finance,Vuma WB,1145,01/03/2026,19/10/2026
+SBF2008,SBF2008,Christopher Smith,svf_krd_christopher_smith,Vuma 100/100,1133,01/11/2024,19/10/2026
+SBF2049,SBF2049,Karen Coetzee,svf_krd_reno_joubert,Vuma BF 500/200 Mbps,1047,01/11/2024,16/10/2026
+SVF2137,SVF2137,Rellings CC,svf_krd_jock_relling,Vuma BF 500/200 Mbps,1007,01/11/2024,16/10/2026
+SVF2137,SVF2137,Rellings CC,krd_rellings_shop,SW 30 Mbps,1008,01/12/2024,16/10/2026
+SVF2137,SVF2137,Rellings CC,krd_sqaush_rellings,Skybre Wireless 4 Mbps,1009,01/12/2024,16/10/2026
+SVF2137,SVF2137,Rellings CC,svf_krd_berdina_steyn,Vuma BF 500/200 Mbps,1010,01/12/2024,16/10/2026
+SVF2137,SVF2137,Rellings CC,krd_ingrid_rellings,Skybre Wireless 6 Mbps,1011,01/12/2024,16/10/2026
+SVF2137,SVF2137,Rellings CC,svf_krd_werner_relling,Vuma 200/200,1012,13/11/2025,16/10/2026
+SVF2152,SVF2152,Carmel Simons,svf_krd_carmel_simons,Vuma 50/50,1136,01/11/2024,19/10/2026
+SBF2048,SBF2048,Freddie Cloete,svf_krd_freddie_cloete,Vuma BF 100/100 Mbps,1089,01/11/2024,19/10/2026
+SBF2058,SBF2058,Otilia Fernandes,svf_krd_otilia_fernandes,Vuma 200/200,1028,01/11/2024,16/10/2026
+SBF2061,SBF2061,Eric Scriven,svf_krd_eric_scriven,Vuma BF 200/200 Mbps,1102,01/11/2024,19/10/2026
+SVF2071,SVF2071,Corr Kuhn,svf_krd_corr_kuhn,Vuma 100/100,1131,01/11/2024,19/10/2026
+SVF2071,SVF2071,Corr Kuhn,bup_svf_corr_kuhn,Vuma WB,1130,24/10/2024,19/10/2026
+SVF2073,SVF2073,Skybre Auto,bup_svf_skybre_kantoor,Vuma WB,925,01/12/2024,16/10/2026
+SVF2073,SVF2073,Skybre Auto,scf_0000,SCF 500 Mbps,609,03/07/2025,13/10/2026
+SVF2073,SVF2073,Skybre Auto,sky_barnard_griesel_cam_ofh_1,Skybre Wireless 4 Mbps,926,23/09/2025,16/10/2026
+SVF2073,SVF2073,Skybre Auto,sky_vgw_cam_1,Skybre Wireless 4 Mbps,927,24/09/2025,16/10/2026
+SVF2073,SVF2073,Skybre Auto,sky_vgw_cam_2,Skybre Wireless 4 Mbps,928,30/09/2025,16/10/2026
+SVF2073,SVF2073,Skybre Auto,sky_panorama,Skybre Wireless 4 Mbps,929,27/11/2025,16/10/2026
+SVF2073,SVF2073,Skybre Auto,sky_panorama_cam,Skybre Wireless 4 Mbps,930,27/11/2025,16/10/2026
+SVF2073,SVF2073,Skybre Auto,sky_panorama_ptz,Skybre Wireless 4 Mbps,931,14/12/2025,16/10/2026
+SVF2073,SVF2073,Skybre Auto,vgw_monitor,Skybre Wireless 4 Mbps,949,05/05/2026,16/10/2026
+SVF2073,SVF2073,Skybre Auto,krd_kamera_psg,Skybre Wireless 10 Mbps,954,18/07/2026,16/10/2026
+SVF2073,SVF2073,Skybre Auto,bup_hnm_kantoor,MTD WB,948,17/09/2026,16/10/2026
+DUP1006,DUP1006,Elmay Heyns,svf_krd_elmay_heyns,Vuma DUP 100/100,1111,01/11/2024,19/10/2026
+DUP1012,DUP1012,Ultimate Property,svf_krd_lavender_guesthouse,Vuma DUP 100/100,971,01/11/2024,16/10/2026
+DUP1012,DUP1012,Ultimate Property,bup_svf_lavender_guest,Vuma WB,972,01/12/2024,16/10/2026
+DUP1012,DUP1012,Ultimate Property,krd_ultimate_property,Skybre Wireless 8 Mbps,973,01/12/2024,16/10/2026
+DUP1013,DUP1013,Nicola Saaiman,svf_krd_nicola_saaiman,Vuma 100/100,1030,01/11/2024,16/10/2026
+SVF2098,SVF2098,Edelkroon,svf_krd_huis_edelkroon,Vuma 1000/200,1120,01/11/2024,19/10/2026
+DUP1019,DUP1019,NKAGRI (Pty) Ltd,svf_krd_jacobus_keyser,Vuma DUP 50/50,1029,01/01/2025,16/10/2026
+SBF1029,SBF1029,Chris Vlok,svf_krd_chris_vlok,Vuma BF 100/100 Mbps,1135,01/11/2024,19/10/2026
+SBF1022,SBF1022,Nico Peyper,svf_krd_nico_peyper,Vuma 500/200,1031,01/11/2024,16/10/2026
+SBF1022,SBF1022,Nico Peyper,krd_nico_peyper,Vuma WB,1032,13/04/2025,16/10/2026
+SVF2155,SVF2155,Riaan Coetzee,svf_krd_riaan_coetzee,Vuma 50/50,1005,01/11/2024,16/10/2026
+SBF1117,SBF1117,Tal Leonard,svf_krd_tal_leonard,Vuma BF 100/100 Mbps,982,01/11/2024,16/10/2026
+SBF1117,SBF1117,Tal Leonard,krd_tal_leonard,Skybre Wireless 9 Mbps,983,23/10/2024,16/10/2026
+SBF2130,SBF2130,Jaco Pieters,svf_krd_jaco_pieters,Vuma BF 100/100 Mbps,1070,01/11/2024,19/10/2026
+SVF2132,SVF2132,Gerhardus Smith,svf_jhb_gerhardus_smith,Vuma 30/30,1086,01/11/2024,19/10/2026
+SMF411,SMF411,De Vleis Huis,smf_hnm_de_vleishuis,MTD 20 Mbps,1507,01/11/2024,20/10/2026
+SMF411,SMF411,De Vleis Huis,hnm_jan_de_wet_pa,Skybre Wireless 6 Mbps,1504,15/12/2025,20/10/2026
+SMF411,SMF411,De Vleis Huis,krd_de_vleishuis,Skybre Wireless 6 Mbps,1506,13/01/2026,20/10/2026
+SMF480,SMF480,Lynette Claassens,smf_hnm_lcd_technologies,MTD 20 Mbps,1407,01/06/2026,20/10/2026
+SMF166,SMF166,Hector Austin Eng t/a Puma Garage,smf_hnm_puma_garage,MTD 20 Mbps,1443,01/11/2024,20/10/2026
+SMF461,SMF461,Sen-Chem,smf_hnm_sen_chem,MTD 20 Mbps,1566,01/11/2024,20/10/2026
+SMF028,SMF028,Sunskills,smf_hnm_sonja_van_der_westhuizen,MTD 20 Mbps,1479,01/11/2024,20/10/2026
+SMF497,SMF497,Antonis Spyrou,smf_hnm_antonis_spyrou,MTD 20 Mbps,1353,01/11/2024,20/10/2026
+SMF495,SMF495,Melanie Compton,smf_hnm_melanie_compton,MTD 100 Mbps,1217,01/04/2025,19/10/2026
+SMF498,SMF498,John Robinson,smf_hnm_john_robinson,MTD 20 Mbps,1457,01/11/2024,20/10/2026
+SMF838,SMF838,Corne Benson,smf_hnm_test,MTD 20 Mbps,1557,19/02/2026,20/10/2026
+SMF835,SMF835,Elna Van Der Walt,smf_hnm_elna_van_der_walt,MTD 10 Mbps,1495,12/06/2026,20/10/2026
+SVF2239,SVF2239,David Lambebo,svf_krd_david_lambebo,Vuma BF 30/30 Mbps,1127,18/06/2026,19/10/2026
+SVF2199,SVF2199,Ronel Van Der Walt,svf_krd_ronel_vd_walt,Vuma 50/50,996,18/03/2025,16/10/2026
+SMF499,SMF499,Jakkie Binedell,smf_hnm_jakkie_benidell,MTD 20 Mbps,1392,18/10/2024,20/10/2026
+SMF500,SMF500,Nickness Khiba,smf_hnm_nickness_khiba,MTD 20 Mbps,1167,19/10/2024,19/10/2026
+SMF501,SMF501,Nosizi Mangani,smf_hnm_nosizi_mangani,MTD 20 Mbps,1754,24/08/2026,21/10/2026
+SMF502,SMF502,Fransie Kotze,smf_hnm_fransie_kotze,MTD 20 Mbps,1526,25/10/2024,20/10/2026
+SMF503,SMF503,Janneke Snyman,smf_hnm_janneke_snyman,MTD 20 Mbps,1376,25/10/2024,20/10/2026
+SMF504,SMF504,Itumeleng Mohokare,smf_hnm_itumeleng_mohokare,MTD 20 Mbps,1406,01/11/2024,20/10/2026
+SMF506,SMF506,Hannes Kok,smf_hnm_hannes_kok,MTD 20 Mbps,1694,09/02/2026,20/10/2026
+SMF507,SMF507,Ansie Badenhorst,smf_hnm_ansie_badenhorst,MTD 20 Mbps,1249,01/11/2024,19/10/2026
+SMF509,SMF509,Armand Agenbag,smf_hnm_armand_agenbag,MTD 20 Mbps,1271,01/11/2024,20/10/2026
+SMF510,SMF510,Dimakatso Moteane,smf_hnm_dimakatso_moteane,MTD 20 Mbps,1225,28/09/2026,19/10/2026
+SVF2185,SVF2185,Cronje Pretorius,svf_krd_cronje_pretorius,Vuma 30/30,1129,07/11/2024,19/10/2026
+SMF513,SMF513,Motsei Khumalo,smf_hnm_motsei_khumalo,MTD 20 Mbps,1234,01/11/2024,19/10/2026
+SMF514,SMF514,Chris Kruger,smf_hnm_chris_kruger,MTD 50 Mbps,1523,31/12/2024,20/10/2026
+SMF515,SMF515,Rudolph Havenga,smf_hnm_rudolph_havenga,MTD 20 Mbps,1515,08/11/2024,20/10/2026
+SW1992,SW1992,BJ van Schalkwyk (Pty) Ltd,krd_barend_van_schalkwyk,Vuma 200/200,1114,01/12/2024,19/10/2026
+SW1992,SW1992,BJ van Schalkwyk (Pty) Ltd,krd_barend_kamera_1,Skybre Wireless 5 Mbps,1112,14/12/2024,19/10/2026
+SW1992,SW1992,BJ van Schalkwyk (Pty) Ltd,krd_barend_van_schalkwyk_werkers,Skybre Wireless 5 Mbps,1115,14/12/2024,19/10/2026
+SW1992,SW1992,BJ van Schalkwyk (Pty) Ltd,krd_barend_kamera_2,Skybre Wireless 5 Mbps,1113,14/12/2024,19/10/2026
+SVF2238,SVF2238,Linda Mays,svf_krd_linda_mays,Vuma 30/30,1048,06/07/2026,16/10/2026
+SW1504,SW1504,Anton Bredell,krd_anton_bredell,Skybre Wireless 8 Mbps,378,12/10/2026,09/10/2026
+SWF2092,SWF2092,AW Bredell,krd_aw_bredell_2,Skybre Wireless 10 Mbps,385,27/08/2026,09/10/2026
+SW1478,SW1478,BJ Du Plessis,kps_jane_du_plessis,Skybre Wireless 6 Mbps,899,01/12/2024,15/10/2026
+SVF2208,SVF2208,Pompo Makate,sty_pompo_makate_home,Skybre Wireless 4 Mbps,1023,01/12/2024,16/10/2026
+SVF2208,SVF2208,Pompo Makate,svf_krd_pompo_makate,Vuma 30/30,1024,23/10/2025,16/10/2026
+SVF2241,SVF2241,Ramona England,svf_krd_ramona_england,Vuma 30/30,1018,17/02/2026,16/10/2026
+SVF2225,SVF2225,Riebru CC,svf_krd_rb_rekenmeesters,Vuma BF 30/30 Mbps,1001,17/03/2026,16/10/2026
+SVF2190,SVF2190,Rina Damon,svf_krd_rina_damon,Vuma 30/30,999,10/01/2025,16/10/2026
+SCF0053,SCF0053,SNG ARGEN Actuarial Solutions (Pty) Ltd,krd_argen,Skybre Wireless 100Mbps,616,01/12/2024,13/10/2026
+SCF0053,SCF0053,SNG ARGEN Actuarial Solutions (Pty) Ltd,scf_0037,SCF 100 Mbps,597,01/01/2026,13/10/2026
+SWF2004,SWF2004,Thomas Van Biljon,sty_thomas_van_biljon,Skybre Wireless 4 Mbps,477,01/12/2024,12/10/2026
+SVF2240,SVF2240,Thys Cotton,svf_krd_thys_cotton,Vuma BF 30/30 Mbps,975,15/06/2026,16/10/2026
+SWF2148,SWF2148,Vuselwa Maseko,krd_vuselwa_maseko,Skybre Wireless 5 Mbps,900,01/06/2026,15/10/2026
+SVF2193,SVF2193,Johannes Wicus,svf_krd_johannes_wicus,Vuma 30/30,1057,16/01/2025,16/10/2026
+SVF2250,SVF2250,Dries Bester,svf_krd_dries_bester,Vuma BF 30/30 Mbps,1122,21/08/2026,19/10/2026
+SW1072,SW1072,Ferdie Bam,sty_ferdi_bam,Skybre Wireless 6 Mbps,542,01/12/2024,12/10/2026
+SWF2466,SWF2466,Jacob Johannes Erasmus,kps_elmar_cheetah_milling,Skybre Wireless 4 Mbps,631,24/11/2025,13/10/2026
+SVF2242,SVF2242,Jan Hendrik Els,krd_jan_els,Skybre Wireless 7 Mbps,1068,01/12/2024,19/10/2026
+SVF2243,SVF2243,JC Swart Boerdery,kps_riaan_swart,Skybre Wireless 8 Mbps,1064,01/12/2024,19/10/2026
+SVF2243,SVF2243,JC Swart Boerdery,svf_krd_elmerene_swart,Vuma 30/30,1065,01/07/2025,19/10/2026
+SW1443,SW1443,Farmprops 19 (Pty)Ltd,krd_eriek_pistorius,Skybre Wireless 6 Mbps,679,01/12/2024,13/10/2026
+SW1443,SW1443,Farmprops 19 (Pty)Ltd,krd_riaan_crous,SW 15 Mbps,680,31/12/2025,13/10/2026
+SKY002,SKY002,Wifiza Telecoms,sty_act_silo,Skybre Wireless 7 Mbps,902,01/03/2025,15/10/2026
+SWF2595,SWF2595,John Austin,hnm_john_austin,Skybre Wireless 4 Mbps,688,01/12/2024,13/10/2026
+SR2539,SR2539,Will Kruger,kps_will_kruger,Skybre Wireless 5 Mbps,916,21/09/2026,15/10/2026
+SMF517,SMF517,Attie Erasmus,smf_hnm_attie_erasmus,MTD 20 Mbps,1430,01/12/2024,20/10/2026
+SMF518,SMF518,Marelize Dippenaar,smf_hnm_marelize_dippenaar,MTD 50 Mbps,1518,01/12/2024,20/10/2026
+SMF519,SMF519,Theo Johnson,smf_hnm_theo_johnson,MTD 20 Mbps,1553,01/12/2024,20/10/2026
+SMF520,SMF520,Marinda Venter,smf_hnm_ernest_lehani,MTD 20 Mbps,1767,01/12/2024,21/10/2026
+SMF530,SMF530,Sithole Moipone,smf_hnm_sithole_moipone,MTD 20 Mbps,1347,01/05/2026,20/10/2026
+SMF111,SMF111,Roeline Correia,smf_hnm_roeline_correira,MTD 50 Mbps,1231,01/10/2025,19/10/2026
+SMF523,SMF523,Stephen Mophoso,smf_hnm_stephen_mophoso,MTD 20 Mbps,1211,10/12/2024,19/10/2026
+SMF524,SMF524,Magriet Wiid,smf_hnm_magriet_wiid,MTD 20 Mbps,1208,10/12/2024,19/10/2026
+SMF524,SMF524,Magriet Wiid,hnm_zandrea_wiid,Skybre Wireless 6 Mbps,1209,26/02/2026,19/10/2026
+SMF525,SMF525,Netta Grobler,smf_hnm_netta_grobler,MTD 20 Mbps,1339,10/12/2024,20/10/2026
+SMF526,SMF526,Hennenman Trailer and Tool Hire (Pty)Ltd,smf_hnm_trailor_&_tool,MTD 20 Mbps,1319,10/12/2024,20/10/2026
+SMF526,SMF526,Hennenman Trailer and Tool Hire (Pty)Ltd,smf_hnm_netta_grobler_2,MTD 20 Mbps,1318,03/06/2026,20/10/2026
+SMF527,SMF527,Christina Bezuidenhout,smf_hnm_christina_bezuidenhout,MTD 20 Mbps,1563,11/12/2024,20/10/2026
+SMF528,SMF528,Pierre Theron,smf_hnm_pierre_theron,MTD 100 Mbps,1551,11/12/2024,20/10/2026
+SMF529,SMF529,Julie-Anne Lin,smf_hnm_julie_anne_lin,MTD 50 Mbps,1237,01/07/2026,19/10/2026
+SMF531,SMF531,Johan Fourie,smf_hnm_johan_fourie,MTD 20 Mbps,1410,12/12/2024,20/10/2026
+SMF532,SMF532,Tersia Knox,smf_hnm_tersia_knox,MTD 20 Mbps,1408,12/12/2024,20/10/2026
+SMF533,SMF533,Jacqueline Fensham,smf_hnm_jacqueline_fensham,MTD 20 Mbps,1219,18/12/2024,19/10/2026
+SMF534,SMF534,Sydney Knutsen,smf_hnm_sydney_knutsen,MTD 20 Mbps,1539,18/12/2024,20/10/2026
+SMF535,SMF535,Michael Conradie,smf_hnm_michael_conradie,MTD 50 Mbps,1591,19/12/2024,20/10/2026
+SMF536,SMF536,JA Gouws,smf_hnm_deon_gouws,MTD 20 Mbps,1561,20/12/2024,20/10/2026
+SMF539,SMF539,Dilahlwane Dhlangisa,smf_hnm_dilahlwane_dhlangisa,MTD 20 Mbps,1275,01/03/2025,20/10/2026
+SMF540,SMF540,Erna Barnard,smf_hnm_erna_barnard,MTD 50 Mbps,1213,09/01/2025,19/10/2026
+SMF541,SMF541,Corne Knoetze,smf_hnm_corne_knoetze,MTD 50 Mbps,1625,09/01/2025,20/10/2026
+SMF543,SMF543,Linda Cooks,smf_hnm_linda_cooks,MTD 20 Mbps,1416,10/01/2025,20/10/2026
+SMF659,SMF659,Johan Pretorius,smf_hnm_johan_pretorius,MTD 20 Mbps,1224,01/08/2025,19/10/2026
+SMF661,SMF661,Samokelo Dlamini,smf_hnm_samokelo_dlamini,MTD 20 Mbps,1189,01/05/2026,19/10/2026
+SMF547,SMF547,Petrus Van Der Walt,smf_hnm_petrus_vd_walt,MTD 20 Mbps,1265,14/01/2025,19/10/2026
+SMF547,SMF547,Petrus Van Der Walt,smf_hnm_alet_vd_walt,MTD 20 Mbps,1264,05/06/2025,19/10/2026
+SMF548,SMF548,Annetjie Kruger,smf_hnm_annetjie_kruger,MTD 20 Mbps,1244,16/01/2025,19/10/2026
+SMF550,SMF550,Ems Motors,smf_hnm_ems_motors,MTD 20 Mbps,1545,16/01/2025,20/10/2026
+SMF551,SMF551,Gys Beket,smf_hnm_gys_beket,MTD 20 Mbps,1450,16/01/2025,20/10/2026
+SMF560,SMF560,Grace Hillocks,smf_hnm_grace_hillocks,MTD 20 Mbps,1262,30/01/2025,19/10/2026
+SMF553,SMF553,Christoffel Botha,smf_hnm_christoffel_botha,MTD 20 Mbps,1617,23/01/2025,20/10/2026
+SMF556,SMF556,John Bolibe,smf_hnm_john_bolibe,MTD 20 Mbps,1580,24/01/2025,20/10/2026
+SMF554,SMF554,Sarlo Logistics PTY(Ltd),smf_hnm_sarlo_logistics,MTD 50 Mbps,1367,01/06/2026,20/10/2026
+SMF557,SMF557,Elizabeth du Plooy,smf_hnm_elizabeth_du_plooy,MTD 20 Mbps,1352,24/01/2025,20/10/2026
+SMF563,SMF563,Edna Opperman,smf_hnm_edna_opperman,MTD 20 Mbps,1329,03/02/2025,20/10/2026
+SMF566,SMF566,James Lelibana,smf_hnm_james_lelibana,MTD 20 Mbps,1470,13/02/2025,20/10/2026
+SMF567,SMF567,Angela Nyamane,smf_hnm_angela_nyamane,MTD 20 Mbps,1567,13/02/2025,20/10/2026
+SMF573,SMF573,Pieta Prinsloo,smf_hnm_pieta_prinsloo,MTD 50 Mbps,1574,01/05/2026,20/10/2026
+SMF575,SMF575,Chris Ehlers,smf_hnm_chris_ehlers,MTD 20 Mbps,1431,01/03/2025,20/10/2026
+SMF579,SMF579,Francios Agencies CC,smf_hnm_francois_leech,MTD 20 Mbps,1677,28/02/2025,20/10/2026
+SMF582,SMF582,Maritza Van Der Merwe,smf_hnm_martiza_vd_merwe,MTD 100 Mbps,1306,06/03/2025,20/10/2026
+SMF584,SMF584,Tinothy James Rogers,smf_hnm_tinothy_rogers,MTD 50 Mbps,1160,01/03/2025,19/10/2026
+SVF2228,SVF2228,Ellen De Beer,svf_krd_ellen_de_beer,Vuma BF 50/25,1116,22/04/2026,19/10/2026
+SMF585,SMF585,Etresia Potgieter,smf_hnm_etresia_potgieter,MTD 20 Mbps,1486,13/03/2025,20/10/2026
+SMF591,SMF591,AJ Reyneke,smf_hnm_aj_reyneke,MTD 20 Mbps,1289,20/03/2025,20/10/2026
+SMF597,SMF597,Philip Mens,smf_hnm_philip_mens,MTD 20 Mbps,1245,28/03/2025,19/10/2026
+SMF596,SMF596,Tsitsi Herry,smf_hnm_tsitsi_herry,MTD 20 Mbps,1648,28/03/2025,20/10/2026
+SMF594,SMF594,Stephen Ntsala,smf_hnm_stephen_ntsala,MTD 20 Mbps,1302,27/03/2025,20/10/2026
+SMF595,SMF595,Piet Ntema,smf_hnm_piet_ntema,MTD 20 Mbps,1449,27/03/2025,20/10/2026
+SMF592,SMF592,Monique Smith,smf_hnm_monique_smith,MTD 50 Mbps,1375,27/03/2025,20/10/2026
+SMF600,SMF600,LizaMbalula,smf_hnm_liza_mbalula,MTD 20 Mbps,1184,02/04/2025,19/10/2026
+SMF602,SMF602,Kathelo Mokoena,smf_hnm_katleho_mokoena,MTD 20 Mbps,1171,22/10/2025,19/10/2026
+SMF603,SMF603,Lena Marais,smf_hnm_lena_marais,MTD 20 Mbps,1525,04/04/2025,20/10/2026
+SMF606,SMF606,David Mkwane,smf_hnm_david_mkwane,MTD 20 Mbps,1433,10/04/2025,20/10/2026
+SVF2200,SVF2200,HP Aucamp,svf_krd_colene_aucamp,Vuma 30/30,1073,30/04/2025,19/10/2026
+SMF609,SMF609,Tino Motseke,smf_hnm_tino_motseke,MTD 20 Mbps,1251,01/07/2026,19/10/2026
+SMF611,SMF611,Super Save & Cash Store,smf_hnm_jahir_uddien,MTD 20 Mbps,1155,16/01/2026,19/10/2026
+SMF612,SMF612,Lincare,smf_hnm_nicolene_pretorius_2,MTD 50 Mbps,1654,01/04/2026,20/10/2026
+SMF612,SMF612,Lincare,smf_hnm_nicolene_pretorius_3,MTD 20 Mbps,1651,02/04/2026,20/10/2026
+SMF613,SMF613,Moleboheng Moiloa,smf_hnm_moleboheng_moiloa,MTD 20 Mbps,1154,24/04/2025,19/10/2026
+SMF614,SMF614,Alberto Investments,smf_hnm_down_touch,MTD 20 Mbps,1678,24/04/2025,20/10/2026
+SMF614,SMF614,Alberto Investments,smf_hnm_down_touch_2,MTD 20 Mbps,1680,24/04/2025,20/10/2026
+SMF614,SMF614,Alberto Investments,smf_hnm_down_touch_3,MTD 20 Mbps,1682,24/04/2025,20/10/2026
+SMF616,SMF616,Hester Moolman,smf_hnm_hester_moolman,MTD 20 Mbps,1659,02/05/2025,20/10/2026
+SMF618,SMF618,Gerhardus Johannes Botha,smf_hnm_whitney_botha,MTD 20 Mbps,1478,02/05/2025,20/10/2026
+SMF619,SMF619,Werner Landman,smf_hnm_werner_ladman_1,MTD 50 Mbps,1445,02/05/2025,20/10/2026
+SMF620,SMF620,Sizakele Mokhuba,smf_hnm_sizakele_mokhuba,MTD 20 Mbps,1180,25/06/2026,19/10/2026
+SMF621,SMF621,Bafedile Monamoli,smf_hnm_bafedile_monamoli,MTD 20 Mbps,1394,05/05/2025,20/10/2026
+SMF622,SMF622,Thembinkosi Manyana,smf_hnm_thembinkosi_manyana,MTD 20 Mbps,1228,25/06/2026,19/10/2026
+SMF623,SMF623,Meikie Mokau,smf_hnm_meikie_mokau_1,MTD 20 Mbps,1643,07/05/2025,20/10/2026
+SMF625,SMF625,Marble & Granite Designs CC t/a TOMBCO,smf_hnm_tombco,MTD 250 Mbps,1684,01/07/2025,20/10/2026
+SMF626,SMF626,Keneuwe Sondag,smf_hnm_keneuwe_sondag,MTD 20 Mbps,1236,30/09/2025,19/10/2026
+SMF627,SMF627,Tiaan Stander,smf_hnm_tiaan_stander,MTD 20 Mbps,1612,15/05/2025,20/10/2026
+SMF628,SMF628,Khachane Mpho,smf_hnm_khachane_mpho,MTD 20 Mbps,1471,16/05/2025,20/10/2026
+SMF629,SMF629,Tshepo Menyatso,smf_hnm_tsepho_menyatso_1,MTD 20 Mbps,1636,21/05/2025,20/10/2026
+SMF632,SMF632,Hermi De Leeuw,smf_hnm_hermi_de_leeuw,MTD 20 Mbps,1437,02/06/2025,20/10/2026
+SMF632,SMF632,Hermi De Leeuw,smf_hnm_hermi_de_leeuw_2,MTD 20 Mbps,1438,18/07/2025,20/10/2026
+SMF638,SMF638,Natasha Van Rooyen,smf_hnm_natasha_van_rooyen,MTD 20 Mbps,1164,05/06/2025,19/10/2026
+SMF633,SMF633,Andries Grobler,smf_hnm_andries_globler,MTD 20 Mbps,1324,29/05/2025,20/10/2026
+SMF635,SMF635,Peet Du Plooy,smf_hnm_peet_du_plooy,MTD 20 Mbps,1616,05/09/2025,20/10/2026
+SMF636,SMF636,Candice Janse van Rensburg,smf_hnm_candice_jv_rensburg,MTD 20 Mbps,1156,05/06/2025,19/10/2026
+SVF2203,SVF2203,Jacques Du Plessis,svf_krd_jacques_du_plessis,Vuma 500/200,1069,05/06/2025,19/10/2026
+SMF637,SMF637,Leonie Myburgh,smf_hnm_leonie_myburgh,MTD 20 Mbps,1744,17/06/2025,21/10/2026
+SMF637,SMF637,Leonie Myburgh,smf_hnm_lynmar_koop_en_verkoop,MTD 20 Mbps,1743,28/07/2026,21/10/2026
+SMF640,SMF640,Monique Van Wyk,smf_hnm_monique_v_wyk,MTD 20 Mbps,1260,26/06/2025,19/10/2026
+SMF641,SMF641,Kamohelo Moalosi,smf_hnm_kamohelo_moalosi,MTD 20 Mbps,1485,01/06/2026,20/10/2026
+SMF650,SMF650,Anna Kruger,smf_hnm_anna_kruger,MTD 20 Mbps,1308,19/06/2025,20/10/2026
+SMF651,SMF651,Werner Herbst,smf_hnm_werner_herbst,MTD 20 Mbps,1611,19/06/2025,20/10/2026
+SMF643,SMF643,Teboho Elisha,smf_hnm_teboho_elisha,MTD 20 Mbps,1235,23/02/2026,19/10/2026
+SMF652,SMF652,Florence Montso,smf_hnm_florence_montso,MTD 20 Mbps,1183,15/09/2025,19/10/2026
+SMF653,SMF653,Richard Piontek,smf_hnm_richard_piontek,MTD 50 Mbps,1708,04/07/2025,21/10/2026
+SCF0030,SCF0030,Jaco Jonker,scf_0030,SCF 20 Mbps,599,14/10/2025,13/10/2026
+SCF0030,SCF0030,Jaco Jonker,sky_tower_cudy,Skybre Wireless 10 Mbps,617,06/11/2025,13/10/2026
+SMF656,SMF656,Mokobori Matshediso Ellen,smf_hnm_mokobori_matshediso,MTD 20 Mbps,1473,04/07/2025,20/10/2026
+SMF654,SMF654,Kaya Lucas Mbombo,smf_hnm_kaya_mbombo,MTD 20 Mbps,1258,10/07/2025,19/10/2026
+SMF657,SMF657,Dunlop Pty Ltd,smf_hnm_dunlop,MTD 20 Mbps,1560,14/07/2025,20/10/2026
+SVF2213,SVF2213,Molien Zandberg,svf_krd_molien_zanberg,Vuma 50/50,1036,01/10/2025,16/10/2026
+SMF666,SMF666,Japie Naude,smf_hnm_japie_naude,MTD 50 Mbps,1259,24/07/2025,19/10/2026
+SMF667,SMF667,Dimakatso Annah,smf_hnm_annah_dimakatso,MTD 20 Mbps,1220,24/07/2025,19/10/2026
+SMF662,SMF662,Zwelibanzi Lempe,smf_hnm_zwelibanzi_lempe,MTD 20 Mbps,1542,24/07/2025,20/10/2026
+SVF2204,SVF2204,Eugene Louw,svf_krd_bianca_louw,Vuma 30/30,1100,31/07/2025,19/10/2026
+SMF668,SMF668,Walter Johnson,smf_hnm_boef_johnson,MTD 20 Mbps,1448,24/07/2025,20/10/2026
+SMF671,SMF671,Piet Moshoadiba,smf_hnm_piet_moshoadiba,MTD 20 Mbps,1441,01/08/2025,20/10/2026
+SMF672,SMF672,Elias Rabanye,smf_hnm_elias_rabanye,MTD 20 Mbps,1210,01/08/2025,19/10/2026
+SMF674,SMF674,William Mula,smf_hnm_william_mula,MTD 20 Mbps,1389,07/08/2025,20/10/2026
+SMF675,SMF675,Molelekoa Johannes Lenyora,smf_hnm_molelekoa_lenyora,MTD 20 Mbps,1464,07/08/2025,20/10/2026
+SMF673,SMF673,Willem Correia,smf_hnm_willem_correia,MTD 20 Mbps,1606,07/08/2025,20/10/2026
+SMF676,SMF676,Robert Ambrose,smf_hnm_robert_ambrose,MTD 20 Mbps,1201,29/01/2026,19/10/2026
+SMF677,SMF677,Adele Ransome,smf_hnm_adele_ransome,MTD 20 Mbps,1453,29/06/2026,20/10/2026
+SVF2205,SVF2205,Lebohang Lara,svf_krd_lebohang_lara,Vuma 30/30,1041,15/08/2025,16/10/2026
+SMF679,SMF679,SJ Opperman,smf_hnm_hannu_opperman,MTD 50 Mbps,1713,01/02/2026,21/10/2026
+SMF681,SMF681,Custom Cutting Pty (Ltd),smf_hnm_custom_cutting,MTD 20 Mbps,1589,21/08/2025,20/10/2026
+SMF683,SMF683,Marthunis Albertus Nortje,smf_hnm_marthinus_nortje,MTD 20 Mbps,1693,01/08/2026,20/10/2026
+SVF2206,SVF2206,Dehan Joubert,svf_krd_dehan_joubert,Vuma 30/30,1126,12/09/2025,19/10/2026
+SVF2207,SVF2207,Calvin Mohapi Moiloa,svf_krd_calvin_mohapi_moiloa,Vuma 30/30,1093,01/09/2025,19/10/2026
+SWF2668,SWF2668,Gerhard Olivier,ccl_gerhard_olivier_restaurant,Skybre Wireless 10 Mbps,732,02/09/2025,14/10/2026
+SWF2668,SWF2668,Gerhard Olivier,ccl_gerhard_olivier_losieshuis1,Skybre Wireless 5 Mbps,731,02/09/2025,14/10/2026
+SWF2668,SWF2668,Gerhard Olivier,ccl_gerhard_olivier_losieshuis2,Skybre Wireless 5 Mbps,730,02/09/2025,14/10/2026
+SWF2668,SWF2668,Gerhard Olivier,ccl_gerhard_olivier_ma,Skybre Wireless 5 Mbps,729,02/09/2025,14/10/2026
+SWF2668,SWF2668,Gerhard Olivier,ccl_gerhard_olivier_kantoor,Skybre Wireless 5 Mbps,728,01/02/2026,14/10/2026
+SMF687,SMF687,Gerhard Joubert,smf_hnm_gerhard_joubert,MTD 20 Mbps,1312,02/09/2025,20/10/2026
+SMF688,SMF688,William Higgs,smf_hnm_william_higgs,MTD 50 Mbps,1301,04/05/2026,20/10/2026
+SMF689,SMF689,Andrea Wiid,smf_hnm_andrea_wiid,MTD 50 Mbps,1191,04/09/2025,19/10/2026
+SMF696,SMF696,Yolandie de Buys,smf_hnm_yolandie_de_buys,MTD 50 Mbps,1196,01/04/2026,19/10/2026
+SMF691,SMF691,Mark Nell,smf_hnm_mark_nell,MTD 20 Mbps,1552,11/09/2025,20/10/2026
+SMF714,SMF714,Dr's Delport en Webber Besigheids Trust,smf_hnm_delweb,MTD 20 Mbps,1159,11/11/2025,19/10/2026
+SMF695,SMF695,Mantoa Mosebi,smf_hnm_mantoa_mosebi,MTD 20 Mbps,1629,18/09/2025,20/10/2026
+SMF694,SMF694,Hanlé Visser,smf_hnm_hanle_visser,MTD 20 Mbps,1226,18/09/2025,19/10/2026
+SMF697,SMF697,Steven Venter,smf_hnm_steven_venter,MTD 20 Mbps,1333,25/09/2025,20/10/2026
+SMF703,SMF703,Dineo Pati,smf_hnm_dineo_pati,MTD 20 Mbps,1276,03/10/2025,20/10/2026
+SMF705,SMF705,Marina Engels,smf_hnm_marina_engels,MTD 20 Mbps,1305,03/10/2025,20/10/2026
+SMF700,SMF700,Francois Labuschagne,smf_hnm_francois_labuschagne,MTD 20 Mbps,1657,02/10/2025,20/10/2026
+SMF707,SMF707,Precious Moeketsi,smf_hnm_precious_moeketsi,MTD 20 Mbps,1766,10/10/2025,21/10/2026
+SMF712,SMF712,Keketso Jako,smf_hnm_keketso_jako,MTD 20 Mbps,1475,31/10/2025,20/10/2026
+SMF709,SMF709,Kamolane Modiehi,smf_hnm_kamolane_modiehi,MTD 20 Mbps,1439,17/10/2025,20/10/2026
+SMF711,SMF711,Karabo Xuma,smf_hnm_karabo_xuma,MTD 20 Mbps,1609,23/10/2025,20/10/2026
+SVF2210,SVF2210,Martin Potgieter,svf_krd_martin_potgieter,Vuma 30/30,1038,31/10/2025,16/10/2026
+SMF716,SMF716,Marina Calderhead,smf_hnm_marina,MTD 20 Mbps,1467,01/12/2025,20/10/2026
+SBF2143,SBF2143,Elize Mynhardt,svf_bfn_elize_mynhardt,Vuma 30/30,1118,11/11/2025,19/10/2026
+SMF721,SMF721,Carel Greyling,smf_hnm_carel_greyling,MTD 20 Mbps,1202,02/12/2025,19/10/2026
+SMF719,SMF719,Bakgat Bottelstoor,smf_hnm_bakgat_bottelstoor,MTD 20 Mbps,1193,20/11/2025,19/10/2026
+SWF2732,SWF2732,Ali Tuckshop,ccl_ali_shop1,Skybre Wireless 6 Mbps,762,17/11/2025,14/10/2026
+SWF2732,SWF2732,Ali Tuckshop,ccl_ali_shop2,Skybre Wireless 6 Mbps,759,17/11/2025,14/10/2026
+SWF2732,SWF2732,Ali Tuckshop,ccl_ali_shop3,Skybre Wireless 5 Mbps,763,18/11/2025,14/10/2026
+SWF2732,SWF2732,Ali Tuckshop,ccl_ali_shop4,Skybre Wireless 5 Mbps,761,14/05/2026,14/10/2026
+SWF2732,SWF2732,Ali Tuckshop,ccl_ali_shop5,Skybre Wireless 5 Mbps,760,10/07/2026,14/10/2026
+SMF725,SMF725,Dinnie Myburgh,smf_hnm_dinnie_myburgh,MTD 20 Mbps,1590,04/12/2025,20/10/2026
+SWF2753,SWF2753,Magdalena Adri Carlson,ccl_adri_carlson,Skybre Wireless 4 Mbps,766,30/11/2025,14/10/2026
+SMF720,SMF720,Hilda Coetzee,smf_hnm_hilda_coetzee,MTD 20 Mbps,1663,20/11/2025,20/10/2026
+SMF722,SMF722,Tokolos Restaurant,smf_hnm_tokolos_restaurant,MTD 20 Mbps,1194,27/11/2025,19/10/2026
+SMF724,SMF724,Hein Kruger,smf_hnm_hein_kruger,MTD 20 Mbps,1432,28/11/2025,20/10/2026
+SVF2214,SVF2214,Brian Downs,svf_krd_brian_downs,Vuma 30/30,1097,02/12/2025,19/10/2026
+SMF734,SMF734,David Van Zyl,smf_hnm_david_van_zyl,MTD 20 Mbps,1482,23/12/2025,20/10/2026
+SWF2759,SWF2759,Maphehello Ramaele,ccl_maphehello_ramaele,Skybre Wireless 6 Mbps,771,18/05/2026,14/10/2026
+SMF730,SMF730,Maleshoane Lenong,smf_hnm_maleshoane_lenong,MTD 20 Mbps,1472,11/12/2025,20/10/2026
+SMF728,SMF728,Riekie Fourie,smf_hnm_riekie_fourie,MTD 20 Mbps,1487,11/12/2025,20/10/2026
+SMF727,SMF727,Rina Jansen Van Nieuwenhuizen,smf_hnm_rina_nieuwenhuizen,MTD 20 Mbps,1529,04/12/2025,20/10/2026
+SMF732,SMF732,Mangojane Masabata,smf_hnm_masabata_mangojane,MTD 20 Mbps,1645,18/12/2025,20/10/2026
+SWF2762,SWF2762,Ahmed Reshid,ccl_ahmed_reshid,Skybre Wireless 4 Mbps,774,01/01/2026,14/10/2026
+SBF1354,SBF1354,Karen Le Roux,svf_krd_karen_le_roux,Vuma BF 30/30 Mbps,1045,27/03/2026,16/10/2026
+SCCTV005,SCCTV005,Hennenman Boere Vereeniging,hnm_bloementuin_kamera,Skybre Wireless 4 Mbps,46,18/12/2025,05/10/2026
+SCCTV005,SCCTV005,Hennenman Boere Vereeniging,hnm_confido_1,Skybre Wireless 4 Mbps,47,20/12/2025,05/10/2026
+SCCTV005,SCCTV005,Hennenman Boere Vereeniging,hnm_confido_14,Skybre Wireless 4 Mbps,48,09/01/2026,05/10/2026
+SCCTV005,SCCTV005,Hennenman Boere Vereeniging,hnm_ons_anker,Skybre Wireless 4 Mbps,49,15/01/2026,05/10/2026
+SCCTV005,SCCTV005,Hennenman Boere Vereeniging,hbv_blydschap,Skybre Wireless 4 Mbps,50,22/09/2026,05/10/2026
+SMF733,SMF733,Marius Pretorius,smf_hnm_dunlop_2,MTD 20 Mbps,1374,01/01/2026,20/10/2026
+SMF735,SMF735,Judy Joubert,smf_hnm_judy_joubert,MTD 50 Mbps,1538,23/12/2025,20/10/2026
+SMF737,SMF737,Pietman van Wyk,smf_hnm_pietman_van_wyk,MTD 50 Mbps,1671,06/01/2026,20/10/2026
+SMF740,SMF740,Themba Mathunza,smf_hnm_themba_mathunza,MTD 20 Mbps,1474,15/01/2026,20/10/2026
+SMF743,SMF743,Lungelwa Maghale,smf_hnm_lungelwa_maghale,MTD 20 Mbps,1639,01/07/2026,20/10/2026
+SMF738,SMF738,George Augusto,smf_hnm_george_augusto,MTD 250 Mbps,1544,09/01/2026,20/10/2026
+SMF741,SMF741,Nellie Calitz,smf_hnm_nellie_calitz,MTD 20 Mbps,1222,15/01/2026,19/10/2026
+SMF744,SMF744,Kholofelo Phasha,smf_hnm_kholofelo_phasha,MTD 20 Mbps,1256,15/01/2026,19/10/2026
+SMF840,SMF840,EP Hills Boerdery (Pty) Ltd,hnm_carmen_hills,SW 15 Mbps,1559,12/01/2026,20/10/2026
+SMF840,SMF840,EP Hills Boerdery (Pty) Ltd,smf_hnm_carmen_hills,MTD 20 Mbps,1558,22/01/2026,20/10/2026
+SMF742,SMF742,Tian Huyzers,smf_hnm_tian_huyzers,MTD 20 Mbps,1261,15/01/2026,19/10/2026
+SMF747,SMF747,Ronel Conradie,smf_hnm_ronel_conradie,MTD 20 Mbps,1618,29/01/2026,20/10/2026
+SMF746,SMF746,Raymund Phillips,smf_hnm_raymond_philips,MTD 50 Mbps,1480,22/01/2026,20/10/2026
+SR2371,SR2371,Tumoro Ersumo,ccl_tumoro_ersumo,Skybre Wireless 4 Mbps,787,01/05/2026,14/10/2026
+SR2371,SR2371,Tumoro Ersumo,ccl_tumoro_ersumo2,Skybre Wireless 4 Mbps,788,09/04/2026,14/10/2026
+SR2371,SR2371,Tumoro Ersumo,ccl_tumoro_ersumo3,Skybre Wireless 4 Mbps,786,23/04/2026,14/10/2026
+SVF2217,SVF2217,Danie Theron Boerdery Bk,svf_krd_lorette_theron,Vuma 50/50,1128,24/01/2026,19/10/2026
+SMF748,SMF748,Ansie Breytenbach,smf_hnm_ansie_breytenbach,MTD 20 Mbps,1573,03/02/2026,20/10/2026
+SMF751,SMF751,Maria Venter,smf_hnm_maria_venter,MTD 20 Mbps,1291,29/01/2026,20/10/2026
+SVF2218,SVF2218,Jaco Kruger,svf_krd_jaco_kruger,Vuma 30/30,1071,30/01/2026,19/10/2026
+SMF749,SMF749,Frik Van Sittert,smf_hnm_frik_van_sittert,MTD 20 Mbps,1516,29/01/2026,20/10/2026
+SMF753,SMF753,Michiel Daniel Nell,smf_hnm_michiel_nell,MTD 50 Mbps,1342,03/02/2026,20/10/2026
+SMF760,SMF760,Stacey Ankiewicz,smf_hnm_stacey_ankiewicz,MTD 50 Mbps,1600,12/02/2026,20/10/2026
+SMF755,SMF755,Matseko Khambule,smf_hnm_matseko_khambule,MTD 20 Mbps,1496,05/02/2026,20/10/2026
+SMF759,SMF759,Patricia Lala,smf_hnm_junior_college,MTD 20 Mbps,1469,01/04/2026,20/10/2026
+SMF761,SMF761,City Of Praise,smf_hnm_city_praise,MTD 20 Mbps,1582,12/02/2026,20/10/2026
+SWF2794,SWF2794,Thole Radebe,sty_thola_radebe,Skybre Wireless 4 Mbps,804,11/02/2026,14/10/2026
+SMF756,SMF756,Mawande Mpandana,smf_hnm_mawande_mpandana,MTD 20 Mbps,1619,12/02/2026,20/10/2026
+SMF765,SMF765,Semonki Matshai,smf_hnm_semonki_matshai,MTD 20 Mbps,1586,19/02/2026,20/10/2026
+SMF763,SMF763,Meisie Vorster,smf_hnm_meisie_vorster,MTD 20 Mbps,1350,25/05/2026,20/10/2026
+SMF767,SMF767,Benita Pelzer,smf_hnm_ben_pelzer,MTD 20 Mbps,1223,19/02/2026,19/10/2026
+SMF768,SMF768,SJ Nare,smf_hnm_sj_nare,MTD 20 Mbps,1168,19/02/2026,19/10/2026
+SMF776,SMF776,Jaco Smit,smf_hnm_jaco_smith,MTD 20 Mbps,1214,26/02/2026,19/10/2026
+SVF2220,SVF2220,Tenice Venter,svf_krd_tenice_venter,Vuma BF 30/30 Mbps,979,25/02/2026,16/10/2026
+SMF769,SMF769,Kobus Venter,smf_hnm_kobus_venter,MTD 20 Mbps,1341,21/02/2026,20/10/2026
+SMF772,SMF772,Retha van Wyk,smf_hnm_retha_van_wyk,MTD 20 Mbps,1603,26/02/2026,20/10/2026
+SMF770,SMF770,Lebohang Emmanuel,smf_hnm_lebohang_emmanuel,MTD 20 Mbps,1388,26/02/2026,20/10/2026
+SMF774,SMF774,Antoinette Deysel,smf_hnm_antoinette_deysel,MTD 20 Mbps,1528,26/02/2026,20/10/2026
+SMF782,SMF782,Jan Marx,smf_hnm_jan_marx,MTD 50 Mbps,1608,12/03/2026,20/10/2026
+SVF2221,SVF2221,Le Le Liu,svf_krd_lele_liu,Vuma 500/200,906,14/09/2026,15/10/2026
+SMF773,SMF773,Hester Nel,smf_hnm_hester_nel,MTD 20 Mbps,1313,26/02/2026,20/10/2026
+SWF2810,SWF2810,Tiaan Ludik,krd_loraine_jonker,Skybre Wireless 7 Mbps,821,03/06/2026,14/10/2026
+SVF2224,SVF2224,Sarel Cilliers,svf_krd_sarel_cilliers,Vuma 50/50,822,13/03/2026,14/10/2026
+SVF2223,SVF2223,Shaun Keogh,svf_krd_shaun_keogh,Vuma BF 50/25,987,17/03/2026,16/10/2026
+SMF784,SMF784,Kevin Swanepoel,smf_hnm_kevin_swanepoel,MTD 20 Mbps,1272,12/03/2026,20/10/2026
+SMF785,SMF785,Thato Borole,smf_hnm_thato_borole,MTD 20 Mbps,1403,19/03/2026,20/10/2026
+SMF786,SMF786,Penny Mitton,smf_hnm_tenny_miton,MTD 250 Mbps,1254,19/03/2026,19/10/2026
+SMF787,SMF787,Clive Cupido,smf_hnm_clive_cupido,MTD 50 Mbps,1379,19/03/2026,20/10/2026
+SMF789,SMF789,Charlene O'Neill,smf_hnm_charlene_oneill,MTD 20 Mbps,1530,20/03/2026,20/10/2026
+SMF788,SMF788,Gerhardt Van Wyk,smf_hnm_gehardt_van_wyk,MTD 100 Mbps,1279,01/09/2026,20/10/2026
+SMF792,SMF792,Dieketseng Lelimo,smf_hnm_dieketseng_lelimo,MTD 20 Mbps,1287,26/03/2026,20/10/2026
+SMF791,SMF791,Hannelie Theron,smf_hnm_hannelie_theron,MTD 20 Mbps,1632,26/03/2026,20/10/2026
+SMF790,SMF790,Belinda Van Deventer,smf_hnm_belinda_van_deventer,MTD 20 Mbps,1340,26/03/2026,20/10/2026
+SMF793,SMF793,Even Makhosi,smf_hnm_even_makhosi,MTD 20 Mbps,1238,02/04/2026,19/10/2026
+SWF2815,SWF2815,Chane Retief,hnm_chane_retief,Skybre Wireless 10 Mbps,830,30/03/2026,14/10/2026
+SMF794,SMF794,Linde Jordaan,smf_hnm_linde_jordaan,MTD 20 Mbps,1536,02/04/2026,20/10/2026
+SMF795,SMF795,Rudolph Ferreira,smf_hnm_rudolph_ferreira,MTD 100 Mbps,1218,01/07/2026,19/10/2026
+SMF796,SMF796,Muhammad Fahad Gulzar,smf_hnm_muhammad_gulzel,MTD 20 Mbps,1532,09/04/2026,20/10/2026
+SMF797,SMF797,Frieda Coetzer,smf_hnm_frieda_coetzer,MTD 20 Mbps,1298,09/04/2026,20/10/2026
+SMF798,SMF798,Mari Van Der Walt,smf_hnm_mari_van_der_walt,MTD 50 Mbps,1458,09/04/2026,20/10/2026
+SWF2825,SWF2825,Hendrietta Jordaan,kps_hendrietta_jordaan,Skybre Wireless 6 Mbps,834,01/05/2026,14/10/2026
+SMF800,SMF800,Rian Engelbrecht,smf_hnm_rian_engelbrecht,MTD 20 Mbps,1524,15/07/2026,20/10/2026
+SVF2227,SVF2227,Annatjie Herbs,svf_krd_annatjie_herbs,Vuma BF 30/30 Mbps,1146,18/04/2026,19/10/2026
+SR2533,SR2533,Judy van Wyk,kps_judy_van_wyk,Skybre Wireless 4 Mbps,837,04/08/2026,14/10/2026
+SMF803,SMF803,Abie Greyling,smf_hnm_abie_greyling,MTD 250 Mbps,1492,21/04/2026,20/10/2026
+SMF802,SMF802,Carl Van Tonder,smf_hnm_carl_van_tonder,MTD 20 Mbps,1615,20/04/2026,20/10/2026
+SMF805,SMF805,Derek Engelbrecht,smf_hnm_derek_engelbrecht,MTD 20 Mbps,1241,28/04/2026,19/10/2026
+SWF2840,SWF2840,Dibura Moerane,krd_dibura_moerane,Skybre Wireless 5 Mbps,918,27/05/2026,15/10/2026
+SMF807,SMF807,Chris Harmse,smf_hnm_chris_harmse,MTD 20 Mbps,1418,04/05/2026,20/10/2026
+SMF809,SMF809,LM Supermarket,smf_hnm_km_supermarket,MTD 20 Mbps,1363,06/05/2026,20/10/2026
+SMF808,SMF808,Partney Tsotetsi,smf_hnm_partney_tsotesi,MTD 20 Mbps,1689,06/05/2026,20/10/2026
+SMF812,SMF812,Ria Vermaak,smf_hnm_ria_vermaak,MTD 20 Mbps,1488,07/05/2026,20/10/2026
+SMF814,SMF814,Venter Elektries,smf_hnm_venter_elektries,MTD 20 Mbps,1679,07/05/2026,20/10/2026
+SMF810,SMF810,Danele Anore,smf_hnm_danele_anore,MTD 20 Mbps,1540,06/05/2026,20/10/2026
+SMF813,SMF813,Catherine Marumo,smf_hnm_catherine_marumo,MTD 20 Mbps,1239,07/05/2026,19/10/2026
+SMF815,SMF815,Marcell Venter,smf_hnm_marcell_venter,MTD 50 Mbps,1336,14/05/2026,20/10/2026
+SVF2236,SVF2236,Hester Van Der Westhuizen,svf_krd_hester_van_der_westhuizen,Vuma BF 30/30 Mbps,1074,25/06/2026,19/10/2026
+SMF816,SMF816,Finance World,smf_hnm_finance_world,MTD 20 Mbps,1216,19/05/2026,19/10/2026
+SMF817,SMF817,Dikeledi Mosebekoa,smf_hnm_dikeledi_mosebekoa,MTD 20 Mbps,1385,25/05/2026,20/10/2026
+SMF821,SMF821,Jacqueline De La Rey,smf_hnm_jacqueline_delarey,MTD 20 Mbps,1628,04/06/2026,20/10/2026
+SMF868,SMF868,Sydney Tumelo,smf_hnm_sydney_tumelo,MTD 20 Mbps,1644,24/08/2026,20/10/2026
+SWF2839,SWF2839,Jana Boerdery,kps_jana_boerdery,Skybre Wireless 9 Mbps,848,28/05/2026,15/10/2026
+SBF1076,SBF1076,RMFS Contractors (Pty) Ltd,svf_krd_charl_de_bruyn,Vuma BF 30/30 Mbps,997,28/05/2026,16/10/2026
+SBF1076,SBF1076,RMFS Contractors (Pty) Ltd,bup_svf_charl_de_bruyn,Vuma WB,998,28/05/2026,16/10/2026
+SMF818,SMF818,Conrad Du Toit,smf_hnm_conrad_du_toit,MTD 50 Mbps,1500,28/05/2026,20/10/2026
+SVF2235,SVF2235,Marelize Hawley,svf_krd_marelize_hawley,Vuma 50/50,1040,23/06/2026,16/10/2026
+SMF819,SMF819,Ingrid Putter,smf_hnm_ingrid_putter,MTD 20 Mbps,1512,02/06/2026,20/10/2026
+SMF820,SMF820,Leon Moller,smf_hnm_leon_moller,MTD 20 Mbps,1699,04/06/2026,21/10/2026
+SWF2843,SWF2843,Sarah Mokgotsi,ccl_sarah_mokgotsi,Skybre Wireless 5 Mbps,854,03/06/2026,15/10/2026
+SVF2230,SVF2230,Leana Vorster,svf_krd_leana_vorster,Vuma BF 30/30 Mbps,1042,08/06/2026,16/10/2026
+SMF822,SMF822,John Campbell,smf_hnm_john_campbell,MTD 20 Mbps,1316,08/06/2026,20/10/2026
+SMF825,SMF825,Gladys Moremi,smf_hnm_gladys_moremi,MTD 20 Mbps,1190,18/06/2026,19/10/2026
+SVF2232,SVF2232,Juandrey Eekhout,svf_krd_juandrey_eekhout,Vuma 100/100,1053,25/06/2026,16/10/2026
+SMF823,SMF823,Aletta Deysel,smf_hnm_aletta_deysel,MTD 20 Mbps,1257,18/06/2026,19/10/2026
+SMF824,SMF824,Anna Maqala,smf_hnm_anna_maqala,MTD 20 Mbps,1331,18/06/2026,20/10/2026
+SVF2233,SVF2233,Juane Grobler,svf_krd_juane_grobler,Vuma BF 30/30 Mbps,1052,17/06/2026,16/10/2026
+SMF827,SMF827,Stiaan Venter,smf_hnm_stiaan_venter,MTD 20 Mbps,1290,25/06/2026,20/10/2026
+SMF826,SMF826,Mitzi De Bruin,smf_hnm_mitzi_du_toit,MTD 20 Mbps,1310,25/06/2026,20/10/2026
+SVF2234,SVF2234,Jan Labuschagne,svf_krd_jan_labuschagne,Vuma 100/100,1067,26/06/2026,19/10/2026
+SMF832,SMF832,Felicia Polori,smf_hnm_felicia_polori,MTD 20 Mbps,1293,01/07/2026,20/10/2026
+SVF2237,SVF2237,JC Burger,svf_krd_jc_burger,Vuma BF 30/30 Mbps,1066,29/06/2026,19/10/2026
+SMF829,SMF829,Lydia Davids,smf_hnm_lydia_davids,MTD 50 Mbps,1505,30/06/2026,20/10/2026
+SMF828,SMF828,Sally Van Niekerk,smf_hnm_sally_van_niekerk,MTD 20 Mbps,1377,30/06/2026,20/10/2026
+SMF830,SMF830,Laura Nel,smf_hnm_laura_nel,MTD 20 Mbps,1404,30/06/2026,20/10/2026
+SMF831,SMF831,Magda Badenhorst,smf_hnm_magda_badenhorst,MTD 20 Mbps,1243,01/07/2026,19/10/2026
+SVF2244,SVF2244,Jessie Jordaan,svf_krd_jessie_jordaan,Vuma BF 50/25,1063,03/08/2026,19/10/2026
+SMF842,SMF842,Hannes Kotze,smf_hnm_hannes_kotze,MTD 20 Mbps,1707,14/07/2026,21/10/2026
+SMF843,SMF843,Anna Long,smf_hnm_anna_long,MTD 20 Mbps,1484,21/07/2026,20/10/2026
+SMF846,SMF846,Elize Thiele,smf_hnm_elize_thiele,MTD 20 Mbps,1719,21/07/2026,21/10/2026
+SMF848,SMF848,Karabo Mohale,smf_hnm_karabo_mohale,MTD 20 Mbps,1698,23/07/2026,21/10/2026
+SMF861,SMF861,Ntebaleng Molai,smf_hnm_ntebaleng_molai,MTD 20 Mbps,1758,15/08/2026,21/10/2026
+SMF850,SMF850,Amanda Jacobs,smf_hnm_amanda_jacobs,MTD 20 Mbps,1706,28/07/2026,21/10/2026
+SMF851,SMF851,Richard Cawood,smf_hnm_richard_cawood,MTD 20 Mbps,1742,29/07/2026,21/10/2026
+SR2530,SR2530,Alexis Bredenhann,krd_alexis_bredenhann,Skybre Wireless 5 Mbps,871,31/07/2026,15/10/2026
+SMF852,SMF852,Liphapang Melato,smf_hnm_liphapang_melato,MTD 20 Mbps,1716,30/07/2026,21/10/2026
+SMF853,SMF853,Derek Botha,smf_hnm_barend_steenkamp,MTD 250 Mbps,1711,01/09/2026,21/10/2026
+SMF857,SMF857,Joshua Kole Thompson,smf_hnm_joshua_kole_thompson,MTD 20 Mbps,1701,04/08/2026,21/10/2026
+SMF854,SMF854,Ferdinand Kelder,smf_hnm_ferdinand_kelder,MTD 100 Mbps,1759,03/08/2026,21/10/2026
+SMF855,SMF855,Juanita Lambrechts,smf_hnm_juanita_lambrechts,MTD 20 Mbps,1705,04/08/2026,21/10/2026
+SMF856,SMF856,Junior Ntsiane,smf_hnm_junior_ntsiane,MTD 20 Mbps,1722,04/08/2026,21/10/2026
+SMF858,SMF858,Jacques Venter,smf_hnm_jacques_venter,MTD 20 Mbps,1752,06/08/2026,21/10/2026
+SVF2247,SVF2247,Elmien Wheeler,svf_krd_elmien_wheeler,Vuma BF 30/30 Mbps,1108,21/08/2026,19/10/2026
+SVF2246,SVF2246,Charlene Bester,svf_krd_charlene_bester,Vuma BF 30/30 Mbps,1138,11/08/2026,19/10/2026
+SMF859,SMF859,Maud Ferreira,smf_hnm_maud_ferreira,MTD 20 Mbps,1709,11/08/2026,21/10/2026
+SMF860,SMF860,Bremer Trust,smf_hnm_bremer_trust,MTD 20 Mbps,1760,11/08/2026,21/10/2026
+SMF869,SMF869,Theunis Kriek,smf_hnm_theunis_kriek,MTD 20 Mbps,1763,25/08/2026,21/10/2026
+SMF863,SMF863,Fastpacking,smf_hnm_fastpacking,MTD 20 Mbps,1702,18/08/2026,21/10/2026
+SVF2249,SVF2249,Lulu de kock,svf_krd_lulu_de_kock,Vuma BF 30/30 Mbps,1046,20/08/2026,16/10/2026
+SMF864,SMF864,Thea Thirion,smf_hnm_thea_thirion,MTD 50 Mbps,1715,01/10/2026,21/10/2026
+SMF865,SMF865,Clementine Mogoloa,smf_hnm_clementine_mogoloa,MTD 20 Mbps,1735,20/08/2026,21/10/2026
+SMF866,SMF866,Tola De Villiers,smf_hnm_tola_de_villiers,MTD 20 Mbps,1764,20/08/2026,21/10/2026
+SMF867,SMF867,Sylvester Msibi,smf_hnm_sylvester_msibi,MTD 50 Mbps,1724,21/08/2026,21/10/2026
+SMF889,SMF889,Gysbert Fourie,smf_hnm_gysbert_fourie,MTD 20 Mbps,884,01/10/2026,15/10/2026
+SMF876,SMF876,Christie Olivier,smf_hnm_christie_olivier,MTD 20 Mbps,1739,04/09/2026,21/10/2026
+SMF879,SMF879,Willie Snyman,smf_hnm_willie_snyman,MTD 20 Mbps,1755,06/09/2026,21/10/2026
+SMF874,SMF874,Ignus Jordaan,smf_hnm_ignus_jordaan,MTD 50 Mbps,1745,02/09/2026,21/10/2026
+SMF870,SMF870,Tony Van Wyk,smf_hnm_tony_van_wyk,MTD 20 Mbps,1730,03/09/2026,21/10/2026
+SMF871,SMF871,Schalk Venter,smf_hnm_schalk_venter,MTD 50 Mbps,1740,07/09/2026,21/10/2026
+SMF875,SMF875,Louis du Plessis,smf_hnm_louis_du_plessis,MTD 20 Mbps,1756,03/09/2026,21/10/2026
+SMF892,SMF892,Anette Roux,smf_hnm_anette_roux,MTD 20 Mbps,1718,01/10/2026,21/10/2026
+SMF893,SMF893,Hannetjie Olivier,smf_hnm_hannetjie_olivier,MTD 20 Mbps,885,01/10/2026,15/10/2026
+SMF877,SMF877,Pieter Barkhuizen,smf_hnm_pieter_barkhuizen,MTD 20 Mbps,1728,01/09/2026,21/10/2026
+SMF878,SMF878,Leonie Koekemoer,smf_hnm_leonie_koekemoer,MTD 20 Mbps,1710,01/09/2026,21/10/2026
+SMF881,SMF881,Buonadonna Vervoer,smf_hnm_buonadonna_vervoer,MTD 250 Mbps,1748,08/09/2026,21/10/2026
+SMF881,SMF881,Buonadonna Vervoer,hnm_buonadonna_vervoer_wb,MTD WB,1749,11/09/2026,21/10/2026
+SMF881,SMF881,Buonadonna Vervoer,smf_hnm_ian_buonadonna,MTD 50 Mbps,1747,29/09/2026,21/10/2026
+SMF881,SMF881,Buonadonna Vervoer,hnm_buonadonna_kantien,Skybre Wireless 6 Mbps,1750,01/10/2026,21/10/2026
+SMF882,SMF882,Buonadonna Truckstop,smf_hnm_buonadonna_truckstop,MTD 50 Mbps,1751,14/09/2026,21/10/2026
+SMF903,SMF903,Delme Handelaars,smf_hnm_delme_handelaars,MTD 20 Mbps,1721,13/10/2026,21/10/2026
+SMF903,SMF903,Delme Handelaars,smf_hnm_delme_handelaars_2,MTD 20 Mbps,1720,13/10/2026,21/10/2026
+SMF880,SMF880,Chamone Ridgard,smf_hnm_chamone_ridgard,MTD 20 Mbps,1727,04/09/2026,21/10/2026
+SMF884,SMF884,Rina Pretorius,smf_hnm_rina_pretorius,MTD 20 Mbps,1753,09/09/2026,21/10/2026
+SMF885,SMF885,Angel Ntsindie,smf_hnm_angel_ntsindie,MTD 20 Mbps,1738,09/09/2026,21/10/2026
+SMF887,SMF887,Debbie Stydom,smf_hnm_debbie_strydom,MTD 20 Mbps,1737,10/09/2026,21/10/2026
+SMF888,SMF888,Gideon Kriel,smf_hnm_gideon_kriel,MTD 20 Mbps,1723,11/09/2026,21/10/2026
+SMF890,SMF890,Christiaan Pretorius,smf_hnm_chistiaan_pretorius,MTD 50 Mbps,1717,15/09/2026,21/10/2026
+SMF891,SMF891,Marinda de Bruin,smf_hnm_marinda_de_bruin,MTD 20 Mbps,1729,15/09/2026,21/10/2026
+SMF895,SMF895,Dawid  Myburgh,smf_hnm_dawid_myburgh,MTD 20 Mbps,893,22/09/2026,15/10/2026
+SMF898,SMF898,Kallie Butterworth,smf_hnm_kallie_butterworth,MTD 20 Mbps,1746,01/10/2026,21/10/2026
+SVF2257,SVF2257,Wynand De Bruyn,svf_krd_wynand_de_bruyn,Vuma BF 30/30 Mbps,965,30/09/2026,16/10/2026
+SMF897,SMF897,Larry Van der Gryp,smf_hnm_larry_van_der_gryp,MTD 20 Mbps,1765,29/09/2026,21/10/2026
+SMF900,SMF900,Delta Engineering,smf_hnm_delta_engineering,MTD 20 Mbps,1733,01/10/2026,21/10/2026
+SMF900,SMF900,Delta Engineering,smf_hnm_delta_huis,MTD 20 Mbps,1732,01/10/2026,21/10/2026
+SMF900,SMF900,Delta Engineering,bup_smf_delta_engineering,MTD WB,1734,01/10/2026,21/10/2026
+SMF901,SMF901,Morena  Mtakane,smf_hnm_morena_mtakane,MTD 20 Mbps,1725,06/10/2026,21/10/2026
+SMF902,SMF902,Disemelo Kokoane,smf_hnm_disemelo_kokoane,MTD 20 Mbps,1726,08/10/2026,21/10/2026
+SVF2166,SVF2166,Johan Zaaiman,svf_krd_johan_zaaiman,Vuma BF 30/30 Mbps,1059,25/02/2026,16/10/2026
+SBF1310,SBF1310,Ryno Dennis,svf_krd_ryno_botes_dennis,Vuma BF 100/100 Mbps,991,01/11/2024,16/10/2026
+SMF439,SMF439,Sello Namane,smf_hnm_sello_namane,MTD 10 Mbps,1179,01/04/2025,19/10/2026
+SMF224,SMF224,Cindy Melville,smf_hnm_cindy_melville,MTD 50 Mbps,1489,13/07/2026,20/10/2026
+SWF2076,SWF2076,Mpho Lithupa,krd_mpho_lithupa,Skybre Wireless 4 Mbps,913,01/12/2024,15/10/2026
+SWF2270,SWF2270,Mary Mariti,sty_mary_mariti,Skybre Wireless 5 Mbps,297,01/12/2024,09/10/2026
+SR2407,SR2407,Raymond Van Der Walt,kps_raymond_van_der_walt,Skybre Wireless 7 Mbps,343,01/12/2024,09/10/2026
+SVF2215,SVF2215,Elzaan van Staden,svf_krd_elzaan_van_staden,Vuma 30/30,1103,12/01/2026,19/10/2026
+SMF806,SMF806,Puleng Lydia,smf_hnm_puleng_lydia,MTD 20 Mbps,1399,18/07/2026,20/10/2026
+SMF862,SMF862,Maritsa Coetzee,smf_hnm_maritsa_coetzee,MTD 20 Mbps,1703,13/08/2026,21/10/2026
+SMF894,SMF894,Andre Visagie,smf_hnm_andre_visagie,MTD 50 Mbps,892,17/09/2026,15/10/2026
+SCF0021,SCF0021,Johnny Martin Van Der Westhuizen,scf_0021,SCF 50 Mbps,1000,14/11/2025,16/10/2026
+SBF2029,SBF2029,Elzane Meyer,bup_krd_elzane_meyer,Vuma WB,72,17/06/2025,05/10/2026
+SBF2029,SBF2029,Elzane Meyer,svf_krd_elzane_meyer,Vuma 100/50 Mbps,71,01/11/2024,05/10/2026
+SBF2016,CUS-001598,Fanie Van Den Heever,svf_krd_fanie_van_den_heever,Vuma BF 200/200 Mbps,24,01/11/2024,14/09/2026
+SMF043,SMF043,Johan Dexter,smf_hnm_johan_dexter,MTD 50 Mbps,1187,01/11/2024,19/10/2026
+SBF2078,SBF2078,Johan Minnie,svf_krd_johan_minnie,Vuma BF 200/200 Mbps,1060,01/11/2024,16/10/2026
+DUP1002,DUP1002,Bejanka De Beer,svf_krd_bejanka_de_beer,Vuma 100/100,1119,01/11/2024,19/10/2026
+SMF463,SMF463,CCTV Central,smf_hnm_bernard_hattingh,MTD 20 Mbps,31,01/09/2026,15/09/2026
+SBF2002,SBF2002,Business Implementation Partners,svf_krd_pierre_human,Vuma BF 500/200 Mbps,1094,01/01/2025,19/10/2026
+SBF2002,SBF2002,Business Implementation Partners,bup_svf_pierre_human,Vuma WB,1095,01/01/2025,19/10/2026
+SBF1290,SBF1290,Filtertec (Edms) Bpk,svf_krd_stephen_kitching,Vuma BF 100/100 Mbps,1091,01/11/2024,19/10/2026
+SBF1290,SBF1290,Filtertec (Edms) Bpk,krd_fillter_tech,Skybre Wireless 6 Mbps,1092,23/10/2024,19/10/2026
+SCF0016,SCF0016,Petrich Crotz,scf_0016,SCF 100 Mbps,921,29/07/2026,15/10/2026
+SWF2129,SWF2129,Regal Real Estate,krd_appointment,Skybre Wireless 5 Mbps,58,08/08/2025,05/10/2026
+SWF2129,SWF2129,Regal Real Estate,krd_coal_brits,Skybre Wireless 4 Mbps,59,08/08/2025,05/10/2026
+SW1303,SW1303,Rudolf Nel,krd_rudolph_nel,SW 15 Mbps,60,10/04/2026,05/10/2026
+SWF2044,SWF2044,Johanna Da Silva,krd_johanna_da_silva,Skybre Wireless 4 Mbps,912,01/12/2024,15/10/2026
+SWF2359,SWF2359,John Lebusa,sty_john_labusa,Skybre Wireless 5 Mbps,895,01/08/2025,15/10/2026
+SWF2331,SWF2331,Muhmmad Ikram,sty_muhmmad_ikram,Skybre Wireless 5 Mbps,914,15/09/2026,15/10/2026
+SW1546,SW1546,Piet Batt,krd_piet_batt,Skybre Wireless 7 Mbps,61,01/12/2024,05/10/2026
+SWF2312,SWF2312,The Rest 1193,krd_zelda_klemp,Skybre Wireless 5 Mbps,896,01/12/2024,15/10/2026
+SW1608,SW1608,Albert Prinsloo,krd_aquatic_sport_club,Skybre Wireless 8 Mbps,897,01/12/2024,15/10/2026
+SVF2251,SVF2251,Magda Brink,svf_krd_magda_brink,Vuma BF 30/30 Mbps,898,30/09/2026,15/10/2026
+SWF2032,SWF2032,Malitaba Moloi,krd_malitaba_moloi,Skybre Wireless 4 Mbps,269,01/12/2024,09/10/2026
+SWF2079,SWF2079,Mamokhethi Nteka,krd_mamokheti_nteka,Skybre Wireless 5 Mbps,271,01/12/2024,09/10/2026
+SWF2508,SWF2508,Marchris Investments (Pty)Ltd t/a Gasco,krd_marchris_investment,Skybre Wireless 5 Mbps,273,01/12/2024,09/10/2026
+SW1543,SW1543,Marina Van Der Westhuizen,krd_marina_van_der_westhuizen,Skybre Wireless 6 Mbps,279,01/12/2024,09/10/2026
+SW1164,SW1164,Marius Du Plessis,krd_marius_du_plessis,Skybre Wireless 7 Mbps,275,01/12/2024,09/10/2026
+SWF2249,SWF2249,Marius Voigt,krd_marius_voigt,Skybre Wireless 6 Mbps,276,01/12/2024,09/10/2026
+SWF2249,SWF2249,Marius Voigt,krd_marius_voigt_kantoor,Skybre Wireless 8 Mbps,277,18/02/2026,09/10/2026
+SW1353,SW1353,Marna Van Niekerk,krd_marna_van_niekerk,Skybre Wireless 6 Mbps,289,16/07/2025,09/10/2026
+SWF2057,SWF2057,Maryna Serfontein,krd_serf_serfontein,Skybre Wireless 6 Mbps,299,01/12/2024,09/10/2026
+SW1987,SW1987,Matthews Semela,kps_matthews_semela,Skybre Wireless 5 Mbps,303,01/12/2024,09/10/2026
+SW1296,SW1296,Nadia Laubscher,krd_nadia_laubscher,Skybre Wireless 6 Mbps,287,01/12/2024,09/10/2026
+SWF2012,SWF2012,Nkosi Mkwanazi,krd_nkosi_nkwanazi,Skybre Wireless 4 Mbps,338,17/11/2024,09/10/2026
+SWF2433,SWF2433,Julian McGowan,krd_julian_mcgowan,Skybre Wireless 6 Mbps,323,01/12/2024,09/10/2026
+SWF2457,SWF2457,Zekarias Mohammed,krd_zack_mohamed,Skybre Wireless 5 Mbps,354,01/12/2024,09/10/2026
+SWF2457,SWF2457,Zekarias Mohammed,krd_zekarias_mohamed,Skybre Wireless 5 Mbps,355,01/12/2024,09/10/2026
+SW1784,SW1784,Andre Van Den Berg,krd_andre_van_den_berg,Skybre Wireless 6 Mbps,367,01/12/2024,09/10/2026
+SW1948,SW1948,Aubrey Pie,krd_aubrey_pie,Skybre Wireless 5 Mbps,384,01/12/2024,09/10/2026
+SWF2039,SWF2039,Renier Bester,krd_renier_bester,Skybre Wireless 10 Mbps,62,01/12/2024,05/10/2026
+SWF2555,SWF2555,Steynsrus Plaaspers (Edms)Bpk,sty_micho_heyns,Skybre Wireless 5 Mbps,907,01/12/2024,15/10/2026
+SW1044,SW1044,Susan Van Niekerk,krd_susan_van_niekerk,Skybre Wireless 6 Mbps,468,01/12/2024,12/10/2026
+SW1040,SW1040,Sylvanus Watson,sty_sylvanus_watson,Skybre Wireless 4 Mbps,472,10/07/2025,12/10/2026
+SW1628,SW1628,Dennis Khasudi,krd_dennis_khasudi,Skybre Wireless 6 Mbps,514,01/12/2024,12/10/2026
+SWF2501,SWF2501,E Taljaard,kps_gert_pretorius,Skybre Wireless 10 Mbps,525,03/06/2025,12/10/2026
+SWF2177,SWF2177,Edwin Modiko,krd_edwin_modiko,Skybre Wireless 4 Mbps,526,06/03/2026,12/10/2026
+SWF2177,SWF2177,Edwin Modiko,krd_edwin_modiko2,Skybre Wireless 4 Mbps,527,22/05/2026,12/10/2026
+SW1368 / SVF2252,SW1368 / SVF2252,HOC Renovations,svf_krd_riaan_kruger,Vuma BF 30/30 Mbps,901,28/08/2026,15/10/2026
+SW1384,SW1384,Francois Deyzel,krd_fj_deyzel,SW 12 Mbps,63,10/01/2025,05/10/2026
+SWF1979,SWF1979,Neels Van Schalkwyk,krd_neels_van_schalkwyk,SW 12 Mbps,64,01/12/2024,05/10/2026
+SWF2585,SWF2585,Masabata Mati,sky_masabata_mati,Skybre Wireless 5 Mbps,65,01/12/2024,05/10/2026
+SW1559,SW1559,Dunfermline Boerdery,krd_dunfermline_bdy,Skybre Wireless 10 Mbps,66,01/12/2024,05/10/2026
+SWF2601,SWF2601,Mantle Family Investments CC,krd_oryx_lodge,SW 20 Mbps,67,01/12/2024,05/10/2026
+SWF2602,SWF2602,Dimakatso Nonoise,kps_dimakatso_nonoise,Skybre Wireless 5 Mbps,903,01/12/2024,15/10/2026
+SWF2620,SWF2620,Lebohang Nala,krd_lebohang_nala,Skybre Wireless 4 Mbps,702,08/05/2025,14/10/2026
+SMF574,SMF574,Elizabeth Thaisi,smf_hnm_mistress_thaisi,MTD 20 Mbps,1769,27/02/2025,21/10/2026
+SWF2645,SWF2645,PPK Koppies,kps_ppk_kerk,Skybre Wireless 4 Mbps,68,12/05/2025,05/10/2026
+SWF2649,SWF2649,Audrey Ludick,krd_audrey_ludick,Vuma WB,904,06/06/2025,15/10/2026
+SWF2653,SWF2653,Desire Wennick,hnm_desire_wennick,SW 20 Mbps,917,08/07/2025,15/10/2026
+SWF2673,SWF2673,Hugo Joubert,ccl_hugo_joubert,Skybre Wireless 10 Mbps,69,01/10/2025,05/10/2026
+SWF2704,SWF2704,Sandra La Grange,ccl_sandra_la_grange,Skybre Wireless 7 Mbps,750,01/11/2025,14/10/2026
+SWF2763,SWF2763,Willem Stephanus Fourie,kps_willem,Skybre Wireless 5 Mbps,772,18/12/2025,14/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x15,Skybre Wireless 4 Mbps,932,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x13,Skybre Wireless 4 Mbps,933,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x14,Skybre Wireless 4 Mbps,934,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x16,Skybre Wireless 4 Mbps,935,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x9,Skybre Wireless 4 Mbps,936,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x3,Skybre Wireless 4 Mbps,937,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x11,Skybre Wireless 4 Mbps,938,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_247,Skybre Wireless 4 Mbps,939,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_hop_249,Skybre Wireless 4 Mbps,940,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x5,Skybre Wireless 4 Mbps,941,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x20,Skybre Wireless 4 Mbps,942,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x10,Skybre Wireless 4 Mbps,943,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x2,Skybre Wireless 4 Mbps,944,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x17,Skybre Wireless 4 Mbps,945,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x19,Skybre Wireless 4 Mbps,946,02/08/2026,16/10/2026
+SCCTV006,SCCTV006,Viljoenskroon Boere Vereeniging,vjk_x18,Skybre Wireless 4 Mbps,947,02/08/2026,16/10/2026
+SWF2768,SWF2768,Cecilia Thoabala,ccl_cecilia_thoabala,Skybre Wireless 5 Mbps,777,12/01/2026,14/10/2026
+SVF2219,SVF2219,Pieter Erasmus,svf_prs_pieter_erasmus,Vuma 30/30,1026,05/02/2026,16/10/2026
+SWF2797,SWF2797,Sello Matli,krd_sello_matli,Skybre Wireless 5 Mbps,909,13/02/2026,15/10/2026
+SMF883,SMF883,Jayden Van Wyk,smf_hnm_jayden_van_wyk,MTD 50 Mbps,23,02/09/2026,14/09/2026
+SWF2835,SWF2835,Minei Uys,sty_minei_uys,Skybre Wireless 5 Mbps,905,18/05/2026,15/10/2026
+SVF2229,CUS-001603,Christo Van Den Heever,svf_krd_christo_vd_heever,SCF 50 Mbps,38,30/09/2026,01/10/2026
+SWF2850,SWF2850,Koppies Landelike Beveiliging,kps_klb,Skybre Wireless 100Mbps,861,23/06/2026,15/10/2026
+SWF2850,SWF2850,Koppies Landelike Beveiliging,kps_steven_pelser,Skybre Wireless 10 Mbps,862,23/06/2026,15/10/2026
+SMF841,SMF841,Nicolette Swanepoel,smf_hnm_nicolette_swanepoel,MTD 50 Mbps,1607,09/07/2026,20/10/2026
+SR2537,SR2537,Moleboheng Mokoena,kps_moleboheng_mokoena1,Skybre Wireless 5 Mbps,919,21/09/2026,15/10/2026
+SMF374,SMF374,Seruwe Bocheli,smf_hnm_seruwe_bocheli,MTD 20 Mbps,1246,16/01/2026,19/10/2026
+SMF405,SMF405,Sharlene Moleboheng,smf_hnm_sharlene_moleboheng,MTD 20 Mbps,1337,01/11/2024,20/10/2026
+SMF226,SMF226,Nandus Potgieter,smf_hnm_ansie_jordaan,MTD 20 Mbps,1462,01/11/2024,20/10/2026
+SWF2272,SWF2272,Japie Victor Moeti,krd_japie_victor,Skybre Wireless 5 Mbps,911,01/12/2024,15/10/2026
+SMF516,SMF516,Isabele Pspag,smf_hnm_isabele_pspag,MTD 20 Mbps,1436,07/11/2024,20/10/2026
+SWF2481,SWF2481,Mannini Mabitsela,sty_mannini_mabitsela,Skybre Wireless 6 Mbps,915,01/04/2026,15/10/2026
+SMF538,SMF538,Tsoaeli Morena,smf_hnm_tsoaeli_morena,MTD 20 Mbps,1509,01/07/2025,20/10/2026
+SMF569,SMF569,James Ferreira,smf_hnm_james_ferreira,MTD 250 Mbps,1372,20/02/2025,20/10/2026
+SMF588,SMF588,Jo-Anne Carstens,smf_hnm_joanne_carstens,MTD 20 Mbps,1440,01/08/2025,20/10/2026
+SMF665,SMF665,Nicolene Cloete,smf_hnm_nicolene_cloete,MTD 20 Mbps,1658,01/08/2025,20/10/2026
+SMF726,SMF726,MD Shahin Rana,smf_hnm_shahin_rana,MTD 20 Mbps,1531,10/06/2026,20/10/2026
+SMF779,SMF779,Tumelo Litabe,smf_hnm_tumelo_litabe,MTD 20 Mbps,1602,12/03/2026,20/10/2026
+SMF804,SMF804,Kagiso Metsing,smf_hnm_kagiso_metsing,MTD 20 Mbps,1685,23/04/2026,20/10/2026
+SMF837,SMF837,Moeketsi Ramolula,smf_hnm_moeketsi_ramolula,MTD 20 Mbps,1646,09/07/2026,20/10/2026

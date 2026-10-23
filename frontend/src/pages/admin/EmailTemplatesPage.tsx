@@ -18,6 +18,8 @@ const EXTRA_PLACEHOLDERS: Record<string, string[]> = {
   quote: ["invoice_number", "invoice_total", "invoice_due_date (the quote's valid-until date)"],
   proforma: ["invoice_number", "invoice_total", "invoice_due_date"],
   payment_reminder: ["invoice_number (blank if none)", "invoice_due_date (blank if none)"],
+  contract: ["contract_title", "contract_reference", "signing_url", "link_expires"],
+  contract_signed: ["contract_title", "contract_reference (the signed PDF is attached)"],
 };
 
 export function EmailTemplatesPage() {

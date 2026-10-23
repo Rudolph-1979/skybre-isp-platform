@@ -39,6 +39,15 @@ class DeviceSerializer(serializers.ModelSerializer):
     # api_password_set tells the frontend whether one's on file.
     api_password = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
     api_password_set = serializers.SerializerMethodField()
+    # The SNMP community is the read password for every box on the network,
+    # and admin.py excludes it from the change form for exactly that reason
+    # ("the credentials the REST API is careful to keep write_only with a
+    # *_set boolean"). It was not, in fact, write_only here: it sat in
+    # `fields` as a plain string, so the device list handed the live
+    # community back to anyone who could open the Networking page, while the
+    # admin form two files over refused to show it.
+    snmp_community = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    snmp_community_set = serializers.SerializerMethodField()
     site_name = serializers.CharField(source="site.title", read_only=True, default=None)
     # Which partners' staff can see this device (see Device.visible_partners
     # docstring) -- plain PK list is enough here, same treatment as
@@ -56,7 +65,7 @@ class DeviceSerializer(serializers.ModelSerializer):
         model = Device
         fields = [
             "id", "name", "device_type", "ip_address", "location", "site", "site_name", "vendor", "model_name",
-            "status", "snmp_community", "snmp_version", "created_at", "latest_reading",
+            "status", "snmp_community", "snmp_community_set", "snmp_version", "created_at", "latest_reading",
             "api_enabled", "api_port", "api_username", "api_password", "api_password_set", "api_use_ssl",
             "api_wan_interface", "visible_partners", "visible_partner_names",
             "block_disabled_customers", "enable_shaper", "shaping_type",
@@ -83,14 +92,17 @@ class DeviceSerializer(serializers.ModelSerializer):
     def get_api_password_set(self, obj):
         return bool(obj.api_password)
 
-    def get_api_password_set(self, obj):
-        return bool(obj.api_password)
+    def get_snmp_community_set(self, obj):
+        return bool(obj.snmp_community)
 
     def update(self, instance, validated_data):
-        # Blank/omitted api_password on an edit means "keep the existing
-        # one" -- only a non-empty value actually overwrites it.
-        if "api_password" in validated_data and not validated_data["api_password"]:
-            validated_data.pop("api_password")
+        # Blank/omitted on an edit means "keep the existing one" -- only a
+        # non-empty value actually overwrites it. Without this, saving the
+        # device form after the community stopped being echoed back would
+        # blank the stored one and silently break SNMP polling.
+        for secret in ("api_password", "snmp_community"):
+            if secret in validated_data and not validated_data[secret]:
+                validated_data.pop(secret)
         return super().update(instance, validated_data)
 
     def get_latest_reading(self, obj):

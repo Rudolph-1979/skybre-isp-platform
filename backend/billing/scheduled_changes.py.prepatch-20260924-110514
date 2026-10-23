@@ -1,0 +1,111 @@
+"""Changes booked for a date that are not a plan change (package #20).
+
+Decided with Rudolph on 2026-09-24, for Christo Van Den Heever moving from a
+Vuma line to a Carfone 50 Mbps line on 1 October: "choose partner from
+1 October and new service 1 October". So a move is three bookings, each
+with its own date, all made ahead of time on the customer page:
+
+  1. the customer's partner changes on a date (Customer.pending_partner /
+     pending_partner_date) -- applied here;
+  2. the old service ends (Service.end_date, the first day WITHOUT service)
+     -- applied by billing.cancellations, as it always has been;
+  3. the new service starts on its own (a Pending Activation service with
+     Service.activate_on) -- applied here.
+
+Run from the daily apply_tariff_changes cron (02:15 UTC = 04:15 SAST), which
+is BEFORE the cancellations cron (02:30 UTC), so on the day the new service
+is already active when the old one is terminated and the customer is never
+left with no live service (which would set them Inactive). Also run by a
+committed billing run, like tariff changes, so a run never bills around a
+booking that is due.
+
+Partner moves go first: a new service on the new partner's plan is only
+valid once the customer is on that partner.
+
+`<=` on the date, like tariff changes and cancellations: a job that missed a
+day still does the work the next day instead of silently skipping it.
+"""
+import logging
+
+from django.db import transaction
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+
+def due_partner_moves(as_of=None, partner_ids=None):
+    from customers.models import Customer
+
+    as_of = as_of or timezone.localdate()
+    qs = Customer.objects.filter(
+        pending_partner__isnull=False, pending_partner_date__isnull=False,
+        pending_partner_date__lte=as_of,
+    )
+    if partner_ids:
+        qs = qs.filter(partner_id__in=partner_ids)
+    return qs.select_related("partner", "pending_partner").order_by("pk")
+
+
+def due_activations(as_of=None, partner_ids=None):
+    from .models import Service
+
+    as_of = as_of or timezone.localdate()
+    qs = Service.objects.filter(
+        status=Service.Status.PENDING, activate_on__isnull=False, activate_on__lte=as_of,
+    )
+    if partner_ids:
+        qs = qs.filter(customer__partner_id__in=partner_ids)
+    return qs.select_related("customer", "tariff").order_by("activate_on", "pk")
+
+
+def apply_due_scheduled_changes(as_of=None, commit=True, partner_ids=None):
+    """Apply every partner move and service start due on or before `as_of`.
+
+    Returns {"moved": [(customer, old_partner, new_partner)],
+             "started": [service], "skipped": [(service, reason)]}.
+    With commit=False nothing is written -- the same lists, as a preview.
+
+    A service is NOT started for a customer who is Suspended, Bad Debt or
+    Inactive: starting it would put a line back on for someone who is off
+    (and a Suspended customer whose service turns Active is lifted by
+    customers.signals). It is reported as skipped and stays Pending with its
+    date, so it starts on the first run after the customer is back on.
+    """
+    from customers.models import Customer
+
+    from .models import Service
+
+    moved, started, skipped = [], [], []
+
+    for customer in due_partner_moves(as_of, partner_ids):
+        old, new = customer.partner, customer.pending_partner
+        moved.append((customer, old, new))
+        if not commit:
+            continue
+        with transaction.atomic():
+            customer.partner = new
+            customer.pending_partner = None
+            customer.pending_partner_date = None
+            customer.save(update_fields=["partner", "pending_partner", "pending_partner_date"])
+        logger.info(
+            "Customer %s moved partner %s -> %s",
+            customer.customer_id, getattr(old, "name", "none"), getattr(new, "name", "none"),
+        )
+
+    for service in due_activations(as_of, partner_ids):
+        owner = Customer.objects.filter(pk=service.customer_id).only("status").first()
+        if owner is not None and owner.status in Customer.OFF_STATUSES:
+            skipped.append((service, f"customer is {owner.get_status_display()}"))
+            continue
+        started.append(service)
+        if not commit:
+            continue
+        with transaction.atomic():
+            service.status = Service.Status.ACTIVE
+            service.activate_on = None
+            # Through .save(): the signals write the RADIUS rows that let the
+            # line authenticate, exactly as when staff set a service Active.
+            service.save(update_fields=["status", "activate_on"])
+        logger.info("Service %s (%s) started on its booked date", service.pk, service.customer.customer_id)
+
+    return {"moved": moved, "started": started, "skipped": skipped}

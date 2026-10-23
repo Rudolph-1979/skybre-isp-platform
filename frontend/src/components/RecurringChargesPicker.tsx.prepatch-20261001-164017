@@ -1,0 +1,70 @@
+import { useEffect, useState } from "react";
+import { api } from "../api/client";
+import type { RecurringCharge, Service } from "../types";
+
+// The recurring-charges checkbox list (IP Rental, Domain Rental, ...) for a
+// service, fetched for this one customer so it offers exactly what
+// ServiceSerializer._validate_recurring_charges will accept (their partner's
+// charges plus the every-partner ones). `attached` is a service's existing
+// recurring_charges_detail: a charge already on it stays listed, marked
+// "no longer offered", even if it later went inactive -- removing one is a
+// deliberate untick, never a side effect of the list changing.
+export function RecurringChargesPicker({
+  customerId,
+  value,
+  onChange,
+  attached = [],
+}: {
+  customerId: number | string;
+  value: number[];
+  onChange: (ids: number[]) => void;
+  attached?: Service["recurring_charges_detail"];
+}) {
+  const [offered, setOffered] = useState<RecurringCharge[] | null>(null);
+
+  useEffect(() => {
+    if (!customerId) return;
+    api
+      .get<{ results: RecurringCharge[] }>(
+        `/recurring-charges/?page_size=200&is_active=true&for_customer=${customerId}`
+      )
+      .then((res) => setOffered(res.data.results))
+      .catch(() => setOffered([]));
+  }, [customerId]);
+
+  const list = offered ?? [];
+  const extra = (attached ?? [])
+    .filter((d) => value.includes(d.id) && !list.some((c) => c.id === d.id))
+    .map((d) => ({ id: d.id, name: d.name, price: d.price, no_longer_offered: true }));
+  const rows = [...list.map((c) => ({ id: c.id, name: c.name, price: c.price, no_longer_offered: false })), ...extra];
+
+  return (
+    <div className="mb-4">
+      <p className="mb-2 text-sm font-medium text-[var(--text-primary)]">Recurring charges</p>
+      <p className="mb-2 text-xs text-[var(--text-muted)]">
+        Billed every month as their own invoice lines under the plan, at the price set under Configs → Tariffs →
+        Recurring Charges.
+      </p>
+      {offered === null ? (
+        <p className="text-xs text-[var(--text-muted)]">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="text-xs text-[var(--text-muted)]">No recurring charges set up for this customer's partner yet.</p>
+      ) : (
+        <div className="max-h-40 space-y-1.5 overflow-y-auto rounded-md border border-[var(--border-hairline)] p-2">
+          {rows.map((c) => (
+            <label key={c.id} className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={value.includes(c.id)}
+                onChange={(e) => onChange(e.target.checked ? [...value, c.id] : value.filter((id) => id !== c.id))}
+              />
+              <span>{c.name}</span>
+              <span className="text-[var(--text-muted)]">R{parseFloat(c.price).toFixed(2)}</span>
+              {c.no_longer_offered && <span className="text-xs text-[var(--text-muted)]">(no longer offered)</span>}
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

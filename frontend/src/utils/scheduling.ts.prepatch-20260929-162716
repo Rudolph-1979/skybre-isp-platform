@@ -1,0 +1,18 @@
+import type { Job } from "../types";
+
+/** Who is on this job, as it should read on a calendar chip.
+ *
+ * "Unassigned" rather than an empty string when nobody is on it. A job
+ * with no tech and a job whose tech simply wasn't displayed looked
+ * identical on the month grid, and the first of those is the one worth
+ * spotting on a Friday afternoon without opening anything.
+ *
+ * The name itself comes from the API (`assigned_to_name`), which returns
+ * a first name and falls back to the username -- see
+ * scheduling/serializers.staff_display_name. Deciding that here instead
+ * would put the rule in two places, and the month grid and the day grid
+ * would eventually disagree about what to call the same person.
+ */
+export function jobAssignee(job: Pick<Job, "assigned_to_name">): string {
+  return job.assigned_to_name?.trim() || "Unassigned";
+}

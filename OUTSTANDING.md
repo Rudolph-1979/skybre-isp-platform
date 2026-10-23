@@ -1,6 +1,6 @@
 # Outstanding items
 
-_Last updated: 2026-08-18_
+_Last updated: 2026-09-04_
 
 Nothing but the to-do list lives here. For what the project is, its full
 history, and how it's deployed, see `PROJECT_STATUS.md` — that's the other
@@ -39,15 +39,235 @@ of the two `.md` files this repo maintains.
 
 ## Small, low-urgency cleanup (no decision needed, just hasn't been done)
 
-- [ ] Remove the static "Demo logins" hint box from the live login page —
-  cosmetic, but shows credentials that don't exist in this deployment.
-- [ ] Raise the password minimum length from 6 to 10+ characters
-  (`AUTH_PASSWORD_VALIDATORS` in settings) — a one-line change.
+- [x] Remove the static "Demo logins" hint box from the live login page.
+  Already gone — 2542b62 ("Catch the repo up to build 43") removed it and
+  this entry was never ticked. `LoginPage.tsx` carries no hint box now.
+- [x] Raise the password minimum length from 6 to 10+ characters
+  (`AUTH_PASSWORD_VALIDATORS` in settings). Done 2026-09-04 — 10, and it
+  turned out not to be a one-line change: the validators only ran on the
+  public forgot-password screen, so the admin path that creates staff
+  logins was checking length and nothing else. Both paths run all four
+  rules now.
 - [ ] Turn on two-factor authentication on Rudolph's own admin account
   (the feature has existed platform-wide since 2026-08-13, just not
   enabled on this one account).
 - [ ] Turn imported customers' Splynx plan info (currently just text in
   each customer's Notes field) into real Tariff/Service links.
+
+## From the 2026-09-04 platform audit — all fixed
+
+Every finding below was reproduced first, fixed with a test that fails
+against the pre-fix code, and verified against the full suite. Done
+2026-09-05. Listed here rather than deleted so there is a record of what
+was wrong, since several were silent and none had ever shown up as a
+complaint.
+
+- [x] Tax invoices did not add up — the PDF rounded VAT per line while the
+  invoice rounded once, so the exclusive + VAT a customer entered in their
+  own books missed the total they were billed.
+- [x] Output VAT on a converted quote was declared in **no** VAT return —
+  dated by `date_created`, which never moves off the day the quote was
+  raised. `Invoice.date_issued` now records when a document actually
+  becomes a tax invoice.
+- [x] Expenses claimed 15% input VAT on wages, where none was ever
+  charged.
+- [x] UIF was capped once per run instead of once per month, so a
+  multi-month catch-up run under-deducted and under-declared on the EMP201.
+- [x] Recalculating a draft payroll run deleted a leaver's line, and their
+  final pay with it.
+- [x] Recording a payment overwrote any credit approved or invoice issued
+  in the same moment, and a second payment against one invoice erased the
+  first. The forward path was the last half of the ledger still doing
+  read-modify-write.
+- [x] A quote could be PATCHed straight to `unpaid`, becoming a live tax
+  invoice still numbered QUO-, with the quoted tariff never turned into a
+  service.
+- [x] Changing a product's Tracking dropdown zeroed its stock on hand; a
+  resell-price typo 500'd the whole Products API; two simultaneous stock
+  issues could both pass the availability check.
+- [x] A mistyped service odometer was permanent and left the vehicle
+  reading Overdue for good, while a late logbook entry could never be
+  recorded at all.
+- [x] Scheduling could only book jobs for the first 500 customers, and
+  swallowed every save and delete error in silence.
+
+And the five that were still unverified leads when the list was written —
+all five turned out to be real:
+
+- [x] Any staff member could pull **any** customer's statement or invoice
+  PDF, ignoring their reseller restriction.
+- [x] Support tickets, and their whole comment threads, were visible and
+  editable across partners.
+- [x] The speed-now endpoint leaked another reseller's plan, live line
+  speed and month-to-date usage.
+- [x] Fair-use shaping and speed-window boosts were pushed only to the
+  live session and never into `radreply`, so a router reboot restored the
+  old speed permanently — and the scheduled job then reported "already
+  correct" and never re-sent it.
+- [x] (the payment race, above)
+
+## Recurring billing: the rest of the engine, audited 2026-09-07
+
+The two bugs earlier audits found in this engine are fixed and tested (the
+late-run cycle shift and the anniversary/UTC day). But those audits covered
+`_generate_document` and the due-date logic only, and said so. Reminders,
+suspension, `upcoming_blocks`, the run lock and bookkeeping,
+partial-failure handling, `cancellations.py` and `tariff_changes.py` had
+never been read by anyone, and had **no tests at all**.
+
+They have now been audited, before this engine bills a real client for the
+first time. Eleven findings, each reproduced by the auditor against a real
+database. Nine bit in production; three were blockers.
+
+**All eleven are now fixed — 2026-09-07.** Each fix carries tests that
+fail against the commit before it, and each was reproduced first. The
+engine's own suite went from no coverage of any of this to 45 tests
+across six new files. Kept here rather than deleted, because several were
+silent and none had ever arrived as a complaint.
+
+- [x] **[was blocker]** A partner-scoped run terminates services and applies tariff changes for every OTHER partner too.
+  Both jobs take `partner_ids` now; a customer with no partner is only touched by an unscoped run. The tariff half was the worse one — applying a change clears the booking, so the other reseller's scheduled change was not merely early, it was gone.
+- [x] **[was blocker]** Every recurring invoice email quotes the balance from before that invoice was debited.
+  `apply_balance_debit` uses `F()`, deliberately, which leaves the in-memory customer stale — and that instance is what renders `{{ balance }}`. Every email was exactly one invoice behind, in the direction that tells the customer to pay less than they owe. Re-read after the commit, in `_send_after_commit`, so it covers every billing email.
+- [x] **[was blocker]** An accepted quote's mandatory "Till" date is written into Service.end_date, so cancellations cuts the customer off and marks them Cancelled on the last day they paid for.
+  The quoted period is no longer read as a termination instruction. It stays on the invoice line, where it is a true statement about what was charged. A real fixed term is still set deliberately on `Service.end_date`.
+- [x] **[was serious]** A payment reminder is sent on invoice status alone, so a customer who has already paid gets a demand quoting "an outstanding balance of R 0.00".
+  The balance is the entire content of the email, so it now decides whether there is anything to chase.
+- [x] **[was serious]** The reminder dedupe treats a FAILED send as "already sent" — and a Run repeated for the same date on a later day re-sends the lot.
+  Both halves came from deduping on "did this customer get an email today". Keyed on `Invoice.last_reminder_run_date` now (migration 0022), written only once the mailer reports success.
+- [x] **[was serious]** An interrupted run leaves History saying "Processed — 0 invoices" on top of invoices that committed and PDFs already emailed.
+  A run starts `in_progress` and carries its counts as each customer commits. The old row read as a clean run that did nothing — and the obvious response to it would have double-billed everybody.
+- [x] **[was serious]** A payment reminder chases the invoice the same run just raised, and silently drops the one actually falling due.
+  Candidates are ordered oldest-due-first, with this run's own invoices excluded. Which of the two won used to depend on the order Postgres returned rows in.
+- [x] **[was minor]** `_describe_failures` names nobody when the failure is on the customer re-read itself.
+  Falls back to the primary key, which is what the logs are keyed on.
+- [x] **[was minor]** The cancellation dry run never names the customers it would cancel.
+  It asked the database who had nothing left running, and in a dry run nothing has been terminated — so the answer was always "none", which reads as a promise that nobody will be cancelled. The preview now predicts exactly what the commit does.
+- [x] **[was serious, latent]** A zero-day blocking period treats an invoice as overdue on the day it falls due, so the run that raises a customer's invoice suspends them in the same transaction.
+  Only this run's own invoices are excluded, so zero days still means zero days for anything raised earlier.
+- [x] **[was serious, latent]** `--as-of` on the two overnight commands executes the future instead of checking it.
+  Both refuse a future date on the writing path only; checking ahead is what the flag is for and still works.
+
+Two notes worth keeping for whoever runs this engine next:
+
+  * `predeploy_check` reports the billing configs more than one period
+    behind, which this engine will now catch up one invoice per Run. Look
+    at that list, and use Preview, before the first real Run.
+  * Nothing here changes the fact that the engine has still never billed a
+    real client. The first Run should be scoped to one partner and
+    checked invoice by invoice.
+
+## Where every claim stands (2026-09-06, final pass)
+
+63 candidate findings across two audits and one adversarial review of this
+branch's own diff. **All 63 have now been looked at.**
+
+**Confirmed, reproduced and fixed: 30.** Each has a test that fails against
+the commit before its fix. Five were blockers:
+
+  * a late billing run losing a whole month of invoices, silently
+  * an anniversary of the 29th/30th/31st getting NO invoice in a short month
+  * UIF charged twice on an ordinary 26th-to-25th pay cycle
+  * a rounded workshop odometer discarding the whole service
+  * a line that only looked offline never getting its speed change
+
+**Refuted on inspection: 5.** Including two that later commits had already
+fixed, and the UIF day-split concern.
+
+**Not verifiable from here: 1.** Nothing has run against real MikroTik
+hardware -- every CoA, shaper and blocking test is against a FakeNAS. See
+the Teraco item above; it needs a maintenance window on the real device.
+
+Three of the fixes were bugs introduced by earlier fixes on this branch,
+and two more were findings that fell out of tracking entirely and were
+recovered by reconciling every finding against the files actually changed.
+Both are worth remembering the next time this looks finished.
+
+## Network / RADIUS — where it actually stands (2026-09-06)
+
+Fixed and verified by probe: the SNMP community is no longer readable
+through the device API *or* the audit trail; speed-now is partner-scoped;
+a speed change reaches `radreply` so it survives a reconnect, and a line
+whose heartbeat merely lapsed is no longer skipped; a suspended PPPoE
+customer is blocked on the walled-garden address they are actually using
+rather than their recycled old one; the device list no longer loads the
+whole monitoring history.
+
+**Still open on the network side:**
+
+- [ ] **[unverified]** A line that was offline when a speed window opened
+  may never get its static shaper queue re-synced, so the boost is
+  swallowed. `apply_speed_policies.py:181`
+- [ ] **[unverified]** `--limit` may no longer cap anything for offline
+  lines, and those writes are invisible in both the dry run and the log.
+  `apply_speed_policies.py:187`
+- [ ] **Nothing here has run against real MikroTik hardware.** Every CoA,
+  shaper and blocking test is against a FakeNAS. See the Teraco item
+  above, which says the same thing about the RouterOS script.
+
+Two of the fixes above were findings from the FIRST audit that I recorded
+nowhere and nearly lost -- the block-list address and the monitoring
+prefetch. Both are now done, but the lesson is in the list, not the code.
+
+## Self-review of this branch — 18 claims still unchecked (2026-09-06)
+
+The branch's own diff was reviewed adversarially for regressions it
+introduced. 29 claims came back. **11 have now been reproduced and dealt
+with** — see the four "found reviewing its own diff" commits. Among them
+were three blockers: UIF charged twice on an ordinary 26th-to-25th pay
+cycle, a rounded workshop odometer throwing away the whole service, and a
+line that only *looked* offline never getting its speed change.
+
+Two of the eleven were closed as "cannot be prevented, but is now
+recoverable and honestly documented" rather than fixed outright: an
+upward odometer typo (450000 for 45000) cannot be told from a genuine
+large jump without inventing a threshold, so both the reading and the
+service record are now deletable instead. A vehicle left holding a bogus
+high service record still reads a calm "ok" rather than announcing the
+contradiction — known, not fixed.
+
+**The 18 below have NOT been verified.** Treat each as a lead: of the
+eleven checked so far, all were real, but the checking is what makes them
+actionable — and the earlier round of this exercise found roughly a third
+of its claims to be wrong. Nothing here should be acted on without
+reproducing it first.
+
+- [ ] **[serious]** Backfill stamps cancelled QUOTES as issued tax invoices, re-creating the exact VAT gap the change fixes
+  `backend/billing/migrations/0021_invoice_date_issued.py:22` — migration_safety
+- [ ] **[serious]** A NULL date_issued is silently invisible to every VAT return, and the one-shot backfill runs while the old code is still writing invoices
+  `backend/billing/models.py:367` — migration_safety
+- [ ] **[serious]** Recalculate can no longer take anyone off a draft run, and there is no other way to remove a line
+  `backend/payroll/services.py:158` — regression
+- [ ] **[serious]** UIF splits remuneration by calendar days rather than by what was actually earned in each month
+  `backend/payroll/services.py:92` — wrong_business_rule
+- [ ] **[serious]** The new UIF tests assert the code's own output, so they lock in the part-month ceiling error
+  `backend/payroll/test_uif_period.py:82` — weak_test
+- [ ] **[serious]** _service_moment files a backdated service at 23:59:59 of its day, so it is checked against readings taken after the vehicle left the workshop
+  `backend/fleet/views.py:29` — regression
+- [ ] **[serious]** Tracking type can no longer be corrected on a product whose stock is already zero
+  `backend/inventory/serializers.py:126` — regression
+- [ ] **[serious]** A line that was offline when a speed window opened never gets its static shaper queue re-synced, so the boost is silently swallowed
+  `backend/radiusauth/management/commands/apply_speed_policies.py:181` — regression
+- [ ] **[serious]** --limit no longer caps anything for offline lines, and the writes are invisible in both dry run and log
+  `backend/radiusauth/management/commands/apply_speed_policies.py:187` — regression
+- [ ] **[serious]** allow_null=False is a no-op on the deletion-request queryset — the comment states a guarantee the SQL does not give
+  `backend/billing/views.py:387` — misapplied_edit
+- [ ] **[serious]** Picking Salaries latches the VAT rate to 0 and nothing ever puts it back
+  `frontend/src/pages/admin/AccountantPage.tsx:620` — wrong_business_rule
+- [ ] **[minor]** New "concurrency" tests are single-threaded and cannot fail if the lock and the atomic block are removed
+  `backend/billing/test_payment_ledger.py:229` — weak_test
+- [ ] **[minor]** date_issued was wired into the tax invoice and the VAT return only, so one invoice now carries two conflicting dates and the return cannot be reconciled
+  `backend/notifications/templates/notifications/statement_pdf.html:35` — misapplied_edit
+- [ ] **[minor]** test_a_bandwidth_expense_still_defaults_to_15 never exercises the default, and no test in the file omits the rate
+  `backend/expenses/test_salary_vat.py:91` — weak_test
+- [ ] **[minor]** Two readings at the exact same instant are accepted as long as the new one is higher
+  `backend/fleet/serializers.py:46` — wrong_business_rule
+- [ ] **[minor]** The new "the product row is the lock" invariant is not honoured by the manual stock adjustment endpoint
+  `backend/inventory/views.py:91` — transaction_lock
+- [ ] **[minor]** Password minimum raised to 10 server-side, but both password UIs still advertise 6 and 8
+  `backend/config/settings.py:154` — regression
+- [ ] **[minor]** No test pins the minimum at 10 -- the boundary test uses a 15-character password despite its name
+  `backend/accounts/test_password_policy.py:151` — weak_test
 
 ## Not yet installed (the code exists, the cron entry doesn't)
 

@@ -1,0 +1,9 @@
+from rest_framework.routers import DefaultRouter
+from .views import JobTypeViewSet, JobViewSet, ShiftViewSet
+
+router = DefaultRouter()
+router.register("jobs", JobViewSet, basename="job")
+router.register("shifts", ShiftViewSet, basename="shift")
+router.register("job-types", JobTypeViewSet, basename="job-type")
+
+urlpatterns = router.urls

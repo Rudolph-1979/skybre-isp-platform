@@ -1,0 +1,39 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block brand %}{% include "contracts/_brand.html" %}{% endblock %}
+{% block content %}
+  <div class="doc-title">Signing certificate</div>
+  <p style="font-size:9pt; color:#444444;">This page was added when the document was signed. It belongs to {{ contract.reference }} and the {{ pages }} page{{ pages|pluralize }} before it.</p>
+
+  <table class="meta-table" style="width:478pt; margin-top:8px;">
+    <tr><td class="meta-label" style="width:130pt;">Document</td><td>{{ contract.reference }} — {{ contract.title }}</td></tr>
+    <tr><td class="meta-label">Client</td><td>{{ customer.full_name }} ({{ customer.customer_id }})</td></tr>
+    <tr><td class="meta-label">Signed by</td><td><b>{{ contract.signer_name }}</b>{% if contract.signer_id_number %}, ID / registration {{ contract.signer_id_number }}{% endif %}</td></tr>
+    <tr><td class="meta-label">Signed on</td><td>{{ signed_at|date:"d/m/Y H:i:s" }} (South African time)</td></tr>
+    <tr><td class="meta-label">How</td><td>{% if contract.signed_in_person %}In person, on a {{ company.name|default:company_name }} device, with {{ contract.witnessed_by.get_full_name|default:contract.witnessed_by.username }}{% else %}Online, from the signing link sent to {{ contract.sent_to|default:"the client" }}{% endif %}</td></tr>
+    <tr><td class="meta-label">IP address</td><td>{{ contract.signer_ip|default:"—" }}</td></tr>
+    <tr><td class="meta-label">Device</td><td style="font-size:8pt;">{{ contract.signer_user_agent|default:"—"|truncatechars:160 }}</td></tr>
+    <tr><td class="meta-label">Agreed to</td><td>"I have read and agree to the terms of this document, and I agree to sign it electronically."</td></tr>
+    <tr><td class="meta-label">Document fingerprint</td><td style="font-size:7.5pt;">SHA-256 {{ contract.document_sha256 }}</td></tr>
+  </table>
+
+  <div style="margin-top:14px;">
+    <div class="addr-label">Signature</div>
+    <img src="{{ signature_src }}" style="height:55pt; margin-top:4px;">
+    <div style="border-top:1px solid #333333; width:220pt; font-size:9pt;">{{ contract.signer_name }}</div>
+  </div>
+
+  <div class="addr-label" style="margin-top:16px;">Audit trail</div>
+  <table class="items" style="width:478pt;">
+    <thead><tr><th style="width:105pt;">When</th><th style="width:100pt;">What</th><th style="width:273pt;">Detail</th></tr></thead>
+    <tbody>
+      {% for e in events %}
+      <tr>
+        <td style="font-size:8pt; padding:3px 4px;">{{ e.at|date:"d/m/Y H:i:s" }}</td>
+        <td style="font-size:8pt; padding:3px 4px;">{{ e.get_kind_display }}</td>
+        <td style="font-size:8pt; padding:3px 4px;">{% if e.user %}{{ e.user.get_full_name|default:e.user.username }}. {% endif %}{{ e.detail }}{% if e.ip %} IP {{ e.ip }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p style="font-size:7.5pt; color:#666666; margin-top:4px;">The fingerprint identifies the exact document that was signed: changing even one character of it gives a different fingerprint.</p>
+{% endblock %}

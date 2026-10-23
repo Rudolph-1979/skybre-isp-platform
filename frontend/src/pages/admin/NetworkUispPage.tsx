@@ -1,0 +1,526 @@
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { api } from "../../api/client";
+import { PageHeader } from "../../components/PageHeader";
+import { StatCard } from "../../components/StatCard";
+import { filterSelectClass, inputClass, btnSecondary } from "../../components/Modal";
+import { usePolling } from "../../hooks/usePolling";
+import { formatIsoDateTime } from "../../utils/billingTerms";
+import type { UispOutage, UispSummary } from "../../components/UispDashboardTiles";
+import { UispDeviceGraphs } from "../../components/UispDeviceGraphs";
+import { UispTopologyMap } from "../../components/UispTopologyMap";
+
+type Device = {
+  id: string;
+  name: string;
+  model: string;
+  kind: string;
+  black_box: boolean;
+  status: string;
+  online: boolean;
+  maintenance: boolean;
+  ip: string;
+  site: { id: string; name: string } | null;
+  link_potential_pct: number | null;
+  downtime_pct: number | null;
+  signal_dbm: number | null;
+  remote_signal_dbm: number | null;
+  downlink_capacity_bps: number | null;
+  uplink_capacity_bps: number | null;
+  downlink_use_pct: number | null;
+  uplink_use_pct: number | null;
+  cpu_pct: number | null;
+  ram_pct: number | null;
+  uptime_s: number | null;
+  frequency_mhz: number | null;
+  channel_width_mhz: number | null;
+  distance_m: number | null;
+  temperature_c: number | null;
+  stations: number | null;
+  firmware: string;
+  update_available: boolean;
+  flags: string[];
+  ap_device_id?: string | null;
+  ap_site_id?: string | null;
+};
+type Site = {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  device_count: number;
+  devices_offline: number;
+  clients: number | null;
+};
+
+const TABS = [
+  { key: "ptp", label: "Point to Point" },
+  { key: "ap", label: "Access Points" },
+  { key: "other", label: "Routers & other" },
+  { key: "topology", label: "Topology" },
+  { key: "outages", label: "Outages" },
+];
+const FLAG_LABELS: Record<string, string> = {
+  offline: "offline",
+  low_link: "low link potential",
+  busy: "busy",
+  update: "update",
+  maintenance: "maintenance",
+};
+const FLAG_TONE: Record<string, string> = {
+  offline: "var(--status-critical)",
+  low_link: "var(--status-warning)",
+  busy: "var(--status-critical)",
+  update: "var(--series-1)",
+  maintenance: "var(--series-1)",
+};
+
+function mbps(bps: number | null) {
+  if (bps == null) return "—";
+  return bps >= 1e9 ? `${(bps / 1e9).toFixed(2)} Gbps` : `${(bps / 1e6).toFixed(1)} Mbps`;
+}
+function duration(s: number | null) {
+  if (s == null) return "—";
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return d ? `${d} d ${h} h` : h ? `${h} h ${m} min` : `${m} min`;
+}
+function UseBar({ pct }: { pct: number | null }) {
+  if (pct == null) return <span className="text-[var(--text-muted)]">—</span>;
+  const tone = pct >= 80 ? "var(--status-critical)" : pct >= 60 ? "var(--status-warning)" : "var(--status-good, #22c55e)";
+  return (
+    <span className="flex items-center gap-1.5 whitespace-nowrap">
+      <span className="tabular-nums">{Math.round(pct)}%</span>
+      <span className="h-1.5 w-14 overflow-hidden rounded bg-[var(--tint-hover)]">
+        <span className="block h-full" style={{ width: `${Math.min(100, pct)}%`, background: tone }} />
+      </span>
+    </span>
+  );
+}
+function StatusPill({ d }: { d: Device }) {
+  const colour = !d.online ? "var(--status-critical)" : d.maintenance ? "var(--series-1)" : "var(--status-good, #22c55e)";
+  return (
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full bg-[var(--tint-hover)] px-2 py-0.5 text-xs">
+      <span className="h-1.5 w-1.5 rounded-full" style={{ background: colour }} />
+      {!d.online ? "Offline" : d.maintenance ? "Maintenance" : "Online"}
+    </span>
+  );
+}
+
+// --- sortable headers (Rudolph, 14 Oct: "Headers should be sortable") ------
+type SortVal = string | number | null | undefined;
+type SortCol<T> = { label: string; value?: (row: T) => SortVal; firstDesc?: boolean };
+type SortState = { col: string; dir: "asc" | "desc" };
+
+function ipNum(ip: string) {
+  const parts = ip.split(".").map(Number);
+  return parts.length === 4 && parts.every((n) => !Number.isNaN(n)) ? parts.reduce((a, n) => a * 256 + n, 0) : null;
+}
+function versionKey(v: string) {
+  return v ? v.replace(/\d+/g, (n) => n.padStart(6, "0")) : null;
+}
+/** Nulls always last; numbers numerically; text A-Z ignoring case. */
+function sortRows<T>(rows: T[], cols: SortCol<T>[], sort: SortState | null) {
+  const col = sort && cols.find((c) => c.label === sort.col);
+  if (!col?.value) return rows;
+  const get = col.value;
+  const mul = sort!.dir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const x = get(a);
+    const y = get(b);
+    const xn = x == null || x === "";
+    const yn = y == null || y === "";
+    if (xn || yn) return xn === yn ? 0 : xn ? 1 : -1;
+    if (typeof x === "number" && typeof y === "number") return (x - y) * mul;
+    return String(x).localeCompare(String(y), undefined, { sensitivity: "base", numeric: true }) * mul;
+  });
+}
+function SortHeader<T>({ cols, sort, onSort }: { cols: SortCol<T>[]; sort: SortState | null; onSort: (s: SortState | null) => void }) {
+  return (
+    <tr className="text-left text-xs uppercase tracking-wide text-[var(--text-muted)]">
+      {cols.map((c) => {
+        const active = sort?.col === c.label;
+        const click = () => {
+          if (!c.value) return;
+          const first = c.firstDesc ? "desc" : "asc";
+          if (!active) onSort({ col: c.label, dir: first });
+          else if (sort!.dir === first) onSort({ col: c.label, dir: first === "asc" ? "desc" : "asc" });
+          else onSort(null); // third click: back to the default order
+        };
+        return (
+          <th
+            key={c.label}
+            className={`whitespace-nowrap px-3 py-2 ${c.value ? "cursor-pointer select-none hover:text-[var(--text-primary)]" : ""} ${active ? "text-[var(--text-primary)]" : ""}`}
+            onClick={click}
+            aria-sort={active ? (sort!.dir === "asc" ? "ascending" : "descending") : undefined}
+          >
+            {c.label}
+            {c.value && <span className="ml-1 inline-block w-2">{active ? (sort!.dir === "asc" ? "▲" : "▼") : ""}</span>}
+          </th>
+        );
+      })}
+    </tr>
+  );
+}
+
+const DEVICE_COLS: SortCol<Device>[] = [
+  { label: "Name", value: (d) => d.name },
+  { label: "Model", value: (d) => d.model },
+  { label: "Status", value: (d) => (!d.online ? 0 : d.maintenance ? 1 : 2) },
+  { label: "IP", value: (d) => ipNum(d.ip) },
+  { label: "Link potential", value: (d) => d.link_potential_pct },
+  { label: "Downtime", value: (d) => d.downtime_pct, firstDesc: true },
+  { label: "Signal", value: (d) => d.signal_dbm },
+  { label: "Downlink use", value: (d) => d.downlink_use_pct, firstDesc: true },
+  { label: "Uplink use", value: (d) => d.uplink_use_pct, firstDesc: true },
+  { label: "Capacity ↓/↑", value: (d) => d.downlink_capacity_bps },
+  { label: "Frequency", value: (d) => d.frequency_mhz },
+  { label: "Site", value: (d) => d.site?.name },
+  { label: "Firmware", value: (d) => versionKey(d.firmware) },
+  { label: "Uptime", value: (d) => d.uptime_s },
+];
+const OUTAGE_COLS: SortCol<UispOutage>[] = [
+  { label: "Started", value: (o) => (o.start ? new Date(o.start).getTime() : null), firstDesc: true },
+  { label: "Device", value: (o) => o.device.name },
+  { label: "Site", value: (o) => o.site },
+  { label: "Type", value: (o) => o.type },
+  { label: "Lasted", value: (o) => (o.in_progress ? Number.MAX_SAFE_INTEGER : o.duration_s), firstDesc: true },
+];
+
+function readSort(key: string): SortState | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) ?? "null");
+    return v && typeof v.col === "string" && (v.dir === "asc" || v.dir === "desc") ? v : null;
+  } catch {
+    return null;
+  }
+}
+function useSort(key: string) {
+  const [sort, setSort] = useState<SortState | null>(() => readSort(key));
+  const update = (s: SortState | null) => {
+    setSort(s);
+    try {
+      if (s) localStorage.setItem(key, JSON.stringify(s));
+      else localStorage.removeItem(key);
+    } catch {
+      /* private window: sort just isn't remembered */
+    }
+  };
+  return [sort, update] as const;
+}
+
+/** Network (UISP) -- Skybre's backhaul, APs and core read from UISP
+ *  (Rudolph, 14 Oct 2026). Read-only; refreshed every minute. */
+export function NetworkUispPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get("tab") ?? "ptp";
+  const topoView = searchParams.get("view") === "list" ? "list" : "map";
+  const [summary, setSummary] = useState<UispSummary | null>(null);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [sites, setSites] = useState<Site[]>([]);
+  const [outages, setOutages] = useState<UispOutage[]>([]);
+  const [error, setError] = useState("");
+  const [loadedAt, setLoadedAt] = useState<Date | null>(null);
+  const [q, setQ] = useState("");
+  const [siteFilter, setSiteFilter] = useState("");
+  // ?flag=low_link from the dashboard tile (15 Oct 2026).
+  const [flagFilter, setFlagFilter] = useState(() => searchParams.get("flag") ?? "");
+  const [graphFor, setGraphFor] = useState<Device | null>(null);
+  const [deviceSort, setDeviceSort] = useSort("uisp.sort.devices");
+  const [outageSort, setOutageSort] = useSort("uisp.sort.outages");
+
+  async function load() {
+    try {
+      const [s, d, st, o] = await Promise.all([
+        api.get<UispSummary>("/uisp/summary/"),
+        api.get<{ results: Device[] }>("/uisp/devices/"),
+        api.get<{ results: Site[] }>("/uisp/sites/"),
+        api.get<{ items: UispOutage[] }>("/uisp/outages/?count=100"),
+      ]);
+      setSummary(s.data);
+      setDevices(d.data.results ?? []);
+      setSites(st.data.results ?? []);
+      setOutages(o.data.items ?? []);
+      setError("");
+      setLoadedAt(new Date());
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Couldn't read UISP.");
+    }
+  }
+  useEffect(() => {
+    load();
+  }, []);
+  usePolling(load, 60000);
+
+  const kindRows = useMemo(() => {
+    const kinds = tab === "ptp" ? ["ptp"] : tab === "ap" ? ["ap"] : ["router", "switch", "station", "other"];
+    const needle = q.trim().toLowerCase();
+    const rows = devices.filter(
+      (d) =>
+        kinds.includes(d.kind) &&
+        (!siteFilter || d.site?.id === siteFilter) &&
+        (!flagFilter || d.flags.includes(flagFilter)) &&
+        (!needle || `${d.name} ${d.ip} ${d.model} ${d.site?.name ?? ""}`.toLowerCase().includes(needle))
+    );
+    return sortRows(rows, DEVICE_COLS, deviceSort);
+  }, [devices, tab, q, siteFilter, flagFilter, deviceSort]);
+
+  const sortedOutages = useMemo(() => sortRows(outages, OUTAGE_COLS, outageSort), [outages, outageSort]);
+
+  if (summary && !summary.connected) {
+    return (
+      <div>
+        <PageHeader title="Network (UISP)" subtitle="Backhaul, access points and core, read from UISP." />
+        <p className="text-sm text-[var(--text-secondary)]">
+          UISP isn't connected yet. Set <code>UISP_URL</code> and <code>UISP_TOKEN</code> in backend/.env and restart the backend.
+        </p>
+      </div>
+    );
+  }
+
+  const count = (kind: string) => devices.filter((d) => d.kind === kind).length;
+  const tabLabel = (t: { key: string; label: string }) =>
+    t.key === "ptp" ? `${t.label} (${count("ptp")})` : t.key === "ap" ? `${t.label} (${count("ap")})` : t.label;
+
+  return (
+    <div>
+      <PageHeader
+        title="Network (UISP)"
+        subtitle="Backhaul, access points and core, read from UISP. Clients and billing stay here."
+        actions={
+          <div className="flex items-center gap-3 text-xs text-[var(--text-muted)]">
+            {loadedAt && <span>Read {loadedAt.toLocaleTimeString()} · every minute</span>}
+            <button type="button" className={btnSecondary} onClick={load}>
+              Refresh
+            </button>
+          </div>
+        }
+      />
+      {error && <p className="mb-3 rounded-md border border-[var(--status-critical)] px-3 py-2 text-sm text-[var(--status-critical)]">{error}</p>}
+
+      {summary && summary.connected && !summary.detail && (
+        <>
+          <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+            <StatCard label="Devices online" value={`${summary.devices_online} / ${summary.devices}`} sublabel={`${summary.maintenance} in maintenance`} accent={summary.devices_online < summary.devices ? "status-warning" : "status-good"} />
+            <StatCard label="Backhaul radios up" value={`${summary.ptp_radios - summary.ptp_offline} / ${summary.ptp_radios}`} sublabel={`${summary.ptp_offline} down`} accent={summary.ptp_offline ? "status-critical" : "status-good"} />
+            <StatCard label="Low link potential" value={summary.low_link} sublabel="Under 50%" accent={summary.low_link ? "status-warning" : "status-good"} />
+            <StatCard label="Busy" value={summary.busy} sublabel="Downlink use 60%+" accent={summary.busy ? "status-warning" : "status-good"} />
+            <StatCard label="Firmware updates" value={summary.updates} sublabel="Available, not applied" accent="series-1" />
+          </div>
+          {summary.outages_open.length > 0 && (
+            <div className="mb-4 rounded-lg border border-[var(--status-critical)] bg-[var(--surface-1)] px-4 py-3 text-sm">
+              <b className="text-[var(--status-critical)]">Down now:</b>{" "}
+              {summary.outages_open.map((o) => `${o.device.name} (${o.site}, since ${o.start ? formatIsoDateTime(o.start) : "?"})`).join(" · ")}
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="mb-3 flex flex-wrap gap-1 border-b border-[var(--border-hairline)]">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => setSearchParams({ tab: t.key })}
+            className={`px-4 py-2 text-sm font-medium ${tab === t.key ? "border-b-2 border-[var(--series-1)] text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"}`}
+          >
+            {tabLabel(t)}
+          </button>
+        ))}
+      </div>
+
+      {(tab === "ptp" || tab === "ap" || tab === "other") && (
+        <>
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <input className={`${inputClass} max-w-xs`} placeholder="Search name, IP, model, site…" value={q} onChange={(e) => setQ(e.target.value)} />
+            <select className={filterSelectClass} value={siteFilter} onChange={(e) => setSiteFilter(e.target.value)}>
+              <option value="">All sites</option>
+              {[...sites].sort((a, b) => a.name.localeCompare(b.name)).map((s) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+            <select className={filterSelectClass} value={flagFilter} onChange={(e) => setFlagFilter(e.target.value)}>
+              <option value="">Any flag</option>
+              {Object.entries(FLAG_LABELS).map(([k, v]) => (
+                <option key={k} value={k}>{v}</option>
+              ))}
+            </select>
+            <span className="text-xs text-[var(--text-muted)]">{kindRows.length} devices</span>
+          </div>
+          <div className="overflow-x-auto rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]">
+            <table className="w-full text-sm">
+              <thead>
+                <SortHeader cols={DEVICE_COLS} sort={deviceSort} onSort={setDeviceSort} />
+              </thead>
+              <tbody>
+                {kindRows.map((d) => (
+                  <tr
+                    key={d.id}
+                    className="cursor-pointer border-t border-[var(--border-hairline)] hover:bg-[var(--tint-hover)]"
+                    onClick={() => setGraphFor(d)}
+                    title={d.black_box ? "UISP only knows whether this device answers" : "Show graphs"}
+                  >
+                    <td className="whitespace-nowrap px-3 py-2 font-medium">
+                      {d.name}
+                      {d.flags.filter((f) => f !== "offline" && f !== "maintenance").map((f) => (
+                        <span key={f} className="ml-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium" style={{ color: FLAG_TONE[f], background: "var(--tint-hover)" }}>
+                          {FLAG_LABELS[f]}
+                        </span>
+                      ))}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-[var(--text-secondary)]">{d.model}</td>
+                    <td className="px-3 py-2"><StatusPill d={d} /></td>
+                    <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">{d.ip || "—"}</td>
+                    <td className="px-3 py-2 tabular-nums" style={{ color: d.link_potential_pct == null ? undefined : d.link_potential_pct < 50 ? "var(--status-warning)" : "var(--status-good, #22c55e)" }}>
+                      {d.link_potential_pct == null ? "—" : `${Math.round(d.link_potential_pct)}%`}
+                    </td>
+                    <td className="px-3 py-2 tabular-nums">{d.downtime_pct == null ? "—" : `${d.downtime_pct}%`}</td>
+                    <td className="whitespace-nowrap px-3 py-2 tabular-nums">
+                      {d.signal_dbm == null ? "—" : `${d.signal_dbm}${d.remote_signal_dbm != null ? ` / ${d.remote_signal_dbm}` : ""} dBm`}
+                    </td>
+                    <td className="px-3 py-2"><UseBar pct={d.downlink_use_pct} /></td>
+                    <td className="px-3 py-2"><UseBar pct={d.uplink_use_pct} /></td>
+                    <td className="whitespace-nowrap px-3 py-2 tabular-nums">
+                      {d.downlink_capacity_bps == null ? "—" : `${mbps(d.downlink_capacity_bps)} / ${mbps(d.uplink_capacity_bps)}`}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 tabular-nums">
+                      {d.frequency_mhz ? `${d.frequency_mhz} MHz${d.channel_width_mhz ? ` · ${d.channel_width_mhz}` : ""}` : "—"}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2">{d.site?.name ?? "—"}</td>
+                    <td className="whitespace-nowrap px-3 py-2">
+                      {d.firmware || "—"}
+                      {d.update_available && <span className="ml-1 text-xs text-[var(--series-1)]">update</span>}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 tabular-nums">{duration(d.uptime_s)}</td>
+                  </tr>
+                ))}
+                {kindRows.length === 0 && (
+                  <tr><td colSpan={14} className="px-3 py-4 text-center text-[var(--text-muted)]">No devices match.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-[var(--text-muted)]">Click a column heading to sort (again to reverse, a third time for the default order). Click a device for its graphs.</p>
+          {tab === "other" && (
+            <p className="mt-2 text-xs text-[var(--text-muted)]">
+              MikroTiks are "black boxes" to UISP: it only knows whether they answer. Their detail comes from Networking → Devices.
+            </p>
+          )}
+        </>
+      )}
+
+      {tab === "topology" && (
+        <>
+          <div className="mb-2 inline-flex rounded-md border border-[var(--baseline)] p-0.5">
+            {(["map", "list"] as const).map((v) => (
+              <button
+                key={v}
+                type="button"
+                aria-pressed={topoView === v}
+                className={`rounded px-2.5 py-1 text-xs ${topoView === v ? "bg-[var(--tint-hover)] font-medium text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:text-[var(--text-primary)]"}`}
+                onClick={() => setSearchParams({ tab: "topology", view: v })}
+              >
+                {v === "map" ? "Map" : "List"}
+              </button>
+            ))}
+          </div>
+          {topoView === "map" ? (
+            <UispTopologyMap sites={sites} devices={devices} onPick={(d) => setGraphFor(d as Device)} />
+          ) : (
+            <Topology sites={sites} devices={devices} onPick={setGraphFor} />
+          )}
+        </>
+      )}
+      {graphFor && <UispDeviceGraphs device={graphFor} onClose={() => setGraphFor(null)} />}
+
+      {tab === "outages" && (
+        <div className="overflow-x-auto rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]">
+          <table className="w-full text-sm">
+            <thead>
+              <SortHeader cols={OUTAGE_COLS} sort={outageSort} onSort={setOutageSort} />
+            </thead>
+            <tbody>
+              {sortedOutages.map((o) => (
+                <tr key={o.id} className="border-t border-[var(--border-hairline)]">
+                  <td className="whitespace-nowrap px-3 py-2">{o.start ? formatIsoDateTime(o.start) : "—"}</td>
+                  <td className="px-3 py-2 font-medium">{o.device.name}<span className="ml-1 text-xs text-[var(--text-muted)]">{o.device.model}</span></td>
+                  <td className="px-3 py-2">{o.site || "—"}</td>
+                  <td className="px-3 py-2">{o.type === "unreachable" ? "Unreachable" : "Outage"}</td>
+                  <td className="whitespace-nowrap px-3 py-2" style={{ color: o.in_progress ? "var(--status-critical)" : undefined }}>
+                    {o.in_progress ? "ongoing" : duration(o.duration_s)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The site tree as UISP links it, upstream first. */
+function Topology({ sites, devices, onPick }: { sites: Site[]; devices: Device[]; onPick: (d: Device) => void }) {
+  const children = useMemo(() => {
+    const map: Record<string, Site[]> = {};
+    const ids = new Set(sites.map((s) => s.id));
+    for (const s of sites) {
+      const parent = s.parent_id && ids.has(s.parent_id) ? s.parent_id : "root";
+      (map[parent] ??= []).push(s);
+    }
+    Object.values(map).forEach((list) => list.sort((a, b) => a.name.localeCompare(b.name)));
+    return map;
+  }, [sites]);
+  const backhaul = useMemo(() => {
+    const m: Record<string, Device[]> = {};
+    for (const d of devices) if (d.kind === "ptp" && d.site) (m[d.site.id] ??= []).push(d);
+    return m;
+  }, [devices]);
+
+  function Node({ site, depth }: { site: Site; depth: number }) {
+    const kids = children[site.id] ?? [];
+    const radios = backhaul[site.id] ?? [];
+    const worst = radios.some((r) => !r.online) ? "var(--status-critical)" : radios.some((r) => r.flags.includes("low_link") || r.flags.includes("busy")) ? "var(--status-warning)" : "var(--status-good, #22c55e)";
+    const down = site.devices_offline > 0;
+    return (
+      <>
+        <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border-hairline)] py-1.5 text-sm" style={{ paddingLeft: 12 + depth * 22 }}>
+          {depth > 0 && <span className="text-[var(--text-muted)]">└</span>}
+          <span className="h-2 w-2 rounded-full" style={{ background: down ? "var(--status-critical)" : worst }} />
+          <span className="font-medium">{site.name}</span>
+          <span className="text-xs text-[var(--text-muted)]">
+            {site.device_count} devices{down ? ` · ${site.devices_offline} down` : ""}
+            {site.clients != null ? ` · ${site.clients} clients` : ""}
+          </span>
+          {radios.map((r) => (
+            <button
+              type="button"
+              key={r.id}
+              onClick={() => onPick(r)}
+              className="rounded bg-[var(--tint-hover)] px-1.5 py-0.5 text-[11px] hover:underline"
+              title={`${r.model} · link potential ${r.link_potential_pct ?? "—"}% · downlink use ${r.downlink_use_pct ?? "—"}% · click for graphs`}
+            >
+              {r.name} {r.downlink_use_pct != null ? `${Math.round(r.downlink_use_pct)}%` : ""}
+            </button>
+          ))}
+        </div>
+        {kids.map((k) => (
+          <Node key={k.id} site={k} depth={depth + 1} />
+        ))}
+      </>
+    );
+  }
+
+  const roots = children["root"] ?? [];
+  return (
+    <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] pb-1">
+      <p className="px-3 py-2 text-xs text-[var(--text-muted)]">
+        Upstream first. Dot: red = a device down at the site; amber = a backhaul radio there is busy or has low link potential.
+        Chips are the site's backhaul radios with downlink use (click one for its graphs). Client counts come from this platform (sites matched by name).
+      </p>
+      {roots.map((r) => (
+        <Node key={r.id} site={r} depth={0} />
+      ))}
+    </div>
+  );
+}

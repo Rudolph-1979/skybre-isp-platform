@@ -1,0 +1,1641 @@
+"""The recurring-billing engine: for a given date, works out which
+opted-in customers (CustomerBillingConfig.billing_enabled=True) are due a
+new invoice/pro forma, which unpaid invoices are due a reminder, and which
+overdue customers should have their services auto-suspended -- then either
+just counts what it would do (commit=False, a "Preview") or actually does
+it and logs a RecurringBillingRun (commit=True, a "Run").
+
+Deliberately simple/staff-triggered for this release -- see the design
+notes in RecurringBillingRun's docstring and the ADR-style comments below
+on a few judgment calls (minimum_balance's interaction with blocking,
+reminder day-offset direction, and the single-cycle invoice-vs-pro-forma
+choice) that weren't spelled out in the original request and were
+resolved with a documented best guess rather than guessed silently.
+"""
+import calendar
+import logging
+from datetime import timedelta
+
+from django.db import connection, transaction
+from django.db.models import Count, F, Max, Min, Q
+from django.utils import timezone
+
+from customers.models import Customer
+from notifications.models import EmailLog, EmailTemplate
+from notifications.services import send_customer_email
+from .business_days import MAX_SHIFT_DAYS, holiday_set, is_business_day, next_business_day
+from .invoice_lines import customer_invoice_lines
+from .models import (
+    Invoice, InvoiceItem, Service, CustomerBillingConfig, ReminderSettings, SuspensionSettings,
+    RecurringBillingRun,
+)
+
+logger = logging.getLogger(__name__)
+
+_PERIOD_MONTHS = {"monthly": 1, "quarterly": 3, "biannually": 6, "annually": 12}
+
+# Advisory-lock coordinates for a committed run. Same mechanism
+# apply_speed_policies uses, different key, so the two can still overlap
+# -- they touch different things.
+_RUN_LOCK_NAMESPACE = 0x5B17
+_RUN_LOCK_KEY = 1
+
+
+class RecurringBillingBusy(RuntimeError):
+    """Raised when a committed run is asked for while one is already going.
+
+    A separate exception type so the API can turn it into a 409 rather
+    than a 500, and so the management command can exit non-zero with a
+    sensible message instead of a traceback.
+    """
+
+
+def _try_run_lock():
+    """True if this process now holds the run lock.
+
+    Session-scoped rather than transaction-scoped (pg_try_advisory_lock,
+    not ..._xact_lock) because a run is deliberately NOT one transaction
+    -- each customer gets their own -- so there is no single transaction
+    for the lock to live in.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", [_RUN_LOCK_NAMESPACE, _RUN_LOCK_KEY])
+        return bool(cursor.fetchone()[0])
+
+
+def _release_run_lock():
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [_RUN_LOCK_NAMESPACE, _RUN_LOCK_KEY])
+
+
+def _billable_customer_ids(partner_ids=None):
+    """Ids of the customers a committed run will walk.
+
+    Ids only, deliberately. The old code iterated a queryset with
+    select_related, which materialised every billing_config -- including
+    next_billing_date, the sole guard against re-invoicing -- before the
+    first invoice was written. Each customer is re-read and locked inside
+    their own transaction instead, so the due test reads committed state.
+    """
+    qs = Customer.objects.filter(billing_config__billing_enabled=True)
+    if partner_ids:
+        qs = qs.filter(partner_id__in=partner_ids)
+    return list(qs.order_by("pk").values_list("pk", flat=True))
+
+
+def _run_preview(run_date, partner_ids=None):
+    """Count what a run WOULD do. Writes nothing -- not an invoice, not an
+    email, not a RecurringBillingRun row -- so it takes no lock and can be
+    run at any time, including while a real run is going."""
+    customers_qs = Customer.objects.filter(billing_config__billing_enabled=True).select_related("billing_config")
+    if partner_ids:
+        customers_qs = customers_qs.filter(partner_id__in=partner_ids)
+
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
+    reminder_settings = ReminderSettings.load()
+    suspension_settings = SuspensionSettings.load()
+    for customer in customers_qs:
+        for key, value in _process_one_customer(
+            customer, customer.billing_config, None, run_date,
+            reminder_settings, suspension_settings, commit=False,
+        ).items():
+            counts[key] += value
+    return {
+        "counts": counts,
+        "status": RecurringBillingRun.Status.PROCESSED,
+        "status_message": "",
+        "run": None,
+    }
+
+
+def _send_after_commit(template_key, customer, on_sent=None, **kwargs):
+    """Hand an email to the mailer only once the surrounding transaction
+    has actually committed.
+
+    This is the difference between a customer receiving an invoice and a
+    customer receiving an invoice that does not exist. SMTP has no
+    rollback: if the send happens inside the transaction and the
+    transaction then fails, the PDF is already in their inbox quoting a
+    number that no longer exists in the database -- and which the next run
+    will hand to somebody else.
+
+    on_commit also means a rolled-back savepoint discards the queued send,
+    which is exactly the behaviour we want per customer.
+
+    The send is wrapped so that a mailer failure can never fail the
+    billing work that already committed. send_customer_email swallows its
+    own exceptions today, but that is its choice to make, not something
+    this module should depend on -- an invoice that exists with no email
+    is recoverable, the reverse is not.
+
+    THE BALANCE IS RE-READ FIRST. Every template here can quote
+    {{ balance }}, and the default ones do -- it is the "your account is
+    now R X" line the customer reads to decide what to pay.
+    Invoice.apply_balance_debit updates the customer row with an F()
+    expression, deliberately (the balance is the field two concurrent
+    finance actions race on), which leaves this in-memory Customer
+    holding the value it was read with, and
+    notifications.services.build_context reads customer.balance straight
+    off it. Without the refresh every invoice email is exactly one
+    invoice behind: a clean account is billed R575 and told it owes
+    R0.00. Wrong in the direction that tells the customer to pay less
+    than they owe.
+
+    After the commit is both the right moment (the true value is in the
+    database by then) and the only one that works -- reading it before
+    would race the very update it is trying to observe.
+    """
+    def _send():
+        try:
+            # Deferred rather than refresh_from_db(): the customer may
+            # have been deleted between the commit and here, and an
+            # exception raised out of an on_commit callback -- after the
+            # invoice has committed -- helps nobody.
+            fresh = type(customer).objects.filter(pk=customer.pk).only("balance").first()
+            if fresh is not None:
+                customer.balance = fresh.balance
+            log = send_customer_email(template_key, customer, **kwargs)
+            # `on_sent` records that this send happened, for callers that
+            # dedupe on it. Only on a real success: send_customer_email
+            # writes an EmailLog row either way and returns it, and a
+            # FAILED row marked as "sent" is how a mail outage turns into
+            # reminders that are skipped rather than retried.
+            if on_sent is not None and getattr(log, "status", None) == EmailLog.Status.SENT:
+                on_sent()
+        except Exception:  # noqa: BLE001 -- see docstring: never fail committed billing over an email
+            logger.exception(
+                "Failed to send %s email to customer %s after billing committed", template_key, customer.pk
+            )
+
+    transaction.on_commit(_send)
+
+
+def _add_period(base_date, period):
+    """base_date advanced by one payment_period, clamping the day to
+    whatever the target month actually has (e.g. the 31st -> the 28th/29th
+    in February) -- billing_day itself is capped 1-28 so this only ever
+    matters for the anniversary-of-creation path."""
+    months = _PERIOD_MONTHS.get(period, 1)
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(base_date.day, calendar.monthrange(year, month)[1])
+    return base_date.replace(year=year, month=month, day=day)
+
+
+def _on_billing_day(when, due_day):
+    """`when` moved to the customer's billing day within its own month.
+
+    Clamped to the length of that month. billing_day is capped 1-28 by the
+    form, so this only ever bites on the anniversary-of-creation path --
+    but it is the same clamp _add_period and _invoice_due already apply,
+    and for the same reason: an exact day-of-month match meant a customer
+    whose day was the 29th, 30th or 31st simply never came round in a
+    short month. Not a late invoice. No invoice, every February, forever.
+    """
+    if not due_day:
+        return when
+    last_day = calendar.monthrange(when.year, when.month)[1]
+    return when.replace(day=min(due_day, last_day))
+
+
+def _billing_due_day(customer, config):
+    if config.use_date_of_customer_creation:
+        # localtime() first. created_at is stored in UTC, and Skybre is
+        # UTC+2, so a customer signed up at 00:30 on the 1st is stored as
+        # 22:30 on the LAST DAY OF THE PREVIOUS MONTH -- .day on the raw
+        # value said 31, and their anniversary billing landed on the wrong
+        # day for ever. Every other date decision in this file already
+        # works in local time; this one read the column directly.
+        return timezone.localtime(customer.created_at).day
+    return config.billing_day
+
+
+def _invoice_due(customer, config, run_date):
+    if not config.auto_create_invoices:
+        return False
+    if config.next_billing_date:
+        return run_date >= config.next_billing_date
+    # Clamped to the end of a short month. An exact match on day-of-month
+    # meant an anniversary of the 29th, 30th or 31st simply never came
+    # round in a month that has no such day: a customer who signed up on
+    # the 31st got no invoice at all in April, June, September or November,
+    # and never in February. Not a late invoice -- no invoice, every short
+    # month, for as long as they are a customer.
+    due_day = _billing_due_day(customer, config)
+    last_day_this_month = calendar.monthrange(run_date.year, run_date.month)[1]
+    return run_date.day == min(due_day, last_day_this_month)
+
+
+def _generate_document(customer, config, run_date, run, commit, issue_date=None):
+    """Returns "invoice", "proforma", or None (nothing to bill -- no
+    active services). Only writes anything when commit=True.
+
+    Judgment call: auto_create_invoices and auto_proforma_enabled share
+    ONE cycle here (billing_day/next_billing_date) rather than each
+    running on its own independent schedule -- the reference this was
+    modeled on has separate day/period settings for pro formas, which
+    would need its own next-proforma-date tracking to do properly. That's
+    flagged as a follow-up rather than built here; auto_proforma_enabled
+    just switches what TYPE of document this cycle produces.
+    """
+    # As they will be ON run_date -- plans per invoice_lines.billable_services,
+    # plus the customer's own recurring charges (a domain- or hosting-only
+    # customer has no service and is still billed). Nothing = no document.
+    lines = customer_invoice_lines(customer, run_date)
+    if not lines:
+        return None
+
+    doc_type = "proforma" if config.auto_proforma_enabled else "invoice"
+    if not commit:
+        return doc_type
+
+    status_value = Invoice.Status.PROFORMA if config.auto_proforma_enabled else Invoice.Status.UNPAID
+    date_due = run_date + timedelta(days=config.payment_due_days or 0)
+    # `issue_date` is set only by an early run (see _run_early): the
+    # invoice is created days before its billing date but must be DATED it
+    # -- on the PDF, on the statement and on the VAT return. A normal run
+    # leaves it None and Invoice.save() stamps today, as always.
+    extra = {"date_issued": issue_date} if issue_date and status_value == Invoice.Status.UNPAID else {}
+    invoice = Invoice.objects.create(
+        customer=customer, status=status_value, date_due=date_due, created_by_run=run, **extra
+    )
+    # WHAT the lines are now lives in billing/invoice_lines.py, which the
+    # preview projection reads too. It used to be written out here, and
+    # again -- differently -- in preview_export._project_invoice: that one
+    # knew nothing about discounts, so a discounted customer was projected
+    # at full price and invoiced at the discounted one, and finance
+    # approved a number that was never going to be billed. This loop now
+    # only turns those lines into rows.
+    #
+    # A discount is its own line at a negative price, directly under the
+    # plan it reduces: the plan bills at full price and the reduction is
+    # visible, rather than one line quietly showing a figure the customer
+    # cannot reconcile against the plan they signed up for. The negative
+    # VAT that comes with it is deliberate and explained there.
+    for line in lines:
+        InvoiceItem.objects.create(
+            invoice=invoice,
+            item_type=(
+                InvoiceItem.ItemType.TARIFF if line["kind"] == "tariff"
+                else InvoiceItem.ItemType.RECURRING_CHARGE if line["kind"] == "recurring_charge"
+                else InvoiceItem.ItemType.CUSTOM
+            ),
+            tariff=line["tariff"],
+            recurring_charge=line.get("recurring_charge"),
+            service=line["service"],
+            description=line["description"],
+            quantity=line["quantity"],
+            unit_price=line["unit_price"],
+            tax_rate_pct=line["tax_rate_pct"],
+            # Only a service's last, pro rata period carries these (#203).
+            period_start=line.get("period_start"),
+            period_end=line.get("period_end"),
+        )
+    invoice.recalc_totals()
+
+    # Mirrors the Splynx reference's "Debit" ledger entry. This used to be
+    # an inline `customer.balance + invoice.total` here and ONLY here, with
+    # a note that manually-created invoices were unaffected -- while
+    # payments credited the balance regardless of which kind of invoice
+    # they settled, so the ledger drifted on every hand-raised invoice.
+    # Invoice.apply_balance_debit is now the single implementation, called
+    # from every path that can change whether an invoice is owed, and it
+    # tracks what it did in Invoice.balance_debited so the debit can be
+    # reversed on a delete or a cancellation.
+    invoice.apply_balance_debit()
+
+    if config.send_billing_notifications:
+        _send_after_commit(doc_type, customer, invoice=invoice)
+
+    # Advance from the date the customer was DUE, not from the date the Run
+    # button happened to be clicked.
+    #
+    # Nothing schedules this engine yet -- staff click Preview -> Run on the
+    # Finance screen each cycle -- so a run landing on the 5th because the
+    # 1st was a Sunday is the ordinary case, not an accident. Anchoring on
+    # run_date moved that customer to the 5th of every month, and the
+    # following month's ON TIME run then found them not yet due and skipped
+    # them: a whole month of service never invoiced, R575 gone per customer,
+    # with the month after that looking completely normal so nobody ever
+    # went looking.
+    #
+    # Advancing one period from the due date means a run that is more than a
+    # period late catches the missed cycle up on the next run rather than
+    # losing it. Billing for service that was actually delivered is the
+    # right direction to err in, and it cannot double-bill within a cycle
+    # because _invoice_due still gates on run_date >= next_billing_date.
+    # THE DAY IS RE-DERIVED FROM billing_day, the CADENCE is not.
+    #
+    # It used to carry the previous date's day forward untouched, which
+    # made billing_day a seed that applied once and was never read again.
+    # A customer first invoiced on the 16th stayed on the 16th for ever,
+    # and editing their billing day changed a number nothing consulted --
+    # the field, the form and the behaviour all disagreed, and only the
+    # behaviour was true.
+    #
+    # Advancing ONE PERIOD FROM THE DUE DATE (not from run_date) is
+    # untouched, for the reason spelled out above: a run that is more than
+    # a period late must catch the missed cycle up on the next run rather
+    # than lose it.
+    unclamped = _add_period(
+        config.next_billing_date or run_date, config.payment_period
+    )
+    candidate = _on_billing_day(unclamped, _billing_due_day(customer, config))
+    # MOVING THE DAY EARLIER MUST NOT CREATE A DOUBLE BILL. A customer on
+    # the 20th whose billing day is now the 1st, invoiced by a run on the
+    # 5th: the unclamped date is the 20th of next month, the clamped one is
+    # the 1st -- which is already behind run_date, so the very next run
+    # would invoice them again days later for an overlapping period.
+    #
+    # Where the unclamped date is still in the future and the clamp would
+    # drag it to on-or-before today, keep the unclamped one for this cycle.
+    # The following cycle clamps cleanly and the customer lands on their
+    # billing day one period later, without ever being billed twice.
+    #
+    # This deliberately does NOT trigger when the unclamped date is itself
+    # in the past -- that is the catch-up case above, and it must stay.
+    if candidate <= run_date < unclamped:
+        candidate = unclamped
+    config.next_billing_date = candidate
+    config.save(update_fields=["next_billing_date"])
+    return doc_type
+
+
+# --- no reminder, no block (George, 12 Oct 2026) -------------------------
+#
+# Lefu Samuel Motaung (SWF2550) was on the next day's suspension list with no
+# reminder ever sent: both his invoices came in through the transaction
+# import AFTER the days their reminders were due, and reminders fire only on
+# an exact day while blocking fires on "past the cut-off". Gaggle Inn, a new
+# client invoiced mid-month, was the same shape. The rule now: a client who
+# CAN be reminded (reminders on, a reminder slot enabled, an address to send
+# to) is not suspended until a reminder about their current debt has gone
+# out, and then not before the usual gap between the last scheduled reminder
+# and the cut-off (EFT 1st: reminders +2 and +3, cut-off +4 -> 1 day). A
+# client whose reminder days were missed gets one catch-up reminder on the
+# next run. Clients who cannot be reminded are blocked as before -- this
+# defers, it never exempts.
+
+
+def reminder_offsets(config, reminder_settings):
+    """The client's reminder offsets whose global slot is switched on."""
+    if not config.reminder_enabled:
+        return set()
+    return {
+        day_value
+        for day_value, enabled in (
+            (config.reminder_1_day, reminder_settings.reminder_1_enabled),
+            (config.reminder_2_day, reminder_settings.reminder_2_enabled),
+            (config.reminder_3_day, getattr(reminder_settings, "reminder_3_enabled", False)),
+        )
+        if day_value is not None and enabled
+    }
+
+
+def _can_be_reminded(customer, config, reminder_settings):
+    if not reminder_offsets(config, reminder_settings):
+        return False
+    return bool((customer.email or "").strip() or (getattr(customer, "billing_email", "") or "").strip())
+
+
+def reminder_gap_days(config, reminder_settings):
+    """Days from the last scheduled reminder to the cut-off, at least 1.
+    Offsets are signed (negative = after the due date), so the last
+    scheduled reminder is the most negative one."""
+    after_due = [-o for o in reminder_offsets(config, reminder_settings) if o <= 0]
+    last = max(after_due) if after_due else 0
+    return max(1, (config.blocking_period_days or 0) - last)
+
+
+def _last_reminder_on(customer, exclude_run=None):
+    owed = customer.invoices.filter(status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE])
+    if exclude_run is not None:
+        owed = owed.exclude(created_by_run=exclude_run)
+    return owed.aggregate(last=Max("last_reminder_run_date"))["last"]
+
+
+def reminder_floor(customer, config, run_date, reminder_settings=None, exclude_run=None):
+    """The earliest date this client may be cut off as far as reminders go,
+    or None when the rule does not apply to them. Never reminded about the
+    current debt: today's run sends the catch-up, so run_date + the gap."""
+    reminder_settings = reminder_settings or ReminderSettings.load()
+    if not _can_be_reminded(customer, config, reminder_settings):
+        return None
+    gap = reminder_gap_days(config, reminder_settings)
+    last = _last_reminder_on(customer, exclude_run=exclude_run)
+    return (last if last is not None else run_date) + timedelta(days=gap)
+
+
+def _process_reminders(customer, config, reminder_settings, run_date, commit, run=None):
+    """Judgment call: reminder_N_day is read as "N days BEFORE the due
+    date" (the far more common convention, and consistent with the
+    reference's own values -- reminder #1 further out, #2 closer in)
+    rather than days after. Sends at most once per (customer, run) even if
+    multiple invoices qualify.
+
+    Three things decide a reminder, and each was wrong on its own axis.
+
+    WHO. A reminder is a demand for money, and its entire content is the
+    balance -- the default template's line is "you have an outstanding
+    balance of R {{ balance }}". The decision was made on invoice status
+    alone, so a customer who had settled their account (paid it off, or
+    in credit) but still had a row sitting at "unpaid" -- a payment
+    captured against the account rather than against that invoice, a
+    credit note, a bank feed confirmed to the balance -- was sent a
+    demand for R 0.00. The account balance is the thing the email is
+    about, so it is the thing that decides whether to send at all.
+
+    WHICH. The candidates were read in no order at all, and the invoice
+    the same run had just raised was among them: its due date is
+    run_date + payment_due_days, so wherever that equals a reminder
+    offset it matched, and the loop breaks on the first match. The
+    customer was chased about an invoice issued minutes earlier while the
+    one actually falling due went unmentioned -- and which of the two won
+    came down to the order Postgres happened to return the rows in.
+    Ordered oldest-due-first now, with this run's own invoices excluded
+    and anything its own payments already cover left out.
+
+    HOW OFTEN. Dedupe was "has this customer had a payment_reminder
+    logged today", which fails in both directions. An EmailLog row is
+    written for a FAILED send too, so a mail outage marked the day done
+    and the re-run sent nothing -- the reminders were not delayed, they
+    were skipped. And keyed on the real calendar day, a backdated Run
+    repeated for the same run_date on a later day chased everybody
+    again. Both go away by keying on the thing that is actually being
+    deduplicated: this invoice, for this run_date, recorded only once the
+    mailer says the send succeeded.
+    """
+    if not config.reminder_enabled:
+        return 0
+
+    # A Management-approved extension in force -- see
+    # SuspensionExtensionRequest. Rudolph's call: an extension pauses the
+    # chasers too, not only the actual cut-off.
+    if config.suspension_extended_until and run_date <= config.suspension_extended_until:
+        return 0
+
+    # Nothing owed, nothing to chase. See WHO above.
+    if customer.balance <= 0:
+        return 0
+
+    offsets = {
+        day_value
+        for day_value, enabled in (
+            (config.reminder_1_day, reminder_settings.reminder_1_enabled),
+            (config.reminder_2_day, reminder_settings.reminder_2_enabled),
+            (config.reminder_3_day, reminder_settings.reminder_3_enabled),
+        )
+        if day_value is not None and enabled
+    }
+    if not offsets:
+        return 0
+
+    candidates = customer.invoices.filter(
+        status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE]
+    ).exclude(paid_amount__gte=F("total"))
+    if run is not None:
+        # An invoice this very run raised is not a debt anybody is late
+        # on. Excluded by the run that made it rather than by date, so it
+        # holds however payment_due_days and the reminder offsets happen
+        # to line up.
+        candidates = candidates.exclude(created_by_run=run)
+
+    due_invoice = None
+    for invoice in candidates.order_by("date_due", "pk"):
+        if (invoice.date_due - run_date).days in offsets:
+            due_invoice = invoice
+            break
+
+    # CATCH-UP (12 Oct 2026). Nothing matched today, nothing owed has ever
+    # been reminded about, and the first scheduled reminder day for the
+    # oldest invoice has already gone by (it was imported, or the client
+    # started, after it): send one now, about that invoice. The
+    # "never reminded" test is per client, so a client with three such
+    # invoices gets one catch-up, not three on consecutive days.
+    if due_invoice is None and not candidates.filter(last_reminder_run_date__isnull=False).exists():
+        earliest_offset = max(offsets)
+        for invoice in candidates.order_by("date_due", "pk"):
+            if (invoice.date_due - run_date).days < earliest_offset:
+                due_invoice = invoice
+            break
+
+    if due_invoice is None:
+        return 0
+    # Already done for this run_date -- a repeat of the same Run, whether
+    # minutes or days later. Deliberately not "try the next invoice
+    # instead": one reminder per customer per run is the documented
+    # behaviour, and re-running a Run should be a no-op, not a way to
+    # send a customer something new.
+    if due_invoice.last_reminder_run_date == run_date:
+        return 0
+    if not commit:
+        return 1
+
+    def _record_sent():
+        Invoice.objects.filter(pk=due_invoice.pk).update(last_reminder_run_date=run_date)
+
+    _send_after_commit(
+        EmailTemplate.Key.PAYMENT_REMINDER, customer, on_sent=_record_sent, invoice=due_invoice
+    )
+    return 1
+
+
+def extension_cutoff(customer, config, exclude_run=None, earliest_due=None):
+    """The agreed cut-off date of an approved suspension extension, or None.
+
+    Rudolph 20 Oct 2026: "We have standard suspension dates set up,
+    extension should accept that there was already communicated with the
+    client and chosen extension till date should suspend client on selected
+    date." So an extension "until 25/10" means: protected BEFORE the 25th,
+    and still owing on the 25th -> suspended ON the 25th. No new reminder and
+    waiting days first (the reminder rule of 12 Oct), and not moved off a
+    weekend or public holiday -- the date was agreed with the client.
+
+    Applies to the debt the extension was about: invoices still owing that
+    fell due on or before the agreed date. A later, separate debt follows
+    the normal rules again. An extension never brings a cut-off FORWARD:
+    the date is never earlier than the oldest such invoice's due date plus
+    the blocking period.
+    """
+    until = config.suspension_extended_until
+    if until is None or config.blocking_period_days is None:
+        return None
+    if earliest_due is None:
+        owed = customer.invoices.filter(
+            status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE], date_due__lte=until
+        )
+        if exclude_run is not None:
+            owed = owed.exclude(created_by_run=exclude_run)
+        earliest_due = owed.aggregate(earliest=Min("date_due"))["earliest"]
+    elif earliest_due > until:
+        return None
+    if earliest_due is None:
+        return None
+    return max(until, earliest_due + timedelta(days=config.blocking_period_days))
+
+
+def blocking_candidate_services(customer, config, run_date, exclude_run=None):
+    """The ACTIVE services that would be suspended if a billing run happened
+    on `run_date`. An empty list means this customer would not be blocked.
+
+    `exclude_run` leaves out invoices raised by the run currently in
+    progress. blocking_period_days is "days after payment is due before
+    this customer's services are automatically suspended", and 0 is a
+    legitimate setting -- but the overdue test is `date_due <= run_date -
+    blocking_period_days`, so at 0 an invoice due today already
+    qualifies, and with payment_due_days unset or 0 the invoice this run
+    just raised is due the day it is raised. The same pass then invoiced
+    the customer and cut them off for not having paid it, seconds apart,
+    without them ever having seen it.
+
+    Only this run's own invoices are excluded. Yesterday's invoice,
+    raised by yesterday's run and due yesterday, still blocks today at
+    zero days -- the setting keeps meaning what it says.
+
+    The dashboard passes nothing here, and should not: it is not inside a
+    run, so every invoice it can see is one the customer has had.
+
+
+    Judgment call (unchanged): blocking requires BOTH a real invoice overdue
+    past blocking_period_days AND the customer's balance being worse than
+    minimum_balance -- the reference's "minimum balance" field reads as a
+    credit cushion that can excuse a technically-overdue invoice, not as a
+    second independent trigger.
+
+    Deliberately does NOT consult SuspensionSettings.auto_suspend_enabled.
+    That master switch belongs to the caller:
+
+      * _process_blocking honours it, so nothing is ever suspended while
+        it's off.
+      * upcoming_blocks (the dashboard panel) deliberately ignores it, and
+        reports its state separately, so the panel still shows who is heading
+        for a cut-off while the automation is disarmed. Gating it there would
+        leave the panel reading zero forever and telling you nothing.
+
+    Extracted from _process_blocking so that the dashboard and the real
+    billing run share ONE definition of "would be blocked". Two copies of
+    this predicate would drift, and a dashboard that quietly disagrees with
+    what the run does is worse than no dashboard.
+    """
+    if config.blocking_period_days is None:
+        return []
+    # A Management-approved extension in force -- see
+    # SuspensionExtensionRequest. Checked first, same reasoning as
+    # is_business_day below: the debt is unchanged, this only defers.
+    # Protected BEFORE the agreed date; on it, cut off (20 Oct 2026, see
+    # extension_cutoff -- it used to protect through the date as well).
+    if config.suspension_extended_until and run_date < config.suspension_extended_until:
+        return []
+    agreed = extension_cutoff(customer, config, exclude_run=exclude_run)
+    agreed_due = agreed is not None and run_date >= agreed
+    # NOT A WORKING DAY, SO NOT A DAY ANYBODY IS DISCONNECTED ON. The debt
+    # is unchanged and the customer qualifies again on Monday -- this defers
+    # the cut-off, it does not forgive it. Checked here rather than in the
+    # blocking pass so that the dashboard, the warning and the run all get
+    # the same answer, which is the whole reason this predicate was
+    # extracted in the first place.
+    # ...except an agreed extension date, which holds on any day.
+    if not agreed_due and not is_business_day(run_date):
+        return []
+    if customer.balance <= config.minimum_balance:
+        return []
+    if not has_overdue_invoice(customer, config, run_date, exclude_run=exclude_run):
+        return []
+    # No reminder, no block (12 Oct 2026) -- see reminder_floor. Here, not
+    # in has_overdue_invoice, so reactivation's is_clear keeps its meaning.
+    # Not after an agreed extension date: the client was spoken to.
+    floor = None if agreed_due else reminder_floor(customer, config, run_date, exclude_run=exclude_run)
+    if floor is not None and run_date < floor:
+        return []
+
+    return list(customer.services.filter(status=Service.Status.ACTIVE))
+
+
+def has_overdue_invoice(customer, config, run_date, exclude_run=None):
+    """The overdue half of blocking_candidate_services' conjunction, on its
+    own -- whether this customer has a real invoice overdue past their
+    blocking period, as of run_date, independent of their balance.
+
+    Extracted so billing.reactivation.is_clear can call the SAME test
+    rather than keeping its own copy. Before this, is_clear only checked
+    `balance <= minimum_balance` -- which blocking_candidate_services also
+    requires, but is only HALF of what it requires. A customer whose old
+    overdue invoice is credited square, then billed for a new month before
+    anyone notices, has a balance back above minimum_balance again with
+    nothing actually overdue -- blocking_candidate_services correctly
+    would not suspend them fresh from this state, but the old
+    balance-only is_clear kept them off anyway, because nothing distinguished
+    "still owes money" from "still owes money THAT IS OVERDUE". Found on a
+    real account: an old invoice was credited down to a R13.55 remainder
+    that was separately cleared, the new month's invoice then raised the
+    balance past minimum_balance, and the daily reactivation sweep kept
+    reporting "no clear balance" every night even though nothing was
+    actually in arrears by the time blocking_period_days was checked.
+
+    config.blocking_period_days is None means blocking is off for this
+    customer -- nothing can be "overdue past a blocking period" that
+    doesn't exist, so this returns False the same way
+    blocking_candidate_services' own None-check does.
+    """
+    if config.blocking_period_days is None:
+        return False
+    cutoff = run_date - timedelta(days=config.blocking_period_days)
+    overdue = customer.invoices.filter(
+        status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE], date_due__lte=cutoff
+    )
+    if exclude_run is not None:
+        overdue = overdue.exclude(created_by_run=exclude_run)
+    return overdue.exists()
+
+
+def suspension_block_date(customer, config, run_date, exclude_run=None):
+    """The date this customer would be suspended on, or None if never.
+
+    The same inversion upcoming_blocks uses, for one customer.
+    blocking_candidate_services requires
+
+        date_due <= run_date - blocking_period_days
+
+    which rearranges to run_date >= date_due + blocking_period_days, so the
+    earliest date they qualify is their OLDEST still-owing invoice's due
+    date plus their blocking period. Valid because the predicate is
+    monotonic in run_date: the cutoff only moves later, so more invoices
+    qualify, never fewer.
+
+    A date in the PAST is returned as-is rather than clamped to today. The
+    caller needs to tell "will be blocked on Friday" from "should already
+    have been blocked and was not", and those are different problems.
+    """
+    if config.blocking_period_days is None:
+        return None
+    # Same extension check as blocking_candidate_services -- while it
+    # holds, there is no date to warn about either (_process_suspension_warning
+    # returns 0 as soon as this comes back None).
+    if config.suspension_extended_until and run_date < config.suspension_extended_until:
+        return None
+    if customer.balance <= config.minimum_balance:
+        return None
+    if not customer.services.filter(status=Service.Status.ACTIVE).exists():
+        return None
+    # An agreed extension date is the date, as agreed (see extension_cutoff).
+    agreed = extension_cutoff(customer, config, exclude_run=exclude_run)
+    if agreed is not None:
+        return agreed
+
+    owed = customer.invoices.filter(
+        status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE]
+    )
+    if exclude_run is not None:
+        owed = owed.exclude(created_by_run=exclude_run)
+    earliest = owed.aggregate(earliest=Min("date_due"))["earliest"]
+    if earliest is None:
+        return None
+    block = earliest + timedelta(days=config.blocking_period_days)
+    # Not before the reminder rule allows (12 Oct 2026).
+    floor = reminder_floor(customer, config, run_date, exclude_run=exclude_run)
+    if floor is not None and floor > block:
+        block = floor
+    # Deferred off a weekend or public holiday. The warning email reads this
+    # date, so shifting it here is what stops a customer being told their
+    # line goes off on a Saturday when it will not.
+    return next_business_day(block)
+
+
+def _process_suspension_warning(customer, config, suspension_settings, run_date, commit, run=None):
+    """Tell a customer their line is about to go off, before it does.
+
+    The gap this closes: the payment reminder is keyed to an invoice's DUE
+    date and says only "to avoid any interruption to your service", while
+    the cut-off happens blocking_period_days LATER and announces itself
+    after the fact. A customer on a 14-day blocking period was reminded,
+    heard nothing for two weeks, and then found the line dead.
+
+    A DAILY COUNTDOWN. Anyone whose cut-off falls within the next
+    `warning_days` is warned, every day, with the number of days left
+    falling as the date approaches: "3 days", then "2 days", then "1 day",
+    then the line goes off. One email naming the date was the first design
+    and it was too quiet -- deleted or filed in spam, nothing follows it,
+    and the next thing the customer knows is a dead line.
+
+    Deduped on the DAY, so the command and a Run happening on the same
+    date, or either being re-run, still sends once.
+
+    NOT ON THE DUE DATE ITSELF. On the day an invoice falls due the
+    customer is not late yet, and "your line will be suspended" is not a
+    thing to say to somebody whose payment is not overdue. The countdown
+    starts the day after.
+
+    NOT for somebody whose cut-off is today or already past. Today's are the
+    suspension pass's business and would get both emails in the same minute;
+    a date in the past cannot honestly be put in a sentence beginning "your
+    line will be suspended on". Both are reported by the command that sends
+    these rather than passed over in silence.
+
+    Deliberately NOT gated on auto_suspend_enabled. Warning people while the
+    cut-off itself is still disarmed is a reasonable way to run a first
+    cycle -- and the reverse, suspending without ever having warned, is the
+    thing this exists to prevent.
+    """
+    if not suspension_settings.warning_enabled:
+        return 0
+    warning_days = suspension_settings.warning_days or 0
+    if warning_days <= 0:
+        return 0
+    # The per-customer email switch, the same gate the invoice and
+    # suspension emails carry. Checked HERE, with the other eligibility
+    # tests, and not down beside the send: the only effect this function has
+    # is an email, so a customer who cannot be emailed is not one who would
+    # be warned, and gating it lower would have the preview promise a
+    # warning the run then quietly did not send.
+    if not config.send_billing_notifications:
+        return 0
+
+    block_date = suspension_block_date(customer, config, run_date, exclude_run=run)
+    if block_date is None:
+        return 0
+
+    days_until = (block_date - run_date).days
+    if days_until < 1 or days_until > warning_days:
+        return 0
+
+    # Not late yet. block_date is the oldest owing invoice's due date plus
+    # the blocking period, so subtracting the period back off gives that
+    # due date -- and on or before it, nothing is overdue.
+    earliest_due = block_date - timedelta(days=config.blocking_period_days)
+    if run_date <= earliest_due:
+        return 0
+
+    if config.suspension_warned_on == run_date:
+        return 0
+    if not commit:
+        return 1
+
+    def _record_sent():
+        CustomerBillingConfig.objects.filter(pk=config.pk).update(
+            suspension_warned_on=run_date
+        )
+
+    _send_after_commit(
+        EmailTemplate.Key.SUSPENSION_WARNING,
+        customer,
+        on_sent=_record_sent,
+        extra_context={
+            "suspend_date": block_date,
+            "days_until_suspension": days_until,
+        },
+    )
+    return 1
+
+
+def _process_blocking(customer, config, suspension_settings, run_date, commit, run=None):
+    """Suspends every ACTIVE service by writing through the normal .save()
+    path, so radiusauth's existing signal keeps doing exactly what it already
+    does for a manual suspension (walled-garden PPPoE routing, hard-reject
+    for OVPN).
+
+    Gated first on SuspensionSettings.auto_suspend_enabled -- the platform-
+    wide master switch (Configs -> Billing -> Auto-suspension). Off by
+    default, and checked before anything else here, so flipping it off is
+    always a guaranteed "nobody gets suspended by this run," regardless of
+    what any individual customer's blocking_period_days says."""
+    if not suspension_settings.auto_suspend_enabled:
+        return 0
+
+    active_services = blocking_candidate_services(customer, config, run_date, exclude_run=run)
+    if not active_services:
+        return 0
+    if not commit:
+        return 1
+
+    for svc in active_services:
+        svc.status = Service.Status.SUSPENDED
+        # LEAVE A MARK. Without this the platform cannot tell later that it
+        # was the one that cut this line off, and so can never put it back
+        # when the customer pays -- which it never did. See
+        # billing.reactivation, and Service.suspended_for_nonpayment.
+        svc.suspended_for_nonpayment = True
+        # Our own doing, so customers.signals does not read the status
+        # change as a human overriding us and clear the mark again.
+        svc._billing_action = True
+        svc.save()
+    if config.send_billing_notifications:
+        _send_after_commit(EmailTemplate.Key.SUSPENSION, customer)
+    return 1
+
+
+def upcoming_blocks(from_date, horizon_days=7, customers=None):
+    """Who is heading for a block, and on which date -- the dashboard's
+    "Blocking tomorrow" panel.
+
+    Returns a list of dicts, one per customer, each carrying the EARLIEST run
+    date within the horizon on which that customer would be blocked. Sorted
+    soonest-first, then by largest balance owed.
+
+    `from_date` is normally tomorrow. `customers` accepts a pre-scoped
+    queryset so the caller can apply partner visibility (see
+    CustomerViewSet.get_queryset) -- a reseller-scoped staff member must not
+    learn the names of customers outside their partners just because those
+    customers appear on a dashboard panel.
+
+    Does NOT consider SuspensionSettings.auto_suspend_enabled; the caller
+    reports that separately. See blocking_candidate_services for why.
+
+    HOW THE DATE IS DERIVED. Rather than re-running the predicate once per
+    day per customer (which would be thousands of queries), this inverts it.
+    blocking_candidate_services requires
+
+        date_due <= run_date - blocking_period_days
+
+    which rearranges to
+
+        run_date >= date_due + blocking_period_days
+
+    so the earliest run date on which a customer qualifies is simply their
+    OLDEST unpaid/overdue invoice's due date plus their blocking period. The
+    predicate is monotonic in run_date -- the cutoff only moves later, so
+    more invoices qualify, never fewer -- which is what makes that inversion
+    valid. The other two conditions (balance, having active services) don't
+    depend on the date at all.
+
+    A customer whose date has already passed is reported as `from_date`: they
+    are overdue for a block and the very next run will catch them. There is a
+    test that checks this fast path agrees with calling
+    blocking_candidate_services day by day, because this optimisation is only
+    safe while that monotonicity holds.
+    """
+    if customers is None:
+        customers = Customer.objects.all()
+
+    candidates = (
+        customers.filter(billing_config__billing_enabled=True)
+        .select_related("billing_config")
+        .annotate(
+            active_service_count=Count(
+                "services", filter=Q(services__status=Service.Status.ACTIVE), distinct=True
+            )
+        )
+    )
+
+    horizon_end = from_date + timedelta(days=max(1, horizon_days) - 1)
+
+    # One query for the whole panel rather than one per customer. The window
+    # runs past horizon_end on purpose: a block landing on the last day of
+    # the horizon can shift beyond it, and asking about a date outside the
+    # loaded set would silently treat a holiday as a working day.
+    holidays = holiday_set(
+        start=from_date, end=horizon_end + timedelta(days=MAX_SHIFT_DAYS)
+    )
+
+    # One aggregate for every customer's oldest still-owing invoice, rather
+    # than a query each.
+    oldest_due = {}
+    overdue_counts = {}
+    last_reminders = {}
+    reminder_settings = ReminderSettings.load()
+    rows = (
+        Invoice.objects.filter(
+            status__in=[Invoice.Status.UNPAID, Invoice.Status.OVERDUE],
+            customer__in=candidates.values("pk"),
+        )
+        .values("customer_id")
+        .annotate(earliest=Min("date_due"), owing=Count("id"), last_reminder=Max("last_reminder_run_date"))
+    )
+    for row in rows:
+        oldest_due[row["customer_id"]] = row["earliest"]
+        overdue_counts[row["customer_id"]] = row["owing"]
+        last_reminders[row["customer_id"]] = row["last_reminder"]
+
+    results = []
+    for customer in candidates:
+        config = customer.billing_config
+        if config.blocking_period_days is None:
+            continue
+        if customer.balance <= config.minimum_balance:
+            continue
+        if not customer.active_service_count:
+            continue
+        due = oldest_due.get(customer.pk)
+        if due is None:
+            continue
+
+        # An approved extension's agreed date: that day exactly -- no reminder
+        # rule, no weekend shift (20 Oct 2026, see extension_cutoff).
+        agreed = extension_cutoff(customer, config, earliest_due=due)
+        if agreed is not None:
+            block_date = max(agreed, from_date)
+            if block_date > horizon_end:
+                continue
+            results.append(_upcoming_row(customer, config, block_date, overdue_counts, due, from_date, agreed=True))
+            continue
+
+        block_date = due + timedelta(days=config.blocking_period_days)
+        # Not before the reminder rule allows (12 Oct 2026). A client never
+        # reminded gets the catch-up on the next run, so from_date + the gap.
+        if _can_be_reminded(customer, config, reminder_settings):
+            last = last_reminders.get(customer.pk)
+            floor = (last if last is not None else from_date) + timedelta(
+                days=reminder_gap_days(config, reminder_settings)
+            )
+            if floor > block_date:
+                block_date = floor
+        if block_date < from_date:
+            # Already past the threshold -- the next run blocks them.
+            block_date = from_date
+        # A Management-approved extension in force: the run skips them
+        # through that date (blocking_candidate_services), so the earliest
+        # block is the day after it. Without this the dashboard listed a
+        # customer as "Blocking tomorrow" while the run would leave them
+        # alone (Tapiwa Mashava, SWF2613, 6 Oct 2026).
+        if config.suspension_extended_until and block_date <= config.suspension_extended_until:
+            block_date = config.suspension_extended_until + timedelta(days=1)
+        # Shifted AFTER the clamp, not before. Somebody already overdue for a
+        # block is caught by the next run that happens on a WORKING day,
+        # which is not necessarily from_date -- and the panel has to say the
+        # date they will actually be cut off, or it is worse than blank.
+        block_date = next_business_day(block_date, holidays)
+        if block_date > horizon_end:
+            continue
+
+        results.append(_upcoming_row(customer, config, block_date, overdue_counts, due, from_date))
+
+    results.sort(key=lambda r: (r["block_date"], -r["balance"]))
+    return results
+
+
+def _upcoming_row(customer, config, block_date, overdue_counts, due, from_date, agreed=False):
+    return {
+        "customer": customer.pk,
+        "reference": customer.customer_id,
+        "name": customer.full_name,
+        "block_date": block_date,
+        "days_until": (block_date - from_date).days,
+        # Counted from TODAY, for the "Today / Tomorrow / In n days" label
+        # (20 Oct 2026: "Dashboard should show exact date that the service
+        # will be cut").
+        "days_from_today": (block_date - timezone.localdate()).days,
+        # True when the date is an approved extension's agreed date.
+        "extension_date": agreed,
+        "balance": customer.balance,
+        "oldest_invoice_due": due,
+        "invoices_owing": overdue_counts.get(customer.pk, 0),
+        "active_services": customer.active_service_count,
+        "blocking_period_days": config.blocking_period_days,
+    }
+
+
+def billing_run_time():
+    """When the daily billing run (and so every suspension) happens, as shown
+    on the dashboard: the cron `0 13 * * * run_recurring_billing --commit`
+    is 15:00 SAST. Override with BILLING_RUN_TIME in settings if the cron
+    moves (Rudolph 20 Oct 2026: "cut off the 21st ... suspended 21st 15:00")."""
+    from django.conf import settings
+
+    return getattr(settings, "BILLING_RUN_TIME", "15:00")
+
+
+def next_run_date():
+    """The first date a billing run can still suspend anybody on: today if
+    today's run hasn't completed yet, else tomorrow. The dashboard and the
+    client's payment tile count from here, so a client due for cut-off
+    today shows today, not tomorrow (20 Oct 2026)."""
+    today = timezone.localdate()
+    done = RecurringBillingRun.objects.filter(
+        run_date=today, status=RecurringBillingRun.Status.PROCESSED,
+    ).exists()
+    return today + timedelta(days=1) if done else today
+
+
+_COUNT_KEYS = (
+    "invoices_created", "proforma_invoices_created", "reminders_sent",
+    "suspension_warnings_sent", "suspensions_applied",
+)
+
+
+def approval_for(run_date, partner_ids=None):
+    """The approved preview that authorises INVOICING on `run_date`.
+
+    THE GATE, and it lives here rather than in the API so that it holds
+    however a run is started. The Run button has checked for an approved
+    preview all along, but the management command went straight to the
+    engine -- so the nightly cron invoiced every due customer with nobody
+    having looked at anything. At nine pilot customers that is untidy. At
+    the 1,500 coming over from the old system it is a very bad afternoon.
+
+    Returns a dict rather than a snapshot so the caller can say WHICH
+    problem it is:
+
+        ok      True only when a matching, approved, unspent preview exists
+        reason  "" | "none" (nothing approved) | "stale" (data moved since)
+
+    `fingerprint` is taken over the projected numbers, not the moment they
+    were produced -- see preview_export.projection_digest -- so
+    re-previewing unchanged data reproduces it, and a tariff, service or
+    customer edited between sign-off and Run does not. That is what stops
+    an approval authorising something nobody agreed to.
+
+    The Run API action performs the same two checks before calling in, so
+    that it can answer 409 with a specific message. That is a convenience,
+    not the guarantee: this function is what actually decides, and a run
+    reaching the engine by any other route is gated here.
+
+    Reminders, cut-off warnings and suspensions are deliberately NOT
+    gated. They chase and enforce debts that already exist and were
+    already agreed; holding them because nobody approved this month's
+    invoicing would punish the customer for an internal process.
+    """
+    from .models import BillingPreviewSnapshot
+    from .preview_export import project_run, projection_digest
+
+    scope = sorted(partner_ids or [])
+    approved = (
+        BillingPreviewSnapshot.objects.filter(
+            run_date=run_date, partner_ids=scope,
+            approved_at__isnull=False, run__isnull=True,
+        )
+        .order_by("-approved_at")
+        .first()
+    )
+    if approved is None:
+        return {"ok": False, "reason": "none", "snapshot": None,
+                "approved_fingerprint": None, "current_fingerprint": None}
+
+    current = projection_digest(project_run(run_date, partner_ids=partner_ids or None))
+    if current != approved.fingerprint:
+        return {"ok": False, "reason": "stale", "snapshot": approved,
+                "approved_fingerprint": approved.fingerprint,
+                "current_fingerprint": current}
+
+    return {"ok": True, "reason": "", "snapshot": approved,
+            "approved_fingerprint": approved.fingerprint,
+            "current_fingerprint": current}
+
+
+#: What a run says for itself when it created no invoices because nobody
+#: had approved anything. Written onto the run's status_message and echoed
+#: by the management command, because the one failure mode of a manual
+#: gate is a month where everybody assumed somebody else had pressed it.
+NO_APPROVAL_NOTE = (
+    "NO INVOICES were created: no approved preview for this date and partner "
+    "scope. Reminders, cut-off warnings and suspensions ran as usual. Preview "
+    "it under Finance -> Recurring Billing, approve it, then run."
+)
+
+STALE_APPROVAL_NOTE = (
+    "NO INVOICES were created: the approved preview no longer matches what "
+    "this run would do -- a tariff, service or customer changed after it was "
+    "signed off. Preview and approve again."
+)
+
+
+def _process_one_customer(customer, config, run, run_date, reminder_settings, suspension_settings, commit,
+                          may_invoice=True):
+    """Everything owed to a single customer on this run, and what it came
+    to. Returns its own counts rather than incrementing a shared tally, so
+    the caller can throw the numbers away if this customer's transaction
+    doesn't survive -- a count for a rolled-back invoice is a lie the
+    History row would otherwise tell forever.
+    """
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
+    # `may_invoice` is the approval gate -- see approval_for(). Defaulted
+    # True so that the preview path and every existing caller behave
+    # exactly as before; only a COMMITTED run computes it.
+    if may_invoice and _invoice_due(customer, config, run_date):
+        doc_type = _generate_document(customer, config, run_date, run, commit)
+        if doc_type == "invoice":
+            counts["invoices_created"] += 1
+        elif doc_type == "proforma":
+            counts["proforma_invoices_created"] += 1
+    counts["reminders_sent"] += _process_reminders(
+        customer, config, reminder_settings, run_date, commit, run=run
+    )
+    # Before the blocking pass, and that order is not cosmetic: the
+    # warning refuses to fire for anyone who is a blocking candidate
+    # today, so running it first keeps "warned" and "suspended" mutually
+    # exclusive for a given customer on a given run.
+    counts["suspension_warnings_sent"] += _process_suspension_warning(
+        customer, config, suspension_settings, run_date, commit, run=run
+    )
+    counts["suspensions_applied"] += _process_blocking(
+        customer, config, suspension_settings, run_date, commit, run=run
+    )
+    return counts
+
+
+def _describe_failures(failures):
+    """A status_message that names names. "3 customers failed" sends
+    somebody digging through logs; naming the first few means the person
+    reading History can go straight to them. Capped to fit the column.
+
+    The fallback matters more than it looks. When the failure IS the
+    customer re-read -- a dropped connection, a lock timeout, the
+    database going away -- there is no customer object to name, and the
+    caller hands over an unsaved Customer(pk=...) whose customer_id is
+    the empty string. The message then read "1 customer(s) failed and
+    were skipped:  (OperationalError)", which tells whoever opens
+    History strictly less than the count beside it already did. The
+    primary key is not the reference staff use, but it is what the logs
+    are keyed on and it is enough to find the row.
+    """
+    names = ", ".join(
+        f"{customer.customer_id or f'customer #{customer.pk}'} ({exc.__class__.__name__})"
+        for customer, exc in failures[:3]
+    )
+    more = len(failures) - 3
+    message = f"{len(failures)} customer(s) failed and were skipped: {names}"
+    if more > 0:
+        message += f", and {more} more"
+    return message[:255]
+
+
+def run_recurring_billing(run_date, partner_ids=None, commit=False, triggered_by=None, early=False):
+    """Core entry point, used by both the Preview and Run API actions (and
+    eventually a crontab-scheduled management command). commit=False never
+    writes anything -- not an invoice, not an email, not a RecurringBillingRun
+    row -- it only counts what WOULD happen.
+
+    commit=True gives EACH CUSTOMER their own transaction, and that is the
+    important part. This used to run every customer inside one atomic
+    block, which meant a single bad row -- a dropped connection, a
+    numbering clash, one malformed tariff -- rolled back every invoice the
+    run had already created, for everybody, while the invoice emails
+    (which are not transactional) had already gone out. The failure mode
+    was hundreds of customers holding a PDF for an invoice that no longer
+    existed, and a History row cheerfully reporting how many invoices it
+    had created.
+
+    Now a customer who fails is rolled back, logged, named in the run's
+    status_message, and stepped over. Everyone else keeps their invoice.
+    A run with any casualties is marked FAILED -- partial success is still
+    something somebody has to look at -- but the counts on it describe
+    only what actually committed.
+
+    A COMMITTED run holds a Postgres advisory lock for its duration, and a
+    second run that cannot take it refuses rather than proceeding. At 1,592
+    customers a run takes minutes -- five queries, one SMTP connection and
+    one PDF render each -- and nothing in the UI stopped a second click.
+    The only guard against re-invoicing is `next_billing_date`, which the
+    old code read from a queryset snapshot materialised before the first
+    invoice was written, so an overlapping run saw every date still in the
+    past and raised a second invoice, a second number, a second balance
+    debit and a second emailed PDF for every due customer -- then wrote the
+    same next_billing_date, leaving no trace that it had happened.
+    apply_speed_policies has taken this lock all along."""
+    if not commit:
+        return _run_preview(run_date, partner_ids)
+
+    # EARLY INVOICING -- invoices only, dated `run_date`, which must be a
+    # billing date still to come and no more than EARLY_INVOICING_MAX_DAYS
+    # away. Checked before the future-date refusal below, which is about a
+    # FULL run (tariff changes, cancellations, enforcement) and still holds
+    # for one.
+    if early:
+        today = timezone.localdate()
+        if run_date <= today:
+            raise ValueError(
+                f"{run_date} is not in the future. Issuing early is for a billing date still to "
+                f"come; for today or an earlier date use the normal Run."
+            )
+        if (run_date - today).days > EARLY_INVOICING_MAX_DAYS:
+            raise ValueError(
+                f"{run_date} is more than {EARLY_INVOICING_MAX_DAYS} days away. Invoices can be "
+                f"issued early at most {EARLY_INVOICING_MAX_DAYS} days before their date."
+            )
+        if not _try_run_lock():
+            raise RecurringBillingBusy(
+                "A recurring-billing run is already in progress. Wait for it to finish before "
+                "starting another."
+            )
+        try:
+            return _run_early(run_date, partner_ids, triggered_by)
+        finally:
+            _release_run_lock()
+
+    # A committed run does not merely invoice for `run_date` -- it calls
+    # apply_due_tariff_changes and apply_due_cancellations, both of which
+    # use `<=` on purpose so a job that missed a day catches up. Handed a
+    # future date, that catch-up becomes a fast-forward: every service with
+    # an end date up to then is TERMINATED and every booked tariff change
+    # lands, months early. `--date` is documented as a way to "preview a
+    # specific date", and with --commit it executed the future instead.
+    today = timezone.localdate()
+    if run_date > today:
+        raise ValueError(
+            f"{run_date} is in the future. A committed run applies every cancellation and tariff "
+            f"change dated up to its run date, so this would terminate services and change plans "
+            f"early. Use a date up to {today}, or drop --commit to preview it."
+        )
+
+    if not _try_run_lock():
+        logger.warning("Refusing to start a recurring-billing run: another one is still going")
+        raise RecurringBillingBusy(
+            "A recurring-billing run is already in progress. Wait for it to finish before "
+            "starting another -- running two at once would invoice every due customer twice."
+        )
+    try:
+        return _run_commit(run_date, partner_ids, triggered_by)
+    finally:
+        _release_run_lock()
+
+
+# ---------------------------------------------------------------------------
+# EARLY INVOICING (package #19, decided with Rudolph 2026-09-24)
+#
+# How Skybre ran Splynx: preview the 1st's invoices around the 24th, approve,
+# and let them run -- the invoices are DATED the 1st but created, emailed and
+# debited to the balance days before. His decisions, verbatim where given:
+#
+#   * emails go out when the early run is processed;
+#   * the balance is debited when the invoices are created;
+#   * services are billed as they will be ON THE BILLING DATE: a plan
+#     change, partner move, service start or service end booked for on or
+#     before it is billed that way (replaced "as they are on the day of the
+#     early run" on 24 Sep -- package #20, invoice_lines.billable_services);
+#   * it is started by a button after approval -- never automatically.
+#
+# So an early run does ONE thing: raises the invoices for `run_date`. It
+# BILLS booked changes as at `run_date` but does NOT apply them to the
+# services (the morning crons of that day do); it does NOT apply booked
+# tariff changes or cancellations early (that would fast-forward
+# the future -- see run_recurring_billing), and it does NOT send reminders,
+# cut-off warnings or suspensions: those belong to their own days and the
+# daily 15:00 cron does them there. Due dates are counted from `run_date`
+# exactly as a normal run would, so nobody is chased a day earlier.
+#
+# It still needs the approval, exactly like a normal run, and spends it.
+# When the normal cron then runs on `run_date` itself, every customer it
+# would have invoiced already has next_billing_date moved on, so it invoices
+# nobody twice -- and its run row says why there was nothing to do.
+# ---------------------------------------------------------------------------
+
+#: How far ahead an early run may be dated. Splynx was run on the 22nd for
+#: the 1st (9 days). A limit exists at all because a run dated two cycles
+#: out would bill the NEXT cycle's period while skipping the one in between.
+EARLY_INVOICING_MAX_DAYS = 14
+
+
+class EarlyInvoicingRefused(Exception):
+    """An early run that must not go ahead: no approval, a stale approval,
+    or a customer who is due on a different date. Nothing was written."""
+
+
+def _off_cycle_customers(run_date, customer_ids):
+    """Customers an early run would invoice for a cycle that is NOT
+    `run_date` -- someone whose own next billing date is earlier (a catch-up)
+    or different. Early invoicing is for one billing date; those customers
+    belong to their own day's normal run, and dating their invoice
+    `run_date` would put the wrong date on it."""
+    found = []
+    for customer in (
+        Customer.objects.select_related("billing_config")
+        .filter(pk__in=customer_ids, billing_config__billing_enabled=True)
+        .order_by("customer_id")
+    ):
+        config = customer.billing_config
+        if (
+            config.next_billing_date
+            and config.next_billing_date != run_date
+            and _invoice_due(customer, config, run_date)
+        ):
+            found.append(customer)
+    return found
+
+
+def _early_run_for(run_date, partner_ids=None):
+    """The early run (if any) that already invoiced `run_date` for this
+    partner scope: a spent, approved preview whose run was created before
+    the date it was for."""
+    from .models import BillingPreviewSnapshot
+
+    snapshot = (
+        BillingPreviewSnapshot.objects.filter(
+            run_date=run_date, partner_ids=sorted(partner_ids or []),
+            approved_at__isnull=False, run__isnull=False,
+            run__created_at__date__lt=run_date,
+        )
+        .select_related("run")
+        .order_by("-run__created_at")
+        .first()
+    )
+    return snapshot.run if snapshot else None
+
+
+def _run_early(run_date, partner_ids, triggered_by):
+    gate = approval_for(run_date, partner_ids)
+    if not gate["ok"]:
+        if gate["reason"] == "stale":
+            raise EarlyInvoicingRefused(
+                "The approved preview for %s no longer matches -- something changed since it was "
+                "approved. Preview and approve again." % run_date.isoformat()
+            )
+        raise EarlyInvoicingRefused(
+            "No approved preview for %s. Preview it, have it approved, then issue." % run_date.isoformat()
+        )
+
+    customer_ids = _billable_customer_ids(partner_ids)
+    off_cycle = _off_cycle_customers(run_date, customer_ids)
+    if off_cycle:
+        names = ", ".join(f"{c.customer_id} {c.full_name}" for c in off_cycle[:10])
+        more = "" if len(off_cycle) <= 10 else f" and {len(off_cycle) - 10} more"
+        raise EarlyInvoicingRefused(
+            "Not issued: these customers are due on a different date than %s, so their invoice "
+            "cannot be dated %s: %s%s. Bill them with a normal run on their own date first."
+            % (run_date.isoformat(), run_date.isoformat(), names, more)
+        )
+
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
+    run = RecurringBillingRun.objects.create(
+        run_date=run_date, triggered_by=triggered_by,
+        status=RecurringBillingRun.Status.IN_PROGRESS,
+    )
+    if partner_ids:
+        run.partners.set(partner_ids)
+
+    failures = []
+    for customer_id in customer_ids:
+        customer = None
+        try:
+            with transaction.atomic():
+                customer = (
+                    Customer.objects.select_related("billing_config")
+                    .filter(pk=customer_id, billing_config__billing_enabled=True)
+                    .select_for_update(of=("billing_config",))
+                    .first()
+                )
+                if customer is None:
+                    continue
+                config = customer.billing_config
+                # Re-checked under the lock: an edit since the pre-check that
+                # moved this customer off `run_date` leaves them to their own
+                # day rather than invoicing them with the wrong date.
+                if config.next_billing_date and config.next_billing_date != run_date:
+                    continue
+                if not _invoice_due(customer, config, run_date):
+                    continue
+                doc_type = _generate_document(
+                    customer, config, run_date, run, True, issue_date=run_date
+                )
+        except Exception as exc:  # noqa: BLE001 -- one bad customer must not end the run for everybody else
+            logger.exception("Early invoicing failed for customer %s; skipping", customer_id)
+            failures.append((customer or Customer(pk=customer_id), exc))
+            continue
+        key = {"invoice": "invoices_created", "proforma": "proforma_invoices_created"}.get(doc_type)
+        if key:
+            counts[key] += 1
+            RecurringBillingRun.objects.filter(pk=run.pk).update(
+                **{f"{key}_count": F(f"{key}_count") + 1}
+            )
+
+    status = RecurringBillingRun.Status.PROCESSED
+    status_message = (
+        f"Issued early on {timezone.localdate().isoformat()} for {run_date.isoformat()}: invoices "
+        f"only. Reminders, warnings and suspensions run on their own days."
+    )
+    if failures:
+        status = RecurringBillingRun.Status.FAILED
+        status_message = (_describe_failures(failures) + " " + status_message).strip()
+
+    from .models import BillingPreviewSnapshot
+
+    BillingPreviewSnapshot.objects.filter(pk=gate["snapshot"].pk, run__isnull=True).update(run=run)
+
+    run.status = status
+    run.status_message = status_message[:255]
+    run.invoices_created_count = counts["invoices_created"]
+    run.proforma_invoices_created_count = counts["proforma_invoices_created"]
+    run.save(update_fields=[
+        "status", "status_message", "invoices_created_count", "proforma_invoices_created_count",
+    ])
+    return {
+        "counts": counts,
+        "status": status,
+        "status_message": run.status_message,
+        "run": run,
+        "invoicing_withheld": False,
+        "approval_reason": "",
+        "early": True,
+    }
+
+
+def _run_commit(run_date, partner_ids, triggered_by):
+    # Booked tariff changes first: a service switching plans today must bill
+    # on the NEW tariff in this same run, not next month's. Idempotent and
+    # also available as its own cron command -- see billing.tariff_changes.
+    from .tariff_changes import apply_due_tariff_changes
+
+    # Scoped to the same partners as the rest of the run. Both of these
+    # walk Service.objects, and both were called unscoped: a run scoped to
+    # one reseller on the Finance screen terminated another reseller's
+    # customers, marked them Cancelled, and consumed their booked tariff
+    # changes -- customers the staff member who clicked Run could not see
+    # on any page in the platform, with nothing on the run row to say it
+    # had happened.
+    # Partner moves and booked service starts first (package #20): a new
+    # service on the new partner's plan follows the partner move.
+    from .scheduled_changes import apply_due_scheduled_changes
+
+    apply_due_scheduled_changes(as_of=run_date, partner_ids=partner_ids)
+    apply_due_tariff_changes(as_of=run_date, partner_ids=partner_ids)
+    # Before invoicing, not after: a customer whose service ended today
+    # should not be handed one more invoice on the way out.
+    from .cancellations import apply_due_cancellations
+
+    apply_due_cancellations(as_of=run_date, commit=True, partner_ids=partner_ids)
+
+    # Ids only. The old code iterated a queryset with select_related, which
+    # materialised every billing_config -- including next_billing_date, the
+    # sole guard against re-invoicing -- before the first invoice was
+    # written. Each customer is now re-read inside their own transaction,
+    # so the due test reads committed state rather than a snapshot taken
+    # minutes earlier. The advisory lock in run_recurring_billing makes two
+    # runs impossible; this makes one run correct even against a concurrent
+    # edit to a customer's billing config.
+    customer_ids = _billable_customer_ids(partner_ids)
+
+    counts = dict.fromkeys(_COUNT_KEYS, 0)
+    status = RecurringBillingRun.Status.PROCESSED
+    status_message = ""
+    reminder_settings = ReminderSettings.load()
+    suspension_settings = SuspensionSettings.load()
+
+    # Created and committed up front, before any customer is touched, so
+    # that every invoice this run generates has a run to point at and the
+    # run survives whatever happens next. A run row that only appears if
+    # the work succeeds is a run row you can't find when you most need it.
+    # Starts as IN_PROGRESS and is moved to PROCESSED/FAILED only by the
+    # last lines of this function, so a run that never reaches them stays
+    # visibly unfinished instead of reading as a clean one.
+    run = RecurringBillingRun.objects.create(
+        run_date=run_date, triggered_by=triggered_by,
+        status=RecurringBillingRun.Status.IN_PROGRESS,
+    )
+    if partner_ids:
+        run.partners.set(partner_ids)
+
+    # THE APPROVAL GATE, decided once for the whole run rather than per
+    # customer: it is a property of the run, and re-deriving the projection
+    # digest for every customer would be both slow and able to disagree
+    # with itself halfway through.
+    gate = approval_for(run_date, partner_ids)
+    if not gate["ok"]:
+        logger.warning(
+            "Recurring billing %s: invoicing withheld (%s). Reminders, warnings "
+            "and suspensions will still run.", run_date, gate["reason"],
+        )
+
+    failures = []
+    for customer_id in customer_ids:
+        customer = None
+        try:
+            with transaction.atomic():
+                # Locked and re-read inside the transaction. select_for_update
+                # on the config row is what makes the next_billing_date test
+                # and the write that satisfies it one atomic decision.
+                customer = (
+                    Customer.objects.select_related("billing_config")
+                    .filter(pk=customer_id, billing_config__billing_enabled=True)
+                    .select_for_update(of=("billing_config",))
+                    .first()
+                )
+                if customer is None:
+                    # Deleted, or billing switched off, since the list was
+                    # taken. Not a failure -- there is simply nothing to do.
+                    continue
+                customer_counts = _process_one_customer(
+                    customer, customer.billing_config, run, run_date,
+                    reminder_settings, suspension_settings, commit=True,
+                    may_invoice=gate["ok"],
+                )
+        except Exception as exc:  # noqa: BLE001 -- one bad customer must not end the run for everybody else
+            logger.exception("Recurring billing failed for customer %s; skipping", customer_id)
+            failures.append((customer or Customer(pk=customer_id), exc))
+            continue
+        # Only reached once this customer's transaction has committed, so
+        # these numbers describe work that actually exists.
+        for key, value in customer_counts.items():
+            counts[key] += value
+        # ...and the run row is brought along with them, rather than
+        # only at the end. Everything this customer just had done to them
+        # is irreversible -- an invoice number issued, a balance debited,
+        # a PDF in their inbox -- and until the totals were written the
+        # only record of it said zero. A run that stops here (container
+        # restart, deploy, kill) now leaves History describing what it
+        # actually got through.
+        #
+        # One cheap single-row UPDATE, skipped entirely for the ordinary
+        # customer who had nothing due today.
+        if any(customer_counts.values()):
+            RecurringBillingRun.objects.filter(pk=run.pk).update(
+                invoices_created_count=F("invoices_created_count") + customer_counts["invoices_created"],
+                proforma_invoices_created_count=(
+                    F("proforma_invoices_created_count") + customer_counts["proforma_invoices_created"]
+                ),
+                reminders_sent_count=F("reminders_sent_count") + customer_counts["reminders_sent"],
+                suspension_warnings_sent_count=(
+                    F("suspension_warnings_sent_count")
+                    + customer_counts["suspension_warnings_sent"]
+                ),
+                suspensions_applied_count=(
+                    F("suspensions_applied_count") + customer_counts["suspensions_applied"]
+                ),
+            )
+
+    if failures:
+        status = RecurringBillingRun.Status.FAILED
+        status_message = _describe_failures(failures)
+
+    # SAY SO, ON THE RUN ITSELF. A gate nobody notices is a month of
+    # uninvoiced customers that looks, from History, like a run that went
+    # fine. Appended rather than assigned, so it cannot silently replace
+    # the names of customers who failed.
+    if not gate["ok"]:
+        # An early run spends the approval for this date, so the normal
+        # cron on the date itself finds none. Say what actually happened
+        # rather than "nobody approved anything".
+        early_run = _early_run_for(run_date, partner_ids) if gate["reason"] == "none" else None
+        if early_run is not None:
+            note = (
+                f"NO NEW INVOICES: {run_date.isoformat()} was already invoiced early by run "
+                f"#{early_run.pk} on {timezone.localtime(early_run.created_at).date().isoformat()}. "
+                f"Anyone who became due since needs a new preview and approval."
+            )
+        else:
+            note = STALE_APPROVAL_NOTE if gate["reason"] == "stale" else NO_APPROVAL_NOTE
+        status_message = (status_message + " " + note).strip() if status_message else note
+    elif gate["snapshot"] is not None:
+        # Spend the approval on the run it authorised, so History and the
+        # sign-off that allowed it can be read together. Filtered on
+        # run__isnull so two runs racing for one approval cannot both
+        # claim it; the Run API action writes the same value afterwards
+        # and that repeat is harmless.
+        from .models import BillingPreviewSnapshot
+
+        BillingPreviewSnapshot.objects.filter(
+            pk=gate["snapshot"].pk, run__isnull=True
+        ).update(run=run)
+
+    run.status = status
+    run.status_message = status_message
+    run.invoices_created_count = counts["invoices_created"]
+    run.proforma_invoices_created_count = counts["proforma_invoices_created"]
+    run.reminders_sent_count = counts["reminders_sent"]
+    run.suspension_warnings_sent_count = counts["suspension_warnings_sent"]
+    run.suspensions_applied_count = counts["suspensions_applied"]
+    run.save(update_fields=[
+        "status", "status_message",
+        "invoices_created_count", "proforma_invoices_created_count",
+        "reminders_sent_count", "suspension_warnings_sent_count",
+        "suspensions_applied_count",
+    ])
+
+    return {
+        "counts": counts,
+        "status": status,
+        "status_message": status_message,
+        "run": run,
+        # So a caller -- the management command, and cron through it -- can
+        # report the gate distinctly from a failure. A withheld run is not
+        # a failed run; it is a run that did what it was told.
+        "invoicing_withheld": not gate["ok"],
+        "approval_reason": gate["reason"],
+    }

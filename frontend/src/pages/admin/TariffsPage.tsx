@@ -8,6 +8,7 @@ import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSeconda
 import { CSVImportModal } from "../../components/CSVImportModal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
+import { RecurringChargesTab } from "../../components/RecurringChargesTab";
 import type { Tariff } from "../../types";
 
 const COLUMNS: ColumnDef[] = [
@@ -37,6 +38,11 @@ const EMPTY: Partial<Tariff> = {
 };
 
 export function TariffsPage() {
+  // Rudolph, 30 Sep: "In tariffs there need to be a option to add standard
+  // recurring billing like IP rental, Domain Rental etc" -- its own tab
+  // alongside the plan list, rather than a separate page, since it's the
+  // same section (Configs) making the same kind of decision.
+  const [tab, setTab] = useState<"plans" | "charges">("plans");
   const [ordering, setOrdering] = useState("name");
   const [typeFilter, setTypeFilter] = useState("");
   const [activeFilter, setActiveFilter] = useState("");
@@ -74,17 +80,45 @@ export function TariffsPage() {
         title="Tariffs & Plans"
         subtitle="Internet, voice, and bundle packages offered to customers."
         actions={
-          <>
-            <button className={btnSecondary} onClick={() => setShowImport(true)}>
-              Import CSV
-            </button>
-            <button className={btnPrimary} onClick={() => setShowModal(true)}>
-              + New tariff
-            </button>
-          </>
+          tab === "plans" ? (
+            <>
+              <button className={btnSecondary} onClick={() => setShowImport(true)}>
+                Import CSV
+              </button>
+              <button className={btnPrimary} onClick={() => setShowModal(true)}>
+                + New tariff
+              </button>
+            </>
+          ) : undefined
         }
       />
 
+      <div className="mb-4 flex gap-1 border-b border-[var(--border-hairline)]">
+        {(
+          [
+            ["plans", "Plans"],
+            ["charges", "Recurring Charges"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setTab(key)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              tab === key
+                ? "border-[var(--series-1)] text-[var(--text-primary)]"
+                : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "charges" && <RecurringChargesTab />}
+
+      {tab === "plans" && (
+        <>
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <select className={filterSelectClass} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
           <option value="">All types</option>
@@ -235,6 +269,8 @@ export function TariffsPage() {
           onClose={() => setShowImport(false)}
           onImported={refetch}
         />
+      )}
+        </>
       )}
     </div>
   );

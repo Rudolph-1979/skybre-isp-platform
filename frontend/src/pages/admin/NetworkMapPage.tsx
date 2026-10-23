@@ -1,0 +1,1023 @@
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Navigate, useNavigate, useSearchParams } from "react-router-dom";
+import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMap, useMapEvents } from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+import { api } from "../../api/client";
+import { PageHeader } from "../../components/PageHeader";
+import { inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
+import { parseGps } from "../../components/LeadBits";
+import { useAuth } from "../../context/AuthContext";
+import { usePolling } from "../../hooks/usePolling";
+import { canAccessSection } from "../../utils/permissions";
+import type { TechnicianPosition } from "../../types";
+import { claimLabel, pin as techPin, statusLabel, STATUS_COLOR } from "./TechnicianPositionsPage";
+import { CoverageLayersCard } from "../../components/CoverageLayers";
+import { LosBadge, LosProfileModal, LOS_COLOUR, LOS_LABEL, type Los } from "../../components/LosProfile";
+
+/**
+ * Networking -> Map (#173, Rudolph 14 Oct 2026: "One map that services
+ * everything"). Layers: UISP towers and backhaul links, technicians live
+ * (Conecto), and the serviceability check -- type an address, paste GPS or
+ * click the map. Coverage areas from KMZ files come later; until then the
+ * check shows the nearest towers (distance and the direction a sector must
+ * face) and can start a lead with the GPS filled in.
+ *
+ * #175 (Rudolph 14 Oct: "Technicians scheduling must move to this map",
+ * then "Use open street Map API" -- the Google version #174 was withdrawn):
+ * Scheduling -> Technician positions now opens this map focused on the
+ * technicians, so staff with Networking OR Scheduling open it. Networking
+ * sees towers, links and the check; Scheduling the technicians and the list
+ * of who hasn't reported. Map and address search are OpenStreetMap.
+ */
+
+type Site = {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  device_count: number;
+  devices_offline: number;
+};
+type Device = {
+  id: string;
+  name: string;
+  kind: string;
+  online: boolean;
+  flags: string[];
+  site: { id: string; name: string } | null;
+  downlink_use_pct: number | null;
+  ap_device_id?: string | null;
+  ap_site_id?: string | null;
+};
+type GeoHit = { label: string; lat: number; lng: number; kind: string };
+type Tower = {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  distance_km: number;
+  bearing: number;
+  compass: string;
+  devices: number;
+  devices_offline: number;
+  access_points: { id: string; name: string; model: string; online: boolean; frequency_mhz: number | null; ssid: string; mikrotik: boolean }[];
+  height_m?: number | null;
+  los?: Los;
+};
+type Check = {
+  point: { lat: number; lng: number };
+  coverage: {
+    loaded: boolean;
+    covered: boolean | null;
+    areas: { name: string; code: string; network: string; status: string; live: boolean; provider: string; layer: string }[];
+    houses: { name: string; kind: string; area: string; distance_m: number; provider: string; lat: number; lng: number }[];
+    note: string;
+  };
+  uisp_connected: boolean;
+  nearest: Tower[];
+  terrain_loaded?: boolean;
+  client_height_m?: number | null;
+};
+type Point = { lat: number; lng: number; label: string };
+
+const FALLBACK_CENTRE: [number, number] = [-27.6547, 27.2349];
+const GOOD = "#22c55e";
+const WARN = "#eda100";
+const BAD = "#e34948";
+const LAYERS_KEY = "netmap.layers";
+// The separate-screen map (#196) remembers its own layers.
+const SCREEN_LAYERS_KEY = "netmap.screen.layers";
+
+const OSM_TILES = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+const OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+// Satellite (#180): Mapbox Raster Tiles, only fetched while Satellite is on.
+const MAPBOX_SAT = "https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.jpg90?access_token=";
+const MAPBOX_ATTRIBUTION =
+  '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; Maxar <a href="https://apps.mapbox.com/feedback/">Improve this map</a>';
+const BASE_KEY = "netmap.base";
+
+type Layers = { towers: boolean; links: boolean; techs: boolean; labels: boolean; houses: boolean; vehicles: boolean };
+const DEFAULT_LAYERS: Layers = { towers: true, links: true, techs: true, labels: false, houses: true, vehicles: true };
+// Separate screen (#196, Rudolph 19 Oct: "Towers for monitoring and vehicles").
+const SCREEN_LAYERS: Layers = { towers: true, links: true, techs: false, labels: true, houses: false, vehicles: true };
+
+// Webfleet vehicles (#186): /api/webfleet/positions/.
+type WfVehicle = {
+  objectno: string;
+  name: string;
+  lat: number | null;
+  lng: number | null;
+  place: string;
+  speed_kmh: number | null;
+  course: number | null;
+  ignition: boolean | null;
+  standstill: boolean | null;
+  driver_name: string;
+  odometer_km: number | null;
+  pos_time: string | null;
+  vehicle_id: number | null;
+  registration: string;
+  vehicle_name: string;
+};
+function wfState(v: WfVehicle) {
+  if (v.ignition && !v.standstill) return { label: `Driving · ${v.speed_kmh ?? 0} km/h`, colour: "#16a34a" };
+  if (v.ignition) return { label: "Engine on, standing", colour: "#eda100" };
+  return { label: "Parked", colour: "#6b7280" };
+}
+function wfPin(v: WfVehicle) {
+  const { colour } = wfState(v);
+  const moving = v.ignition && !v.standstill;
+  const arrow = moving
+    ? `<div style="position:absolute;left:5px;top:-7px;width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:7px solid ${colour};transform-origin:5px 16px;transform:rotate(${v.course ?? 0}deg)"></div>`
+    : "";
+  return L.divIcon({
+    className: "",
+    iconSize: [20, 20],
+    iconAnchor: [10, 10],
+    html: `<div style="position:relative;width:20px;height:20px">${arrow}<div style="width:20px;height:20px;border-radius:5px;background:${colour};border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;color:#fff;font:700 10px sans-serif">V</div></div>`,
+  });
+}
+function wfAge(iso: string | null) {
+  if (!iso) return "";
+  const min = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  return min < 1 ? "just now" : min < 60 ? `${min} min ago` : min < 1440 ? `${Math.round(min / 60)} h ago` : new Date(iso).toLocaleDateString("en-ZA");
+}
+const HOUSE = "#16a34a";
+// [lat, lng, kind, name, area] from /map/coverage/houses/
+type HouseDot = [number, number, string, string, string];
+
+/** Tells the page what part of the map is in view (for the house dots). */
+function ViewWatcher({ onView }: { onView: (b: L.LatLngBounds) => void }) {
+  const map = useMapEvents({ moveend: () => onView(map.getBounds()) });
+  useEffect(() => {
+    onView(map.getBounds());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map]);
+  return null;
+}
+
+function readLayers(screen = false): Layers {
+  try {
+    if (screen) {
+      const saved = JSON.parse(localStorage.getItem(SCREEN_LAYERS_KEY) ?? "{}");
+      // Only towers, links, names and vehicles exist on the separate screen.
+      return { ...SCREEN_LAYERS, ...saved, techs: false, houses: false };
+    }
+    return { ...DEFAULT_LAYERS, ...JSON.parse(localStorage.getItem(LAYERS_KEY) ?? "{}") };
+  } catch {
+    return screen ? SCREEN_LAYERS : DEFAULT_LAYERS;
+  }
+}
+
+/** Opens the map on its own (#196) -- drag the window to the other screen. */
+export function openMapScreen() {
+  window.open("/map-screen", "vexar-map-screen", "popup=yes,width=1400,height=900");
+}
+
+const pointIcon = L.divIcon({
+  className: "",
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+  html: `<div style="width:18px;height:18px;border-radius:50%;background:#2a78d6;border:3px solid #fff;box-shadow:0 0 0 2px #2a78d6,0 2px 6px rgba(0,0,0,.4)"></div>`,
+});
+
+function km(v: number) {
+  return v < 1 ? `${Math.round(v * 1000)} m` : `${v.toFixed(v < 10 ? 2 : 1)} km`;
+}
+
+/** Map for staff with Networking or Scheduling (it replaced Technician positions). */
+export function MapRoute({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  // Vehicles staff too, for the Webfleet vehicles (#186).
+  if (!(["networking", "scheduling", "vehicles"] as const).some((sec) => canAccessSection(user, sec))) return <Navigate to="/admin" replace />;
+  return <>{children}</>;
+}
+
+/** Clicks on the map pick the point to check. */
+function ClickToCheck({ onPick, enabled }: { onPick: (p: Point) => void; enabled: boolean }) {
+  useMapEvents({
+    click(e) {
+      if (!enabled) return;
+      onPick({ lat: +e.latlng.lat.toFixed(6), lng: +e.latlng.lng.toFixed(6), label: "Picked on the map" });
+    },
+  });
+  return null;
+}
+
+/** Fly to the checked point; fit the towers (or, focused on technicians,
+ *  the technicians) once on first load. */
+function Camera({ point, fitTo, maxZoom }: { point: Point | null; fitTo: [number, number][]; maxZoom: number }) {
+  const map = useMap();
+  const fitted = useRef(false);
+  useEffect(() => {
+    if (!fitted.current && fitTo.length) {
+      map.fitBounds(L.latLngBounds(fitTo), { padding: [40, 40], maxZoom });
+      fitted.current = true;
+    }
+  }, [fitTo, map, maxZoom]);
+  useEffect(() => {
+    if (point) map.flyTo([point.lat, point.lng], Math.max(map.getZoom(), 12), { duration: 0.6 });
+  }, [point, map]);
+  return null;
+}
+
+/**
+ * `screen` (#196, Rudolph 19 Oct 2026: "an external link for the map to view
+ * the map on a separate screen"): /map-screen, outside the admin layout --
+ * the map fills the window (F11 / "Full screen" for a TV), with a small
+ * panel for tower monitoring (sites with devices down, radio links down or
+ * busy) and the Webfleet vehicles. Same sign-in and section rights as
+ * Networking -> Map; no search, house check, coverage or technicians.
+ */
+export function NetworkMapPage({ screen = false }: { screen?: boolean } = {}) {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const canNet = canAccessSection(user, "networking");
+  const canTechs = canAccessSection(user, "scheduling");
+  const canLeads = canAccessSection(user, "sales");
+  const focusTechs = searchParams.get("focus") === "techs" || (!canNet && canTechs);
+  // Webfleet vehicles (#186): Vehicles or Scheduling staff.
+  const canVehicles = canTechs || canAccessSection(user, "vehicles");
+  const focusVehicles = searchParams.get("focus") === "vehicles" || (!canNet && !canTechs);
+
+  const [layers, setLayers] = useState<Layers>(() =>
+    screen
+      ? readLayers(true)
+      : focusVehicles
+        ? { ...readLayers(), vehicles: true }
+        : focusTechs
+          ? { ...readLayers(), techs: true }
+          : readLayers(),
+  );
+  const [netUpdated, setNetUpdated] = useState<Date | null>(null);
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [wfVehicles, setWfVehicles] = useState<WfVehicle[]>([]);
+  const [wfConfigured, setWfConfigured] = useState(false);
+  const [wfError, setWfError] = useState("");
+  const [sites, setSites] = useState<Site[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [techs, setTechs] = useState<TechnicianPosition[]>([]);
+  const [uispError, setUispError] = useState("");
+
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<GeoHit[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [point, setPoint] = useState<Point | null>(null);
+  const [check, setCheck] = useState<Check | null>(null);
+  const [checkError, setCheckError] = useState("");
+
+  function toggle(key: keyof Layers) {
+    const next = { ...layers, [key]: !layers[key] };
+    setLayers(next);
+    try {
+      localStorage.setItem(screen ? SCREEN_LAYERS_KEY : LAYERS_KEY, JSON.stringify(next));
+    } catch {
+      /* not remembered in a private window */
+    }
+  }
+
+  function loadNetwork() {
+    if (!canNet) return;
+    Promise.all([api.get<{ results?: Site[]; detail?: string }>("/uisp/sites/"), api.get<{ results?: Device[] }>("/uisp/devices/")])
+      .then(([s, d]) => {
+        setSites(s.data.results ?? []);
+        setDevices(d.data.results ?? []);
+        setUispError(s.data.results ? "" : "UISP isn't connected.");
+        if (s.data.results) setNetUpdated(new Date());
+      })
+      .catch((err) => setUispError(err?.response?.data?.detail ?? "Couldn't read UISP."));
+  }
+  function loadTechs() {
+    if (!canTechs || screen) return;
+    api
+      .get<TechnicianPosition[] | { results: TechnicianPosition[] }>("/technician-positions/")
+      .then((r) => setTechs(Array.isArray(r.data) ? r.data : r.data.results ?? []))
+      .catch(() => setTechs([]));
+  }
+  function loadVehicles() {
+    if (!canVehicles) return;
+    api
+      .get<{ configured: boolean; detail?: string; results: WfVehicle[] }>("/webfleet/positions/")
+      .then((r) => {
+        setWfConfigured(r.data.configured);
+        setWfVehicles(r.data.results ?? []);
+        setWfError(r.data.detail ?? "");
+      })
+      .catch(() => setWfVehicles([]));
+  }
+  useEffect(() => {
+    loadNetwork();
+    loadTechs();
+    loadVehicles();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canNet, canTechs, canVehicles]); // the user can arrive after the first render
+  usePolling(loadNetwork, 60_000);
+  usePolling(loadTechs, 20_000);
+  usePolling(loadVehicles, 30_000);
+
+  // Client antenna height for line of sight (#179; Rudolph: 9 m default).
+  const [clientHeight, setClientHeight] = useState(9);
+  const [profileFor, setProfileFor] = useState<Tower | null>(null);
+  useEffect(() => {
+    if (!point || !canNet) return;
+    let cancelled = false;
+    setCheck(null);
+    setCheckError("");
+    api
+      .get<Check>(`/map/serviceability/?lat=${point.lat}&lng=${point.lng}&h=${clientHeight}`)
+      .then((r) => !cancelled && setCheck(r.data))
+      .catch((err) => !cancelled && setCheckError(err?.response?.data?.detail ?? "Couldn't check this point."));
+    return () => {
+      cancelled = true;
+    };
+  }, [point, canNet, clientHeight]);
+
+  async function search(e: FormEvent) {
+    e.preventDefault();
+    setSearchError("");
+    setHits(null);
+    const q = query.trim();
+    if (!q) return;
+    const gps = parseGps(q);
+    if (gps && gps[0] && gps[1]) {
+      setPoint({ lat: Number(gps[0]), lng: Number(gps[1]), label: `GPS ${Number(gps[0])}, ${Number(gps[1])}` });
+      return;
+    }
+    setSearching(true);
+    try {
+      const r = await api.get<{ results: GeoHit[] }>(`/map/geocode/?q=${encodeURIComponent(q)}`);
+      setHits(r.data.results);
+      if (r.data.results.length === 1) pick(r.data.results[0]);
+      if (!r.data.results.length) setSearchError("Not found on OpenStreetMap. Paste the GPS or click the map instead.");
+    } catch (err: any) {
+      setSearchError(err?.response?.data?.detail ?? "Address search failed.");
+    } finally {
+      setSearching(false);
+    }
+  }
+  function pick(h: GeoHit) {
+    setPoint({ lat: h.lat, lng: h.lng, label: h.label });
+  }
+
+  const placedSites = useMemo(() => {
+    const parents = new Set(sites.map((s) => s.parent_id).filter(Boolean));
+    // Stand-alone UISP sites are client installs, not towers.
+    return sites.filter((s) => s.latitude != null && s.longitude != null && (s.parent_id || parents.has(s.id)));
+  }, [sites]);
+  const siteById = useMemo(() => Object.fromEntries(sites.map((s) => [s.id, s])), [sites]);
+
+  const links = useMemo(() => {
+    const byId = Object.fromEntries(devices.map((d) => [d.id, d]));
+    const pairs: Record<string, { a: Site; b: Site; radios: Device[] }> = {};
+    for (const d of devices) {
+      if (!d.ap_site_id || !d.site || d.ap_site_id === d.site.id) continue;
+      const a = siteById[d.ap_site_id];
+      const b = siteById[d.site.id];
+      if (!a || !b || a.latitude == null || b.latitude == null) continue;
+      const key = [a.id, b.id].sort().join("|");
+      const entry = (pairs[key] ??= { a, b, radios: [] });
+      entry.radios.push(d);
+      if (d.ap_device_id && byId[d.ap_device_id]) entry.radios.push(byId[d.ap_device_id]);
+    }
+    return Object.entries(pairs).map(([key, p]) => {
+      const colour = p.radios.some((r) => !r.online)
+        ? BAD
+        : p.radios.some((r) => r.flags.includes("busy") || r.flags.includes("low_link"))
+          ? WARN
+          : GOOD;
+      const uses = p.radios.map((r) => r.downlink_use_pct).filter((v): v is number => v != null);
+      return { key, ...p, colour, use: uses.length ? Math.round(Math.max(...uses)) : null };
+    });
+  }, [devices, siteById]);
+
+  const towerCoords = useMemo(() => placedSites.map((s) => [s.latitude!, s.longitude!] as [number, number]), [placedSites]);
+  const placedTechs = useMemo(() => techs.filter((t) => t.lat != null && t.lng != null), [techs]);
+  const techCoords = useMemo(() => placedTechs.map((t) => [t.lat as number, t.lng as number] as [number, number]), [placedTechs]);
+  const placedVehicles = useMemo(() => wfVehicles.filter((v) => v.lat != null && v.lng != null), [wfVehicles]);
+  const vehicleCoords = useMemo(() => placedVehicles.map((v) => [v.lat as number, v.lng as number] as [number, number]), [placedVehicles]);
+  const [mapObj, setMapObj] = useState<L.Map | null>(null);
+  const [mapboxToken, setMapboxToken] = useState("");
+  const [base, setBase] = useState<"map" | "satellite">(() => {
+    try {
+      return localStorage.getItem(BASE_KEY) === "satellite" ? "satellite" : "map";
+    } catch {
+      return "map";
+    }
+  });
+  useEffect(() => {
+    if (screen) return; // no satellite there (#197)
+    api
+      .get<{ mapbox_token: string }>("/map/config/")
+      .then((r) => setMapboxToken(r.data.mapbox_token || ""))
+      .catch(() => setMapboxToken(""));
+  }, []);
+  function chooseBase(b: "map" | "satellite") {
+    setBase(b);
+    try {
+      localStorage.setItem(BASE_KEY, b);
+    } catch {
+      /* private window */
+    }
+  }
+  // Never satellite on the separate screen (#197, Rudolph 19 Oct: "Remove
+  // satellite option from pop out map"), whatever the main map is set to.
+  const satellite = base === "satellite" && !!mapboxToken && !screen;
+  const [view, setView] = useState<L.LatLngBounds | null>(null);
+  const [houses, setHouses] = useState<HouseDot[]>([]);
+  const [housesTruncated, setHousesTruncated] = useState(false);
+  const [coverageRev, setCoverageRev] = useState(0);
+  useEffect(() => {
+    if (!canNet || !layers.houses || !view) {
+      setHouses([]);
+      return;
+    }
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      const bbox = [view.getWest(), view.getSouth(), view.getEast(), view.getNorth()].map((v) => v.toFixed(5)).join(",");
+      api
+        .get<{ houses: HouseDot[]; truncated: boolean }>(`/map/coverage/houses/?bbox=${bbox}`)
+        .then((r) => {
+          if (cancelled) return;
+          setHouses(r.data.houses);
+          setHousesTruncated(r.data.truncated);
+        })
+        .catch(() => !cancelled && setHouses([]));
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [view, layers.houses, canNet, coverageRev]);
+  function panTo(lat: number, lng: number, zoom = 14) {
+    mapObj?.flyTo([lat, lng], zoom, { duration: 0.6 });
+  }
+
+  function createLead() {
+    if (!point) return;
+    const near = check?.nearest[0];
+    const notes = [
+      check?.coverage.loaded ? `Map check (coverage): ${check.coverage.note}` : "",
+      near ? `Map check: nearest tower ${near.name}, ${km(near.distance_km)} ${near.compass} of the tower (bearing ${near.bearing}°).` : "",
+      ...(check?.nearest ?? [])
+        .filter((t) => t.los?.available)
+        .map((t) => `LOS from ${t.name} (antenna ${t.los!.tower_height_m} m, house ${t.los!.client_height_m} m): ${LOS_LABEL[t.los!.verdict!]} — ${t.los!.detail}`),
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const params = new URLSearchParams({
+      new: "1",
+      gps: `${point.lat}, ${point.lng}`,
+      address: point.label.startsWith("GPS ") || point.label === "Picked on the map" ? "" : point.label.split(", South Africa")[0],
+      notes,
+    });
+    navigate(`/admin/leads?${params.toString()}`);
+  }
+
+  const chip = (on: boolean) =>
+    `rounded-md border px-2 py-1 text-xs ${on ? "border-[var(--series-1)] text-[var(--text-primary)]" : "border-[var(--baseline)] text-[var(--text-muted)]"}`;
+
+
+  // The map itself, shared by the page and the separate screen (#196).
+  const mapEl = (height: string) => (
+    <MapContainer ref={setMapObj} center={FALLBACK_CENTRE} zoom={10} style={{ height, width: "100%" }} scrollWheelZoom preferCanvas>
+      <ViewWatcher onView={setView} />
+      {canNet &&
+        layers.houses &&
+        houses.map(([lat, lng, kind, name, area], i) => (
+          <CircleMarker
+            key={`h${i}-${lat}-${lng}`}
+            center={[lat, lng]}
+            radius={3.5}
+            bubblingMouseEvents={false}
+            pathOptions={{ color: "#fff", weight: 1, fillColor: HOUSE, fillOpacity: 0.95 }}
+            eventHandlers={{ click: () => setPoint({ lat: +lat.toFixed(6), lng: +lng.toFixed(6), label: `${area} · ${name}` }) }}
+          >
+            <Tooltip direction="top" offset={[0, -4]}>
+              {area} · {name}
+              {kind === "wall_box" ? " (wall box — house next to it)" : ""}
+            </Tooltip>
+          </CircleMarker>
+        ))}
+      {satellite ? (
+        <TileLayer key="sat" url={MAPBOX_SAT + encodeURIComponent(mapboxToken)} attribution={MAPBOX_ATTRIBUTION} maxNativeZoom={19} maxZoom={21} />
+      ) : (
+        <TileLayer key="osm" url={OSM_TILES} attribution={OSM_ATTRIBUTION} maxZoom={19} />
+      )}
+      <ClickToCheck onPick={setPoint} enabled={canNet && !screen} />
+      <Camera
+        point={point}
+        fitTo={screen ? (towerCoords.length ? towerCoords : vehicleCoords) : focusVehicles ? vehicleCoords : focusTechs ? techCoords : towerCoords}
+        maxZoom={focusVehicles || focusTechs ? 14 : 12}
+      />
+
+      {canNet &&
+        layers.links &&
+        links.map((l) => (
+          <Polyline key={l.key} positions={[[l.a.latitude!, l.a.longitude!], [l.b.latitude!, l.b.longitude!]]} pathOptions={{ color: l.colour, weight: 3, opacity: 0.85 }}>
+            <Tooltip sticky>
+              {l.a.name} ↔ {l.b.name}: {[...new Set(l.radios.map((r) => r.name))].join(" / ")}
+              {l.use != null ? ` · ${l.use}% downlink use` : ""}
+            </Tooltip>
+          </Polyline>
+        ))}
+
+      {canNet &&
+        layers.towers &&
+        placedSites.map((s) => (
+          <CircleMarker
+            key={`${s.id}-${layers.labels}`}
+            center={[s.latitude!, s.longitude!]}
+            radius={6}
+            pathOptions={{ color: "#fff", weight: 2, fillColor: s.devices_offline ? BAD : "#2a78d6", fillOpacity: 1 }}
+          >
+            <Tooltip permanent={layers.labels} direction="right" offset={[8, 0]}>
+              {s.name}
+              {s.devices_offline ? ` · ${s.devices_offline} down` : ""}
+            </Tooltip>
+          </CircleMarker>
+        ))}
+
+      {canTechs &&
+        layers.techs &&
+        techs
+          .filter((t) => t.trail.length > 2)
+          .map((t) => (
+            <Polyline
+              key={`trail-${t.code}`}
+              positions={t.trail}
+              pathOptions={{ color: STATUS_COLOR[t.status] ?? "#4a3aa7", weight: 3, opacity: t.live ? 0.7 : 0.3 }}
+            />
+          ))}
+
+      {canTechs &&
+        layers.techs &&
+        placedTechs.map((t) => (
+          <Marker key={t.code} position={[t.lat as number, t.lng as number]} icon={techPin(t)}>
+            <Popup>
+              <div className="text-xs">
+                <div className="font-semibold">{t.name}</div>
+                <div>
+                  {statusLabel(t.status)} · {claimLabel(t)}
+                </div>
+                {t.job_title && <div className="mt-1">{t.job_title}{t.customer_name ? ` — ${t.customer_name}` : ""}</div>}
+              </div>
+            </Popup>
+          </Marker>
+        ))}
+
+      {canVehicles &&
+        wfConfigured &&
+        layers.vehicles &&
+        placedVehicles.map((v) => {
+          const st = wfState(v);
+          return (
+            <Marker key={`wf-${v.objectno}`} position={[v.lat as number, v.lng as number]} icon={wfPin(v)}>
+              <Popup>
+                <div className="text-xs">
+                  <div className="font-semibold">
+                    {v.registration || v.name}
+                    {v.vehicle_name ? ` · ${v.vehicle_name}` : ""}
+                  </div>
+                  <div>
+                    {st.label} · {wfAge(v.pos_time)}
+                  </div>
+                  {v.driver_name && <div>Driver: {v.driver_name}</div>}
+                  {v.place && <div className="mt-1">{v.place}</div>}
+                  {v.vehicle_id && (
+                    <button type="button" className="mt-1 text-[var(--series-1)] hover:underline" onClick={() =>
+                  screen ? window.open(`/admin/vehicles/${v.vehicle_id}`, "_blank") : navigate(`/admin/vehicles/${v.vehicle_id}`)
+                }>
+                      Open vehicle
+                    </button>
+                  )}
+                </div>
+              </Popup>
+            </Marker>
+          );
+        })}
+
+      {canNet && point && (
+        <>
+          {check?.nearest.slice(0, 3).map((t) => (
+            <Polyline
+              key={`n-${t.id}-${t.los?.verdict ?? ""}`}
+              positions={[[point.lat, point.lng], [t.latitude, t.longitude]]}
+              pathOptions={{ color: t.los?.available ? LOS_COLOUR[t.los.verdict!] : "#2a78d6", weight: 2.5, dashArray: "6 6", opacity: 0.9 }}
+            >
+              <Tooltip permanent direction="center" className="!bg-white/90 !px-1 !py-0 !text-[10px]">
+                {km(t.distance_km)}
+              </Tooltip>
+            </Polyline>
+          ))}
+          <Marker position={[point.lat, point.lng]} icon={pointIcon} />
+        </>
+      )}
+    </MapContainer>
+  );
+
+  // Tower monitoring for the separate screen (#196).
+  const sitesDown = placedSites.filter((s) => s.devices_offline > 0);
+  const linksDown = links.filter((l) => l.colour === BAD);
+  const linksBusy = links.filter((l) => l.colour === WARN);
+
+  if (screen) {
+    const fullScreen = () => {
+      if (document.fullscreenElement) document.exitFullscreen?.();
+      else document.documentElement.requestFullscreen?.().catch(() => undefined);
+    };
+    return (
+      <div className="relative h-screen w-screen overflow-hidden bg-[var(--surface-1)]">
+        <div className="absolute inset-0 z-0">{mapEl("100vh")}</div>
+        <div className="absolute right-3 top-3 z-[1000] w-[300px] max-w-[calc(100vw-24px)] rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)]/95 p-3 text-xs text-[var(--text-primary)] shadow-lg">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-sm font-semibold">Vexar map</p>
+            <div className="flex items-center gap-2">
+              <button type="button" className="text-[var(--series-1)] hover:underline" onClick={fullScreen}>
+                Full screen
+              </button>
+              <button type="button" className="text-[var(--text-muted)] hover:underline" onClick={() => setPanelOpen(!panelOpen)}>
+                {panelOpen ? "Hide" : "Show"}
+              </button>
+            </div>
+          </div>
+          {panelOpen && (
+            <>
+              {canNet && (
+                <div className="mt-2">
+                  <p className="font-semibold uppercase tracking-wide text-[var(--text-muted)]">Towers</p>
+                  {uispError ? (
+                    <p className="text-[var(--status-critical)]">{uispError}</p>
+                  ) : (
+                    <p>
+                      <span style={{ color: sitesDown.length ? BAD : GOOD }}>●</span> {placedSites.length - sitesDown.length} of{" "}
+                      {placedSites.length} towers fully up
+                      {linksDown.length ? ` · ${linksDown.length} link${linksDown.length === 1 ? "" : "s"} down` : ""}
+                      {linksBusy.length ? ` · ${linksBusy.length} busy / low` : ""}
+                    </p>
+                  )}
+                  {sitesDown.length > 0 && (
+                    <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto">
+                      {sitesDown.map((st) => (
+                        <li
+                          key={st.id}
+                          className="cursor-pointer rounded px-1 hover:bg-[var(--tint-hover)]"
+                          onClick={() => panTo(st.latitude!, st.longitude!, 13)}
+                        >
+                          <span style={{ color: BAD }}>●</span> {st.name} — {st.devices_offline} device{st.devices_offline === 1 ? "" : "s"} down
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {linksDown.length > 0 && (
+                    <ul className="mt-1 space-y-0.5">
+                      {linksDown.map((l) => (
+                        <li key={l.key}>
+                          <span style={{ color: BAD }}>━</span> {l.a.name} ↔ {l.b.name}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {netUpdated && (
+                    <p className="mt-1 text-[10px] text-[var(--text-muted)]">
+                      UISP checked {netUpdated.toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })} · every minute
+                    </p>
+                  )}
+                </div>
+              )}
+              {canVehicles && wfConfigured && layers.vehicles && (
+                <div className="mt-2">
+                  <p className="font-semibold uppercase tracking-wide text-[var(--text-muted)]">Vehicles</p>
+                  {wfError && <p className="text-[var(--status-critical)]">{wfError}</p>}
+                  <ul className="space-y-0.5">
+                    {wfVehicles.map((v) => {
+                      const st = wfState(v);
+                      return (
+                        <li
+                          key={v.objectno}
+                          className={`rounded px-1 ${v.lat != null ? "cursor-pointer hover:bg-[var(--tint-hover)]" : ""}`}
+                          onClick={() => v.lat != null && panTo(v.lat as number, v.lng as number)}
+                        >
+                          <span className="mr-1 inline-block h-2 w-2 rounded-sm" style={{ background: st.colour }} />
+                          <span className="font-medium">{v.registration || v.name}</span>{" "}
+                          <span className="text-[var(--text-secondary)]">{st.label}</span>{" "}
+                          <span className="text-[var(--text-muted)]">{wfAge(v.pos_time)}</span>
+                        </li>
+                      );
+                    })}
+                    {wfVehicles.length === 0 && <li className="text-[var(--text-muted)]">No vehicles reported by Webfleet.</li>}
+                  </ul>
+                </div>
+              )}
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {canNet && <button type="button" className={chip(layers.towers)} onClick={() => toggle("towers")}>Towers</button>}
+                {canNet && <button type="button" className={chip(layers.links)} onClick={() => toggle("links")}>Links</button>}
+                {canNet && <button type="button" className={chip(layers.labels)} onClick={() => toggle("labels")}>Names</button>}
+                {canVehicles && wfConfigured && (
+                  <button type="button" className={chip(layers.vehicles)} onClick={() => toggle("vehicles")}>Vehicles</button>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PageHeader
+        title="Map"
+        subtitle={
+          canNet
+            ? "Towers and links from UISP, technicians live, and the serviceability check. Click the map, paste GPS or search an address."
+            : "Technicians live from the Conecto app."
+        }
+        actions={
+          <button type="button" className={btnSecondary} onClick={openMapScreen} title="Opens the map in its own window — drag it to the other screen">
+            Open on separate screen ↗
+          </button>
+        }
+      />
+      <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
+        {/* ---- left: search + result ---- */}
+        <div className="space-y-3">
+          {canNet && (
+          <form onSubmit={search} className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3">
+            <p className="mb-2 text-sm font-semibold">Can we service it?</p>
+            <div className="flex gap-2">
+              <input
+                className={inputClass}
+                placeholder="Address, or GPS -27.65, 27.23"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              <button type="submit" className={btnPrimary} disabled={searching}>
+                {searching ? "…" : "Check"}
+              </button>
+            </div>
+            <p className="mt-1.5 text-[11px] text-[var(--text-muted)]">Or click anywhere on the map. Address search uses OpenStreetMap; farm roads may be missing.</p>
+            {searchError && <p className="mt-2 text-xs text-[var(--status-critical)]">{searchError}</p>}
+            {hits && hits.length > 1 && (
+              <ul className="mt-2 space-y-1">
+                {hits.map((h) => (
+                  <li key={`${h.lat},${h.lng}`}>
+                    <button type="button" className="w-full rounded px-2 py-1 text-left text-xs hover:bg-[var(--tint-hover)]" onClick={() => pick(h)}>
+                      {h.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </form>
+          )}
+
+          {canNet && point && (
+            <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3 text-sm">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <div>
+                  <p className="font-semibold">{point.label}</p>
+                  <p className="font-mono text-xs text-[var(--text-muted)]">
+                    {point.lat}, {point.lng}
+                  </p>
+                </div>
+                <button type="button" className="text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]" onClick={() => { setPoint(null); setCheck(null); }}>
+                  Clear
+                </button>
+              </div>
+              {checkError && <p className="text-xs text-[var(--status-critical)]">{checkError}</p>}
+              {!check && !checkError && <p className="text-xs text-[var(--text-muted)]">Checking…</p>}
+              {check && (
+                <>
+                  <div
+                    className="mb-2 rounded-md px-2 py-1.5 text-xs"
+                    style={{
+                      background: "var(--tint-hover)",
+                      borderLeft: `3px solid ${!check.coverage.loaded ? "var(--text-muted)" : check.coverage.covered ? HOUSE : BAD}`,
+                    }}
+                  >
+                    {check.coverage.loaded && (
+                      <p className="font-semibold" style={{ color: check.coverage.covered ? HOUSE : BAD }}>
+                        {check.coverage.covered ? "Fibre: can possibly be serviced" : "Fibre: not in the imported coverage"}
+                      </p>
+                    )}
+                    <p className="text-[var(--text-secondary)]">{check.coverage.note}</p>
+                    {check.coverage.houses.length > 0 && (
+                      <p className="mt-1 text-[var(--text-muted)]">
+                        Nearest houses: {check.coverage.houses.map((h) => `${h.name} ${h.distance_m} m`).join(" · ")}
+                      </p>
+                    )}
+                    {check.coverage.areas.length > 0 && (
+                      <p className="mt-1 text-[var(--text-muted)]">
+                        Areas: {check.coverage.areas.map((a) => `${a.code || a.name}${a.network ? ` (${a.network})` : ""}${a.live ? "" : " — not live"}`).join(" · ")}
+                      </p>
+                    )}
+                  </div>
+                  {!check.uisp_connected && <p className="text-xs text-[var(--text-muted)]">UISP isn't connected, so no towers to compare.</p>}
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Nearest towers</p>
+                    <label className="flex items-center gap-1 text-[11px] text-[var(--text-muted)]">
+                      House antenna
+                      <select
+                        className="rounded border border-[var(--baseline)] bg-[var(--surface-1)] px-1 py-0.5 text-[11px] text-[var(--text-primary)]"
+                        value={clientHeight}
+                        onChange={(e) => setClientHeight(Number(e.target.value))}
+                      >
+                        {[3, 4, 6, 9, 12, 15, 18, 24].map((h) => (
+                          <option key={h} value={h}>
+                            {h} m
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  {check.terrain_loaded === false && (
+                    <p className="mb-1 text-[11px] text-[var(--status-warning)]">
+                      Terrain isn't downloaded yet, so no line of sight: run <code>python manage.py fetch_terrain</code> on the server.
+                    </p>
+                  )}
+                  <ul className="space-y-2">
+                    {check.nearest.map((t) => (
+                      <li key={t.id} className="cursor-pointer rounded-md border border-[var(--border-hairline)] px-2 py-1.5 hover:bg-[var(--tint-hover)]" onClick={() => panTo(t.latitude, t.longitude, 13)}>
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="font-medium">
+                            <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ background: t.devices_offline ? BAD : GOOD }} />
+                            {t.name}
+                          </span>
+                          <span className="tabular-nums">{km(t.distance_km)}</span>
+                        </div>
+                        <p className="text-[11px] text-[var(--text-muted)]">
+                          Site is {t.compass} of the tower (bearing {t.bearing}°){t.devices_offline ? ` · ${t.devices_offline} device(s) down` : ""}
+                        </p>
+                        {t.los && (
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <LosBadge los={t.los} />
+                            {t.los.available && (
+                              <button
+                                type="button"
+                                className="text-[11px] text-[var(--series-1)] hover:underline"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setProfileFor(t);
+                                }}
+                              >
+                                Profile
+                              </button>
+                            )}
+                            {t.los.available && (
+                              <span className="text-[10px] text-[var(--text-muted)]">
+                                tower antenna {t.los.tower_height_m} m{t.height_m == null ? " (not set in UISP, 10 m assumed)" : ""}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {t.los?.available && t.los.verdict !== "clear" && <p className="text-[11px] text-[var(--text-muted)]">{t.los.detail}</p>}
+                        {t.access_points.length > 0 ? (
+                          <p className="mt-0.5 text-[11px] text-[var(--text-secondary)]">
+                            Sectors: {t.access_points.map((a) => `${a.name}${a.online ? "" : " (down)"}`).join(", ")}
+                          </p>
+                        ) : (
+                          <p className="mt-0.5 text-[11px] text-[var(--text-muted)]">No sectors at this site in UISP (backhaul only).</p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {canLeads && (
+                      <button type="button" className={btnPrimary} onClick={createLead}>
+                        Create lead here
+                      </button>
+                    )}
+                    <a className={btnSecondary} href={`https://www.google.com/maps?q=${point.lat},${point.lng}`} target="_blank" rel="noreferrer">
+                      Open in Google Maps
+                    </a>
+                  </div>
+                  <p className="mt-2 text-[11px] text-[var(--text-muted)]">
+                    Line of sight is over terrain (30 m surface model) for the 3 nearest towers — confirm with a scan before promising the install.
+                  </p>
+                  {profileFor?.los && (
+                    <LosProfileModal title={`${profileFor.name} → this house`} los={profileFor.los} onClose={() => setProfileFor(null)} />
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Layers</p>
+            <div className="flex flex-wrap gap-1.5">
+              {canNet && <button type="button" className={chip(layers.towers)} onClick={() => toggle("towers")}>Towers</button>}
+              {canNet && <button type="button" className={chip(layers.links)} onClick={() => toggle("links")}>Backhaul links</button>}
+              {canTechs && <button type="button" className={chip(layers.techs)} onClick={() => toggle("techs")}>Technicians</button>}
+              {canVehicles && wfConfigured && (
+                <button type="button" className={chip(layers.vehicles)} onClick={() => toggle("vehicles")}>Vehicles (Webfleet)</button>
+              )}
+              {canNet && <button type="button" className={chip(layers.labels)} onClick={() => toggle("labels")}>Tower names</button>}
+              {canNet && <button type="button" className={chip(layers.houses)} onClick={() => toggle("houses")}>Serviceable houses</button>}
+            </div>
+            {mapboxToken ? (
+              <div className="mt-2 inline-flex rounded-md border border-[var(--baseline)] p-0.5">
+                {(["map", "satellite"] as const).map((b) => (
+                  <button
+                    key={b}
+                    type="button"
+                    aria-pressed={base === b}
+                    onClick={() => chooseBase(b)}
+                    className={`rounded px-2.5 py-1 text-xs ${base === b ? "bg-[var(--tint-hover)] font-medium text-[var(--text-primary)]" : "text-[var(--text-muted)]"}`}
+                  >
+                    {b === "map" ? "Map" : "Satellite"}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-2 text-[11px] text-[var(--text-muted)]">Satellite: add MAPBOX_TOKEN to backend/.env.</p>
+            )}
+            {canNet && (
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-[var(--text-muted)]">
+              <span><span className="mr-1 inline-block h-0.5 w-3 align-middle" style={{ background: GOOD }} />link fine</span>
+              <span><span className="mr-1 inline-block h-0.5 w-3 align-middle" style={{ background: WARN }} />busy / low link</span>
+              <span><span className="mr-1 inline-block h-0.5 w-3 align-middle" style={{ background: BAD }} />radio down</span>
+            </div>
+            )}
+            {uispError && <p className="mt-2 text-xs text-[var(--status-critical)]">{uispError}</p>}
+          </div>
+
+          {canNet && <CoverageLayersCard onChanged={() => setCoverageRev((r) => r + 1)} />}
+          {canNet && layers.houses && housesTruncated && (
+            <p className="text-[11px] text-[var(--text-muted)]">Too many houses in view: zoom in to see them all.</p>
+          )}
+
+          {canVehicles && wfConfigured && layers.vehicles && (
+            <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Vehicles (Webfleet)</p>
+              {wfError && <p className="mb-1 text-[11px] text-[var(--status-critical)]">{wfError}</p>}
+              <ul className="space-y-1 text-xs">
+                {wfVehicles.map((v) => {
+                  const st = wfState(v);
+                  return (
+                    <li
+                      key={v.objectno}
+                      className={`rounded px-1.5 py-1 ${v.lat != null ? "cursor-pointer hover:bg-[var(--tint-hover)]" : ""}`}
+                      onClick={() => v.lat != null && panTo(v.lat as number, v.lng as number)}
+                    >
+                      <span className="mr-1.5 inline-block h-2 w-2 rounded-sm" style={{ background: st.colour }} />
+                      <span className="font-medium">{v.registration || v.name}</span>
+                      <span className="ml-1 text-[var(--text-secondary)]">{st.label}</span>
+                      <span className="ml-1 text-[var(--text-muted)]">{wfAge(v.pos_time)}</span>
+                      {(v.driver_name || v.place) && (
+                        <div className="ml-3.5 text-[var(--text-muted)]">
+                          {v.driver_name ? `${v.driver_name} · ` : ""}
+                          {v.place}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+                {wfVehicles.length === 0 && <li className="text-[var(--text-muted)]">No vehicles reported by Webfleet.</li>}
+              </ul>
+            </div>
+          )}
+
+          {canTechs && layers.techs && (
+            <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-3">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Technicians</p>
+              {/* Kept from Technician positions: a technician whose phone has
+                  sent nothing has no pin, and must still be listed. */}
+              <p className="mb-2 text-[11px] text-[var(--text-muted)]">
+                Conecto reports a position every minute while a technician is en route (live, with a trail). A faded pin is the last status
+                change, usually the customer&rsquo;s address, and may be hours old.
+              </p>
+              <ul className="space-y-1 text-xs">
+                {techs.map((t) => (
+                  <li
+                    key={t.code}
+                    className={`rounded px-1.5 py-1 ${t.lat != null ? "cursor-pointer hover:bg-[var(--tint-hover)]" : ""}`}
+                    onClick={() => t.lat != null && panTo(t.lat as number, t.lng as number)}
+                  >
+                    <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ background: STATUS_COLOR[t.status] ?? "#4a3aa7", opacity: t.live ? 1 : 0.4 }} />
+                    <span className="font-medium">{t.name}</span>
+                    <span className="ml-1 text-[var(--text-secondary)]">{statusLabel(t.status)}</span>
+                    <span className={`ml-1 ${t.live ? "font-medium text-[var(--text-secondary)]" : "text-[var(--text-muted)]"}`}>{claimLabel(t)}</span>
+                    {t.job_title && <div className="ml-3.5 text-[var(--text-muted)]">{t.job_title}{t.customer_name ? ` — ${t.customer_name}` : ""}</div>}
+                  </li>
+                ))}
+                {techs.length === 0 && <li className="text-[var(--text-muted)]">No technician has reported a position yet today.</li>}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {/* ---- right: the map ---- */}
+        {/* relative z-0: Leaflet's panes sit at z-index 400+, which would
+            otherwise cover the import dialog. */}
+        <div className="relative z-0 overflow-hidden rounded-lg border border-[var(--border-hairline)]">
+          {mapEl("78vh")}
+        </div>
+      </div>
+    </div>
+  );
+}

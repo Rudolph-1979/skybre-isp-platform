@@ -47,6 +47,100 @@ class BankAccount(models.Model):
     api_client_id = models.CharField(max_length=255, blank=True)
     api_client_secret = models.CharField(max_length=255, blank=True)
 
+    # -- FNB Integration Channel: OAuth 2.0 authorisation code (#185) -----
+    # FNB's Transaction History API page (read 16 Oct 2026): client ID +
+    # secret, JWT-signed client authentication, OAuth 2.0 AUTHORISATION
+    # CODE flow (the code arrives at our redirect URL), access token +
+    # refresh token; when the refresh token expires the connection has to
+    # be made again on Integration Channel. Exact endpoint paths come with
+    # FNB's private Swagger document -- see fnb_client.py.
+    api_token_url = models.CharField(
+        max_length=255, blank=True,
+        help_text="FNB's OAuth 2.0 token endpoint (from their spec). Blank = API base URL + /oauth/token.",
+    )
+    api_authorize_url = models.CharField(
+        max_length=255, blank=True,
+        help_text="FNB's authorisation page, if they give one. Enables the Connect to FNB button; "
+                  "otherwise paste the auth code FNB gives you.",
+    )
+    api_scope = models.CharField(max_length=255, blank=True)
+
+    class ClientAuth(models.TextChoices):
+        POST = "post", "Client ID + secret in the request body"
+        BASIC = "basic", "Client ID + secret as HTTP Basic"
+        JWT = "jwt", "JWT signed with the client secret (client_secret_jwt)"
+
+    api_client_auth = models.CharField(max_length=10, choices=ClientAuth.choices, default=ClientAuth.POST)
+
+    class Grant(models.TextChoices):
+        # What FNB's own Transaction History page describes.
+        AUTHORIZATION_CODE = "authorization_code", "Authorisation code (FNB Integration Channel)"
+        # Kept as a fallback in case FNB's spec says otherwise for
+        # "connect on my own behalf": the client ID + secret alone get a token.
+        CLIENT_CREDENTIALS = "client_credentials", "Client credentials (ID + secret only)"
+
+    api_grant = models.CharField(max_length=20, choices=Grant.choices, default=Grant.AUTHORIZATION_CODE)
+    api_account_id = models.CharField(
+        max_length=64, blank=True,
+        help_text="FNB's own identifier for this account in the API, if it isn't the account number.",
+    )
+    # Tokens are encrypted at rest (bankfeeds/tokens.py, key derived from
+    # SECRET_KEY) and never leave the server: not in the API, not in logs.
+    api_access_token_enc = models.TextField(blank=True)
+    api_refresh_token_enc = models.TextField(blank=True)
+    api_token_expires_at = models.DateTimeField(null=True, blank=True)
+    api_connected_at = models.DateTimeField(null=True, blank=True)
+    api_connected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # Set when FNB refuses the refresh token: somebody has to connect again
+    # on Integration Channel. Cleared by a successful connect.
+    api_needs_reconnect = models.BooleanField(default=False)
+    # The balance FNB itself reported on the last successful sync.
+    bank_balance = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    bank_balance_at = models.DateTimeField(null=True, blank=True)
+
+    # --- balance ----------------------------------------------------------
+    # What the account held before the first transaction below, and the
+    # date that was true. The running balance is this plus every
+    # transaction on or after that date.
+    #
+    # Built from the BANK LINES, not from payments and expenses. Those are
+    # different things and only one of them is the bank: a card payment
+    # recorded against a customer, a transfer between two of these
+    # accounts, a bank charge nobody has captured yet -- each moves the
+    # real balance, and a figure summed from payments and expenses would
+    # miss some and double others. The transactions ARE the statement.
+    #
+    # The date is separate and not optional in practice: an opening
+    # balance with no date cannot be placed, and guessing wrong adds a
+    # month of transactions to a balance that already included them. With
+    # no date, no balance is shown at all -- a blank is better than a
+    # number that is confidently a month out.
+    opening_balance = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0,
+        help_text="The balance on this account immediately before the first transaction on the feed.",
+    )
+    opening_balance_date = models.DateField(
+        null=True, blank=True,
+        help_text=(
+            "The date that opening balance was true. Transactions on or after it are added to "
+            "it. Without a date no running balance is shown."
+        ),
+    )
+    # What internet banking actually said, the last time a person looked.
+    # Kept so the page can show the DIFFERENCE rather than just the
+    # platform's own figure -- when the two disagree that gap is the
+    # useful part, because it means a statement is missing, imported
+    # twice, or the opening balance is dated wrong.
+    confirmed_balance = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True,
+    )
+    confirmed_balance_at = models.DateTimeField(null=True, blank=True)
+    confirmed_balance_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+
     last_synced_at = models.DateTimeField(null=True, blank=True)
 
     class SyncStatus(models.TextChoices):
@@ -67,6 +161,59 @@ class BankAccount(models.Model):
 
     def api_client_secret_set(self):
         return bool(self.api_client_secret)
+
+    @property
+    def connection_status(self):
+        """csv_only / not_connected / connected / reconnect (#185)."""
+        if not self.api_base_url:
+            return "csv_only"
+        if self.api_needs_reconnect:
+            return "reconnect"
+        if self.api_grant == self.Grant.CLIENT_CREDENTIALS:
+            return "connected" if (self.api_client_id and self.api_client_secret) else "not_connected"
+        if self.api_refresh_token_enc or self.api_access_token_enc:
+            return "connected"
+        return "not_connected"
+
+    def balance_as_at(self, on_date=None):
+        """Opening balance plus every transaction on or after the opening
+        date, up to `on_date` (default: everything on file).
+
+        None when no opening date has been set -- see the field's comment
+        for why a dateless opening balance is worse than no balance.
+
+        IGNORED status is deliberately still counted. "Ignored" means
+        "this is not a customer payment I need to match", not "this did
+        not happen": a bank charge marked ignored still left the account.
+        Excluding them would make the balance drift by exactly the amount
+        of everything somebody dismissed.
+        """
+        from decimal import Decimal
+
+        if self.opening_balance_date is None:
+            return None
+        # Lines marked as the same transaction already on file from the
+        # other source (CSV vs FNB API, #185) are counted once.
+        rows = self.transactions.filter(date__gte=self.opening_balance_date, duplicate_of__isnull=True)
+        if on_date is not None:
+            rows = rows.filter(date__lte=on_date)
+        moved = rows.aggregate(total=models.Sum("amount"))["total"] or Decimal("0")
+        return (self.opening_balance or Decimal("0")) + moved
+
+    @property
+    def current_balance(self):
+        return self.balance_as_at()
+
+    @property
+    def balance_variance(self):
+        """Calculated balance minus the balance somebody last confirmed by
+        eye. None when either is missing. Zero means the two agreed; any
+        other number is a transaction missing from, or duplicated on, the
+        feed -- which is the whole reason for recording a confirmation."""
+        calculated = self.current_balance
+        if calculated is None or self.confirmed_balance is None:
+            return None
+        return calculated - self.confirmed_balance
 
 
 class BankTransaction(models.Model):
@@ -108,6 +255,15 @@ class BankTransaction(models.Model):
     date = models.DateField()
     description = models.CharField(max_length=500, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2, help_text="Positive = money in, negative = money out.")
+    # FNB's API gives the payment reference separately from the details
+    # (#185); CSV rows keep theirs in the description.
+    reference = models.CharField(max_length=255, blank=True)
+    # The same bank line already on file from the OTHER source (a CSV
+    # statement vs the FNB API, #185). Such a row is kept for the record
+    # but ignored: not counted in the balance, never confirmed.
+    duplicate_of = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="duplicates",
+    )
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.UNMATCHED)
     matched_customer = models.ForeignKey(

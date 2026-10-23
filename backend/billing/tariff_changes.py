@@ -23,33 +23,49 @@ from django.utils import timezone
 logger = logging.getLogger(__name__)
 
 
-def due_tariff_changes(as_of=None):
+def due_tariff_changes(as_of=None, partner_ids=None):
     """Services whose booked change has come due, oldest first.
 
     `__lte` rather than `==` on purpose: if nothing ran for three days -- cron
     was down, the box was rebooted -- a change dated Monday must still apply
     on Thursday rather than being skipped forever because its exact day passed.
+
+    `partner_ids` scopes the work to those resellers' customers, for the
+    same reason billing.cancellations.due_services takes it: a
+    recurring-billing run scoped to one partner calls this, and unscoped
+    it changed the plan -- and, through the signals, the live rate limit
+    -- of customers belonging to resellers deliberately left out of that
+    run. Worse than a wrong invoice, because applying the change CLEARS
+    the booking, so the change the other reseller had scheduled is gone
+    and the next run finds nothing to do. None means every customer,
+    which is what the nightly cron wants; a customer with no partner is
+    only ever touched by an unscoped run.
     """
     from .models import Service
 
     as_of = as_of or timezone.localdate()
+    qs = Service.objects.filter(
+        pending_tariff__isnull=False,
+        pending_tariff_date__isnull=False,
+        pending_tariff_date__lte=as_of,
+    )
+    if partner_ids:
+        qs = qs.filter(customer__partner_id__in=partner_ids)
     return (
-        Service.objects.filter(
-            pending_tariff__isnull=False,
-            pending_tariff_date__isnull=False,
-            pending_tariff_date__lte=as_of,
-        )
-        .select_related("customer", "tariff", "pending_tariff", "device")
+        qs.select_related("customer", "tariff", "pending_tariff", "device")
         .order_by("pending_tariff_date", "pk")
     )
 
 
-def apply_due_tariff_changes(as_of=None, commit=True):
+def apply_due_tariff_changes(as_of=None, commit=True, partner_ids=None):
     """Switch every due service onto its pending tariff.
 
     Returns a list of (service, old_tariff, new_tariff) for reporting. With
     commit=False nothing is written -- the caller gets the same list as a
     preview, which is what the management command's --dry-run prints.
+
+    `partner_ids` scopes it to those resellers' customers; see
+    due_tariff_changes.
 
     Saved one at a time through the normal .save() path, never a queryset
     .update(): the signals ARE the rest of the job. Service's post_save
@@ -59,7 +75,7 @@ def apply_due_tariff_changes(as_of=None, commit=True):
     reconnect, which on a stable link can be weeks.
     """
     applied = []
-    for service in due_tariff_changes(as_of):
+    for service in due_tariff_changes(as_of, partner_ids=partner_ids):
         old_tariff = service.tariff
         new_tariff = service.pending_tariff
         applied.append((service, old_tariff, new_tariff))

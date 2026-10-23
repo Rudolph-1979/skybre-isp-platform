@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../api/client";
 import { PageHeader } from "../../components/PageHeader";
-import { Table, THead, TH, TR, TD } from "../../components/Table";
+import { Table, THead, SortableTH, TR, TD } from "../../components/Table";
 import { PeriodSwitcher, formatBytes, type Period } from "../../components/UsageChart";
 import type { UsageReport } from "../../types";
 
@@ -26,17 +26,55 @@ function capTone(pct: number | null) {
   return "var(--chart-1)";
 }
 
+// Sorting is server-side (the API takes `ordering`), so the order survives
+// the row limit: the top 200 is always the heaviest 200, whichever column
+// you then arrange them by. Sorting in the browser would only ever reorder
+// the rows that happened to be fetched.
+const ORDERING_KEY = "skybre.usage-report.ordering";
+const DEFAULT_ORDERING = "-total_bytes";
+
+function storedOrdering() {
+  // Wrapped: a browser with site data blocked throws on access rather than
+  // returning null, and a remembered sort is not worth a blank page.
+  try {
+    return localStorage.getItem(ORDERING_KEY) || DEFAULT_ORDERING;
+  } catch {
+    return DEFAULT_ORDERING;
+  }
+}
+
 export function UsageReportPage() {
   const [period, setPeriod] = useState<Period>("month");
+  const [ordering, setOrdering] = useState<string>(storedOrdering);
   const [report, setReport] = useState<UsageReport | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
+
+  // Clicking a header cycles descending -> ascending, starting on descending
+  // for the figures: the first question about a usage column is always "who
+  // is at the top of it". Names start ascending, because A-Z is what a name
+  // column is for.
+  function handleSort(field: string) {
+    setOrdering((current) => {
+      const textual = field === "full_name" || field === "customer_ref";
+      const next =
+        current === field ? `-${field}` : current === `-${field}` ? field : textual ? field : `-${field}`;
+      try {
+        localStorage.setItem(ORDERING_KEY, next);
+      } catch {
+        // Not worth a word to the user: the sort still works, it just
+        // won't be here next time.
+      }
+      return next;
+    });
+  }
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     api
-      .get<UsageReport>(`/usage-report/?period=${period}`)
+      .get<UsageReport>(`/usage-report/?period=${period}&ordering=${encodeURIComponent(ordering)}`)
       .then((res) => {
         if (cancelled) return;
         setReport(res.data);
@@ -51,10 +89,43 @@ export function UsageReportPage() {
     return () => {
       cancelled = true;
     };
-  }, [period]);
+  }, [period, ordering]);
+
+  // The export is authenticated, so it cannot be a plain <a href>: the JWT
+  // lives in localStorage and only axios attaches it. Fetch the file as a
+  // blob and hand the browser an object URL. Same as the billing bundle.
+  async function handleExport() {
+    setExporting(true);
+    try {
+      const res = await api.get("/usage-report/export/", {
+        params: { period, ordering },
+        responseType: "blob",
+      });
+      // The server names the file after the period it actually covers, and
+      // that name is the only thing separating one month's export from
+      // another in a downloads folder -- so use it rather than inventing one.
+      const disposition = String(res.headers?.["content-disposition"] ?? "");
+      const named = /filename="?([^";]+)"?/.exec(disposition)?.[1];
+      const url = URL.createObjectURL(res.data as Blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = named || `usage_${period}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("Couldn't export the usage report.");
+    } finally {
+      setExporting(false);
+    }
+  }
 
   const rows = report?.results ?? [];
   const grandTotal = rows.reduce((sum, r) => sum + r.total_bytes, 0);
+  // The table is capped; the CSV is not. Say so rather than letting the
+  // count read as the whole story.
+  const truncated = (report?.total_rows ?? 0) > rows.length;
 
   return (
     <div>
@@ -67,9 +138,22 @@ export function UsageReportPage() {
         <PeriodSwitcher value={period} onChange={setPeriod} />
         {report && (
           <span className="text-sm text-[var(--text-muted)]">
-            {report.period_label} · {rows.length} customer{rows.length === 1 ? "" : "s"} ·{" "}
-            {formatBytes(grandTotal)} total
+            {report.period_label} ·{" "}
+            {truncated
+              ? `heaviest ${rows.length} of ${report.total_rows} customers`
+              : `${rows.length} customer${rows.length === 1 ? "" : "s"}`}{" "}
+            · {formatBytes(grandTotal)} total
           </span>
+        )}
+        {rows.length > 0 && (
+          <button
+            type="button"
+            className="rounded-md border border-[var(--border-hairline)] px-3 py-1.5 text-sm text-[var(--text-secondary)] hover:bg-[var(--tint-subtle)] disabled:opacity-50"
+            disabled={exporting}
+            onClick={handleExport}
+          >
+            {exporting ? "Preparing…" : "Export CSV"}
+          </button>
         )}
       </div>
 
@@ -91,11 +175,21 @@ export function UsageReportPage() {
         <Table>
           <THead>
             <tr>
-              <TH>Customer</TH>
-              <TH>Download</TH>
-              <TH>Upload</TH>
-              <TH>Total</TH>
-              <TH>Cap</TH>
+              <SortableTH field="full_name" ordering={ordering} onSort={handleSort}>
+                Customer
+              </SortableTH>
+              <SortableTH field="download_bytes" ordering={ordering} onSort={handleSort}>
+                Download
+              </SortableTH>
+              <SortableTH field="upload_bytes" ordering={ordering} onSort={handleSort}>
+                Upload
+              </SortableTH>
+              <SortableTH field="total_bytes" ordering={ordering} onSort={handleSort}>
+                Total
+              </SortableTH>
+              <SortableTH field="cap_used_pct" ordering={ordering} onSort={handleSort}>
+                Cap
+              </SortableTH>
             </tr>
           </THead>
           <tbody>

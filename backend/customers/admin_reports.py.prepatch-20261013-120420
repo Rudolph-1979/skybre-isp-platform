@@ -1,0 +1,323 @@
+"""Administration -> Reports: clients per partner and clients per tariff
+(Rudolph, 9 Oct 2026: "a tab in the left pane for Administration, under
+administration we will add reports of which the first will be clients per
+partner and clients per tariff").
+
+How a client is counted (agreed 9 Oct 2026):
+
+  * Only clients whose status is in the chosen list (empty = every status).
+  * A client's LIVE lines are its non-terminated services (active,
+    suspended, pending) -- the same "non-terminated" rule partner scoping
+    already uses.
+  * Per partner: a client counts under the partner of each live line
+    (Service.partner, else the client's own partner -- effective_partner_id).
+    A client with no live line counts under its own partner (or Direct).
+    So a client with a Vumatel line and a Skybre line is in both rows, and
+    the total is the number of DISTINCT clients, not the sum of the rows.
+  * Per tariff: a client counts under the tariff of each live line. A
+    client with no live line is in the "No live service" row.
+  * Monthly (excl. VAT) is the sum of tariff prices of the group's ACTIVE
+    lines -- the same definition as the dashboard's MRR
+    (billing.dashboard.recurring). Suspended and pending lines are not
+    billed, so they count as lines but add nothing. Discounts and
+    quarterly/annual tariffs are not adjusted for, same as the dashboard.
+  * A partner-restricted user sees only rows (and lines) for partners they
+    are allowed, plus Direct when that is ticked for them.
+  * Cost and markup (George, 13 Oct 2026): a line's cost is its tariff's
+    cost_price, carried by ACTIVE and SUSPENDED lines -- a suspended line
+    still costs (wholesale fees run on) but bills nothing, so it pulls
+    markup down on purpose. Pending lines carry no cost. Lines whose tariff
+    has no cost are left out of cost, gross profit, markup and margin and
+    counted in `uncosted_lines`, so an unknown cost never reads as free.
+    Markup = gross profit / cost; margin = gross profit / revenue, both over
+    the costed lines only.
+"""
+from collections import defaultdict
+from decimal import Decimal
+
+from billing.models import Service
+
+from .models import Customer, Partner
+from .scoping import allowed_partner_ids, is_partner_restricted, scope_customers_to_user, sees_direct
+
+DIRECT_KEY = "direct"
+NO_SERVICE_KEY = "none"
+ZERO = Decimal("0.00")
+
+
+def parse_statuses(raw):
+    """'active,online' -> ['active', 'online']; unknown values are an error."""
+    values = [v.strip() for v in (raw or "").split(",") if v.strip()]
+    unknown = [v for v in values if v not in Customer.Status.values]
+    if unknown:
+        raise ValueError(f"Unknown status(es): {', '.join(unknown)}")
+    return values
+
+
+def _customers(user, statuses):
+    qs = scope_customers_to_user(Customer.objects.all(), user)
+    if statuses:
+        qs = qs.filter(status__in=statuses)
+    return qs
+
+
+def _partner_allowed(user):
+    """A predicate on an effective partner id (None = direct)."""
+    if not is_partner_restricted(user):
+        return lambda _pid: True
+    ids = set(allowed_partner_ids(user))
+    direct = sees_direct(user)
+    return lambda pid: (pid is None and direct) or (pid is not None and pid in ids)
+
+
+def parse_partners(user, raw):
+    """'12,direct' -> {'12', 'direct'} for the per-partner filter on clients
+    per tariff (George, 13 Oct 2026). Empty = no narrowing. Only partners
+    this user may see; anything else is an error."""
+    from .revenue_reports import partner_options
+
+    picked = parse_keys(raw)
+    if not picked:
+        return None
+    known = {o["key"] for o in partner_options(user)}
+    unknown = [k for k in picked if k not in known]
+    if unknown:
+        raise ValueError(f"Unknown partner(s): {', '.join(unknown)}")
+    return set(picked)
+
+
+def _collect(user, statuses, partners=None):
+    """(customers by id, live lines by customer id), after partner rules.
+    `partners` (keys from parse_partners) narrows further: only lines whose
+    partner (the line's own, else the client's) is picked."""
+    customers = {c.pk: c for c in _customers(user, statuses).only("pk", "customer_id", "full_name", "status", "partner_id")}
+    allowed = _partner_allowed(user)
+    if partners:
+        user_allowed = allowed
+        allowed = lambda pid: user_allowed(pid) and _partner_key(pid) in partners  # noqa: E731
+    lines = defaultdict(list)
+    has_line = set()
+    services = (
+        Service.objects.filter(customer_id__in=list(customers))
+        .exclude(status=Service.Status.TERMINATED)
+        .select_related("tariff")
+        .only("pk", "customer_id", "partner_id", "status", "tariff__id", "tariff__name", "tariff__price",
+              "tariff__cost_price")
+    )
+    for svc in services:
+        has_line.add(svc.customer_id)
+        pid = svc.partner_id or customers[svc.customer_id].partner_id
+        if allowed(pid):
+            lines[svc.customer_id].append((pid, svc))
+    # Clients whose live lines are all with partners this user may not see.
+    hidden = has_line - set(lines)
+    return customers, lines, allowed, hidden
+
+
+def _line_value(svc):
+    return Decimal(svc.tariff.price or 0) if svc.status == Service.Status.ACTIVE else ZERO
+
+
+COSTED_STATUSES = (Service.Status.ACTIVE, Service.Status.SUSPENDED)
+
+
+def _pct(part, whole):
+    return f"{(part / whole * 100).quantize(Decimal('0.1'))}" if whole else None
+
+
+def _cost_figures(svcs):
+    """monthly_cost, gross_profit, markup_pct, margin_pct, uncosted_lines
+    for a set of lines -- see the module docstring for the rules."""
+    carrying = [s for s in svcs if s.status in COSTED_STATUSES]
+    costed = [s for s in carrying if s.tariff.cost_price is not None]
+    uncosted = len(carrying) - len(costed)
+    if not costed:
+        return {"monthly_cost": None, "gross_profit": None, "markup_pct": None, "margin_pct": None,
+                "uncosted_lines": uncosted}
+    cost = sum((Decimal(s.tariff.cost_price) for s in costed), ZERO)
+    revenue = sum((_line_value(s) for s in costed), ZERO)
+    profit = revenue - cost
+    return {
+        "monthly_cost": f"{cost:.2f}",
+        "gross_profit": f"{profit:.2f}",
+        "markup_pct": _pct(profit, cost),
+        "margin_pct": _pct(profit, revenue),
+        "uncosted_lines": uncosted,
+    }
+
+
+def _unit_figures(svcs):
+    """A tariff row's own price, cost and markup per line."""
+    tariff = svcs[0].tariff if svcs else None
+    if tariff is None:
+        return {"unit_price": None, "unit_cost": None, "unit_markup_pct": None}
+    price = Decimal(tariff.price or 0)
+    cost = tariff.cost_price
+    return {
+        "unit_price": f"{price:.2f}",
+        "unit_cost": None if cost is None else f"{Decimal(cost):.2f}",
+        "unit_markup_pct": None if cost is None else _pct(price - Decimal(cost), Decimal(cost)),
+    }
+
+
+def _partner_key(pid):
+    return DIRECT_KEY if pid is None else str(pid)
+
+
+def _partner_groups(user, statuses):
+    """{key: {customer_id: [services]}} for the per-partner report."""
+    customers, lines, allowed, _hidden = _collect(user, statuses)
+    groups = defaultdict(dict)
+    for cid, customer in customers.items():
+        own = lines.get(cid, [])
+        if own:
+            for pid, svc in own:
+                groups[_partner_key(pid)].setdefault(cid, []).append(svc)
+        elif allowed(customer.partner_id):
+            groups[_partner_key(customer.partner_id)].setdefault(cid, [])
+        else:
+            # None of this client's lines, nor the client itself, is with a
+            # partner this user may see.
+            continue
+    return customers, groups
+
+
+def _tariff_groups(user, statuses, partners=None):
+    customers, lines, allowed, hidden = _collect(user, statuses, partners)
+    groups = defaultdict(dict)
+    names = {}
+    for cid in customers:
+        own = lines.get(cid, [])
+        if not own and cid in hidden:
+            continue
+        if not own and partners and not allowed(customers[cid].partner_id):
+            # No live line, and the client's own partner isn't picked.
+            continue
+        if not own:
+            groups[NO_SERVICE_KEY].setdefault(cid, [])
+            continue
+        for _pid, svc in own:
+            key = str(svc.tariff_id)
+            names[key] = svc.tariff.name
+            groups[key].setdefault(cid, []).append(svc)
+    return customers, groups, names
+
+
+def _name_order(name):
+    """A-Z, ignoring case, with numbers compared as numbers so "4 Mbps"
+    comes before "10 Mbps" (George, 9 Oct 2026: "Sorting should always be
+    alphabetical")."""
+    import re
+
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part) for part in re.split(r"(\d+)", name.lower())]
+
+
+def _row_order(row):
+    # "No live service" isn't a tariff -- it always closes the list.
+    return (row["key"] == NO_SERVICE_KEY, _name_order(row["name"]))
+
+
+def _rows(groups, names, per_tariff=False, customers=None):
+    """`customers` given: each row also carries `client_list`, the clients
+    behind it, for the CSV export (George, 13 Oct 2026)."""
+    rows = []
+    for key, members in groups.items():
+        svcs = [s for lst in members.values() for s in lst]
+        row = {
+            "key": key,
+            "name": names.get(key, key),
+            "clients": len(members),
+            "services": len(svcs),
+            "active_services": sum(1 for s in svcs if s.status == Service.Status.ACTIVE),
+            "monthly_excl": f"{sum((_line_value(s) for s in svcs), ZERO):.2f}",
+            **_cost_figures(svcs),
+        }
+        if per_tariff:
+            row.update(_unit_figures(svcs))
+        if customers is not None:
+            row["client_list"] = _members_out(customers, members)
+        rows.append(row)
+    rows.sort(key=_row_order)
+    return rows
+
+
+def _totals(groups):
+    clients = set()
+    svcs = {}
+    for members in groups.values():
+        for cid, lst in members.items():
+            clients.add(cid)
+            for s in lst:
+                svcs[s.pk] = s
+    return {
+        "clients": len(clients),
+        "services": len(svcs),
+        "active_services": sum(1 for s in svcs.values() if s.status == Service.Status.ACTIVE),
+        "monthly_excl": f"{sum((_line_value(s) for s in svcs.values()), ZERO):.2f}",
+        **_cost_figures(list(svcs.values())),
+    }
+
+
+def _partner_names():
+    names = {str(p.pk): p.name for p in Partner.objects.only("pk", "name")}
+    names[DIRECT_KEY] = "Direct (no partner)"
+    return names
+
+
+def clients_per_partner(user, statuses, with_clients=False):
+    customers_by_id, groups = _partner_groups(user, statuses)
+    rows = _rows(groups, _partner_names(), customers=customers_by_id if with_clients else None)
+    return {"statuses": statuses, "rows": rows, "total": _totals(groups)}
+
+
+def parse_keys(raw):
+    """'12,7,none' -> ['12', '7', 'none'] (empty = no narrowing)."""
+    return [v.strip() for v in (raw or "").split(",") if v.strip()]
+
+
+def clients_per_tariff(user, statuses, tariffs=None, partners=None, with_clients=False):
+    """`tariffs`: only these rows (tariff ids as strings, and/or "none"),
+    with the total worked out over just them -- Rudolph, 9 Oct 2026: "Add a
+    filter to choose a tariff and see how many under each tariff".
+    `options` always lists every tariff that has clients under the chosen
+    statuses, so the picker doesn't shrink to what is already picked."""
+    from .revenue_reports import partner_options
+
+    customers_by_id, groups, names = _tariff_groups(user, statuses, partners)
+    names[NO_SERVICE_KEY] = "No live service"
+    options = sorted(({"key": k, "name": names.get(k, k)} for k in groups), key=_row_order)
+    if tariffs:
+        groups = {k: v for k, v in groups.items() if k in set(tariffs)}
+    return {"statuses": statuses, "tariffs": tariffs or [], "options": options,
+            "partners": sorted(partners or []), "partner_options": partner_options(user),
+            "rows": _rows(groups, names, per_tariff=True, customers=customers_by_id if with_clients else None),
+            "total": _totals(groups)}
+
+
+def clients_in_group(user, report, key, statuses, partners=None):
+    """The clients behind one row, for the click-through list."""
+    if report == "partner":
+        customers, groups = _partner_groups(user, statuses)
+    else:
+        customers, groups, _names = _tariff_groups(user, statuses, partners)
+    return _members_out(customers, groups.get(key, {}))
+
+
+def _members_out(customers, members):
+    """One row's clients, A-Z, each with its lines and monthly figures."""
+    out = []
+    for cid, svcs in members.items():
+        c = customers[cid]
+        out.append({
+            "id": c.pk,
+            "customer_ref": c.customer_id,
+            "full_name": c.full_name,
+            "status": c.status,
+            "services": [
+                {"id": s.pk, "tariff": s.tariff.name, "status": s.status} for s in svcs
+            ],
+            "monthly_excl": f"{sum((_line_value(s) for s in svcs), ZERO):.2f}",
+            "monthly_cost": _cost_figures(svcs)["monthly_cost"],
+        })
+    out.sort(key=lambda r: _name_order(r["full_name"]))
+    return out

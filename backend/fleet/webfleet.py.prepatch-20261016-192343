@@ -1,0 +1,410 @@
+"""Webfleet (Bridgestone) vehicle tracking, read-only (#186).
+
+Rudolph, 16 Oct 2026: "Next look at Webfleet Tracking company" -> vehicles
+on the map, automatic odometer, trips, OptiDrive. Then: "I dont want extras
+in the vehicle page, webfleet must just add to our current build except we
+can add optidrive" -- so Webfleet trips go into the existing Trips list,
+odometer readings into the existing odometer history, and the only new
+figure on the vehicle page is OptiDrive.
+
+WEBFLEET.connect (docs 1.76.0, read 16 Oct 2026):
+* HTTPS GET https://csv.webfleet.com/extern?account=..&apikey=..&lang=en
+  &action=..&outputformat=json&useISO8601=true&useUTF8=true, with the
+  Webfleet user as HTTP Basic auth (user/password in the URL is deprecated,
+  removed end of June 2026).
+* Errors: X-Webfleet-Errorcode / X-Webfleet-Errormessage headers (or an
+  errorCode object). 63 = no data, 8011 = request quota reached.
+* Limits used here: showObjectReportExtern 6/min (cached 30 s),
+  showVehicleReportExtern 10/min, showTripReportExtern 1/min (continuous
+  replication by tripid, not more often than every 15 min),
+  getObjectKPIs 10/min (OptiDrive only, one call per vehicle, spaced out).
+
+Nothing is ever written to Webfleet.
+"""
+import logging
+import re
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+
+import requests
+from django.conf import settings
+from django.core.cache import cache
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
+logger = logging.getLogger(__name__)
+
+URL = "https://csv.webfleet.com/extern"
+POSITIONS_CACHE = "webfleet:objects"
+POSITIONS_TTL = 30
+KPI_GAP_S = 6.5          # getObjectKPIs: 10/min
+KPI_EVERY = timedelta(hours=1)
+
+
+class WebfleetError(Exception):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class WebfleetQuota(WebfleetError):
+    """8011: wait for the next run."""
+
+
+def configured():
+    return all(getattr(settings, k, "") for k in ("WEBFLEET_ACCOUNT", "WEBFLEET_USERNAME", "WEBFLEET_PASSWORD", "WEBFLEET_API_KEY"))
+
+
+def call(action, **params):
+    """One WEBFLEET.connect action -> list of dicts ([] for 'no data')."""
+    if not configured():
+        raise WebfleetError("Webfleet isn't set up (WEBFLEET_* in backend/.env).")
+    query = {
+        "account": settings.WEBFLEET_ACCOUNT, "apikey": settings.WEBFLEET_API_KEY, "lang": "en",
+        "action": action, "outputformat": "json", "useISO8601": "true", "useUTF8": "true",
+        **{k: v for k, v in params.items() if v not in (None, "")},
+    }
+    try:
+        resp = requests.get(URL, params=query, auth=(settings.WEBFLEET_USERNAME, settings.WEBFLEET_PASSWORD), timeout=25)
+    except requests.RequestException as exc:
+        raise WebfleetError(f"Couldn't reach Webfleet: {exc}") from exc
+    code = resp.headers.get("X-Webfleet-Errorcode")
+    message = resp.headers.get("X-Webfleet-Errormessage", "")
+    payload = None
+    if not code:
+        try:
+            payload = resp.json()
+        except ValueError:
+            text = (resp.text or "").strip()
+            m = re.match(r"^(\d+)\s*,\s*(.*)$", text)
+            if m:
+                code, message = m.group(1), m.group(2)
+            elif resp.status_code >= 400:
+                code, message = str(resp.status_code), text[:300]
+            else:
+                raise WebfleetError(f"Webfleet answered {action} with something that isn't JSON: {text[:200]}")
+        if isinstance(payload, dict) and payload.get("errorCode") not in (None, 0, "0"):
+            code, message = str(payload.get("errorCode")), payload.get("errorMsg") or payload.get("errorMessage") or ""
+    if code and str(code) != "0":
+        code = str(code)
+        if code == "63":
+            return []
+        if code == "8011":
+            raise WebfleetQuota(f"Webfleet request limit reached for {action} -- tries again next run.", code)
+        hint = {
+            "1106": " Check WEBFLEET_ACCOUNT / USERNAME / PASSWORD.",
+            "1143": " Check WEBFLEET_API_KEY.",
+            "8014": " The Webfleet user needs the WEBFLEET.connect interface right, and an API key must be used.",
+            "45": " The Webfleet user lacks the access right for this report.",
+        }.get(code, "")
+        raise WebfleetError(f"Webfleet error {code} on {action}: {message}.{hint}", code)
+    if isinstance(payload, dict):
+        return [payload]
+    return payload or []
+
+
+# ---- small converters -------------------------------------------------------
+
+def _num(v, kind=float):
+    if v in (None, ""):
+        return None
+    try:
+        return kind(v) if kind is not Decimal else Decimal(str(v))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+
+
+def _when(v):
+    if not v:
+        return None
+    dt = parse_datetime(str(v).replace(" ", "T")) if isinstance(v, str) else None
+    if dt is None:
+        return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt)
+    return dt
+
+
+def _mdeg(v):
+    n = _num(v)
+    return None if n is None else n / 1_000_000
+
+
+def reg_key(text):
+    return "".join(ch for ch in str(text or "").upper() if ch.isalnum())
+
+
+# ---- live positions ----------------------------------------------------------
+
+def object_row(raw):
+    odo_m = _num(raw.get("odometer_long"), int)
+    if odo_m is None:
+        odo_100 = _num(raw.get("odometer"), int)
+        odo_m = odo_100 * 100 if odo_100 is not None else None
+    ign = raw.get("ignition")
+    still = raw.get("standstill")
+    return {
+        "objectno": str(raw.get("objectno") or ""),
+        "objectuid": raw.get("objectuid") or "",
+        "name": raw.get("objectname") or "",
+        "lat": _mdeg(raw.get("latitude_mdeg")),
+        "lng": _mdeg(raw.get("longitude_mdeg")),
+        "pos_time": _when(raw.get("pos_time")),
+        "place": raw.get("postext") or "",
+        "speed_kmh": _num(raw.get("speed"), int),
+        "course": _num(raw.get("course"), int),
+        "ignition": None if ign in (None, "") else str(ign) == "1",
+        "standstill": None if still in (None, "") else str(still) == "1",
+        "driver_name": raw.get("drivername") or "",
+        "odometer_km": None if odo_m is None else int(odo_m // 1000),
+        "fuel_level_pct": _num(raw.get("fuellevel"), int),
+        "deleted": str(raw.get("deleted")).lower() == "true",
+    }
+
+
+def objects(use_cache=True):
+    """All Webfleet objects with their last position (cached 30 s: the
+    action allows 6 a minute for the whole account)."""
+    if use_cache:
+        hit = cache.get(POSITIONS_CACHE)
+        if hit is not None:
+            return hit
+    rows = [object_row(r) for r in call("showObjectReportExtern")]
+    rows = [r for r in rows if r["objectno"] and not r["deleted"]]
+    cache.set(POSITIONS_CACHE, rows, POSITIONS_TTL)
+    return rows
+
+
+def linked_vehicles():
+    """{Webfleet objectno: Vehicle} for every linked vehicle."""
+    from .models import Vehicle
+
+    return {v.webfleet_objectno: v for v in Vehicle.objects.exclude(webfleet_objectno="")}
+
+
+# ---- linking -----------------------------------------------------------------
+
+def auto_link():
+    """Link unlinked Vexar vehicles to Webfleet objects with the same
+    registration (Webfleet's licence plate, else a registration inside the
+    object name). Returns the number linked."""
+    from .models import Vehicle
+
+    taken = set(Vehicle.objects.exclude(webfleet_objectno="").values_list("webfleet_objectno", flat=True))
+    by_reg = {}
+    for r in call("showVehicleReportExtern"):
+        objectno = str(r.get("objectno") or "")
+        if not objectno or objectno in taken:
+            continue
+        for text in (r.get("licenseplatenumber"), r.get("objectname")):
+            key = reg_key(text)
+            if len(key) >= 5:
+                by_reg.setdefault(key, objectno)
+    linked = 0
+    for v in Vehicle.objects.filter(webfleet_objectno=""):
+        key = reg_key(v.registration_number)
+        objectno = by_reg.get(key) or next((o for k, o in by_reg.items() if key and key in k), None)
+        if objectno and objectno not in taken:
+            v.webfleet_objectno = objectno
+            v.save(update_fields=["webfleet_objectno"])
+            taken.add(objectno)
+            linked += 1
+    return linked
+
+
+# ---- odometer ----------------------------------------------------------------
+
+# ---- trips -------------------------------------------------------------------
+
+def trip_row(raw):
+    start_m = _num(raw.get("start_odometer"), int)
+    end_m = _num(raw.get("end_odometer"), int)
+    distance_m = _num(raw.get("distance"))
+    return {
+        "trip_id": _num(raw.get("tripid"), int),
+        "objectno": str(raw.get("objectno") or ""),
+        "started_at": _when(raw.get("start_time")),
+        "ended_at": _when(raw.get("end_time")),
+        "start_place": raw.get("start_postext") or "",
+        "end_place": raw.get("end_postext") or "",
+        "start_km": None if start_m is None else int(start_m // 1000),
+        "end_km": None if end_m is None else int(end_m // 1000),
+        "distance_km": int(round((distance_m or 0) / 1000)),
+        "driver_name": (raw.get("drivername") or "")[:150],
+    }
+
+
+def sync_trips(state):
+    """Webfleet's trips into the vehicle's existing Trips list (TripLog),
+    keyed on Webfleet's tripid. Continuous replication: everything after
+    the highest tripid seen; the very first run takes the floating week.
+    Each trip's END odometer goes into the odometer history (#189, Rudolph
+    16 Oct: "I need more km readings" -> one at the end of every trip),
+    logged by Webfleet, notes left empty, only where it fits the history."""
+    from .conecto_logs import add_reading
+    from .models import TripLog
+
+    if state.last_trip_id:
+        raw = call("showTripReportExtern", tripid=state.last_trip_id)
+    else:
+        raw = call("showTripReportExtern", range_pattern="wf0")
+    linked = linked_vehicles()
+    new = 0
+    state.odometer_added = 0
+    highest = state.last_trip_id or 0
+    for r in sorted(map(trip_row, raw), key=lambda t: (t["ended_at"] is None, t["ended_at"] or 0)):
+        if r["trip_id"] is None:
+            continue
+        highest = max(highest, r["trip_id"])
+        v = linked.get(r["objectno"])
+        if v is None or not r["started_at"] or not r["ended_at"]:
+            continue
+        end_km = r["end_km"] if r["end_km"] is not None else 0
+        start_km = r["start_km"] if r["start_km"] is not None else max(0, end_km - r["distance_km"])
+        route = " → ".join(p for p in (r["start_place"], r["end_place"]) if p)
+        _obj, created = TripLog.objects.update_or_create(webfleet_trip_id=r["trip_id"], defaults={
+            "vehicle": v, "driver_name": r["driver_name"], "start_odometer": start_km, "end_odometer": max(end_km, start_km),
+            "km_driven": r["distance_km"], "started_at": r["started_at"], "ended_at": r["ended_at"],
+            "notes": f"Webfleet: {route}" if route else "Webfleet",
+        })
+        new += int(created)
+        if r["end_km"]:
+            before = v.odometer_readings.count()
+            fits = add_reading(v, r["end_km"], r["ended_at"], None, "", source="webfleet")
+            state.odometer_added += v.odometer_readings.count() - before
+        else:
+            fits = True  # no odometer from Webfleet: nothing to contradict
+        if _obj.odometer_recorded != fits:
+            _obj.odometer_recorded = fits
+            _obj.save(update_fields=["odometer_recorded"])
+    state.last_trip_id = highest or None
+    return new
+
+
+def backfill_trip_odometers():
+    """Odometer readings for Webfleet trips already in the Trips list --
+    the ones synced before #189 (once, from the deploy)."""
+    from .conecto_logs import add_reading
+    from .models import TripLog
+
+    added = 0
+    for t in TripLog.objects.exclude(webfleet_trip_id=None).filter(end_odometer__gt=0).select_related("vehicle").order_by("ended_at"):
+        before = t.vehicle.odometer_readings.count()
+        fits = add_reading(t.vehicle, t.end_odometer, t.ended_at, None, "", source="webfleet")
+        added += t.vehicle.odometer_readings.count() - before
+        if t.odometer_recorded != fits:
+            t.odometer_recorded = fits
+            t.save(update_fields=["odometer_recorded"])
+    return added
+
+
+# ---- OptiDrive (KPIs) ----------------------------------------------------------
+
+def sync_optidrive(sleep=time.sleep):
+    """OptiDrive per vehicle per day for the last 8 days (Webfleet's
+    floating week), one call per linked vehicle, spaced to stay inside 10
+    calls a minute."""
+    from .models import Vehicle, WebfleetDay
+
+    updated = 0
+    vehicles = list(Vehicle.objects.exclude(webfleet_objectno="").filter(is_active=True))
+    for i, v in enumerate(vehicles):
+        if i:
+            sleep(KPI_GAP_S)
+        for raw in call("getObjectKPIs", objectno=v.webfleet_objectno, kpinames="optidrive", level="day", range_pattern="wf0"):
+            try:
+                day = datetime(int(raw["year"]), int(raw["month"]), int(raw["day"])).date()
+            except (KeyError, TypeError, ValueError):
+                continue
+            score = _num(raw.get("optidrive_indicator"))
+            if score is None:
+                continue
+            WebfleetDay.objects.update_or_create(vehicle=v, date=day, defaults={"optidrive": score})
+            updated += 1
+    return updated
+
+
+# ---- speeding (#188) ----------------------------------------------------------
+
+def speeding_row(raw):
+    limits = [_num(raw.get(k)) for k in ("road_speedlimit", "area_speedlimit", "object_speedlimit")]
+    limits = [l for l in limits if l and l > 0]
+    duration_ms = _num(raw.get("duration"), int)
+    return {
+        "started_at": _when(raw.get("start_time")),
+        "ended_at": _when(raw.get("end_time")),
+        "max_speed_kmh": _num(raw.get("max_speed"), int),
+        "avg_speed_kmh": _num(raw.get("avg_speed"), int),
+        "limit_kmh": int(min(limits)) if limits else None,
+        "place": (raw.get("start_postext") or raw.get("end_postext") or "")[:255],
+        "driver_name": (raw.get("drivername") or "")[:100],
+        "duration_s": int((duration_ms or 0) // 1000),
+        "distance_m": _num(raw.get("distance"), int) or 0,
+    }
+
+
+def sync_speeding(sleep=time.sleep):
+    """Today's speeding events for every linked vehicle, one call each
+    (showSpeedingEvents: 10 a minute)."""
+    from .models import Vehicle, WebfleetSpeeding
+
+    new = 0
+    vehicles = list(Vehicle.objects.exclude(webfleet_objectno="").filter(is_active=True))
+    for i, v in enumerate(vehicles):
+        if i:
+            sleep(KPI_GAP_S)
+        for raw in call("showSpeedingEvents", objectno=v.webfleet_objectno, range_pattern="d0"):
+            row = speeding_row(raw)
+            if not row["started_at"]:
+                continue
+            start = row.pop("started_at")
+            _obj, created = WebfleetSpeeding.objects.update_or_create(vehicle=v, started_at=start, defaults=row)
+            new += int(created)
+    return new
+
+
+# ---- the whole run (management command sync_webfleet, cron every 15 min) -------
+
+def sync(force_kpis=False, sleep=time.sleep):
+    from .models import WebfleetSync
+
+    state = WebfleetSync.load()
+    notes, ok = [], True
+    steps = [
+        ("link", lambda: f"{auto_link()} vehicle(s) linked"),
+        ("positions", None),
+        ("trips", lambda: f"{sync_trips(state)} new trip(s), {getattr(state, 'odometer_added', 0)} odometer reading(s)"),
+    ]
+    for name, step in steps:
+        try:
+            if name == "positions":
+                rows = objects(use_cache=False)
+                # km readings now come from each trip's end (#189), not once a day.
+                notes.append(f"{len(rows)} object(s)")
+            else:
+                notes.append(step())
+        except WebfleetError as exc:
+            ok = False
+            notes.append(str(exc))
+            if not isinstance(exc, WebfleetQuota) and exc.code in ("1106", "1143", "8014"):
+                break  # credentials: the rest would fail the same way
+    if ok:
+        try:
+            notes.append(f"{sync_speeding(sleep=sleep)} new speeding event(s)")
+        except WebfleetError as exc:
+            ok = False
+            notes.append(str(exc))
+    now = timezone.now()
+    if ok and (force_kpis or not state.last_kpis_at or now - state.last_kpis_at >= KPI_EVERY):
+        try:
+            notes.append(f"{sync_optidrive(sleep=sleep)} OptiDrive day(s)")
+            state.last_kpis_at = now
+        except WebfleetError as exc:
+            ok = False
+            notes.append(str(exc))
+    state.last_run_at = now
+    state.last_ok = ok
+    state.last_message = "; ".join(notes)[:2000]
+    state.save()
+    return ok, state.last_message

@@ -25,8 +25,10 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from billing.models import Invoice, InvoiceItem, IssuedNumberHighWater, Tariff
+from billing.models import Invoice, InvoiceItem, IssuedNumberHighWater, Service, Tariff
 from customers.models import Customer
+from billing.gate_testing import ApprovalGateOpenMixin
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 
@@ -35,7 +37,8 @@ class _InvoiceApiTestCase(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.staff = User.objects.create_user(
-            username="finance2", password="pw-for-tests", role=User.Role.ACCOUNTS
+            username="finance2", password="pw-for-tests", role=User.Role.ACCOUNTS,
+            allowed_sections=ALL_SECTIONS,
         )
         self.client.force_authenticate(self.staff)
         self.customer = Customer.objects.create(
@@ -184,6 +187,84 @@ class InvoiceStatusTransitionTests(_InvoiceApiTestCase):
         )
         self.assertEqual(res.status_code, 200, res.data)
 
+    def _tariff_quote(self):
+        """A quote for a real plan -- the shape that matters, because a
+        tariff line is what convert_to_invoice() turns into a Service."""
+        tariff = Tariff.objects.create(
+            name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"),
+            speed_download_kbps=20480, speed_upload_kbps=10240,
+        )
+        res = self.client.post(
+            "/api/invoices/",
+            {
+                "customer": self.customer.id,
+                "status": "quote",
+                "date_due": "2026-09-30",
+                "items": [{
+                    "item_type": "tariff", "tariff": tariff.id, "description": "Home 20",
+                    "quantity": 1, "unit_price": "500.00", "tax_rate_pct": "15.00",
+                    "period_start": "2026-09-01", "period_end": "2027-08-31",
+                }],
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data
+
+    def test_a_quote_cannot_be_patched_straight_to_unpaid(self):
+        """The forwards half of the same hole. This skipped
+        convert_to_invoice(), and save() only issues a number when there
+        isn't one -- so the customer was handed a live, debited invoice
+        still printed QUO-000001, out of the quote sequence and unknown to
+        the INV one."""
+        quote = self._tariff_quote()
+        res = self.client.patch(
+            f"/api/invoices/{quote['id']}/", {"status": "unpaid"}, format="json"
+        )
+        self.assertEqual(res.status_code, 400)
+        invoice = Invoice.objects.get(pk=quote["id"])
+        self.assertEqual(invoice.status, Invoice.Status.QUOTE)
+        self.assertTrue(invoice.number.startswith("QUO-"))
+        self.assertEqual(self._balance(), Decimal("0.00"))
+
+    def test_a_quote_must_go_through_convert_to_start_the_service_it_quoted(self):
+        """The half nobody would spot on the invoice itself: only
+        activate_tariff_services() turns an accepted tariff line into a
+        real Service, and a status PATCH never calls it -- the customer
+        was billed every month for a line nobody ever switched on. The
+        supported route has to do the whole job instead."""
+        quote = self._tariff_quote()
+        self.client.patch(f"/api/invoices/{quote['id']}/", {"status": "unpaid"}, format="json")
+        self.assertFalse(Service.objects.filter(customer=self.customer).exists())
+        self.assertEqual(self._balance(), Decimal("0.00"))
+
+        res = self.client.post(f"/api/invoices/{quote['id']}/convert-to-invoice/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertTrue(Invoice.objects.get(pk=quote["id"]).number.startswith("INV-"))
+        self.assertEqual(Service.objects.filter(customer=self.customer).count(), 1)
+        self.assertEqual(self._balance(), Decimal("575.00"))
+
+    def test_a_quote_cannot_be_patched_into_a_pro_forma(self):
+        """Same defect, PF prefix: only convert_to_proforma() clears the
+        number, so this left a pro forma numbered QUO-."""
+        quote_id = self._create("1000.00", status="quote").data["id"]
+        res = self.client.patch(
+            f"/api/invoices/{quote_id}/", {"status": "proforma"}, format="json"
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(Invoice.objects.get(pk=quote_id).status, Invoice.Status.QUOTE)
+
+    def test_a_pro_forma_cannot_be_patched_back_into_a_quote(self):
+        """The lifecycle is one-directional in both halves -- the first
+        check only caught real invoices going backwards, so pro forma ->
+        quote slipped through it."""
+        proforma_id = self._create("1000.00", status="proforma").data["id"]
+        res = self.client.patch(
+            f"/api/invoices/{proforma_id}/", {"status": "quote"}, format="json"
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(Invoice.objects.get(pk=proforma_id).status, Invoice.Status.PROFORMA)
+
     def test_an_issued_invoice_cannot_be_moved_to_another_customer(self):
         """It carries a debit against the customer it was issued to, and
         its line items' service FKs point at that customer's services."""
@@ -235,7 +316,7 @@ class InvoiceNumberReuseTests(_InvoiceApiTestCase):
         self.assertEqual(res.status_code, 201, res.data)
 
 
-class RecurringEngineStillDebitsTests(TestCase):
+class RecurringEngineStillDebitsTests(ApprovalGateOpenMixin, TestCase):
     """Regression guard: the engine's own debit moved from inline code
     into Invoice.apply_balance_debit, so it has to still happen."""
 

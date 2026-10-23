@@ -1,0 +1,106 @@
+"""Reconnect services whose customer no longer owes enough to be off.
+
+    python manage.py apply_reactivations                      # dry run
+    python manage.py apply_reactivations --commit
+    python manage.py apply_reactivations --client-code CUS-001600 --commit
+    python manage.py apply_reactivations --include-unflagged   # the sweep
+
+THE DAILY SWEEP, alongside the suspension run:
+
+    10 13 * * * cd /home/ubuntu/isp-platform && docker compose exec -T backend \\
+        python manage.py apply_reactivations --commit >> logs/billing.log 2>&1
+
+A payment already reconnects a customer within seconds -- billing.signals
+does that. This exists for everything a payment hook cannot see: an
+approved credit note, a balance corrected by hand, a reconnection that
+failed at the time, and any payment recorded while the app was down.
+
+--include-unflagged IS THE ONE-OFF SWEEP, and it is not safe to leave on.
+
+Services suspended before `Service.suspended_for_nonpayment` existed
+carry no flag, so the ordinary run will never touch them -- including the
+customer who prompted all this. This option ignores the flag and
+considers every suspended service whose balance is clear.
+
+What it CANNOT do is tell a billing suspension from one a human made
+deliberately. A line suspended for abuse, pending hardware recovery, or
+at the customer's own request looks identical. So it is off by default,
+it prints exactly what it would reconnect, and it changes nothing until
+--commit is added on a run you have read.
+
+DRY RUN BY DEFAULT, because reconnecting somebody who should be off is
+not a mistake you find out about from the platform.
+"""
+from django.core.management.base import BaseCommand
+
+
+class Command(BaseCommand):
+    help = "Reconnect services whose customer has paid (dry run unless --commit)."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--client-code", help="One customer only, e.g. CUS-001600.")
+        parser.add_argument(
+            "--include-unflagged", action="store_true",
+            help="Also consider services suspended before the flag existed. "
+                 "Cannot tell a billing suspension from a manual one -- read the list.",
+        )
+        parser.add_argument(
+            "--commit", action="store_true",
+            help="Actually reconnect. Without it, nothing changes.",
+        )
+
+    def handle(self, *args, **options):
+        from customers.models import Customer
+
+        from billing import reactivation
+
+        customer = None
+        if options["client_code"]:
+            code = options["client_code"].strip()
+            customer = Customer.objects.filter(customer_id__iexact=code).first()
+            if customer is None:
+                self.stderr.write(f'No customer with client code "{code}".')
+                return
+
+        unflagged = options["include_unflagged"]
+        found = reactivation.candidates(customer=customer, include_unflagged=unflagged)
+
+        if unflagged:
+            self.stdout.write(
+                "INCLUDING UNFLAGGED services -- these may have been suspended by "
+                "hand for reasons that have nothing to do with money. Read every "
+                "line below before committing.\n"
+            )
+
+        if not found:
+            self.stdout.write("Nothing to reconnect: no suspended service has a clear balance.")
+            return
+
+        verb = "Reconnecting" if options["commit"] else "Would reconnect"
+        self.stdout.write(f"{verb} {len(found)} service(s)\n")
+
+        for service, config in found:
+            owner = service.customer
+            flag = "billing" if service.suspended_for_nonpayment else "UNFLAGGED"
+            self.stdout.write(
+                f"  {(owner.customer_id or '-'):<12} {owner.full_name[:26]:<28} "
+                f"service #{service.pk:<5} balance {owner.balance:>10,.2f}  "
+                f"minimum {config.minimum_balance:>8,.2f}  [{flag}]"
+            )
+
+        if not options["commit"]:
+            self.stdout.write(
+                "\nNothing was changed. Add --commit when the list above looks right."
+            )
+            return
+
+        done = failed = 0
+        for service, _config in found:
+            try:
+                reactivation.reactivate(service, reason="apply_reactivations")
+                done += 1
+            except Exception as exc:
+                failed += 1
+                self.stderr.write(f"    FAILED service #{service.pk}: {exc}")
+
+        self.stdout.write(f"\nReconnected {done} service(s)" + (f", {failed} failed" if failed else ""))

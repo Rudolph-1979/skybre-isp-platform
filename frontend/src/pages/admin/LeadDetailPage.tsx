@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
 import { PageHeader } from "../../components/PageHeader";
 import { Modal, FormField, inputClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import {
-  LEAD_NOTE_KINDS, LEAD_SOURCES, LOST_REASONS, LeadStatusBadge,
+  LEAD_NOTE_KINDS, LEAD_SOURCES, LeadStatusBadge, gpsText, parseGps,
 } from "../../components/LeadBits";
-import { LEAD_STAGES } from "../../types";
-import type { Lead, LeadNote, LeadStatus, Partner, Tariff, User } from "../../types";
+import { LeadFlowPanel, LeadStepper, LostModal } from "../../components/LeadFlow";
+import type { Lead, LeadNote, Partner, Tariff, User } from "../../types";
 
 /**
  * One lead: who they are, what stage they're at, and the conversation so
@@ -42,7 +42,6 @@ function money(value: string) {
 
 export function LeadDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const navigate = useNavigate();
   const [lead, setLead] = useState<Lead | null>(null);
   const [notes, setNotes] = useState<LeadNote[]>([]);
   const [loading, setLoading] = useState(true);
@@ -54,8 +53,8 @@ export function LeadDetailPage() {
   const [noteFollowUp, setNoteFollowUp] = useState("");
 
   const [showEdit, setShowEdit] = useState(false);
-  const [showLost, setShowLost] = useState(false);
-  const [lostReason, setLostReason] = useState("no_coverage");
+  // The lost dialog, opened with the reason that fits where it was lost.
+  const [lostReason, setLostReason] = useState<string | null>(null);
 
   const { items: partners } = useApiList<Partner>("/partners/?page_size=200&ordering=name");
   const { items: tariffs } = useApiList<Tariff>("/tariffs/?page_size=200");
@@ -95,15 +94,11 @@ export function LeadDetailPage() {
     }
   }
 
-  async function moveStage(status: LeadStatus) {
-    // Lost needs a reason, so it goes through the dialog rather than
-    // straight onto the record. The rule is enforced on the backend too;
-    // this just means the person is asked instead of refused.
-    if (status === "lost") {
-      setShowLost(true);
-      return;
-    }
-    await patch({ status, lost_reason: "" });
+  function defaultLostReason(l: Lead) {
+    if (l.status === "quoted") return "quote_rejected";
+    if (l.coverage_result === "fail") return "no_los";
+    if (l.coverage_result === "fibre_unavailable") return "no_fibre";
+    return "went_quiet";
   }
 
   async function addNote(e: FormEvent) {
@@ -126,21 +121,10 @@ export function LeadDetailPage() {
     }
   }
 
-  async function convert() {
-    setBusy(true);
-    try {
-      const res = await api.post<{ customer_id: number }>(`/leads/${id}/convert/`);
-      navigate(`/admin/customers/${res.data.customer_id}`);
-    } catch {
-      setError("Couldn't convert this lead.");
-      setBusy(false);
-    }
-  }
-
   if (loading && !lead) return <p className="text-sm text-[var(--text-muted)]">Loading…</p>;
   if (!lead) return <p className="text-sm text-[var(--status-critical)]">{error || "Not found."}</p>;
 
-  const canConvert = !lead.customer;
+  const isOpen = lead.status !== "won" && lead.status !== "lost";
 
   return (
     <div>
@@ -157,11 +141,21 @@ export function LeadDetailPage() {
             <button className={btnSecondary} onClick={() => setShowEdit(true)}>
               Edit
             </button>
-            {canConvert ? (
-              <button className={btnPrimary} disabled={busy} onClick={convert}>
-                Convert to customer
+            {isOpen && (
+              <button className={btnSecondary} disabled={busy} onClick={() => setLostReason(defaultLostReason(lead))}>
+                Mark lost…
               </button>
-            ) : (
+            )}
+            {lead.status === "lost" && (
+              <button
+                className={btnSecondary}
+                disabled={busy}
+                onClick={() => patch({ status: lead.lost_at_stage || "new", lost_reason: "" })}
+              >
+                Reopen
+              </button>
+            )}
+            {lead.customer && (
               <Link to={`/admin/customers/${lead.customer}`} className={btnPrimary}>
                 Open {lead.customer_reference || "customer"}
               </Link>
@@ -176,32 +170,25 @@ export function LeadDetailPage() {
         </p>
       )}
 
-      {/* Stage picker. The whole path is visible rather than a dropdown --
-          a rep should be able to see where a deal is without opening
-          anything. */}
-      <div className="mb-6 flex flex-wrap gap-1.5">
-        {LEAD_STAGES.map((s) => (
-          <button
-            key={s}
-            type="button"
-            disabled={busy || s === lead.status}
-            onClick={() => moveStage(s)}
-            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
-              s === lead.status
-                ? "bg-[var(--series-1)] text-white"
-                : "bg-[var(--surface-1)] text-[var(--text-secondary)] ring-1 ring-[var(--border-hairline)] hover:bg-[var(--tint-hover)]"
-            }`}
-          >
-            {s.charAt(0).toUpperCase() + s.slice(1)}
-          </button>
-        ))}
-      </div>
+      {/* Where the lead is on Rudolph's flow (6 Oct 2026). Moving it on
+          happens in the cards below -- each step does its own bookkeeping. */}
+      <LeadStepper lead={lead} />
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* Facts */}
         <div className="space-y-4 lg:col-span-1">
           <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4 text-sm">
             <Row label="Stage" value={<LeadStatusBadge lead={lead} />} />
+            {lead.next_action?.text && (
+              <Row
+                label="Next"
+                value={
+                  <span style={{ color: lead.next_action.late ? "var(--status-warning)" : undefined }}>
+                    {lead.next_action.text}
+                  </span>
+                }
+              />
+            )}
             <Row label="Value / month" value={money(lead.value)} />
             <Row label="Interested in" value={lead.tariff_name || "Not sure yet"} />
             <Row
@@ -232,6 +219,21 @@ export function LeadDetailPage() {
             <Row label="Phone" value={lead.phone || "—"} />
             <Row label="Email" value={lead.email || "—"} />
             <Row label="Address" value={[lead.address, lead.city, lead.zip_code].filter(Boolean).join(", ") || "—"} />
+            {lead.latitude && lead.longitude && (
+              <Row
+                label="GPS"
+                value={
+                  <a
+                    className="text-[var(--series-1)] hover:underline"
+                    href={`https://www.google.com/maps?q=${lead.latitude},${lead.longitude}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {gpsText(lead)}
+                  </a>
+                }
+              />
+            )}
             <Row label="Added" value={formatWhen(lead.created_at)} />
             {lead.closed_at && <Row label="Closed" value={formatWhen(lead.closed_at)} />}
           </div>
@@ -246,8 +248,19 @@ export function LeadDetailPage() {
           )}
         </div>
 
-        {/* Timeline */}
+        {/* The flow, then the timeline */}
         <div className="lg:col-span-2">
+          <LeadFlowPanel
+            lead={lead}
+            tariffs={tariffs}
+            partners={partners}
+            staff={staff}
+            busy={busy}
+            onChanged={load}
+            onQualify={() => patch({ status: "qualified", lost_reason: "" })}
+            onLost={(reason) => setLostReason(reason)}
+          />
+
           <form
             onSubmit={addNote}
             className="mb-4 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-1)] p-4"
@@ -334,38 +347,16 @@ export function LeadDetailPage() {
         </div>
       </div>
 
-      {showLost && (
-        <Modal title="Mark this lead lost" onClose={() => setShowLost(false)}>
-          <p className="mb-3 text-sm text-[var(--text-secondary)]">
-            Why did it go? This is the part worth knowing later — it's the difference between
-            "our pricing is wrong" and "we need a tower there".
-          </p>
-          <FormField label="Reason" required>
-            <select className={inputClass} value={lostReason} onChange={(e) => setLostReason(e.target.value)}>
-              {LOST_REASONS.map((r) => (
-                <option key={r.key} value={r.key}>
-                  {r.label}
-                </option>
-              ))}
-            </select>
-          </FormField>
-          <div className="mt-4 flex justify-end gap-2">
-            <button type="button" className={btnSecondary} onClick={() => setShowLost(false)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className={btnPrimary}
-              disabled={busy}
-              onClick={async () => {
-                const ok = await patch({ status: "lost", lost_reason: lostReason });
-                if (ok) setShowLost(false);
-              }}
-            >
-              Mark lost
-            </button>
-          </div>
-        </Modal>
+      {lostReason !== null && (
+        <LostModal
+          lead={lead}
+          initialReason={lostReason}
+          onClose={() => setLostReason(null)}
+          onDone={() => {
+            setLostReason(null);
+            load();
+          }}
+        />
       )}
 
       {showEdit && (
@@ -420,6 +411,7 @@ function EditLeadModal({
     address: lead.address,
     city: lead.city,
     zip_code: lead.zip_code,
+    gps: gpsText(lead),
     source: lead.source,
     source_detail: lead.source_detail,
     partner: lead.partner ? String(lead.partner) : "",
@@ -430,12 +422,20 @@ function EditLeadModal({
     notes: lead.notes,
   });
 
+  const [gpsError, setGpsError] = useState("");
+
   return (
     <Modal title="Edit lead" onClose={onClose}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          const payload: Record<string, unknown> = { ...form };
+          const gps = parseGps(form.gps);
+          if (!gps) {
+            setGpsError("GPS should look like -24.8841, 28.2906 (paste it from Google Maps).");
+            return;
+          }
+          const { gps: _gps, ...rest } = form;
+          const payload: Record<string, unknown> = { ...rest, latitude: gps[0], longitude: gps[1] };
           for (const key of [
             "partner", "assigned_to", "interested_tariff", "estimated_monthly_value", "next_follow_up",
           ]) {
@@ -487,6 +487,17 @@ function EditLeadModal({
               className={inputClass}
               value={form.city}
               onChange={(e) => setForm({ ...form, city: e.target.value })}
+            />
+          </FormField>
+          <FormField label="GPS">
+            <input
+              className={inputClass}
+              placeholder="-24.8841, 28.2906"
+              value={form.gps}
+              onChange={(e) => {
+                setGpsError("");
+                setForm({ ...form, gps: e.target.value });
+              }}
             />
           </FormField>
           <FormField label="Source">
@@ -577,6 +588,7 @@ function EditLeadModal({
             onChange={(e) => setForm({ ...form, notes: e.target.value })}
           />
         </FormField>
+        {gpsError && <p className="mt-2 text-sm text-[var(--status-critical)]">{gpsError}</p>}
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" className={btnSecondary} onClick={onClose}>
             Cancel

@@ -21,7 +21,11 @@ export function LoginPage() {
     try {
       const user = await login(username, password, needsCode ? totpCode : undefined);
       const isStaff = user.role !== "customer";
-      navigate(isStaff ? "/admin" : "/portal");
+      // ?next= (only a path on this site) -- used by the FNB callback page
+      // to come back after signing in (#185).
+      const next = new URLSearchParams(window.location.search).get("next") || "";
+      if (isStaff && next.startsWith("/") && !next.startsWith("//")) navigate(next);
+      else navigate(isStaff ? "/admin" : "/portal");
     } catch (err) {
       const data = (err as { response?: { data?: { code?: string } } })?.response?.data;
       if (data?.code === "two_factor_required") {

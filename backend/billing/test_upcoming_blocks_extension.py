@@ -1,0 +1,68 @@
+"""The dashboard's "Blocking soon" list has to honour an approved suspension
+extension, the same as the billing run does (6 Oct 2026: Tapiwa Mashava,
+SWF2613, extension approved through 5 Nov, still listed as "Blocking
+tomorrow"). Dates are relative to today so these don't rot."""
+import datetime
+from decimal import Decimal
+
+from django.test import TestCase
+from django.utils import timezone
+
+from customers.models import Customer
+
+from .models import CustomerBillingConfig, Invoice, Service, Tariff
+from .recurring import blocking_candidate_services, upcoming_blocks
+
+
+class UpcomingBlocksExtensionTests(TestCase):
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.tomorrow = self.today + datetime.timedelta(days=1)
+        tariff = Tariff.objects.create(name="Home 20", price=Decimal("500.00"), tax_rate_pct=Decimal("15.00"))
+        self.customer = Customer.objects.create(
+            full_name="Tapiwa", status=Customer.Status.ACTIVE, balance=Decimal("1569.00"),
+        )
+        Service.objects.create(
+            customer=self.customer, tariff=tariff, status=Service.Status.ACTIVE,
+            start_date=self.today - datetime.timedelta(days=120), radius_username="tapiwa",
+        )
+        self.config = CustomerBillingConfig.for_customer(self.customer)
+        self.config.billing_enabled = True
+        self.config.auto_create_invoices = False
+        self.config.blocking_period_days = 4
+        self.config.save()
+        Invoice.objects.filter(
+            pk=Invoice.objects.create(
+                customer=self.customer, status=Invoice.Status.UNPAID,
+                date_due=self.today - datetime.timedelta(days=60),
+            ).pk
+        ).update(total=Decimal("1569.00"))
+
+    def refs(self, horizon):
+        return {r["customer"]: r for r in upcoming_blocks(self.tomorrow, horizon_days=horizon)}
+
+    def test_listed_without_an_extension(self):
+        self.assertIn(self.customer.pk, self.refs(7))
+
+    def test_extension_keeps_them_off_the_list(self):
+        self.config.suspension_extended_until = self.today + datetime.timedelta(days=30)
+        self.config.save()
+        self.assertNotIn(self.customer.pk, self.refs(7))
+
+    def test_block_date_is_the_extension_date_itself(self):
+        """20 Oct 2026 (Rudolph): the agreed date is the cut-off day -- not
+        the working day after it, and any day of the week."""
+        until = self.today + datetime.timedelta(days=10)
+        self.config.suspension_extended_until = until
+        self.config.save()
+        row = self.refs(40)[self.customer.pk]
+        self.assertEqual(row["block_date"], until)
+        self.assertTrue(row["extension_date"])
+        # ... and agrees with the run's own predicate.
+        self.assertEqual(blocking_candidate_services(self.customer, self.config, until - datetime.timedelta(days=1)), [])
+        self.assertNotEqual(blocking_candidate_services(self.customer, self.config, until), [])
+
+    def test_an_expired_extension_changes_nothing(self):
+        self.config.suspension_extended_until = self.today - datetime.timedelta(days=1)
+        self.config.save()
+        self.assertIn(self.customer.pk, self.refs(7))

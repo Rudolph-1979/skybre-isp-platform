@@ -1,31 +1,298 @@
+import re
+
+from django.contrib.auth import get_user_model
+from django.utils.text import slugify
 from rest_framework import serializers
-from .models import Job, Shift
+from .models import Job, JobType, SchedulingSettings, Shift
+
+HEX_COLOUR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+class JobTypeSerializer(serializers.ModelSerializer):
+    """Scheduling -> Job types. `key` is made from the name on create and
+    never changes after, so renaming relabels existing jobs."""
+
+    job_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = JobType
+        fields = ["id", "key", "name", "colour", "is_active", "sort_order", "job_count"]
+        read_only_fields = ["id", "key", "job_count"]
+
+    def get_job_count(self, obj):
+        counts = self.context.get("job_counts")
+        if counts is not None:
+            return counts.get(obj.key, 0)
+        return Job.objects.filter(job_type=obj.key).count()
+
+    def validate_name(self, value):
+        value = " ".join((value or "").split())
+        if not value:
+            raise serializers.ValidationError("Give the job type a name.")
+        clash = JobType.objects.filter(name__iexact=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(f"There is already a job type called {value}.")
+        return value
+
+    def validate_colour(self, value):
+        if not HEX_COLOUR.match(value or ""):
+            raise serializers.ValidationError("Colour must look like #1baf7a.")
+        return value.lower()
+
+    def create(self, validated_data):
+        base = slugify(validated_data["name"]).replace("-", "_")[:40] or "type"
+        key, n = base, 2
+        while JobType.objects.filter(key=key).exists():
+            key = f"{base}_{n}"
+            n += 1
+        validated_data["key"] = key
+        if "sort_order" not in validated_data:
+            last = JobType.objects.order_by("-sort_order").values_list("sort_order", flat=True).first() or 0
+            validated_data["sort_order"] = last + 10
+        return super().create(validated_data)
+
+#: Same roles as Job.assigned_technicians' own limit_choices_to. Spelled out
+#: again here because DRF's auto-generated field for a M2M does not reliably
+#: apply a model field's limit_choices_to the way it does for a plain FK --
+#: without this a customer or an accounts-only login neither the calendar
+#: dropdown nor the model would ever offer could still be POSTed in directly.
+TECHNICIAN_ROLES = ["admin", "support", "sales", "technician", "management", "accounts"]
+
+
+def staff_display_name(user):
+    """What to call a staff member on a calendar.
+
+    Their first name, falling back to the username. The username is a
+    LOGIN -- "cbosman", "admin2" -- and these fields were serialising it
+    straight onto the schedule, so a calendar of who is doing what showed
+    account names instead of people. Every staff dropdown on the page
+    already does `first_name || username`; this is the same rule on the
+    other side of the API, so the chip and the picker agree.
+
+    First name rather than full name on purpose: a month cell is about
+    120px wide, and a chip that truncates loses the surname anyway --
+    while costing the job title the room it needed to be recognisable.
+    """
+    if user is None:
+        return None
+    return (getattr(user, "first_name", "") or "").strip() or user.username
+
+
+
+#: What the technician's PHONE says about a job, as one value the calendar
+#: can render.
+#:
+#: "not_dispatched" is deliberately not folded into "pending". Pending means
+#: Conecto has the job and the technician has not set off yet. Not
+#: dispatched means it never reached a phone at all -- nobody assigned,
+#: assigned to somebody who is not a technician, or a push that failed.
+#: Showing both as "Pending" would hide the one that needs somebody to act,
+#: behind the one that needs nobody to do anything.
+FIELD_STATUS = {
+    "": "pending",
+    "scheduled": "pending",
+    "en_route": "en_route",
+    "checked_in": "checked_in",
+    "checked_out": "completed",
+    "completed": "completed",
+    "cancelled": "cancelled",
+}
+
+
+def _one_field_status(conecto_job):
+    """Same mapping as before, for one technician's own push record.
+
+    An unknown value passes through rather than becoming "pending": a
+    status we have not seen before should appear on screen as itself, so
+    somebody asks about it, rather than being quietly rounded down to the
+    most reassuring thing we have.
+    """
+    if conecto_job is None:
+        return "not_dispatched"
+    return FIELD_STATUS.get(conecto_job.last_status, conecto_job.last_status or "pending")
+
+
+def field_status(job):
+    """Kept for anything still calling the old singular helper directly
+    (management commands, a shell one-liner) -- the first technician's
+    status, or not_dispatched if the job carries nobody. `technicians`
+    below is what the API and the frontend actually use now that a job
+    can have more than one person on it, each possibly at a different
+    stage of their own drive.
+    """
+    links = {cj.technician_id: cj for cj in getattr(job, "conecto_jobs").all()}
+    technicians = list(job.assigned_technicians.all())
+    if not technicians:
+        return "not_dispatched"
+    return _one_field_status(links.get(technicians[0].id))
 
 
 class JobSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(source="customer.full_name", read_only=True, default=None)
-    assigned_to_name = serializers.CharField(source="assigned_to.username", read_only=True, default=None)
     ticket_number = serializers.CharField(source="ticket.ticket_number", read_only=True, default=None)
+    # Attached quote (8 Oct 2026): number, total and kind for the form.
+    quote_number = serializers.CharField(source="quote.number", read_only=True, default=None)
+    quote_total = serializers.DecimalField(
+        source="quote.total", max_digits=12, decimal_places=2, read_only=True, default=None
+    )
+    quote_status = serializers.CharField(source="quote.status", read_only=True, default=None)
+    # One entry per assigned technician, each with THEIR OWN field_status --
+    # two people on the same job can be at different stages (one en route,
+    # one already checked in), so this can no longer be a single value the
+    # way it was when a job only ever had one person on it. Ordered by name
+    # so the calendar chip and the modal always list the same two people in
+    # the same order.
+    technicians = serializers.SerializerMethodField()
+    assigned_technicians = serializers.PrimaryKeyRelatedField(
+        many=True, required=False,
+        queryset=get_user_model().objects.filter(role__in=TECHNICIAN_ROLES),
+    )
+
+    def get_technicians(self, obj):
+        links = {cj.technician_id: cj for cj in obj.conecto_jobs.all()}
+        people = sorted(obj.assigned_technicians.all(), key=lambda u: staff_display_name(u) or "")
+        return [
+            {
+                "id": u.id,
+                "name": staff_display_name(u),
+                "field_status": _one_field_status(links.get(u.id)),
+            }
+            for u in people
+        ]
 
     class Meta:
         model = Job
         fields = [
             "id", "customer", "customer_name", "ticket", "ticket_number",
-            "assigned_to", "assigned_to_name", "job_type", "title", "description",
-            "status", "start", "end", "location", "created_at", "updated_at",
+            "quote", "quote_number", "quote_total", "quote_status",
+            "assigned_technicians", "technicians", "job_type", "title", "description",
+            "status", "start", "end", "location",
+            "created_at", "updated_at", "deleted_at", "deleted_by_name",
+            "returned_at", "return_reason", "return_count", "urgent",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "created_at", "updated_at", "deleted_at", "deleted_by_name",
+            "returned_at", "return_reason", "return_count",
+        ]
+
+    deleted_by_name = serializers.SerializerMethodField()
+
+    def get_deleted_by_name(self, obj):
+        return staff_display_name(obj.deleted_by) if obj.deleted_by_id else None
+
+    def validate_job_type(self, value):
+        """One of the Scheduling -> Job types. A switched-off type is refused
+        for a new job or a change of type, but a job already carrying it
+        can still be saved."""
+        jt = JobType.objects.filter(key=value).first()
+        if jt is None:
+            raise serializers.ValidationError("Choose a job type from the list.")
+        unchanged = self.instance is not None and self.instance.job_type == value
+        if not jt.is_active and not unchanged:
+            raise serializers.ValidationError(f"{jt.name} is switched off. Choose another job type.")
+        return value
 
     def validate(self, attrs):
         start = attrs.get("start", getattr(self.instance, "start", None))
         end = attrs.get("end", getattr(self.instance, "end", None))
+
+        # An attached quote must be this client's, and still a quote or pro
+        # forma when it is attached (later conversion to an invoice is fine).
+        quote = attrs.get("quote")
+        if quote is not None and quote.pk != getattr(self.instance, "quote_id", None):
+            customer = attrs["customer"] if "customer" in attrs else getattr(self.instance, "customer", None)
+            if customer is None:
+                raise serializers.ValidationError({"quote": "Pick the client before attaching their quote."})
+            if quote.customer_id != customer.pk:
+                raise serializers.ValidationError({"quote": "That quote belongs to another client."})
+            if quote.status not in ("quote", "proforma"):
+                raise serializers.ValidationError({"quote": "Only a quote or pro forma can be attached."})
+
+        # Half-blank is not a real state: either both are set (scheduled) or
+        # neither is (pooled, unscheduled). One without the other would sort
+        # nowhere sensible (Job.Meta.ordering is by start) and would dodge
+        # the calendar's own start_from/start_to filters without actually
+        # being poolable either.
+        if bool(start) != bool(end):
+            raise serializers.ValidationError(
+                "Start and end must be set together, or both left blank to add this job to the pool."
+            )
         if start and end and end <= start:
             raise serializers.ValidationError("End time must be after the start time.")
+
+        # No scheduling without somewhere to go (Rudolph, 8 Oct 2026: "reject
+        # scheduling if a address or coordinates are not inserted"). The
+        # pool is exempt -- a job can wait there while the address is
+        # found -- and so are Completed / Cancelled jobs, which nobody is
+        # being sent to.
+        # Checked when the save is about scheduling (new job, or a change to
+        # time, place, client, technicians or status) -- a title tweak on a
+        # job already in the diary isn't refused for an old gap.
+        status = attrs.get("status", getattr(self.instance, "status", Job.Status.SCHEDULED))
+        scheduling_change = self.instance is None or any(
+            key in attrs for key in ("start", "end", "location", "customer", "assigned_technicians", "status")
+        )
+        if start and scheduling_change and status in (Job.Status.SCHEDULED, Job.Status.IN_PROGRESS):
+            location = attrs.get("location", getattr(self.instance, "location", ""))
+            customer = attrs["customer"] if "customer" in attrs else getattr(self.instance, "customer", None)
+            if not has_job_address(location, customer):
+                raise serializers.ValidationError(
+                    "Add an address or GPS coordinates before scheduling: type one in Location, "
+                    "or add a street address or GPS pin to the client. "
+                    "Leave the time blank to keep the job in the pool until then."
+                )
+
+        # A pool job (no start) can't carry technicians. Conecto's push
+        # (conecto/signals.py's _schedule_job, on post_save AND on the
+        # assigned_technicians m2m changing) dispatches to whoever is
+        # assigned regardless of whether the job has a time -- there is no
+        # guard on job.start there, so an assigned-but-undated job would
+        # send a technician's phone a real job with a blank start instead of
+        # quietly waiting in the pool. Scheduling and assigning happen
+        # together, not one before the other.
+        if not start:
+            technicians = attrs.get("assigned_technicians", None)
+            if technicians is None and self.instance is not None:
+                technicians = list(self.instance.assigned_technicians.all())
+            if technicians:
+                raise serializers.ValidationError(
+                    "A job in the pool can't have technicians assigned yet — assign them when you schedule it."
+                )
+
+        # Sending an already-in-progress or completed job back to the pool
+        # would un-happen work that (per Conecto, or the office) already
+        # happened. Cancelled is also refused: a cancelled job needs no
+        # further scheduling, pool included.
+        if not start and self.instance is not None and self.instance.start:
+            current_status = attrs.get("status", self.instance.status)
+            if current_status != Job.Status.SCHEDULED:
+                raise serializers.ValidationError(
+                    "Only a Scheduled job can be sent back to the pool."
+                )
+
         return attrs
 
 
+def has_job_address(location, customer):
+    """Somewhere a technician can navigate to: the job's own Location, or
+    the client's street address / area, or the client's GPS pin. A town or
+    postal code on its own is not enough to find a house."""
+    if (location or "").strip():
+        return True
+    if customer is None:
+        return False
+    if (customer.address or "").strip() or (customer.complex_or_area or "").strip():
+        return True
+    return customer.latitude is not None and customer.longitude is not None
+
+
 class ShiftSerializer(serializers.ModelSerializer):
-    staff_name = serializers.CharField(source="staff.username", read_only=True)
+    staff_name = serializers.SerializerMethodField()
+
+    def get_staff_name(self, obj):
+        return staff_display_name(obj.staff)
 
     class Meta:
         model = Shift
@@ -38,3 +305,10 @@ class ShiftSerializer(serializers.ModelSerializer):
         if start and end and end <= start:
             raise serializers.ValidationError("End time must be after the start time.")
         return attrs
+
+
+class SchedulingSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SchedulingSettings
+        fields = ["auto_return_enabled", "auto_return_time", "last_auto_return_on"]
+        read_only_fields = ["last_auto_return_on"]

@@ -1,0 +1,54 @@
+"""Paying / Sponsor / Deal with a reason (Rudolph, 6 Oct 2026)."""
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from customers.models import Customer
+
+User = get_user_model()
+
+
+class AccountTypeTests(TestCase):
+    def setUp(self):
+        self.api = APIClient()
+        self.api.force_authenticate(User.objects.create_user(username="a", password="x", role="admin"))
+
+    def test_default_is_paying(self):
+        res = self.api.post("/api/customers/", {"full_name": "Plain"}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["account_type"], "paying")
+        self.assertEqual(res.data["account_type_reason"], "")
+
+    def test_sponsor_needs_a_reason(self):
+        res = self.api.post("/api/customers/", {"full_name": "Club", "account_type": "sponsor"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("account_type_reason", res.data)
+        res = self.api.post(
+            "/api/customers/",
+            {"full_name": "Club", "account_type": "sponsor", "account_type_reason": "  Rugby club sponsorship "},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["account_type_reason"], "Rugby club sponsorship")
+
+    def test_back_to_paying_drops_the_reason(self):
+        c = Customer.objects.create(full_name="Deal", account_type="deal", account_type_reason="3 months half price")
+        res = self.api.patch(f"/api/customers/{c.id}/", {"account_type": "paying"}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        c.refresh_from_db()
+        self.assertEqual(c.account_type_reason, "")
+
+    def test_editing_other_fields_leaves_it_alone(self):
+        c = Customer.objects.create(full_name="Deal", account_type="deal", account_type_reason="Launch deal")
+        res = self.api.patch(f"/api/customers/{c.id}/", {"phone": "082"}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        c.refresh_from_db()
+        self.assertEqual((c.account_type, c.account_type_reason), ("deal", "Launch deal"))
+
+    def test_filter_and_sort(self):
+        Customer.objects.create(full_name="A", account_type="sponsor", account_type_reason="x")
+        Customer.objects.create(full_name="B")
+        names = [r["full_name"] for r in self.api.get("/api/customers/?account_type=sponsor").data["results"]]
+        self.assertEqual(names, ["A"])
+        res = self.api.get("/api/customers/?ordering=account_type")
+        self.assertEqual(res.status_code, 200)

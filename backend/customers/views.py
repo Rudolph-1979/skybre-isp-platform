@@ -11,9 +11,15 @@ from rest_framework.exceptions import MethodNotAllowed
 from rest_framework.response import Response
 from .models import Customer, CustomerDeletionRequest, CustomerTask, Partner
 from .serializers import (
+    ClientAccountTypeSerializer,
     CustomerSerializer, CustomerDeletionRequestSerializer, CustomerTaskSerializer, PartnerSerializer,
 )
 from .filters import CustomerFilter, CustomerTaskFilter
+from .suspension import suspension_state
+from .scoping import (
+    allowed_partner_ids, is_partner_restricted, partner_condition, sees_direct,
+)
+from .payment_status import annotate_payment_status
 from accounts.permissions import IsManagement, IsStaffMember, section_permission
 from config.csv_import import CSVImportMixin
 
@@ -43,7 +49,8 @@ def public_ip_prefetch():
             # Terminated lines are excluded: their address has been released
             # back to the pool and belongs to whoever holds it now. Showing it
             # against the old customer would send support to the wrong house.
-            queryset=Service.objects.exclude(status=Service.Status.TERMINATED).order_by("id"),
+            queryset=Service.objects.exclude(status=Service.Status.TERMINATED)
+            .select_related("partner").order_by("id"),
         ),
         # select_related("pool") because Service.public_ip reads
         # addr.pool.category, which would otherwise be one query per address.
@@ -64,20 +71,56 @@ def scope_customers_to_user(qs, user):
 
     Partner visibility restriction (see User.allowed_partners): empty
     means unrestricted, same convention as allowed_sections. Admin always
-    sees everything regardless. Restricted staff still see customers with
-    no partner at all (direct customers aren't "owned" by any reseller).
+    sees everything regardless. Restricted staff see direct customers (no
+    partner) only when "Direct" is ticked for them (customers.scoping).
     A customer-role user sees only their own record; anyone with neither
     a staff role nor a customer profile sees nothing.
     """
     if user.is_staff_member:
-        allowed = getattr(user, "allowed_partners", None) or []
-        if allowed and user.role != user.Role.ADMIN:
-            qs = qs.filter(Q(partner_id__in=allowed) | Q(partner__isnull=True))
-        return qs
+        condition = partner_condition(user)
+        return qs if condition is None else qs.filter(condition)
     customer_profile = getattr(user, "customer_profile", None)
     if customer_profile is None:
         return qs.none()
     return qs.filter(pk=customer_profile.pk)
+
+
+class ClientAccountTypeViewSet(viewsets.ModelViewSet):
+    """Customers -> Account types: Paying, Sponsor, Deal, Staff, and what
+    else staff add (Rudolph, 6 Oct 2026). Anyone with the Customers section
+    can manage the list. A type in use can't be deleted (switch it off);
+    Paying can't be deleted at all."""
+
+    serializer_class = ClientAccountTypeSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember, section_permission("customers")]
+    pagination_class = None
+    filterset_fields = ["is_active"]
+
+    def get_queryset(self):
+        from .models import ClientAccountType
+
+        return ClientAccountType.objects.all()
+
+    def get_serializer_context(self):
+        from django.db.models import Count
+
+        context = super().get_serializer_context()
+        context["customer_counts"] = dict(
+            Customer.objects.values("account_type").annotate(n=Count("id")).values_list("account_type", "n")
+        )
+        return context
+
+    def destroy(self, request, *args, **kwargs):
+        option = self.get_object()
+        if option.key == Customer.AccountType.PAYING:
+            return Response({"detail": "Paying is the default and can't be deleted."}, status=400)
+        used = Customer.objects.filter(account_type=option.key).count()
+        if used:
+            return Response(
+                {"detail": f"{used} client{'s are' if used != 1 else ' is'} on {option.name}. Switch it off instead."},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class PartnerViewSet(viewsets.ModelViewSet):
@@ -97,6 +140,13 @@ class PartnerViewSet(viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [permissions.IsAuthenticated(), IsStaffMember()]
         return [permissions.IsAuthenticated(), IsStaffMember(), IsManagement()]
+
+
+def _payer_ratings(customers):
+    """Payer rating for these rows (billing.payer_rating); staff-only data."""
+    from billing.payer_rating import ratings
+
+    return ratings([c.pk for c in customers])
 
 
 class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
@@ -125,6 +175,7 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         "full_name", "company_name", "email", "phone", "customer_id",
         "city", "address", "zip_code", "id_number", "vat_number",
         "status", "category", "customer_type", "balance",
+        "account_type", "account_type_reason",
         "partner__name",
         "assigned_staff__username", "assigned_staff__first_name", "assigned_staff__last_name",
         # Public IP, both ways a service can hold one, plus the login that
@@ -132,7 +183,13 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         "services__static_ip", "services__ip_addresses__address",
         "services__radius_username",
     ]
-    ordering_fields = ["created_at", "full_name", "customer_id", "category", "city", "status", "balance"]
+    # payment_rank is annotated in get_queryset (customers.payment_status):
+    # the Payment status column sorts worst first -- overdue, partially
+    # paid, unpaid, paid up, in credit.
+    ordering_fields = [
+        "created_at", "full_name", "customer_id", "category", "address", "city", "status", "balance",
+        "payment_rank", "account_type", "payment_method_name", "start_date",
+    ]
 
     import_model = Customer
     import_fields = {
@@ -173,6 +230,14 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
             "aliases": ["ID number", "Id number", "Identity number", "Registration number", "Company registration"],
         },
         "vat_number": {"default": "", "aliases": ["VAT number", "Vat number", "VAT ID", "VAT no"]},
+        # Business contact person (business lines) -- the person to deal with,
+        # as opposed to the account holder the rest of the row describes.
+        "contact_person": {"default": "", "aliases": ["Contact person", "Contact name", "Representative"]},
+        "contact_person_phone": {"default": "", "aliases": ["Contact person phone", "Contact phone", "Representative phone"]},
+        "contact_person_email": {"default": "", "aliases": ["Contact person email", "Contact email", "Representative email"]},
+        # Secondary contact (residential lines) -- a second number on standby.
+        "secondary_contact_name": {"default": "", "aliases": ["Second contact name", "2nd contact name", "Secondary contact"]},
+        "secondary_contact_phone": {"default": "", "aliases": ["Second contact phone", "2nd contact phone", "Secondary phone"]},
         "customer_type": {
             "default": Customer.CustomerType.INDIVIDUAL,
             "choices": Customer.CustomerType.values,
@@ -230,7 +295,8 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         partner_name = (cleaned.pop("partner_name", "") or "").strip()
         requested = (self.request.data.get("partner") or "").strip()
         user = self.request.user
-        allowed = getattr(user, "allowed_partners", None) or []
+        allowed = allowed_partner_ids(user)
+        restricted = is_partner_restricted(user)
 
         partner = None
         if partner_name:
@@ -244,21 +310,21 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         elif len(allowed) == 1:
             partner = Partner.objects.filter(pk=allowed[0]).first()
 
-        if partner is not None and allowed and user.role != user.Role.ADMIN:
+        if partner is not None and restricted:
             if partner.pk not in allowed:
                 errors.append(
                     f"You can't import customers for '{partner.name}' -- it is not one of the "
                     "resellers you have access to."
                 )
                 partner = None
-        elif partner is None and allowed and user.role != user.Role.ADMIN:
+        elif partner is None and restricted and not sees_direct(user):
             # Restricted staff with more than one allowed reseller have to
-            # say which. Importing as partner-less would publish the rows
-            # to every other reseller.
+            # say which -- unless "Direct" is ticked for them, a blank
+            # partner makes a direct customer they could not see afterwards.
             errors.append(
                 "This import needs a reseller: add a 'Partner' column, or send a `partner` "
-                "field with the upload. Leaving it blank would make these customers visible "
-                "to every reseller."
+                "field with the upload. Leaving it blank would make these direct customers, "
+                "which you don't have access to."
             )
         cleaned["partner"] = partner
 
@@ -334,25 +400,244 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
         # records requires the Customers section itself.
         # "ids" backs the Customers page's select-all checkbox -- same
         # access tier as "list" since it's just ids off the same queryset.
-        if self.action in ("list", "ids"):
+        # "picker" is the same argument again, and belongs here for the
+        # reason the comment above already gives: it IS the customer picker
+        # those pages need. Requiring the Customers section for it would
+        # mean a Finance-only staff member could not name a customer on a
+        # new invoice at all -- which is worse than the truncation it was
+        # added to fix.
+        if self.action in ("list", "ids", "picker"):
             return [permissions.IsAuthenticated(), IsStaffMember()]
         return [permissions.IsAuthenticated(), IsStaffMember(), HasCustomersAccess()]
 
     def get_queryset(self):
-        return scope_customers_to_user(
-            Customer.objects.select_related("assigned_staff", "partner")
-            .prefetch_related(*public_ip_prefetch())
-            .all(),
-            self.request.user,
+        from django.db.models import F, OuterRef, Subquery
+        from django.db.models.functions import Coalesce, TruncDate
+
+        from billing.models import SuspensionExtensionRequest
+
+        pending_extension = (
+            SuspensionExtensionRequest.objects.filter(
+                customer=OuterRef("pk"), status=SuspensionExtensionRequest.Status.PENDING
+            )
+            .order_by("-created_at")
+            .values("extend_until")[:1]
+        )
+        return annotate_payment_status(
+            scope_customers_to_user(
+                Customer.objects.select_related("assigned_staff", "partner")
+                .prefetch_related(*public_ip_prefetch())
+                # Payment method column (7 Oct 2026): the method on the
+                # client's billing config, e.g. "EFT 1st" / "Debit order".
+                .annotate(payment_method_name=F("billing_config__payment_method__name"))
+                # Extension column (#194): a pending suspension-extension
+                # request, and the extension approved on the billing config.
+                .annotate(
+                    extension_pending_until=Subquery(pending_extension),
+                    extension_granted_until=F("billing_config__suspension_extended_until"),
+                )
+                # Start date column (#199): Customer.effective_signup_date in
+                # SQL, so the column can be sorted.
+                .annotate(start_date=Coalesce("signup_date", TruncDate("created_at")))
+                .all(),
+                self.request.user,
+            )
         )
 
+    # --- Online / Offline / Last seen ------------------------------------
+    #
+    # The Connection and Last seen columns come from RADIUS accounting, not
+    # from anything on Customer, so they are resolved ONCE PER PAGE and
+    # handed to the serializer through the context. Three queries for fifty
+    # customers instead of three per customer.
+    #
+    # The serializer will not compute them on its own (see the note on
+    # `online` there) -- so any code path that serialises customers and
+    # wants these populated has to set the map, and one that doesn't gets
+    # nulls rather than a silent N+1.
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["connection_map"] = getattr(self, "_connection_map", None)
+        context["suspension_map"] = getattr(self, "_suspension_map", None)
+        context["payer_map"] = getattr(self, "_payer_map", None)
+        return context
+
+    def _filter_by_connection(self, queryset, request):
+        """Apply ?connection=online|offline|none.
+
+        Kept out of CustomerFilter because it isn't a column -- it is a
+        join into radacct, and django-filter would have to materialise the
+        queryset to evaluate it. This resolves to a set of ids and hands
+        the database an IN clause, so paging still happens in Postgres.
+        """
+        value = (request.query_params.get("connection") or "").strip().lower()
+        if value not in {"online", "offline", "none"}:
+            return queryset
+
+        from radiusauth.offline import customer_ids_by_connection
+
+        online_ids, with_line_ids, line_down_ids = customer_ids_by_connection(queryset)
+        if value == "online":
+            return queryset.filter(pk__in=online_ids)
+        if value == "offline":
+            # Has a line, and at least one of its lines is not up (8 Oct
+            # 2026: a client with one of two lines down belongs here too).
+            # NOT the same as "not online", which would sweep in everyone on
+            # somebody else's network.
+            return queryset.filter(pk__in=line_down_ids)
+        return queryset.exclude(pk__in=with_line_ids)
+
+    def list(self, request, *args, **kwargs):
+        from radiusauth.offline import connection_state
+
+        queryset = self._filter_by_connection(
+            self.filter_queryset(self.get_queryset()), request
+        )
+        ordering = (request.query_params.get("ordering") or "").strip()
+        if ordering in ("last_seen", "-last_seen"):
+            return self._list_by_last_seen(queryset, descending=ordering.startswith("-"))
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            self._connection_map = connection_state(page)
+            self._suspension_map = suspension_state(page)
+            self._payer_map = _payer_ratings(page)
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        rows = list(queryset)
+        self._connection_map = connection_state(rows)
+        self._suspension_map = suspension_state(rows)
+        self._payer_map = _payer_ratings(rows)
+        return Response(self.get_serializer(rows, many=True).data)
+
+    def _list_by_last_seen(self, queryset, descending):
+        """?ordering=last_seen / -last_seen (#200, Rudolph 19 Oct 2026: "Make
+        Last Seen Sortable"). Last seen is not a column -- it comes from
+        RADIUS accounting (radiusauth.offline.connection_state) -- so the
+        filtered list is sorted here with that same function, the one the
+        column itself shows, then paged. Ascending = longest ago first.
+        "Never" (a line that has never been seen) counts as the oldest;
+        customers with no line of ours ("—") always go last."""
+        import datetime
+
+        from radiusauth.offline import connection_state
+
+        rows = list(queryset)
+        state = connection_state(rows)
+        never = datetime.datetime(1900, 1, 1, tzinfo=datetime.timezone.utc)
+
+        def key(customer):
+            entry = state.get(customer.pk)
+            seen = (entry["last_seen"] or never) if entry else None
+            return seen, (customer.full_name or "").lower(), customer.pk
+
+        with_line = sorted((c for c in rows if c.pk in state), key=key, reverse=descending)
+        no_line = sorted((c for c in rows if c.pk not in state), key=lambda c: ((c.full_name or "").lower(), c.pk))
+        ordered = with_line + no_line
+        page = self.paginate_queryset(ordered)
+        shown = page if page is not None else ordered
+        self._connection_map = {c.pk: state[c.pk] for c in shown if c.pk in state}
+        self._suspension_map = suspension_state(shown)
+        self._payer_map = _payer_ratings(shown)
+        data = self.get_serializer(shown, many=True).data
+        return self.get_paginated_response(data) if page is not None else Response(data)
+
     def retrieve(self, request, *args, **kwargs):
+        from radiusauth.offline import connection_state
+
         # Expire a lapsed live-view grant before showing the toggle, so staff
         # are never looking at a switch that says On for access that has
         # already timed out.
         instance = self.get_object()
         instance.expire_live_bandwidth_if_idle()
+        self._connection_map = connection_state([instance])
+        self._suspension_map = suspension_state([instance])
+        if getattr(request.user, "is_staff_member", False):
+            self._payer_map = _payer_ratings([instance])
         return Response(self.get_serializer(instance).data)
+
+    # --- Billing history import ------------------------------------------
+    #
+    # Lives on the CUSTOMER rather than on invoices, because the account is
+    # the thing being migrated and the page you are on is half the safety
+    # check: the file names a reference, the URL names a customer, and
+    # billing.ledger_import refuses when they disagree. A ledger landing on
+    # the wrong account is not recoverable by anything short of a restore.
+    #
+    # Preview and commit are separate endpoints on purpose, and preview is
+    # the one that matters -- it reports every row, the VAT split for each,
+    # and the net effect on the customer's balance, without writing
+    # anything. A migration nobody dry-ran is a migration nobody can undo.
+    #
+    # Management/Admin only. This writes invoices, payments and a balance.
+
+    def _ledger_bytes(self, request):
+        """Raw bytes, deliberately. Decoding here would rule out the .xlsx
+        the old system actually exports -- billing.ledger_import sniffs the
+        format and decodes text itself."""
+        upload = request.FILES.get("file")
+        if upload is None:
+            return None, "Attach the ledger export as `file`."
+        return upload.read(), None
+
+    @action(detail=True, methods=["post"], url_path="import-ledger-preview",
+            permission_classes=[permissions.IsAuthenticated, IsStaffMember, IsManagement])
+    def import_ledger_preview(self, request, pk=None):
+        from billing.ledger_import import plan
+
+        data, error = self._ledger_bytes(request)
+        if error:
+            return Response({"errors": [error]}, status=400)
+        return Response(plan(self.get_object(), data))
+
+    @action(detail=True, methods=["post"], url_path="import-ledger-commit",
+            permission_classes=[permissions.IsAuthenticated, IsStaffMember, IsManagement])
+    def import_ledger_commit(self, request, pk=None):
+        from billing.ledger_import import commit
+
+        data, error = self._ledger_bytes(request)
+        if error:
+            return Response({"errors": [error]}, status=400)
+        result = commit(self.get_object(), data, user=request.user)
+        return Response(result, status=400 if result.get("errors") else 200)
+
+    # --- Transaction report import -----------------------------------------
+    #
+    # A separate, richer file from the one above (see billing.
+    # transaction_import's module docstring): every individual debit/credit
+    # line with its own running balance, rather than one row per invoice.
+    # Same safety shape as the ledger import right above it -- preview
+    # writes nothing, commit is atomic, both refuse on a reference mismatch
+    # or a broken running-balance chain -- so it reuses the same permission
+    # class and the same raw-bytes helper.
+
+    @action(detail=True, methods=["post"], url_path="import-transactions-preview",
+            permission_classes=[permissions.IsAuthenticated, IsStaffMember, IsManagement])
+    def import_transactions_preview(self, request, pk=None):
+        from billing.transaction_import import plan
+
+        data, error = self._ledger_bytes(request)
+        if error:
+            return Response({"errors": [error]}, status=400)
+        return Response(plan(self.get_object(), data))
+
+    @action(detail=True, methods=["post"], url_path="import-transactions-commit",
+            permission_classes=[permissions.IsAuthenticated, IsStaffMember, IsManagement])
+    def import_transactions_commit(self, request, pk=None):
+        from billing.transaction_import import commit
+
+        data, error = self._ledger_bytes(request)
+        if error:
+            return Response({"errors": [error]}, status=400)
+        result = commit(self.get_object(), data, user=request.user)
+        return Response(result, status=400 if result.get("errors") else 200)
+
+    def perform_create(self, serializer):
+        customer = serializer.save()
+        # A contract to sign, when Configs -> Contracts says so. Only here,
+        # the New client form: imports and lead conversions don't pass by.
+        from contracts.services import schedule_auto_send
+
+        schedule_auto_send(customer, "new_client", self.request.user)
 
     def perform_update(self, serializer):
         customer = serializer.save()
@@ -375,6 +660,145 @@ class CustomerViewSet(CSVImportMixin, viewsets.ModelViewSet):
                 "(POST /customer-deletion-requests/) for Management to approve."
             ),
         )
+
+    @action(detail=True, methods=["get"], url_path="payment-summary")
+    def payment_summary(self, request, pk=None):
+        """The client's Overview "Payment" tile (7 Oct 2026): payment method,
+        next invoice, and when they will next be blocked -- worked out by
+        billing.recurring.upcoming_blocks, the same rule as the dashboard's
+        "Blocking" panel and the billing run."""
+        import datetime
+
+        from billing.models import CustomerBillingConfig, SuspensionSettings
+        from billing.recurring import upcoming_blocks
+
+        customer = self.get_object()
+        config = CustomerBillingConfig.objects.filter(customer=customer).select_related("payment_method").first()
+        auto = SuspensionSettings.load().auto_suspend_enabled
+        body = {
+            "payment_method": config.payment_method.name if config and config.payment_method_id else "",
+            "billing_enabled": bool(config and config.billing_enabled),
+            "next_billing_date": config.next_billing_date if config else None,
+            "blocking_period_days": config.blocking_period_days if config else None,
+            "extended_until": config.suspension_extended_until if config else None,
+            "auto_suspend_enabled": auto,
+            "block_date": None,
+            "days_until_block": None,
+            "block_note": "",
+            "run_time": "",
+        }
+        if not config or not config.billing_enabled:
+            body["block_note"] = "Recurring billing is off for this client."
+        elif config.blocking_period_days is None:
+            body["block_note"] = "No blocking period set — never blocked automatically."
+        else:
+            from billing.recurring import billing_run_time, next_run_date
+
+            body["run_time"] = billing_run_time()
+
+            rows = upcoming_blocks(next_run_date(), horizon_days=400, customers=Customer.objects.filter(pk=customer.pk))
+            if rows:
+                body["block_date"] = rows[0]["block_date"]
+                body["days_until_block"] = (rows[0]["block_date"] - timezone.localdate()).days
+                body["block_is_extension_date"] = rows[0]["extension_date"]
+            else:
+                body["block_note"] = "Nothing owing that would block them."
+        return Response(body)
+
+    @action(detail=True, methods=["get"], url_path="extension")
+    def extension(self, request, pk=None):
+        """The suspension extension behind the Customers list Extension
+        badge (#195, Rudolph 19 Oct 2026: "When I click on extension I want
+        to see the reason"): the waiting request, or the approved one in
+        force, with its reason and who asked / decided."""
+        from billing.models import CustomerBillingConfig, SuspensionExtensionRequest
+
+        def name(user):
+            return (user.get_full_name() or user.username) if user else ""
+
+        def row(ext):
+            if ext is None:
+                return None
+            return {
+                "id": ext.id,
+                "status": ext.status,
+                "extend_until": ext.extend_until,
+                "reason": ext.reason,
+                "requested_by": name(ext.requested_by),
+                "requested_at": ext.created_at,
+                "decided_by": name(ext.decided_by),
+                "decided_at": ext.decided_at,
+                "decision_note": ext.decision_note,
+            }
+
+        customer = self.get_object()
+        requests = SuspensionExtensionRequest.objects.filter(customer=customer).select_related("requested_by", "decided_by")
+        pending = requests.filter(status=SuspensionExtensionRequest.Status.PENDING).order_by("-created_at").first()
+        config = CustomerBillingConfig.objects.filter(customer=customer).first()
+        granted = config.suspension_extended_until if config else None
+        approved = None
+        if granted and granted >= timezone.localdate():
+            approved = (
+                requests.filter(status=SuspensionExtensionRequest.Status.APPROVED, extend_until=granted)
+                .order_by("-decided_at", "-created_at")
+                .first()
+            )
+        else:
+            granted = None
+        return Response({
+            "status": "requested" if pending else ("extended" if granted else ""),
+            "extended_until": granted,
+            "pending": row(pending),
+            "approved": row(approved),
+        })
+
+    @action(detail=False, methods=["get"], url_path="payment-methods")
+    def payment_methods(self, request):
+        """The payment methods, for the Customers list filter (7 Oct 2026).
+        Here rather than /payment-methods/ because that one needs Finance."""
+        from billing.models import PaymentMethod
+
+        return Response([
+            {"id": m.id, "name": m.name, "is_active": m.is_active}
+            for m in PaymentMethod.objects.order_by("-is_active", "name")
+        ])
+
+    @action(detail=False, methods=["get"], url_path="picker")
+    def picker(self, request):
+        """Every customer a staff member may see, as the three fields a
+        picker needs -- unpaginated.
+
+        The pickers on Finance, Services and Tickets asked for
+        `?page_size=1000`, and config.pagination caps page_size at 500. DRF
+        clamps silently, so they were handed the first 500 customers by
+        name and nothing said so: searching a picker for a customer whose
+        surname sorted after roughly the 500th returned "Nothing matches",
+        and the invoice, credit, service or ticket simply could not be
+        raised for them. On 1,592 customers that is about 1,092 people who
+        could not be picked.
+
+        A dedicated endpoint rather than raising max_page_size, for the
+        same reason `ids` above exists: the picker needs a name, a
+        reference and an id, not a full serialized customer each with its
+        prefetched services and addresses. This is a few hundred KB where
+        the paginated serializer would be several MB, and raising the
+        global cap would let any endpoint return 2,000 fully-serialized
+        rows.
+
+        Ordered by name because that is the order the picker shows, and
+        scoped through the same get_queryset as everything else -- a
+        reseller-restricted staff member must not be handed the whole book
+        through a convenience endpoint.
+        """
+        queryset = self.filter_queryset(self.get_queryset()).order_by("full_name")
+        # `email` is here for the bulk-email page's "select all matching",
+        # which has to know who actually has an address -- it used to ask
+        # the paginated list for `page_size=<count>` and get 500 back, so
+        # "Select all 1592 matching" quietly became "send to 500".
+        return Response({
+            "results": list(queryset.values("id", "full_name", "customer_id", "email")),
+            "count": queryset.count(),
+        })
 
     @action(detail=False, methods=["get"], url_path="ids")
     def ids(self, request):
@@ -585,12 +1009,8 @@ class CustomerTaskViewSet(viewsets.ModelViewSet):
         # other partners' customers through this endpoint either. Without
         # this, tasks would be a side door onto customer names the
         # Customers page deliberately hides from them.
-        allowed = getattr(user, "allowed_partners", None) or []
-        if allowed and user.role != user.Role.ADMIN:
-            qs = qs.filter(
-                Q(customer__partner_id__in=allowed) | Q(customer__partner__isnull=True)
-            )
-        return qs
+        condition = partner_condition(user, "customer")
+        return qs if condition is None else qs.filter(condition)
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)

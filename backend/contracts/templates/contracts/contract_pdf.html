@@ -1,0 +1,23 @@
+{% extends "notifications/_pdf_base.html" %}
+{% block brand %}{% include "contracts/_brand.html" %}{% endblock %}
+{% block content %}
+  <div class="doc-title">{{ contract.title }}</div>
+
+  <table class="meta-table" style="width:300pt;">
+    <tr><td class="meta-label" style="width:100pt;">Reference</td><td>{{ contract.reference }}</td></tr>
+    <tr><td class="meta-label">Date</td><td>{{ generated_date|date:"d/m/Y" }}</td></tr>
+    <tr><td class="meta-label">Client</td><td>{{ customer.full_name }}{% if customer.company_name and customer.company_name != customer.full_name %} ({{ customer.company_name }}){% endif %}</td></tr>
+    <tr><td class="meta-label">Client code</td><td>{{ customer.customer_id }}</td></tr>
+  </table>
+
+  <div class="contract-body" style="margin-top:14px;">
+    {{ body }}
+  </div>
+
+  <table style="width:478pt; margin-top:28px;" cellpadding="4">
+    <tr>
+      <td style="width:239pt; border-top:1px solid #333333; font-size:9pt; color:#444444;">Signed by the client electronically<br>See the signing certificate, last page</td>
+      <td style="width:239pt;"></td>
+    </tr>
+  </table>
+{% endblock %}

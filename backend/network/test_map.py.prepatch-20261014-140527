@@ -1,0 +1,72 @@
+"""Networking -> Map (#173/#174): the Google key and the serviceability check."""
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+
+from network import geo
+from network.test_uisp import fake_get as uisp_get
+
+User = get_user_model()
+
+
+@override_settings(UISP_URL="https://uisp.test", UISP_TOKEN="t0ken", UISP_VERIFY_TLS=False)
+class MapTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.client.force_authenticate(User.objects.create_user(username="boss", password="x", role="admin"))
+
+    @override_settings(GOOGLE_MAPS_API_KEY="browser-key")
+    def test_config_gives_the_browser_key(self):
+        res = self.client.get("/api/map/config/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data, {"google_maps_key": "browser-key"})
+
+    @override_settings(GOOGLE_MAPS_API_KEY="")
+    def test_config_without_key(self):
+        self.assertEqual(self.client.get("/api/map/config/").data, {"google_maps_key": ""})
+
+    def test_scheduling_staff_get_the_map_but_not_the_check(self):
+        sched = APIClient()
+        sched.force_authenticate(User.objects.create_user(username="disp", password="x", role="support", allowed_sections=["scheduling"]))
+        self.assertEqual(sched.get("/api/map/config/").status_code, 200)
+        self.assertEqual(sched.get("/api/map/serviceability/?lat=-27&lng=27").status_code, 403)
+
+    def test_serviceability_nearest_towers(self):
+        # A point a little north-east of the first fixture site that has
+        # coordinates.
+        with mock.patch("network.uisp.requests.get", side_effect=uisp_get):
+            all_sites = geo.uisp.sites()
+            parents = {s["parent_id"] for s in all_sites}
+            here = next(s for s in all_sites if s["name"] == "Winter Hoek")
+            lat, lng = here["latitude"] + 0.001, here["longitude"] + 0.001
+            res = self.client.get(f"/api/map/serviceability/?lat={lat}&lng={lng}")
+        self.assertEqual(res.status_code, 200)
+        data = res.data
+        self.assertFalse(data["coverage"]["loaded"])
+        self.assertIsNone(data["coverage"]["covered"])
+        near = data["nearest"]
+        self.assertEqual(near[0]["name"], here["name"])
+        self.assertAlmostEqual(near[0]["distance_km"], 0.15, delta=0.03)   # ~110 m N + ~100 m E
+        self.assertEqual(near[0]["compass"], "NE")
+        self.assertEqual([t["distance_km"] for t in near], sorted(t["distance_km"] for t in near))
+        self.assertLessEqual(len(near), 5)
+        # stand-alone client sites are not towers
+        loose = [s["name"] for s in all_sites if not s["parent_id"] and s["id"] not in parents]
+        self.assertFalse(set(loose) & {t["name"] for t in near})
+        # the MikroTik sector at Winter Hoek (WTH_SECT_01) counts as a sector
+        names = {a["name"] for a in near[0]["access_points"]}
+        self.assertTrue(any("sect" in n.lower() for n in names), names)
+
+    def test_bad_point(self):
+        self.assertEqual(self.client.get("/api/map/serviceability/?lat=x&lng=1").status_code, 400)
+        self.assertEqual(self.client.get("/api/map/serviceability/?lat=95&lng=1").status_code, 400)
+
+    def test_needs_networking(self):
+        desk = APIClient()
+        desk.force_authenticate(User.objects.create_user(username="desk", password="x", role="support", allowed_sections=["tickets"]))
+        self.assertEqual(desk.get("/api/map/serviceability/?lat=-27&lng=27").status_code, 403)
+        self.assertEqual(desk.get("/api/map/config/").status_code, 403)

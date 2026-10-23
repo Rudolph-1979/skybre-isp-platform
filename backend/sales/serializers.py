@@ -28,6 +28,18 @@ class LeadSerializer(serializers.ModelSerializer):
     value = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     follow_up_is_due = serializers.BooleanField(read_only=True)
     note_count = serializers.IntegerField(source="lead_notes.count", read_only=True)
+    # The coverage check and quote (6 Oct 2026) -- set through the
+    # coverage/ and quote/ actions, read-only here.
+    coverage_method_display = serializers.CharField(source="get_coverage_method_display", read_only=True)
+    coverage_result_display = serializers.CharField(source="get_coverage_result_display", read_only=True)
+    coverage_partner_name = serializers.CharField(source="coverage_partner.name", read_only=True, default="")
+    coverage_checked_by_name = serializers.SerializerMethodField()
+    lost_at_stage_display = serializers.SerializerMethodField()
+    scan = serializers.SerializerMethodField()
+    install = serializers.SerializerMethodField()
+    quote_number = serializers.SerializerMethodField()
+    quote_totals = serializers.SerializerMethodField()
+    next_action = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
@@ -39,12 +51,25 @@ class LeadSerializer(serializers.ModelSerializer):
             "assigned_to", "assigned_to_name",
             "interested_tariff", "tariff_name", "estimated_monthly_value", "value",
             "status", "status_display", "lost_reason", "lost_reason_display",
+            "lost_at_stage", "lost_at_stage_display",
+            "latitude", "longitude",
+            "coverage_method", "coverage_method_display", "coverage_result", "coverage_result_display",
+            "coverage_tower", "coverage_sector", "coverage_signal", "coverage_notes",
+            "coverage_partner", "coverage_partner_name", "coverage_checked_at", "coverage_checked_by_name",
+            "scan_job", "scan",
+            "quote_items", "quote_recurring", "quote_start_date", "quote_discount", "quote_valid_until", "quote_sent_at", "quote_number", "quote_totals",
+            "install_job", "install", "next_action",
             "next_follow_up", "follow_up_is_due",
             "customer", "customer_name", "customer_reference",
             "notes", "note_count",
             "created_at", "updated_at", "closed_at",
         ]
-        read_only_fields = ["id", "customer", "created_at", "updated_at", "closed_at"]
+        read_only_fields = [
+            "id", "customer", "created_at", "updated_at", "closed_at", "lost_at_stage",
+            "coverage_method", "coverage_result", "coverage_tower", "coverage_sector", "coverage_signal",
+            "coverage_notes", "coverage_partner", "coverage_checked_at",
+            "scan_job", "quote_items", "quote_recurring", "quote_start_date", "quote_discount", "quote_valid_until", "quote_sent_at", "install_job",
+        ]
 
     def get_assigned_to_name(self, obj):
         if not obj.assigned_to_id or not obj.assigned_to:
@@ -52,6 +77,78 @@ class LeadSerializer(serializers.ModelSerializer):
         user = obj.assigned_to
         full = f"{user.first_name} {user.last_name}".strip()
         return full or user.username
+
+    @staticmethod
+    def _name(user):
+        if user is None:
+            return ""
+        return f"{user.first_name} {user.last_name}".strip() or user.username
+
+    def get_coverage_checked_by_name(self, obj):
+        return self._name(obj.coverage_checked_by) if obj.coverage_checked_by_id else ""
+
+    def get_lost_at_stage_display(self, obj):
+        if not obj.lost_at_stage:
+            return ""
+        try:
+            return Lead.Status(obj.lost_at_stage).label
+        except ValueError:
+            return obj.lost_at_stage
+
+    @staticmethod
+    def _job(job):
+        if job is None:
+            return None
+        return {
+            "id": job.pk,
+            "title": job.title,
+            "status": job.status,
+            "start": job.start,
+            "end": job.end,
+            "deleted": job.deleted_at is not None,
+            "technicians": [
+                (f"{u.first_name} {u.last_name}".strip() or u.username) for u in job.assigned_technicians.all()
+            ],
+        }
+
+    def get_scan(self, obj):
+        return self._job(obj.scan_job) if obj.scan_job_id else None
+
+    def get_install(self, obj):
+        return self._job(obj.install_job) if obj.install_job_id else None
+
+    def get_quote_number(self, obj):
+        from .workflow import quote_number
+
+        return quote_number(obj) if obj.quote_sent_at and obj.pk else ""
+
+    def get_quote_totals(self, obj):
+        from .workflow import quote_totals
+
+        t = quote_totals(obj)
+        return {
+            "monthly": {k: str(v) for k, v in t["monthly"].items()},
+            "plan": {k: str(v) for k, v in t["plan"].items()},
+            "pro_rata": {k: str(v) for k, v in t["pro_rata"].items()},
+            "pro_rata_period": t["pro_rata_period"],
+            "plan_gross": {k: str(v) for k, v in t["plan_gross"].items()},
+            "once_off_gross": {k: str(v) for k, v in t["once_off_gross"].items()},
+            "discount": {
+                "monthly": {k: str(v) for k, v in t["discount"]["monthly"].items()},
+                "once_off": {k: str(v) for k, v in t["discount"]["once_off"].items()},
+                "months": t["discount"]["months"],
+                "reason": t["discount"]["reason"],
+                "monthly_after": ({k: str(v) for k, v in t["discount"]["monthly_after"].items()}
+                                  if t["discount"]["monthly_after"] else None),
+            },
+            "once_off": {k: str(v) for k, v in t["once_off"].items()},
+            "rate_pct": str(t["rate_pct"]),
+        }
+
+    def get_next_action(self, obj):
+        from .workflow import next_action
+
+        return next_action(obj)
 
     def validate(self, attrs):
         """Run the model's own rules, so the API and the shell agree.

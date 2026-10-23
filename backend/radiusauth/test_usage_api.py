@@ -11,6 +11,7 @@ from billing.models import Service, Tariff
 from customers.models import Customer, Partner
 from radiusauth import usage
 from radiusauth.views import CustomerUsageView, PublicUsageView, UsageReportView
+from accounts.testing import ALL_SECTIONS
 
 User = get_user_model()
 MB = 1024 * 1024
@@ -108,7 +109,7 @@ class UsageApiTests(TestCase):
         theirs = Partner.objects.create(name="Theirs")
         self.customer.partner = theirs
         self.customer.save()
-        scoped = User.objects.create_user(username="reseller", password="x", role="support")
+        scoped = User.objects.create_user(username="reseller", password="x", role="support", allowed_sections=ALL_SECTIONS)
         scoped.allowed_partners = [mine.id]
         scoped.save()
         r = self._get(UsageReportView, "/x", {"period": "month", "date": "2026-08-26"}, user=scoped)

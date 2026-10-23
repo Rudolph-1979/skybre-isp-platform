@@ -152,6 +152,42 @@ def get_system_resource(device):
         return next(iter(api("/system/resource/print")), {})
 
 
+# RouterOS changed what this command's argument is called. 7.x's API wants
+# `interface=`; older builds took `numbers=`, the CLI spelling, and 7.24
+# rejects that outright with "unknown parameter numbers". Both spellings are
+# tried, newest first, so one platform can poll a mixed-version fleet --
+# which is exactly what this network is: the same /ip service field is
+# `address=` on one PE and `available-from=` on another.
+_MONITOR_TRAFFIC_ARGS = ("interface", "numbers")
+
+
+def _monitor_traffic_row(api, device, interface):
+    """One /interface/monitor-traffic snapshot, trying each argument
+    spelling in turn. A trap ends the command, not the connection, so the
+    next attempt reuses the same session."""
+    first_error = None
+    for argument in _MONITOR_TRAFFIC_ARGS:
+        try:
+            return next(
+                iter(api("/interface/monitor-traffic", **{argument: interface, "once": ""})),
+                {},
+            )
+        except (TrapError, MultiTrapError) as exc:
+            if first_error is None:
+                first_error = exc
+
+    # The FIRST error is the one worth reporting, not the last. `interface=`
+    # is the modern spelling, so on a 7.x router its error is the real
+    # answer -- usually "no such item", i.e. a wrong interface name. The
+    # `numbers=` attempt afterwards always fails there with "unknown
+    # parameter numbers", and reporting that instead sends you hunting an
+    # API incompatibility that isn't the problem.
+    raise MikrotikError(
+        f"{device.name}: couldn't read traffic for interface '{interface}' -- "
+        f"check the name matches RouterOS exactly. ({first_error})"
+    )
+
+
 def get_wan_interface_traffic(device, interface):
     """Instantaneous rx/tx bits-per-second for one interface, via
     /interface/monitor-traffic's "once" snapshot mode (a single reading
@@ -161,7 +197,7 @@ def get_wan_interface_traffic(device, interface):
     tx = router-to-client (download for the customer), rx = client-to-
     router (upload)."""
     with api_connection(device) as api:
-        row = next(iter(api("/interface/monitor-traffic", numbers=interface, once="")), {})
+        row = _monitor_traffic_row(api, device, interface)
         rx_bps = float(row.get("rx-bits-per-second", 0) or 0)
         tx_bps = float(row.get("tx-bits-per-second", 0) or 0)
         return round(rx_bps / 1_000_000, 2), round(tx_bps / 1_000_000, 2)

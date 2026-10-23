@@ -1,0 +1,711 @@
+"""Links and audit for the Conecto subscriber app.
+
+Three tables, each earning its place:
+
+  ConectoTicket  ties a Skybre ticket to its Conecto id, and records
+                 which side created it. Without the origin, a ticket
+                 that arrived from Conecto would be pushed straight back
+                 to Conecto by the outbound signal -- an echo, and on a
+                 bad day a loop.
+
+  ConectoLink    what the subscriber's app account is. Written when
+                 Conecto tells us somebody finished self-registering.
+
+  ConectoCall    every outbound call and how it went.
+
+Job Dispatch adds four more (see the section at the bottom of this file):
+ConectoTechnician, ConectoJob, ConectoJobEvent and ConectoStockChecklist.
+
+ConectoCall is the important one. Conecto's webhooks have no retry queue
+(their spec says so plainly: "if Vexar's endpoint fails, Conecto just
+logs it and moves on"), and neither direction is transactional. So a
+failed push here must not vanish into a log file -- it has to be a row
+somebody can see and replay, which is what `conecto_resync` does. This
+is the same reasoning as radiusauth.RadiusAction: a push that silently
+failed is worse than one that loudly did.
+"""
+import uuid
+
+from django.conf import settings
+from django.db import models
+
+
+class ConectoTicket(models.Model):
+    """One Skybre ticket <-> one Conecto ticket."""
+
+    class Origin(models.TextChoices):
+        SKYBRE = "skybre", "Raised in Skybre"
+        CONECTO = "conecto", "Raised in the Conecto app"
+
+    ticket = models.OneToOneField(
+        "tickets.Ticket", on_delete=models.CASCADE, related_name="conecto"
+    )
+    # Conecto's Firestore document id, returned by createTicket and needed
+    # in the URL path of every updateTicket.
+    conecto_ticket_id = models.CharField(max_length=128, unique=True)
+    origin = models.CharField(max_length=10, choices=Origin.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.ticket.ticket_number} <-> {self.conecto_ticket_id}"
+
+
+class ConectoLink(models.Model):
+    """A customer who has registered in the subscriber app."""
+
+    customer = models.OneToOneField(
+        "customers.Customer", on_delete=models.CASCADE, related_name="conecto_link"
+    )
+    firebase_uid = models.CharField(max_length=128, unique=True)
+    email = models.EmailField(blank=True)
+    registered_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-registered_at"]
+
+    def __str__(self):
+        return f"{self.customer} ({self.firebase_uid})"
+
+
+class ConectoCall(models.Model):
+    """One outbound call to Conecto, and what became of it.
+
+    Kept whether it succeeded or not: the successes are how you prove a
+    client code was registered before somebody tried to use it, and the
+    failures are the work queue.
+    """
+
+    class Status(models.TextChoices):
+        OK = "ok", "Succeeded"
+        FAILED = "failed", "Failed"
+
+    endpoint = models.CharField(max_length=40)
+    # What was sent, verbatim. Replay re-sends exactly this rather than
+    # rebuilding it from the current state of the record -- a ticket that
+    # has since been edited should be re-sent as it was when the call was
+    # made, or the retry quietly becomes a different call.
+    payload = models.JSONField()
+    status = models.CharField(max_length=10, choices=Status.choices)
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Truncated: a Cloud Run error page is HTML and long, and the useful
+    # part is always at the front.
+    detail = models.TextField(blank=True)
+    attempts = models.PositiveSmallIntegerField(default=1)
+    # What this call was about, so a failed row can be traced back to the
+    # thing it was supposed to keep in step. Deliberately loose strings
+    # rather than a ForeignKey -- a call about a deleted ticket should
+    # still be readable afterwards.
+    subject_kind = models.CharField(max_length=20, blank=True)
+    subject_ref = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        # Named explicitly rather than left to Django's hash suffix, so the
+        # hand-written migration and the model agree exactly and a later
+        # makemigrations cannot produce a spurious drop-and-recreate.
+        indexes = [models.Index(fields=["status", "-created_at"], name="conecto_call_status_idx")]
+
+    def __str__(self):
+        return f"{self.endpoint} {self.status} ({self.subject_ref or '-'})"
+
+
+# --- job dispatch ---------------------------------------------------------
+#
+# Added when Conecto's Job Dispatch went live: Vexar pushes a job onto a
+# technician's phone, Conecto reports back every step of it.
+
+
+class ConectoTechnician(models.Model):
+    """A staff member's technician code in the Conecto app.
+
+    A link table rather than a column on the user model, for the same
+    reason ConectoLink is one for subscribers: everything this integration
+    knows lives in this app, and the whole app could be removed without
+    leaving a Conecto-shaped hole in the platform's core account model.
+
+    The code is issued INSIDE Conecto by a Skybre admin; nothing here
+    generates one. This table only records which of our staff it belongs
+    to, which is the lookup every push needs.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conecto_technician"
+    )
+    # Blank is allowed, and means "this row is not about a code".
+    #
+    # A link with no code and is_active=False is a BLOCKING RECORD: the
+    # only way to take a technician off dispatch who never had a hand-set
+    # Conecto code, which since staff-code dispatch went live is most of
+    # them. See conecto_link_technician --remove.
+    #
+    # Uniqueness moved to a conditional constraint below for that reason.
+    # At the column level, Postgres permits many NULLs but only one empty
+    # string, so the second blocking record would have collided with the
+    # first on a command that has nothing to do with codes.
+    technician_code = models.CharField(max_length=40, blank=True)
+    # Turned off rather than deleted when somebody stops doing field work:
+    # deleting the row would orphan the job history that refers to the code.
+    #
+    # This is THE control for "stop sending this person jobs", and it has
+    # to keep meaning that. When staff codes became routable it briefly
+    # stopped -- dispatch fell through to the staff code and the switch
+    # did nothing at all -- which is why _dispatch_code now returns early
+    # on an inactive link instead of falling through.
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["technician_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["technician_code"],
+                condition=~models.Q(technician_code=""),
+                name="conecto_technician_code_unique_when_set",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.user} ({self.technician_code})"
+
+
+class ConectoJob(models.Model):
+    """One Skybre job, as pushed to ONE technician's phone.
+
+    One row per (job, technician) rather than one row per job, since a job
+    can now carry more than one technician (Rudolph, 29 Sep: "allow me to
+    assign to two technicians") and Conecto has no notion of a job with two
+    people on it -- it is two independent scheduleJob calls, one per
+    technician_code, each tracked and cancelled on its own. Two people on
+    one job can be at different stages of it (one en route, one already
+    checked in), which is exactly what having a row each makes possible.
+
+    `technician` is the join scheduling/serializers.py actually reads --
+    unambiguous and index-friendly, unlike matching back through
+    technician_code, which is whichever of two different code schemes
+    (a hand-set Conecto code, or this platform's own staff code) happened
+    to be routable for that person at push time; see
+    conecto.signals._dispatch_code. `technician_code` stays alongside it
+    for the same reason it always has: so a later re-link of the person's
+    OWN code can be told apart from "this is a different technician" (see
+    _schedule_job) and so a call log still reads correctly on its own.
+
+    `pushed_digest` is what stops this app talking to Conecto for no
+    reason. A Job row is saved by plenty of code that changes nothing a
+    technician would care about, and a push on every save would be a
+    notification on somebody's phone each time an unrelated field moved.
+    The digest covers exactly the fields that go over the wire (per
+    technician_code, since that is part of the digest too), so a re-push
+    happens when -- and only when -- the job a technician was sent is no
+    longer the job they are looking at.
+    """
+
+    job = models.ForeignKey("scheduling.Job", on_delete=models.CASCADE, related_name="conecto_jobs")
+    technician = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conecto_jobs"
+    )
+    # The code the job was last sent TO. Kept here as well as on the
+    # technician link so a reassignment can be detected without a join, and
+    # so history still reads correctly if the link is later re-pointed.
+    technician_code = models.CharField(max_length=40)
+    conecto_job_id = models.CharField(max_length=128, blank=True)
+    last_status = models.CharField(max_length=20, blank=True)
+    pushed_at = models.DateTimeField(null=True, blank=True)
+    pushed_digest = models.CharField(max_length=32, blank=True)
+
+    class Meta:
+        ordering = ["-pushed_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["job", "technician"], name="conecto_job_once_per_technician")
+        ]
+
+    def __str__(self):
+        return f"job {self.job_id} -> {self.technician_code} ({self.technician_id})"
+
+
+class ConectoJobEvent(models.Model):
+    """One status update from a technician's phone, kept whole.
+
+    Conecto reports progress and nothing else -- it has no screen showing
+    where anyone is, and said so. That screen, if it is ever built, can
+    only be built from these rows, so they record the position, the
+    distance and the time on site as they arrive rather than folding them
+    into the job and throwing the detail away.
+
+    The job FK is nullable and SET_NULL: an update can arrive for a job
+    that has since been deleted, and the event is still the record of a
+    technician having driven somewhere.
+    """
+
+    job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="conecto_events",
+    )
+    vexar_job_id = models.CharField(max_length=64, blank=True)
+    conecto_job_id = models.CharField(max_length=128, blank=True)
+    technician_code = models.CharField(max_length=40, blank=True)
+    status = models.CharField(max_length=20)
+    # When it happened on the technician's phone, which is not when it
+    # reached us -- a phone out of signal at a tower reports the whole trip
+    # when it comes back.
+    occurred_at = models.DateTimeField(null=True, blank=True)
+    lat = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    lng = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    km_traveled = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    duration_minutes = models.PositiveIntegerField(null=True, blank=True)
+    # The body as received. Costs little and is the only thing that can
+    # answer "what did they actually send us" when a field turns out to
+    # mean something other than what the spec said.
+    payload = models.JSONField(default=dict, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-received_at"]
+        indexes = [
+            models.Index(fields=["technician_code", "-received_at"], name="conecto_ev_tech_idx"),
+            models.Index(fields=["vexar_job_id"], name="conecto_ev_job_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.technician_code} {self.status} {self.occurred_at or self.received_at:%Y-%m-%d %H:%M}"
+
+
+class ConectoStockChecklist(models.Model):
+    """The tick-list a technician sees before their first job of a day, and
+    what came back when they submitted it.
+
+    One row per technician per date -- Conecto replaces the list when it is
+    set again, so a second row would be a second version of something that
+    only has one.
+
+    `any_missing` is the field support actually acts on: it means the
+    technician went out having ticked past something they did not have.
+    """
+
+    technician_code = models.CharField(max_length=40)
+    effective_date = models.DateField()
+    items = models.JSONField(default=list)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    completed_at = models.DateTimeField(null=True, blank=True)
+    # {"item": ..., "confirmed": true/false} as submitted.
+    results = models.JSONField(default=list, blank=True)
+    any_missing = models.BooleanField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-effective_date", "technician_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["technician_code", "effective_date"], name="conecto_checklist_once_per_day"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.technician_code} {self.effective_date} ({len(self.items)} items)"
+
+
+class ConectoTechnicianPosition(models.Model):
+    """One GPS ping from a technician's phone while en route.
+
+    New on 2026-09-21, when Conecto added periodic reporting. Before it,
+    a position only ever arrived attached to a status change -- twice per
+    job, at the start tap and the check-in tap -- and the map built on
+    that could only honestly claim to show where somebody had last been
+    seen. A ping a minute between Start and Checked In is a different
+    thing, and this table is what makes it one.
+
+    SEPARATE FROM ConectoJobEvent, ON PURPOSE.
+
+    An event is a fact about a JOB: it moved to en route, it was checked
+    in at, it finished. A ping is a fact about a PERSON at a moment, and
+    may carry no job at all. Folding pings into the event table would put
+    a thousand rows with status="" between the six that say what actually
+    happened to the work, and every existing query that reads events as a
+    job's history would have to learn to ignore most of them.
+
+    recorded_at IS THE PHONE'S CLOCK, not ours. A phone in a valley
+    buffers and flushes, so rows arrive out of order and received_at can
+    be minutes later. Everything user-facing reads recorded_at, because
+    the question being asked is "when was he there", not "when did we
+    hear about it" -- and the gap between them is exactly when the two
+    answers differ most.
+
+    The unique constraint on (technician_code, recorded_at) is the
+    idempotency guard. Conecto retries nothing, but proxies replay and a
+    reconnecting phone re-sends its backlog; the same reading twice is
+    the same reading. Saying so in the database beats remembering to
+    check for it in the receiver.
+    """
+
+    technician_code = models.CharField(max_length=40)
+    # Nullable and SET_NULL for the same reason as on ConectoJobEvent: a
+    # ping is a record of somebody having been somewhere, and it stays
+    # true after the job it belonged to is deleted.
+    job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="conecto_positions",
+    )
+    vexar_job_id = models.CharField(max_length=64, blank=True)
+    conecto_job_id = models.CharField(max_length=128, blank=True)
+    lat = models.DecimalField(max_digits=9, decimal_places=6)
+    lng = models.DecimalField(max_digits=9, decimal_places=6)
+    recorded_at = models.DateTimeField()
+    received_at = models.DateTimeField(auto_now_add=True)
+    # As received. Costs almost nothing and is the only thing that can
+    # answer "what did they actually send us" when a field turns out to
+    # mean something other than what the spec said -- which has already
+    # happened once on this integration.
+    payload = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-recorded_at"]
+        indexes = [
+            models.Index(fields=["technician_code", "-recorded_at"], name="conecto_pos_tech_idx"),
+            models.Index(fields=["job", "-recorded_at"], name="conecto_pos_job_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["technician_code", "recorded_at"], name="conecto_position_once"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.technician_code} @ {self.lat},{self.lng} {self.recorded_at:%H:%M:%S}"
+
+
+class ConectoInternalTicket(models.Model):
+    """A technician's feedback on a job, as a ticket on both sides.
+
+    SEPARATE FROM ConectoTicket, AND THAT IS THE WHOLE SAFETY ARGUMENT.
+
+    Conecto confirmed on 2026-09-21 that internal and client tickets share
+    one Firestore collection and one id generator -- no prefix, no range
+    split -- and that addTicketReply writes a reply to whatever ticket id
+    it is handed without checking the internal flag. Their words: "one
+    guard only -- yours."
+
+    A single table with an is_internal column would put that guard in
+    every query that reads it, forever, and the cost of one caller
+    forgetting is a technician's "customer refused to pay" arriving as a
+    push notification on that customer's phone.
+
+    Two tables make the lookup typed by the table it runs against.
+    _send_ticket_comment asks ConectoTicket for a client thread's id and
+    physically cannot be handed an internal one, because internal ids are
+    not in that table. Nothing to remember.
+
+    The job FK is nullable and SET_NULL: feedback outlives the job it was
+    raised from, and "the technician said there was no stock" stays true
+    after somebody deletes the calendar entry.
+    """
+
+    ticket = models.OneToOneField(
+        "tickets.Ticket", on_delete=models.CASCADE, related_name="conecto_internal"
+    )
+    conecto_ticket_id = models.CharField(max_length=128, unique=True)
+    job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="conecto_internal_tickets",
+    )
+    vexar_job_id = models.CharField(max_length=64, blank=True)
+    technician_code = models.CharField(max_length=40, blank=True)
+    #: Conecto's job card id when the technician ticked "additional work
+    #: needed" on it (category additional_work, 7 Oct 2026).
+    job_card_id = models.CharField(max_length=128, blank=True, default="")
+    #: quote_needed | return_booking | stock_needed | other, as sent.
+    #: Stored raw rather than mapped onto a department: these are Conecto's
+    #: categories for field work and ours are for customer enquiries, and
+    #: forcing one into the other would lose the only word that says what
+    #: the technician actually needs.
+    category = models.CharField(max_length=32, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.ticket.ticket_number} (internal) <-> {self.conecto_ticket_id}"
+
+
+class ConectoBandwidthSession(models.Model):
+    """One client watching their live speed in the Conecto app.
+
+    THE FIRST TIME CONECTO CALLS US RATHER THAN THE OTHER WAY ROUND. Every
+    other endpoint in this app receives; these three are asked.
+
+    Why a row at all, when the platform already has an interest mechanism
+    that needs no session: because the caller is not the viewer. Our own
+    staff UI treats "you asked for the figures" as the signal that somebody
+    is watching, and a closed laptop simply stops asking. Conecto's Cloud
+    Functions ask on a client's behalf, so a client who closes the app
+    leaves a function that might keep asking -- and the cost of that is a
+    router connection held open for nothing.
+
+    So the session is the thing that expires. Conecto send `stop` when the
+    client leaves the screen, and we treat that as an optimisation rather
+    than a guarantee: a phone that loses signal mid-session never sends it.
+    The five-minute expiry below is what actually ends the session, and it
+    is enforced here regardless.
+
+    In practice neither usually matters. network.live_broker tears its
+    router connection down about twenty seconds after the last poll, so an
+    abandoned session costs twenty seconds of one connection, not five
+    minutes. The expiry is the backstop; the teardown is the mechanism.
+    """
+
+    #: What Conecto holds and sends back. A UUID rather than our primary
+    #: key: it is handed to a third party, and a sequential id would let
+    #: anybody holding one guess at the others.
+    session_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE,
+        related_name="conecto_bandwidth_sessions",
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    #: Stored rather than computed from started_at, so the cutoff survives a
+    #: restart and a later "why did this stop" can be answered from the row.
+    expires_at = models.DateTimeField()
+    last_polled_at = models.DateTimeField(null=True, blank=True)
+    stopped_at = models.DateTimeField(null=True, blank=True)
+    #: Not statistics. If this is ever in the thousands for one session,
+    #: something on their side is polling in a loop rather than on a timer,
+    #: and this row is where that becomes visible.
+    poll_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["customer", "-started_at"], name="conecto_bw_customer_idx"),
+        ]
+
+    @property
+    def is_live(self):
+        from django.utils import timezone as _tz
+
+        return self.stopped_at is None and self.expires_at > _tz.now()
+
+    def __str__(self):
+        return f"{self.customer} live bandwidth ({self.session_id})"
+
+
+class ConectoInvoice(models.Model):
+    """What Conecto currently believes about one invoice.
+
+    Same job as ConectoJob: stop the platform talking for no reason. An
+    Invoice row is saved by plenty of code that changes nothing a customer
+    would notice -- a reminder date, a balance flag, a recurring-run
+    reference -- and a push on every save would be a call per save.
+
+    `pushed_status` is also how a CANCELLATION becomes visible. Conecto's
+    invoice schema has three statuses and none of them is cancelled, so an
+    invoice withdrawn after we pushed it cannot be corrected on their side
+    today. Recording what they were told is what lets us say so out loud
+    rather than leave a customer looking at a bill we have written off.
+    """
+
+    invoice = models.OneToOneField(
+        "billing.Invoice", on_delete=models.CASCADE, related_name="conecto"
+    )
+    #: The number as pushed. Kept separately because billing REISSUES the
+    #: number when a quote or pro forma is converted -- convert_to_invoice
+    #: blanks it and takes a fresh one from the INV sequence -- so the row's
+    #: current number is not always the key Conecto holds.
+    pushed_number = models.CharField(max_length=30)
+    pushed_status = models.CharField(max_length=20, blank=True)
+    pushed_digest = models.CharField(max_length=32, blank=True)
+    pushed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-pushed_at"]
+
+    def __str__(self):
+        return f"{self.pushed_number} -> Conecto ({self.pushed_status})"
+
+
+class ConectoDocumentToken(models.Model):
+    """One short-lived, revocable URL for one document.
+
+    CONECTO CAUGHT THE FLAW IN THE FIRST DESIGN, and they were right.
+
+    The original plan put a signed `pdf_url` in the push payload. Their app
+    stores what we send and opens it when the client taps -- which may be
+    weeks later. An expiry measured from the push and a tap measured from
+    the client's own curiosity have nothing to do with each other, so the
+    link would be dead almost every time it was used.
+
+    So the URL is minted when it is needed. Conecto ask us for one at the
+    moment of the tap, we hand back something good for a couple of minutes,
+    and `pdf_url` in the webhook payload is decoration they can ignore.
+
+    A STORED RANDOM TOKEN, NOT A SIGNATURE, for exactly the reason
+    Customer.usage_token gives: a signature cannot be revoked. These open a
+    customer's tax invoice or their full statement -- name, address,
+    everything billed, what they still owe -- so being able to kill one by
+    deleting a row matters more than saving the row.
+    """
+
+    class Kind(models.TextChoices):
+        INVOICE = "invoice", "Invoice"
+        STATEMENT = "statement", "Statement"
+        # A quote's PDF (7 Oct 2026, /conecto/documents/quote-url/). Same
+        # `invoice` row: a quote is an Invoice at status quote.
+        QUOTE = "quote", "Quote"
+
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    kind = models.CharField(max_length=20, choices=Kind.choices)
+    #: Always set, including for an invoice -- it is the invoice's customer.
+    #: The permission check reads this rather than walking to the invoice,
+    #: so both kinds take the same path.
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE,
+        related_name="conecto_document_tokens",
+    )
+    invoice = models.ForeignKey(
+        "billing.Invoice", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="conecto_document_tokens",
+    )
+    #: "2026-09" for a statement. Blank for an invoice.
+    period = models.CharField(max_length=7, blank=True)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    #: Whether the link was ever opened. Not a statistic: a token minted and
+    #: never fetched means the client tapped and something failed between
+    #: Conecto and us, which is otherwise invisible from this side.
+    fetched_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["expires_at"], name="conecto_doctoken_expiry_idx")]
+
+    @property
+    def is_valid(self):
+        from django.utils import timezone as _tz
+
+        return self.expires_at > _tz.now()
+
+    def __str__(self):
+        return f"{self.kind} token for {self.customer} ({self.token})"
+
+
+class ConectoUsagePush(models.Model):
+    """What Conecto were last told about one customer's month.
+
+    Exists for the same reason as ConectoInvoice.pushed_digest: to stop the
+    platform talking for no reason. This job runs daily over every customer
+    with traffic, and most days most customers' figures have moved by some
+    amount -- but a customer who disconnected on the 9th has an unchanging
+    September total from the 10th onwards, and re-sending it every night for
+    three weeks is twenty-one notifications about one number.
+
+    The digest covers the FIGURES ONLY, deliberately, and not `as_of`. The
+    timestamp changes on every run by definition, so including it would mean
+    the digest never matched and the skip never fired -- a guard that is
+    always false is not a guard.
+
+    One row per customer per period, enforced in the database rather than by
+    the command, so two overlapping runs cannot both decide they are the
+    first.
+    """
+
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.CASCADE,
+        related_name="conecto_usage_pushes",
+    )
+    #: "2026-09". Calendar month, matching Conecto's own period key and the
+    #: month every other usage surface in the platform shows.
+    period = models.CharField(max_length=7)
+    download_bytes = models.BigIntegerField(default=0)
+    upload_bytes = models.BigIntegerField(default=0)
+    pushed_digest = models.CharField(max_length=32, blank=True)
+    pushed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-pushed_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["customer", "period"], name="conecto_usage_once_per_period"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.customer} {self.period} -> Conecto"
+
+
+class ConectoQuote(models.Model):
+    """What Conecto has been told about one quote (quoteCreated, 7 Oct 2026).
+
+    Kept because billing REISSUES the number when a quote is converted --
+    QUO-000123 becomes INV-000456 -- and Conecto must hear "QUO-000123 was
+    accepted and became INV-000456". quote_number is the number they hold.
+    """
+
+    invoice = models.OneToOneField(
+        "billing.Invoice", on_delete=models.CASCADE, related_name="conecto_quote"
+    )
+    quote_number = models.CharField(max_length=40, db_index=True)
+    #: pending / declined / expired / accepted, as last sent.
+    pushed_status = models.CharField(max_length=20, blank=True)
+    pushed_digest = models.CharField(max_length=32, blank=True)
+    pushed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.quote_number} ({self.pushed_status})"
+
+
+class ConectoJobCard(models.Model):
+    """A technician's digital job card from the Conecto app (7 Oct 2026) --
+    it replaces the paper "Jobcard / L.O.S / Installation Document".
+
+    Kept for the record: the whole body as sent (`data`), plus the fields
+    worth searching and linking pulled out. The client's signature is
+    COPIED into the database (signature_png) rather than kept as a link,
+    because Conecto's storage link is theirs and a signed record should not
+    depend on it. Idempotent on conecto_job_card_id: Conecto retries until
+    accepted.
+    """
+
+    conecto_job_card_id = models.CharField(max_length=128, unique=True)
+    job = models.ForeignKey(
+        "scheduling.Job", on_delete=models.SET_NULL, null=True, blank=True, related_name="job_cards",
+    )
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.SET_NULL, null=True, blank=True, related_name="job_cards",
+    )
+    technician = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    conecto_job_id = models.CharField(max_length=128, blank=True)
+    vexar_job_id = models.CharField(max_length=64, blank=True)
+    vexar_ticket_id = models.CharField(max_length=64, blank=True)
+    client_code = models.CharField(max_length=40, blank=True)
+    client_name = models.CharField(max_length=255, blank=True)
+    technician_name = models.CharField(max_length=255, blank=True)
+    job_types = models.JSONField(default=list, blank=True)
+    line_of_sight = models.CharField(max_length=10, blank=True)
+    additional_work_needed = models.BooleanField(default=False)
+    additional_work_ticket_id = models.CharField(max_length=128, blank=True)
+    client_signed_name = models.CharField(max_length=255, blank=True)
+    client_unavailable_reason = models.CharField(max_length=255, blank=True)
+    signature_url = models.URLField(max_length=1000, blank=True)
+    signature_png = models.BinaryField(null=True, blank=True)
+    signature_error = models.CharField(max_length=255, blank=True)
+    checked_in_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    data = models.JSONField(default=dict)
+    received_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-completed_at", "-received_at"]
+
+    def __str__(self):
+        return f"Job card {self.conecto_job_card_id}"
+
+    @property
+    def reference(self):
+        return f"JC-{self.pk:05d}" if self.pk else "JC-new"

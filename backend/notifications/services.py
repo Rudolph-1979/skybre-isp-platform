@@ -14,23 +14,54 @@ from django.utils.html import strip_tags
 
 from .email_settings import get_email_config, get_email_connection
 from .models import EmailTemplate, EmailLog
-from .pdf import render_invoice_pdf, render_statement_pdf
+from .pdf import render_invoice_pdf, render_period_statement_pdf, render_statement_pdf
 
 logger = logging.getLogger(__name__)
 
 
-def build_context(template_key: str, customer, invoice=None, payment=None) -> dict:
+def build_context(template_key: str, customer, invoice=None, payment=None, extra=None) -> dict:
     """Placeholders available to every template's subject/body — documented
     for staff in the Email Templates admin page. Keep this in sync with
     that page's "available placeholders" hint list.
     """
+    # Imported here, not at module scope: billing imports notifications
+    # (recurring.py sends through this module), so a top-level import the
+    # other way round is a cycle. _build_attachment below does the same.
+    from urllib.parse import quote
+
+    from billing.models import BillingDefaults
+
     cfg = get_email_config()
+    defaults = BillingDefaults.load()
     ctx = {
         "company_name": cfg["company_name"],
         "customer_name": customer.full_name,
         "customer_id": customer.customer_id,
         "customer_email": customer.email,
         "portal_url": f"{cfg['site_url'].rstrip('/')}/login",
+        # Where a SUSPENDED customer should be sent, and why it is not
+        # portal_url: a suspended customer cannot log in, so a link to
+        # the login form is a dead end at the one moment they most need
+        # to be told something. /suspension needs no session and carries
+        # their reference so the page can show it back to them.
+        #
+        # quote() because customer_id is editable (a migrated Splynx
+        # reference, a surname) and may legitimately contain a space or
+        # an ampersand -- either of which truncates or corrupts the link
+        # if pasted in raw.
+        "suspension_url": (
+            f"{cfg['site_url'].rstrip('/')}/suspension?ref={quote(customer.customer_id or '')}"
+        ),
+        "site_url": cfg["site_url"].rstrip("/"),
+        # Available to EVERY template, not just the suspension one. A
+        # suspended customer is inside the walled garden -- portal host
+        # and DNS, nothing else -- so they will read this email on their
+        # phone's mobile data, and the email, not the page, is what has
+        # to carry the account number. Payment reminders want the same
+        # thing for the same reason.
+        "bank_name": defaults.bank_name,
+        "bank_account_number": defaults.bank_account_number,
+        "bank_branch_code": defaults.bank_branch_code,
         # Whatever customer.balance is at the moment this is rendered --
         # for payment_received this is called after the payment has
         # already been applied, so it reflects the post-payment balance.
@@ -57,6 +88,16 @@ def build_context(template_key: str, customer, invoice=None, payment=None) -> di
         ctx["payment_amount"] = f"{payment.amount:.2f}"
         if payment.invoice_id:
             ctx["invoice_number"] = payment.invoice.number
+
+    # Placeholders the caller has and this module cannot work out: the
+    # suspension warning's cut-off date and the days remaining, both of
+    # which come from the billing engine's own blocking predicate.
+    # Applied last, so a caller can override a default above when it
+    # genuinely knows better -- and used sparingly, because a value this
+    # function cannot see is a placeholder nobody can document on the
+    # Email Templates page.
+    if extra:
+        ctx.update(extra)
     return ctx
 
 
@@ -72,9 +113,17 @@ def preview_template(template_key: str, customer, invoice=None):
     return render_template_strings(template, context)
 
 
-def _build_attachment(template_key: str, customer, invoice=None):
+def _build_attachment(template_key: str, customer, invoice=None, period=None):
     """Returns (filename, pdf_bytes, mimetype) for template types that ship
-    a PDF, or None for plain-text-only template types."""
+    a PDF, or None for plain-text-only template types.
+
+    `period` ("2026-09") turns a statement into ONE MONTH's statement:
+    opening balance, that month's movements, closing balance. Without it a
+    statement is the whole account as it stands today, which is what this
+    has always produced and what the staff PDF view and the customer
+    portal still ask for. Optional and defaulted, so every existing caller
+    keeps the document it was already getting.
+    """
     from billing.models import Invoice
 
     company_name = get_email_config()["company_name"]
@@ -85,6 +134,25 @@ def _build_attachment(template_key: str, customer, invoice=None):
         # switches the heading/wording based on invoice.status.
         pdf_bytes = render_invoice_pdf(invoice, company_name)
         return f"{invoice.number}.pdf", pdf_bytes, "application/pdf"
+    if template_key == EmailTemplate.Key.STATEMENT and period:
+        # The ROLLING statement -- twelve months of movements closing at
+        # today's balance -- derived from the dated records rather than
+        # from the stored balance. See billing.statements for why that
+        # distinction exists at all.
+        #
+        # `period` is NOT what the document covers. It is the run key the
+        # monthly job uses to avoid sending twice in a month, and it names
+        # the attachment. Closing at a month end put a figure on the page
+        # that disagreed with the account the day it arrived.
+        from billing.statements import rolling_statement
+
+        statement = rolling_statement(customer)
+        pdf_bytes = render_period_statement_pdf(customer, statement, company_name)
+        return (
+            f"Statement-{customer.customer_id}-{period}.pdf",
+            pdf_bytes,
+            "application/pdf",
+        )
     if template_key == EmailTemplate.Key.STATEMENT:
         # Quotes and pro formas aren't real invoices yet -- excluding them
         # keeps the statement an accurate record of actual billing, not a
@@ -99,14 +167,58 @@ def _build_attachment(template_key: str, customer, invoice=None):
     return None
 
 
-def send_customer_email(template_key: str, customer, sent_by_id=None, invoice=None, payment=None, batch_id: str = "") -> EmailLog:
+# Money documents. When the customer has a billing_email these go THERE,
+# with their main email in CC (Rudolph, 1 Oct). Anything else -- welcome,
+# and whatever is added later -- stays on the main email.
+BILLING_TEMPLATE_KEYS = {
+    EmailTemplate.Key.QUOTE,
+    EmailTemplate.Key.PROFORMA,
+    EmailTemplate.Key.STATEMENT,
+    EmailTemplate.Key.INVOICE,
+    EmailTemplate.Key.PAYMENT_REMINDER,
+    EmailTemplate.Key.SUSPENSION_WARNING,
+    EmailTemplate.Key.SUSPENSION,
+    EmailTemplate.Key.PAYMENT_RECEIVED,
+    EmailTemplate.Key.SERVICE_RESTORED,
+}
+
+
+def billing_recipients(template_key, customer):
+    """(to, cc) for one customer email. A billing document goes to the
+    billing email with the main email in CC; everything else, or a
+    customer with no billing email, goes to the main email alone. Either
+    side may be "" -- a customer with only a billing email still gets
+    their billing mail, with nothing to CC."""
+    main = (customer.email or "").strip()
+    billing = (getattr(customer, "billing_email", "") or "").strip()
+    if template_key in BILLING_TEMPLATE_KEYS and billing:
+        cc = main if main and main.lower() != billing.lower() else ""
+        return billing, cc
+    return main, ""
+
+
+def send_customer_email(template_key: str, customer, sent_by_id=None, invoice=None, payment=None, batch_id: str = "", extra_context=None, period=None) -> EmailLog:
     """Renders + sends one email to one customer. Always writes an
     EmailLog row, on success or failure, so every attempt is auditable from
-    the customer's Email tab / the platform-wide email log."""
-    recipient = (customer.email or "").strip()
+    the customer's Email tab / the platform-wide email log.
+
+    Financial notifications (reminders, suspension warnings, suspended,
+    payment received, service restored) are then mirrored to the client's
+    Conecto app whatever happened to the email -- see conecto_feed."""
+    log = _send_customer_email(template_key, customer, sent_by_id=sent_by_id, invoice=invoice, payment=payment,
+                               batch_id=batch_id, extra_context=extra_context, period=period)
+    from .conecto_feed import mirror
+
+    mirror(template_key, customer, log, invoice=invoice, payment=payment, extra_context=extra_context)
+    return log
+
+
+def _send_customer_email(template_key: str, customer, sent_by_id=None, invoice=None, payment=None, batch_id: str = "", extra_context=None, period=None) -> EmailLog:
+    recipient, cc = billing_recipients(template_key, customer)
     if not recipient:
         return EmailLog.objects.create(
             customer=customer,
+            invoice=invoice,
             template_key=template_key,
             recipient_email="",
             subject="",
@@ -119,9 +231,9 @@ def send_customer_email(template_key: str, customer, sent_by_id=None, invoice=No
     subject = ""
     try:
         template = EmailTemplate.objects.get(key=template_key)
-        context = build_context(template_key, customer, invoice, payment)
+        context = build_context(template_key, customer, invoice, payment, extra=extra_context)
         subject, body = render_template_strings(template, context)
-        attachment = _build_attachment(template_key, customer, invoice)
+        attachment = _build_attachment(template_key, customer, invoice, period=period)
 
         plain_text = strip_tags(body)
         message = EmailMultiAlternatives(
@@ -129,6 +241,7 @@ def send_customer_email(template_key: str, customer, sent_by_id=None, invoice=No
             body=plain_text,
             from_email=get_email_config()["from_email"],
             to=[recipient],
+            cc=[cc] if cc else None,
             connection=get_email_connection(),
         )
         message.attach_alternative(body, "text/html")
@@ -139,8 +252,10 @@ def send_customer_email(template_key: str, customer, sent_by_id=None, invoice=No
 
         return EmailLog.objects.create(
             customer=customer,
+            invoice=invoice,
             template_key=template_key,
             recipient_email=recipient,
+            cc_email=cc,
             subject=subject,
             status=EmailLog.Status.SENT,
             sent_by_id=sent_by_id,
@@ -150,8 +265,10 @@ def send_customer_email(template_key: str, customer, sent_by_id=None, invoice=No
         logger.exception("Failed to send %s email to customer %s", template_key, customer.pk)
         return EmailLog.objects.create(
             customer=customer,
+            invoice=invoice,
             template_key=template_key,
             recipient_email=recipient,
+            cc_email=cc,
             subject=subject,
             status=EmailLog.Status.FAILED,
             error_message=str(exc),

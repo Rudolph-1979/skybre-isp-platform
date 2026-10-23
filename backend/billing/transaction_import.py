@@ -1,0 +1,536 @@
+"""Import a customer's full history from Splynx's per-customer TRANSACTION
+REPORT — a different file from the one billing.ledger_import reads. Read
+this module's docstring in full before touching either; they solve
+different problems and are not interchangeable.
+
+WHY THIS EXISTS
+---------------
+billing.ledger_import reads Splynx's per-customer INVOICE ledger — a
+summary of invoices, payments and credit notes, keyed on each invoice's own
+Number. That summary is INCOMPLETE: Splynx settles some invoices through a
+channel it doesn't export as a distinct "Payment" row at all — a salary
+deduction, on the account this was found on. The invoice's own Status still
+says "Paid", but nothing tells that importer HOW MUCH, so nothing ever
+credits the customer's balance for it. The result is a customer's imported
+balance sitting too high, by exactly the amount of the uncaptured payment,
+with no visible sign anything is wrong — found by comparing a live
+customer's imported balance (R1,326.99) against Splynx's own live balance
+for the same account (R546.37); the entire R780.62 gap was that one
+transaction.
+
+The Transaction Report doesn't have this gap. It's the RAW ledger — every
+individual debit and credit, in order, each with the running Account
+balance immediately after it — so every row can be checked against the one
+before it (previous balance + debit − credit == this row's balance). If
+that chain never breaks across the whole file, the file is self-proving:
+its own last row's balance IS the account's true balance, full stop,
+without needing Splynx's live balance to separately confirm it.
+
+WHAT THIS BUILDS
+----------------
+Splynx has no invoice/payment/credit-note structure at this level here —
+it's a flat list of line items. This reconstructs Vexar's own documents
+from it:
+
+* Every DEBIT row, plus any same-day "Discount for <X>" CREDIT row, is
+  combined into ONE Invoice for that calendar date — one line item per raw
+  row (the discount as a negative line). This is exactly how
+  billing.ledger_import's own coarser export already grouped the same
+  account's history into invoices; verified line for line against it while
+  building this (six invoices, identical totals, on the real file this was
+  built for).
+* A row categorised "Payment", or a standalone Credit that isn't a same-day
+  discount and isn't under a recognised billable category (category
+  "Service" — the "Deducted from Salary" case above) — becomes a Payment,
+  uninvoiced, same convention billing.ledger_import already uses for
+  payments.
+* A standalone Credit under a billable category (matches a category also
+  seen on a charge row) that ISN'T a same-day discount — a full waiver,
+  not a routine monthly reduction — becomes a credit note: an Invoice with
+  a negative total, same as billing.ledger_import.
+
+Nothing here is guessed: every row lands in exactly one of those three
+buckets, so the total money moved never changes — only how it's labelled.
+That is what makes the result provably correct regardless of any single
+row's classification: sum(invoice debits) − sum(credit-note debits) −
+sum(payment credits) is mathematically the same total the file's own
+running balance already proves, column for column, independent of this
+module. Verified against the real file this was built for: reconstructs to
+R546.37, matching Splynx's own live balance exactly.
+
+PER-INVOICE Paid/Unpaid IS APPROXIMATE
+---------------------------------------
+Splynx's transaction ledger tracks one account-wide running balance, not
+which invoice a particular payment went against. There is no way to know,
+from this file, that payment X specifically settled invoice Y. So each
+invoice's own Paid/Unpaid badge here is inferred from the file's OWN
+running balance immediately after that invoice's own rows: if the account
+was square (<= 0) by then, it's marked Paid; otherwise its paid_amount is
+however much of its own total the still-outstanding balance at that point
+doesn't explain. This can be wrong about which SPECIFIC invoice is unpaid
+in an account with a long back-and-forth history. What it cannot be wrong
+about is the CUSTOMER'S OVERALL BALANCE, which is reconciled exactly as
+described above, independent of this approximation.
+
+VAT, numbering, idempotency — same conventions as billing.ledger_import:
+Totals are VAT-inclusive; _split_vat is reused unchanged. Every created
+Invoice/credit-note keeps a synthetic but stable number, "TXN<id>" (or,
+for a date-group, "TXN<the lowest id in the group>") — <id> is Splynx's own
+per-transaction ID column, not the "#" sequence column (used only to
+restore chronological order — see below — and never stored). A Payment's
+idempotency key is that same id, kept in its note, exactly as
+billing.ledger_import already does for its own payments.
+"""
+import datetime
+import re
+from decimal import Decimal
+
+from django.db import transaction
+from django.db.models import F
+
+from .ledger_import import (
+    VAT_RATE,
+    _cell,
+    _date,
+    _grid_from_text,
+    _grid_from_xlsx,
+    _money,
+    _split_vat,
+    _REF_IN_HEADER,
+)
+from .models import Invoice, InvoiceItem, Payment
+
+_DISCOUNT_RE = re.compile(r"^\s*discount\s+for\s+", re.IGNORECASE)
+# The generic, non-tariff bucket Splynx files ancillary lines under (a
+# Public IP rental fee — and, on the account this was built for, a salary
+# deduction that settled an invoice outside any bank/EFT channel). A
+# standalone credit here is treated as a payment, not a credit note — see
+# the module docstring.
+_ANCILLARY_CATEGORY = "service"
+_PAYMENT_CATEGORY = "payment"
+
+
+def parse(data):
+    """(reference_or_None, rows, fatal_errors) from raw file bytes.
+
+    Same file-format sniffing as billing.ledger_import.parse (accepts the
+    .xlsx straight out of Splynx as well as CSV/TSV), keyed on this
+    report's own columns instead — Debit / Credit / Account balance, rather
+    than Total / Due / Status.
+    """
+    if not data:
+        return None, [], ["The file is empty."]
+
+    if data[:2] == b"PK":                       # xlsx/zip magic
+        try:
+            grid = _grid_from_xlsx(data)
+        except Exception as exc:                              # noqa: BLE001
+            return None, [], [f"Couldn't read that spreadsheet: {exc}"]
+    else:
+        grid = _grid_from_text(data)
+        if grid is None:
+            return None, [], [
+                "Couldn't read that file — save it as .xlsx, or as CSV in UTF-8."
+            ]
+
+    grid = [row for row in grid if any(str(cell).strip() for cell in row)]
+    if not grid:
+        return None, [], ["The file is empty."]
+
+    reference = None
+    header_index = None
+    for index, row in enumerate(grid[:10]):
+        cells = [str(cell).strip().lower() for cell in row]
+        if "debit" in cells and "credit" in cells and "account balance" in cells:
+            header_index = index
+            break
+        for cell in row:
+            match = _REF_IN_HEADER.search(str(cell).strip())
+            if match and reference is None:
+                reference = match.group(1).strip()
+
+    if header_index is None:
+        return reference, [], [
+            "Couldn't find the column headings. The file needs a row containing "
+            "Debit, Credit and Account balance. (A summary export of invoices, "
+            "payments and credit notes is a different file — use Import billing "
+            "history for that one instead.)"
+        ]
+
+    headers = [str(cell).strip() for cell in grid[header_index]]
+    rows = [dict(zip(headers, row)) for row in grid[header_index + 1:]]
+    return reference, rows, []
+
+
+def _chronological(raw_rows):
+    """Splynx lists this report newest-first. The running balance only
+    makes sense walked forward in time, so everything downstream needs it
+    the other way round.
+
+    Ordered on the report's own "#" sequence column, which is what a
+    person reads as "how far back in the account's history is this" — not
+    on "ID", which is Splynx's internal per-transaction identifier and is
+    used only for idempotency (see the module docstring), never for
+    ordering. Falls back to reversing the file's own order when "#" is
+    missing or unreadable, rather than refusing outright — but the
+    consistency check right after this only trusts an actual "#".
+    """
+    numbered = [(_money(_cell(raw, "#")), raw) for raw in raw_rows]
+    if numbered and all(n is not None for n, _ in numbered):
+        return [raw for _, raw in sorted(numbered, key=lambda pair: pair[0])]
+    return list(reversed(raw_rows))
+
+
+def _classify(category, description, debit, credit):
+    """-> (kind, amount) where kind is "charge" / "discount" / "payment" /
+    "credit_note", and amount is always positive (the caller applies the
+    sign the kind implies). See the module docstring for the reasoning."""
+    if debit is not None:
+        return "charge", debit
+    cat = category.strip().lower()
+    if cat == _PAYMENT_CATEGORY:
+        return "payment", credit
+    if _DISCOUNT_RE.match(description or ""):
+        return "discount", credit
+    if cat == _ANCILLARY_CATEGORY:
+        return "payment", credit
+    return "credit_note", credit
+
+
+def plan(customer, data):
+    """What an import WOULD do. Writes nothing.
+
+    Returns {"reference", "rows": [...], "summary": {...}, "errors": [...]}.
+    Each row carries an `action` — group_charge / group_discount (folded
+    into that date's invoice) / create_payment / create_credit / skip /
+    error — and a message a human can act on. commit() re-derives the same
+    groupings from these rows rather than re-parsing the file, so preview
+    and commit can never disagree about what a row is.
+    """
+    reference, raw_rows, errors = parse(data)
+    result = {"reference": reference, "rows": [], "summary": {}, "errors": list(errors)}
+    if errors:
+        return result
+
+    # The file says who, the page says who. Disagreement is refused rather
+    # than resolved — see billing.ledger_import's own version of this check.
+    if reference and customer.customer_id and reference.strip().lower() != customer.customer_id.strip().lower():
+        result["errors"].append(
+            f"This file is for reference '{reference}', but this customer's reference is "
+            f"'{customer.customer_id}'. Nothing has been imported. Open the right customer, or "
+            f"correct the reference on one of them first."
+        )
+        return result
+
+    ordered = _chronological(raw_rows)
+
+    # The consistency check that makes this file trustworthy in the first
+    # place: every row's own Account balance must equal the one before it,
+    # plus this row's Debit, minus this row's Credit. If this ever breaks,
+    # nothing past that point can be trusted, so the whole import is
+    # refused rather than importing a partial, silently-wrong history.
+    running = None
+    for i, raw in enumerate(ordered, start=1):
+        debit = _money(_cell(raw, "debit")) or Decimal("0")
+        credit = _money(_cell(raw, "credit")) or Decimal("0")
+        balance = _money(_cell(raw, "account balance"))
+        if balance is None:
+            result["errors"].append(
+                f"Row {i}: no readable Account balance — can't verify the running total. "
+                f"Nothing has been imported."
+            )
+            return result
+        if running is not None and running + debit - credit != balance:
+            result["errors"].append(
+                f"Row {i} ({_cell(raw, 'description') or 'no description'}): the running balance "
+                f"doesn't add up — expected R{running + debit - credit}, the file says R{balance}. "
+                f"Nothing has been imported. This file may be out of order, edited, or missing rows."
+            )
+            return result
+        running = balance
+
+    counts = {"invoices": 0, "payments": 0, "credits": 0, "skipped": 0, "errors": 0}
+    invoiced = Decimal("0")
+    paid = Decimal("0")
+    credited = Decimal("0")
+    groups: dict[datetime.date, list] = {}
+
+    for index, raw in enumerate(ordered, start=1):
+        txn_id = _cell(raw, "id")
+        when = _date(_cell(raw, "transaction date"))
+        description = (_cell(raw, "description") or "").strip()
+        category = (_cell(raw, "category") or "").strip()
+        debit = _money(_cell(raw, "debit"))
+        credit = _money(_cell(raw, "credit"))
+        row_balance = _money(_cell(raw, "account balance"))
+        entry = {
+            "line": index, "id": str(txn_id) if txn_id not in (None, "") else None,
+            "date": when.isoformat() if when else None,
+            "description": description, "category": category,
+            "action": "error", "message": "",
+            # The file's own running balance immediately after this row —
+            # already validated above (the consistency check refuses the
+            # whole import if any row's balance is unreadable or doesn't
+            # add up). Carried through so commit() can approximate each
+            # invoice's Paid/Unpaid from it — see _last_raw_balance below.
+            "account_balance": str(row_balance) if row_balance is not None else None,
+        }
+
+        if not txn_id:
+            entry.update(action="skip", message="No transaction ID on this row — skipped.")
+            counts["skipped"] += 1
+            result["rows"].append(entry)
+            continue
+        if when is None:
+            entry["message"] = f"Couldn't read the date '{_cell(raw, 'transaction date')}'. Expected 04/08/2026."
+            counts["errors"] += 1
+            result["rows"].append(entry)
+            continue
+        if debit is not None and credit is not None:
+            entry["message"] = "This row has both a Debit and a Credit — can't tell which it is."
+            counts["errors"] += 1
+            result["rows"].append(entry)
+            continue
+        if debit is None and credit is None:
+            entry.update(action="skip", message="No Debit or Credit amount on this row — skipped.")
+            counts["skipped"] += 1
+            result["rows"].append(entry)
+            continue
+
+        kind, amount = _classify(category, description, debit, credit)
+        entry["amount"] = str(amount)
+
+        if kind in ("charge", "discount"):
+            entry.update(
+                action=f"group_{kind}",
+                message=(
+                    f"{'Charge' if kind == 'charge' else 'Discount'} of R{amount} "
+                    f"({description or category}) on the {when.isoformat()} invoice."
+                ),
+            )
+            groups.setdefault(when, []).append(entry)
+        elif kind == "payment":
+            if Payment.objects.filter(customer=customer, note__contains=str(txn_id)).exists():
+                entry.update(action="skip", message="Already imported.")
+                counts["skipped"] += 1
+            else:
+                entry.update(action="create_payment", message=f"Payment of R{amount} ({description or category}).")
+                counts["payments"] += 1
+                paid += amount
+        else:
+            number = f"TXN{txn_id}"
+            if Invoice.objects.filter(number=number).exists():
+                entry.update(action="skip", message="Already imported.")
+                counts["skipped"] += 1
+            else:
+                entry.update(action="create_credit", message=f"Credit note of R{amount} ({description or category}).")
+                counts["credits"] += 1
+                credited += amount
+
+        result["rows"].append(entry)
+
+    # Each date's charge/discount rows become one invoice — matched here,
+    # not while walking rows above, because a later row can still add to
+    # an earlier date's group (see _chronological: order is chronological,
+    # but nothing guarantees every row for one date is contiguous).
+    for when in sorted(groups):
+        rows_for_date = groups[when]
+        ids = [r["id"] for r in rows_for_date]
+        number = f"TXN{min(ids, key=lambda i: int(i))}"
+        if Invoice.objects.filter(number=number).exists():
+            for r in rows_for_date:
+                r["action"] = "skip"
+                r["message"] = "Already imported."
+            counts["skipped"] += len(rows_for_date)
+            continue
+        total = sum(
+            (Decimal(r["amount"]) if r["action"] == "group_charge" else -Decimal(r["amount"]))
+            for r in rows_for_date
+        )
+        if total <= 0:
+            for r in rows_for_date:
+                r["action"] = "error"
+                r["message"] = (
+                    f"The {when.isoformat()} invoice would total R{total} — a discount larger than "
+                    f"its charge. Nothing imported for this date; check the file."
+                )
+            counts["errors"] += len(rows_for_date)
+            counts["skipped"] = max(0, counts["skipped"])
+            continue
+        for r in rows_for_date:
+            r["invoice_number"] = number
+        counts["invoices"] += 1
+        invoiced += total
+
+    net = invoiced - paid - credited
+    counts.update(
+        invoiced_total=str(invoiced), paid_total=str(paid), credited_total=str(credited),
+        balance_change=str(net),
+    )
+    result["summary"] = counts
+    return result
+
+
+@transaction.atomic
+def commit(customer, data, user=None):
+    """Apply the plan. Everything or nothing — see billing.ledger_import's
+    commit() for why: a ledger half-written looks like a real, if strange,
+    balance rather than an obviously incomplete one."""
+    planned = plan(customer, data)
+    if planned["errors"]:
+        return planned
+
+    written = {"invoices": 0, "payments": 0, "credits": 0}
+
+    for entry in planned["rows"]:
+        if entry["action"] == "create_payment":
+            when = datetime.date.fromisoformat(entry["date"])
+            amount = Decimal(entry["amount"])
+            note_tail = f" — {entry['description']}" if entry["description"] else ""
+            payment = Payment.objects.create(
+                customer=customer,
+                amount=amount,
+                method=Payment.Method.MANUAL,
+                note=f"Imported from previous system (transaction report): {entry['id']}{note_tail}",
+                received_by=user,
+            )
+            Payment.objects.filter(pk=payment.pk).update(
+                date=datetime.datetime.combine(when, datetime.time(12, 0))
+            )
+            type(customer).objects.filter(pk=customer.pk).update(balance=F("balance") - amount)
+            written["payments"] += 1
+
+        elif entry["action"] == "create_credit":
+            when = datetime.date.fromisoformat(entry["date"])
+            amount = Decimal(entry["amount"])
+            ex, vat, adj = _split_vat(amount)
+            ex, adj = -ex, -adj
+            invoice = Invoice(
+                customer=customer,
+                number=f"TXN{entry['id']}",
+                status=Invoice.Status.PAID,
+                date_due=when,
+                date_issued=when,
+            )
+            invoice.save()
+            Invoice.objects.filter(pk=invoice.pk).update(date_created=when)
+            InvoiceItem.objects.create(
+                invoice=invoice,
+                item_type=InvoiceItem.ItemType.CUSTOM,
+                description=f"Credit note — imported from previous system ({entry['description'] or entry['category']})",
+                quantity=1,
+                unit_price=ex,
+                tax_rate_pct=VAT_RATE,
+            )
+            if adj:
+                InvoiceItem.objects.create(
+                    invoice=invoice, item_type=InvoiceItem.ItemType.CUSTOM,
+                    description="Rounding adjustment", quantity=1, unit_price=adj, tax_rate_pct=0,
+                )
+            invoice.refresh_from_db()
+            invoice.recalc_totals()
+            Invoice.objects.filter(pk=invoice.pk).update(paid_amount=invoice.total)
+            invoice.apply_balance_debit()
+            written["credits"] += 1
+
+    # Invoices last: grouped rows carry an invoice_number only once
+    # (assigned in plan(), above), so group by it directly rather than
+    # re-deriving dates.
+    by_invoice: dict[str, list] = {}
+    for entry in planned["rows"]:
+        if entry["action"] in ("group_charge", "group_discount") and entry.get("invoice_number"):
+            by_invoice.setdefault(entry["invoice_number"], []).append(entry)
+
+    for number, rows_for_invoice in by_invoice.items():
+        when = datetime.date.fromisoformat(rows_for_invoice[0]["date"])
+        invoice = Invoice(
+            customer=customer,
+            number=number,
+            status=Invoice.Status.UNPAID,      # corrected to Paid/partial below
+            date_due=when,
+            date_issued=when,
+        )
+        invoice.save()
+        Invoice.objects.filter(pk=invoice.pk).update(date_created=when)
+
+        raw_total = Decimal("0")
+        for r in rows_for_invoice:
+            signed = Decimal(r["amount"]) if r["action"] == "group_charge" else -Decimal(r["amount"])
+            raw_total += signed
+            ex, vat, adj = _split_vat(abs(signed))
+            if signed < 0:
+                ex, adj = -ex, -adj
+            InvoiceItem.objects.create(
+                invoice=invoice,
+                item_type=InvoiceItem.ItemType.CUSTOM,
+                description=f"{r['description'] or r['category']} — imported from previous system",
+                quantity=1,
+                unit_price=ex,
+                tax_rate_pct=VAT_RATE,
+            )
+            if adj:
+                InvoiceItem.objects.create(
+                    invoice=invoice, item_type=InvoiceItem.ItemType.CUSTOM,
+                    description="Rounding adjustment", quantity=1, unit_price=adj, tax_rate_pct=0,
+                )
+
+        invoice.refresh_from_db()
+        invoice.recalc_totals()
+        # This invoice's own Paid/Unpaid is approximate — see the module
+        # docstring. Based on the file's OWN running balance immediately
+        # after this date's rows: square (<= 0) means Paid; otherwise this
+        # invoice's paid_amount is whatever its own total doesn't explain
+        # of the still-outstanding balance at that point, clamped so it
+        # never goes negative or above the invoice's own (recalculated)
+        # total.
+        last_raw = _last_raw_balance(planned, number)
+        if last_raw is not None and last_raw <= 0:
+            paid_amount = invoice.total
+        elif last_raw is not None:
+            paid_amount = max(Decimal("0"), min(invoice.total, invoice.total - last_raw))
+        else:
+            paid_amount = Decimal("0")
+        Invoice.objects.filter(pk=invoice.pk).update(
+            paid_amount=paid_amount,
+            status=Invoice.Status.PAID if paid_amount >= invoice.total else Invoice.Status.UNPAID,
+        )
+        invoice.apply_balance_debit()
+        written["invoices"] += 1
+
+    # Imported money settles this client's open invoices once it lands
+    # (12 Oct 2026): four clients sat "Overdue but in credit" because their
+    # payments arrived by import AFTER the platform had raised the invoice,
+    # and nothing swept them. sweep_customer only ever lets imported money
+    # settle what the balance proves is covered (_settle_from_imported), so
+    # it can never pay an invoice twice. Runs after this transaction commits.
+    if any(written.values()):
+        from .allocation import sweep_after_commit
+
+        sweep_after_commit(customer.pk)
+
+    planned["written"] = written
+    return planned
+
+
+def _last_raw_balance(planned, invoice_number):
+    """The file's own Account balance as of the LAST row belonging to this
+    invoice's date-group — see commit()'s Paid/Unpaid note above.
+
+    planned["rows"] is in the same chronological order _chronological()
+    established (each entry's "line" only ever increases), and an
+    invoice's own rows aren't guaranteed contiguous within it (see the
+    grouping note in plan()) — so this can't just take rows_for_invoice's
+    last element. Instead it walks every row in the plan and keeps the
+    latest one tagged with this invoice_number; because that walk is in
+    chronological order, whichever such row comes last IS the last one
+    chronologically, contiguous or not.
+
+    Returns None only if the plan carries no account_balance for this
+    invoice at all (shouldn't happen — plan() refuses the whole import
+    first if any row's balance can't be read).
+    """
+    last = None
+    for entry in planned["rows"]:
+        if entry.get("invoice_number") == invoice_number and entry.get("account_balance") is not None:
+            last = entry["account_balance"]
+    return Decimal(last) if last is not None else None

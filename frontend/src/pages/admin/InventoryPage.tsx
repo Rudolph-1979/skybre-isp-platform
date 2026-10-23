@@ -1,3 +1,4 @@
+import { byStaffName, staffFullName } from "../../utils/scheduling";
 import { useEffect, useState, type FormEvent } from "react";
 import { api } from "../../api/client";
 import { useApiList } from "../../hooks/useApiList";
@@ -7,9 +8,24 @@ import { StatusBadge } from "../../components/StatusBadge";
 import { Modal, FormField, inputClass, filterSelectClass, btnPrimary, btnSecondary } from "../../components/Modal";
 import { ColumnToggle, type ColumnDef } from "../../components/ColumnToggle";
 import { useColumnVisibility } from "../../hooks/useColumnVisibility";
-import type { Supplier, Product, SerializedUnit, StockReceipt, StockIssue, Job, User } from "../../types";
+import { formatIsoDate, formatIsoDateTime } from "../../utils/billingTerms";
+import type {
+  Account,
+  Supplier,
+  SupplierCategory,
+  StockSite,
+  StockSiteType,
+  Vehicle,
+  NetworkSite,
+  Product,
+  SerializedUnit,
+  StockReceipt,
+  StockIssue,
+  Job,
+  User,
+} from "../../types";
 
-type Tab = "products" | "units" | "suppliers" | "receipts" | "issues";
+type Tab = "products" | "units" | "sites" | "suppliers" | "categories" | "receipts" | "issues";
 
 type NewAction = { label: string; onClick: () => void } | null;
 
@@ -22,15 +38,28 @@ const CATEGORY_LABEL: Record<Product["category"], string> = {
   other: "Other",
 };
 
+// Stock by location (George, 13 Oct 2026): the active stock sites, for the
+// location pickers and filters. The default site comes first.
+function useStockSites() {
+  const { items } = useApiList<StockSite>("/stock-sites/?is_active=true&page_size=200");
+  return [...items].sort((a, b) => Number(b.is_default) - Number(a.is_default) || a.name.localeCompare(b.name));
+}
+
+function siteLabel(s: StockSite) {
+  return `${s.name}${s.is_default ? " (default)" : ""}`;
+}
+
 export function InventoryPage() {
   const [tab, setTab] = useState<Tab>("products");
   const [newAction, setNewAction] = useState<NewAction>(null);
   const TABS: { key: Tab; label: string }[] = [
     { key: "products", label: "Products" },
     { key: "units", label: "Units (serial / MAC)" },
+    { key: "sites", label: "Sites" },
     { key: "suppliers", label: "Suppliers" },
+    { key: "categories", label: "Supplier categories" },
     { key: "receipts", label: "Stock Receipts" },
-    { key: "issues", label: "Stock Issues" },
+    { key: "issues", label: "Stock Issues & Transfers" },
   ];
 
   return (
@@ -63,9 +92,227 @@ export function InventoryPage() {
       </div>
       {tab === "products" && <ProductsTab onRegisterNewAction={setNewAction} />}
       {tab === "units" && <UnitsTab onRegisterNewAction={setNewAction} />}
+      {tab === "sites" && <SitesTab onRegisterNewAction={setNewAction} />}
       {tab === "suppliers" && <SuppliersTab onRegisterNewAction={setNewAction} />}
+      {tab === "categories" && <SupplierCategoriesTab onRegisterNewAction={setNewAction} />}
       {tab === "receipts" && <ReceiptsTab onRegisterNewAction={setNewAction} />}
       {tab === "issues" && <IssuesTab onRegisterNewAction={setNewAction} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Supplier categories -- a label and, more importantly, the expense
+// account it pre-fills. See backend inventory.models.SupplierCategory.
+// ---------------------------------------------------------------------------
+
+function SupplierCategoriesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const { items, loading, refetch } = useApiList<SupplierCategory>(
+    "/supplier-categories/?page_size=200&ordering=name"
+  );
+  // Only expense accounts can be a default here -- a supplier invoice is
+  // a cost, and offering the bank account or debtors would be offering a
+  // mistake.
+  const { items: accounts } = useApiList<Account>(
+    "/chart-accounts/?page_size=200&type=expense&is_active=true&ordering=code"
+  );
+  const [showModal, setShowModal] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [form, setForm] = useState<{ name: string; default_account: string; notes: string }>({
+    name: "", default_account: "", notes: "",
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    onRegisterNewAction({
+      label: "+ New category",
+      onClick: () => {
+        setEditingId(null);
+        setForm({ name: "", default_account: "", notes: "" });
+        setError("");
+        setShowModal(true);
+      },
+    });
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function openEdit(category: SupplierCategory) {
+    setEditingId(category.id);
+    setForm({
+      name: category.name,
+      default_account: category.default_account == null ? "" : String(category.default_account),
+      notes: category.notes,
+    });
+    setError("");
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      const payload = {
+        name: form.name,
+        default_account: form.default_account ? Number(form.default_account) : null,
+        notes: form.notes,
+      };
+      if (editingId === null) {
+        await api.post("/supplier-categories/", payload);
+      } else {
+        await api.patch(`/supplier-categories/${editingId}/`, payload);
+      }
+      setShowModal(false);
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: Record<string, string[] | string> } })?.response?.data;
+      const first = data ? Object.values(data)[0] : null;
+      setError((Array.isArray(first) ? first[0] : (first as string)) || "Could not save this category.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /** Deleting a category un-categorises its suppliers, so the backend
+   * refuses the first attempt and says how many. Re-sent with confirm,
+   * because "delete Bandwidth" reads like removing a label. */
+  async function handleDelete(category: SupplierCategory) {
+    setError("");
+    try {
+      await api.delete(`/supplier-categories/${category.id}/`);
+      refetch();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      if (detail && confirm(`${detail}\n\nGo ahead?`)) {
+        await api.delete(`/supplier-categories/${category.id}/?confirm=yes`);
+        refetch();
+        return;
+      }
+      setError(detail || "Could not delete this category.");
+    }
+  }
+
+  return (
+    <div>
+      <p className="mb-3 max-w-3xl text-sm text-[var(--text-secondary)]">
+        A category groups suppliers that share an expense account, so capturing an invoice from one of them
+        already knows where it belongs. It is only a starting point: the account is written onto the expense
+        when it is captured, so changing a category later affects new expenses only and cannot move a VAT
+        period you have already filed.
+      </p>
+
+      {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <TH>Category</TH>
+              <TH>Pre-fills account</TH>
+              <TH>Suppliers</TH>
+              <TH>Notes</TH>
+              <TH></TH>
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((c) => (
+              <TR key={c.id}>
+                <TD className="font-medium">{c.name}</TD>
+                <TD>
+                  {c.default_account_name ? (
+                    <span className="text-[var(--text-secondary)]">
+                      <span className="tabular-nums text-[var(--text-muted)]">{c.default_account_code}</span>{" "}
+                      {c.default_account_name}
+                    </span>
+                  ) : (
+                    // Worth naming rather than showing a dash: a category
+                    // with no account is inert, and looks identical to one
+                    // that works until somebody captures an invoice.
+                    <span className="text-[var(--text-muted)]">None — nothing will be pre-filled</span>
+                  )}
+                </TD>
+                <TD className="tabular-nums">{c.supplier_count}</TD>
+                <TD className="text-[var(--text-muted)]">{c.notes || "—"}</TD>
+                <TD>
+                  <div className="flex gap-2">
+                    <button type="button" className={btnSecondary} onClick={() => openEdit(c)}>
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-md border border-[var(--status-critical)] px-4 py-2 text-sm font-medium text-[var(--status-critical)] hover:bg-[var(--tint-hover)]"
+                      onClick={() => handleDelete(c)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </TD>
+              </TR>
+            ))}
+            {items.length === 0 && (
+              <TR>
+                <TD className="text-[var(--text-muted)]">
+                  No categories yet. Add one for each kind of supplier you buy from — bandwidth, hardware,
+                  fuel — and point it at the matching account.
+                </TD>
+              </TR>
+            )}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal
+          title={editingId === null ? "New supplier category" : `Edit ${form.name || "category"}`}
+          onClose={() => setShowModal(false)}
+        >
+          <form onSubmit={handleSubmit}>
+            <FormField label="Name">
+              <input
+                className={inputClass}
+                required
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                placeholder="e.g. Transit / bandwidth"
+              />
+            </FormField>
+            <FormField label="Pre-fills this account">
+              <select
+                className={inputClass}
+                value={form.default_account}
+                onChange={(e) => setForm({ ...form, default_account: e.target.value })}
+              >
+                <option value="">No account — nothing will be pre-filled</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.code} — {a.name}
+                  </option>
+                ))}
+              </select>
+            </FormField>
+            <FormField label="Notes (optional)">
+              <input
+                className={inputClass}
+                value={form.notes}
+                onChange={(e) => setForm({ ...form, notes: e.target.value })}
+              />
+            </FormField>
+            {error && <p className="mb-3 text-sm text-[var(--status-critical)]">{error}</p>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={saving} className={btnPrimary}>
+                {saving ? "Saving…" : editingId === null ? "Create category" : "Save changes"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -234,11 +481,14 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [categoryFilter, setCategoryFilter] = useState("");
   const [trackingFilter, setTrackingFilter] = useState("");
   const [activeFilter, setActiveFilter] = useState("");
+  // On hand at one location (13 Oct 2026); blank = all locations.
+  const [siteFilter, setSiteFilter] = useState("");
+  const sites = useStockSites();
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-products", ["name"]);
   const { items, loading, refetch } = useApiList<Product>(
     `/products/?page_size=200&ordering=${ordering}${categoryFilter ? `&category=${categoryFilter}` : ""}${
       trackingFilter ? `&tracking_type=${trackingFilter}` : ""
-    }${activeFilter ? `&is_active=${activeFilter}` : ""}`
+    }${activeFilter ? `&is_active=${activeFilter}` : ""}${siteFilter ? `&site=${siteFilter}` : ""}`
   );
   const [showModal, setShowModal] = useState(false);
   const [form, setForm] = useState<Partial<Product>>(EMPTY_PRODUCT);
@@ -257,6 +507,23 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [adjusting, setAdjusting] = useState<Product | null>(null);
   const [adjustQty, setAdjustQty] = useState("");
   const [adjustNote, setAdjustNote] = useState("");
+  const [adjustSite, setAdjustSite] = useState("");
+  const [adjustError, setAdjustError] = useState("");
+  const [deleteError, setDeleteError] = useState("");
+
+  // Delete a duplicate / mistaken product (14 Oct 2026). The server refuses
+  // one with stock history and says to make it inactive instead.
+  async function handleDeleteProduct(p: Product) {
+    setDeleteError("");
+    const used = p.quantity_on_hand ? ` It shows ${p.quantity_on_hand} on hand.` : "";
+    if (!window.confirm(`Delete "${p.name}"${p.sku ? ` (${p.sku})` : ""}?${used}\n\nThis can't be undone. Quotes and invoices that used it keep their lines.`)) return;
+    try {
+      await api.delete(`/products/${p.id}/`);
+      refetch();
+    } catch (err: any) {
+      setDeleteError(err?.response?.data?.detail || `Couldn't delete "${p.name}".`);
+    }
+  }
 
   useEffect(() => {
     onRegisterNewAction({ label: "+ New product", onClick: () => setShowModal(true) });
@@ -326,15 +593,19 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
     e.preventDefault();
     if (!adjusting) return;
     setSaving(true);
+    setAdjustError("");
     try {
       await api.post(`/products/${adjusting.id}/adjust/`, {
         quantity: Number(adjustQty),
         note: adjustNote,
+        ...(adjustSite ? { site: Number(adjustSite) } : {}),
       });
       setAdjusting(null);
       setAdjustQty("");
       setAdjustNote("");
       refetch();
+    } catch (err: any) {
+      setAdjustError(err?.response?.data?.detail || "Couldn't apply the adjustment.");
     } finally {
       setSaving(false);
     }
@@ -359,7 +630,13 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
           <option value="true">Active only</option>
           <option value="false">Inactive only</option>
         </select>
-        {(categoryFilter || trackingFilter || activeFilter) && (
+        <select className={filterSelectClass} value={siteFilter} onChange={(e) => setSiteFilter(e.target.value)}>
+          <option value="">All locations</option>
+          {sites.map((s) => (
+            <option key={s.id} value={s.id}>{siteLabel(s)}</option>
+          ))}
+        </select>
+        {(categoryFilter || trackingFilter || activeFilter || siteFilter) && (
           <button
             type="button"
             className={btnSecondary}
@@ -367,6 +644,7 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               setCategoryFilter("");
               setTrackingFilter("");
               setActiveFilter("");
+              setSiteFilter("");
             }}
           >
             Clear filters
@@ -376,6 +654,12 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
           <ColumnToggle columns={PRODUCT_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
         </div>
       </div>
+      {deleteError && (
+        <div className="mb-3 flex items-start justify-between gap-3 rounded-md border border-[var(--status-critical)]/50 px-3 py-2 text-sm text-[var(--status-critical)]">
+          <span>{deleteError}</span>
+          <button type="button" aria-label="Dismiss" onClick={() => setDeleteError("")}>✕</button>
+        </div>
+      )}
       {loading ? (
         <p className="text-[var(--text-muted)]">Loading…</p>
       ) : (
@@ -389,7 +673,7 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               {isVisible("cost") && <TH>Latest cost</TH>}
               {isVisible("sell") && <SortableTH field="sell_price" ordering={ordering} onSort={toggleSort}>Resell price</SortableTH>}
               {isVisible("margin") && <TH>Margin</TH>}
-              {isVisible("on_hand") && <TH>On hand</TH>}
+              {isVisible("on_hand") && <TH>{siteFilter ? "On hand here" : "On hand"}</TH>}
               {isVisible("status") && <TH>Status</TH>}
               <TH></TH>
             </tr>
@@ -433,8 +717,16 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                     {p.quantity_on_hand} {p.tracking_type === "quantity" ? p.unit : ""}
                     {p.is_low_stock && (
                       <span className="ml-2 inline-block align-middle">
-                        <StatusBadge status="overdue" />
+                        <StatusBadge status="overdue" label="Low stock" />
                       </span>
+                    )}
+                    {!siteFilter && (p.stock_by_site?.length ?? 0) > 1 && (
+                      <span className="block text-xs text-[var(--text-muted)]">
+                        {p.stock_by_site!.map((s) => `${s.site_name}: ${s.quantity}`).join(" · ")}
+                      </span>
+                    )}
+                    {!siteFilter && p.stock_by_site?.length === 1 && (
+                      <span className="block text-xs text-[var(--text-muted)]">{p.stock_by_site[0].site_name}</span>
                     )}
                   </TD>
                 )}
@@ -454,11 +746,21 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                     {p.tracking_type === "quantity" && (
                       <button
                         className="text-xs text-[var(--series-1)] hover:underline"
-                        onClick={() => setAdjusting(p)}
+                        onClick={() => {
+                          setAdjusting(p);
+                          setAdjustSite(siteFilter || String(sites.find((s) => s.is_default)?.id ?? ""));
+                          setAdjustError("");
+                        }}
                       >
                         Adjust
                       </button>
                     )}
+                    <button
+                      className="text-xs text-red-600 hover:underline dark:text-red-400"
+                      onClick={() => handleDeleteProduct(p)}
+                    >
+                      Delete
+                    </button>
                   </div>
                 </TD>
               </TR>
@@ -683,8 +985,23 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
         <Modal title={`Adjust stock — ${adjusting.name}`} onClose={() => setAdjusting(null)}>
           <form onSubmit={handleAdjust}>
             <p className="mb-3 text-sm text-[var(--text-secondary)]">
-              Currently {adjusting.quantity_on_hand} {adjusting.unit} on hand.
+              Currently {adjusting.quantity_on_hand} {adjusting.unit} on hand
+              {siteFilter ? " at this location" : " in total"}.
+              {(adjusting.stock_by_site?.length ?? 0) > 0 && (
+                <span className="block text-xs text-[var(--text-muted)]">
+                  {adjusting.stock_by_site!.map((s) => `${s.site_name}: ${s.quantity}`).join(" · ")}
+                </span>
+              )}
             </p>
+            {sites.length > 0 && (
+              <FormField label="Location">
+                <select className={inputClass} value={adjustSite} onChange={(e) => setAdjustSite(e.target.value)}>
+                  {sites.map((s) => (
+                    <option key={s.id} value={s.id}>{siteLabel(s)}</option>
+                  ))}
+                </select>
+              </FormField>
+            )}
             <FormField label="Adjustment (positive to add, negative to remove)">
               <input
                 type="number"
@@ -702,6 +1019,7 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 placeholder="e.g. damaged, recount…"
               />
             </FormField>
+            {adjustError && <p className="mt-2 text-sm text-[var(--status-critical)]">{adjustError}</p>}
             <div className="mt-4 flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setAdjusting(null)}>
                 Cancel
@@ -718,11 +1036,429 @@ function ProductsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
 }
 
 // ---------------------------------------------------------------------------
+// Sites — where stock physically is
+// ---------------------------------------------------------------------------
+//
+// Store rooms and bakkies, in one list. A vehicle is a site here rather than
+// a thing of its own because everything you want to do with the stock in a
+// bakkie — count it, move stock in, move stock out — is exactly what you want
+// to do with the stock in a store room.
+//
+// The vehicle itself still lives in Fleet: a vehicle site points at it rather
+// than re-typing the registration and the driver, so re-registering a bakkie
+// or handing it to another technician can't leave this list stale.
+//
+// Nothing has a location yet — this is somewhere for stock to be, ahead of
+// the ledger learning about locations. That's why there is no "on hand"
+// column: it would read 0 everywhere and look like a bug rather than a
+// feature that hasn't arrived.
+
+const SITE_TYPE_OPTIONS: { value: StockSiteType; label: string }[] = [
+  { value: "warehouse", label: "Store room / Warehouse" },
+  { value: "vehicle", label: "Vehicle" },
+  { value: "other", label: "Other" },
+];
+
+const SITE_COLUMNS: ColumnDef[] = [
+  { key: "name", label: "Name" },
+  { key: "code", label: "Code" },
+  { key: "type", label: "Type" },
+  { key: "holder", label: "Held by" },
+  { key: "network_site", label: "Tower / site" },
+  { key: "address", label: "Address" },
+  { key: "status", label: "Status" },
+];
+
+const EMPTY_SITE: Partial<StockSite> = {
+  name: "",
+  code: "",
+  site_type: "warehouse",
+  address: "",
+  contact_person: "",
+  phone: "",
+  vehicle: null,
+  network_site: null,
+  is_default: false,
+  is_active: true,
+  notes: "",
+};
+
+function SitesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
+  const [ordering, setOrdering] = useState("name");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [activeFilter, setActiveFilter] = useState("");
+  const query = [
+    "page_size=200",
+    `ordering=${ordering}`,
+    typeFilter && `site_type=${typeFilter}`,
+    activeFilter && `is_active=${activeFilter}`,
+  ]
+    .filter(Boolean)
+    .join("&");
+  const { items, loading, refetch } = useApiList<StockSite>(`/stock-sites/?${query}`);
+  // Vehicles and towers are only needed to fill two dropdowns, so they are
+  // fetched once here rather than per row.
+  const { items: vehicles } = useApiList<Vehicle>("/vehicles/?page_size=200&is_active=true");
+  const { items: networkSites } = useApiList<NetworkSite>("/network-sites/?page_size=200");
+  const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-sites", [
+    "name",
+  ]);
+  const [showModal, setShowModal] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [form, setForm] = useState<Partial<StockSite>>(EMPTY_SITE);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    onRegisterNewAction({
+      label: "+ New site",
+      onClick: () => {
+        setEditingId(null);
+        setForm(EMPTY_SITE);
+        setError("");
+        setShowModal(true);
+      },
+    });
+    return () => onRegisterNewAction(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function toggleSort(field: string) {
+    setOrdering((prev) => (prev === field ? `-${field}` : prev === `-${field}` ? "name" : field));
+  }
+
+  function openEdit(site: StockSite) {
+    setEditingId(site.id);
+    setForm({ ...site });
+    setError("");
+    setShowModal(true);
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSaving(true);
+    // A store room must not carry a vehicle, and the server rejects it. Sent
+    // as null rather than left as-is so switching an existing vehicle site
+    // back to a store room actually clears the link instead of failing.
+    const payload = {
+      ...form,
+      vehicle: form.site_type === "vehicle" ? form.vehicle ?? null : null,
+    };
+    try {
+      if (editingId === null) {
+        await api.post("/stock-sites/", payload);
+      } else {
+        await api.patch(`/stock-sites/${editingId}/`, payload);
+      }
+      setShowModal(false);
+      setEditingId(null);
+      setForm(EMPTY_SITE);
+      refetch();
+    } catch (err) {
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      setError(
+        typeof data === "string"
+          ? data
+          : (data as { detail?: string })?.detail || JSON.stringify(data) || "Failed to save site."
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const noDefault = !loading && items.length > 0 && !items.some((s) => s.is_default);
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <select
+          className={filterSelectClass}
+          value={typeFilter}
+          onChange={(e) => setTypeFilter(e.target.value)}
+        >
+          <option value="">All types</option>
+          {SITE_TYPE_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <select
+          className={filterSelectClass}
+          value={activeFilter}
+          onChange={(e) => setActiveFilter(e.target.value)}
+        >
+          <option value="">Active and retired</option>
+          <option value="true">Active only</option>
+          <option value="false">Retired only</option>
+        </select>
+        <div className="ml-auto">
+          <ColumnToggle columns={SITE_COLUMNS} hidden={hiddenCols} onToggle={toggleCol} alwaysVisible={["name"]} />
+        </div>
+      </div>
+
+      {/* Said out loud, because the consequence is invisible until stock
+          starts moving: with no default, anything received without a site
+          chosen has nowhere to land. */}
+      {noDefault && (
+        <p className="mb-4 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] px-3 py-2 text-sm text-[var(--text-secondary)]">
+          No site is marked as the default yet. Open the site you keep most stock at and tick
+          “Default site” — that's where stock lands when nobody picks a site.
+        </p>
+      )}
+
+      {loading ? (
+        <p className="text-[var(--text-muted)]">Loading…</p>
+      ) : items.length === 0 ? (
+        <p className="text-[var(--text-muted)]">
+          No stock sites yet. Add the store room you keep stock in, and a site for each bakkie that
+          carries stock.
+        </p>
+      ) : (
+        <Table>
+          <THead>
+            <tr>
+              <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
+              {isVisible("code") && <TH>Code</TH>}
+              {isVisible("type") && (
+                <SortableTH field="site_type" ordering={ordering} onSort={toggleSort}>Type</SortableTH>
+              )}
+              {isVisible("holder") && <TH>Held by</TH>}
+              {isVisible("network_site") && <TH>Tower / site</TH>}
+              {isVisible("address") && <TH>Address</TH>}
+              {isVisible("status") && <TH>Status</TH>}
+            </tr>
+          </THead>
+          <tbody>
+            {items.map((s) => (
+              <TR key={s.id} onClick={() => openEdit(s)}>
+                <TD className="font-medium">
+                  {s.name}
+                  {s.is_default && (
+                    <span className="ml-2 rounded-sm bg-[var(--surface-2)] px-1.5 py-0.5 text-[11px] font-normal text-[var(--text-muted)]">
+                      Default
+                    </span>
+                  )}
+                </TD>
+                {isVisible("code") && <TD>{s.code || "—"}</TD>}
+                {isVisible("type") && (
+                  <TD>
+                    {s.site_type_display}
+                    {s.vehicle_registration && (
+                      <span className="text-[var(--text-muted)]"> · {s.vehicle_registration}</span>
+                    )}
+                  </TD>
+                )}
+                {isVisible("holder") && <TD>{s.holder_name || "—"}</TD>}
+                {isVisible("network_site") && <TD>{s.network_site_name || "—"}</TD>}
+                {isVisible("address") && <TD>{s.address || "—"}</TD>}
+                {isVisible("status") && (
+                  <TD>
+                    {/* "inactive" rather than a "retired" label: StatusBadge
+                        styles by the status string, and an unknown one falls
+                        through to the grey unknown style. Same words the
+                        product list already uses for the same idea. */}
+                    <StatusBadge status={s.is_active ? "active" : "inactive"} />
+                  </TD>
+                )}
+              </TR>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {showModal && (
+        <Modal
+          title={editingId === null ? "New stock site" : `Edit ${form.name || "site"}`}
+          onClose={() => setShowModal(false)}
+        >
+          <form onSubmit={handleSubmit}>
+            {error && (
+              <p className="mb-3 rounded-md bg-[#fbeaea] px-3 py-2 text-sm text-[#b32e2e]">{error}</p>
+            )}
+
+            <FormField label="Name">
+              <input
+                className={inputClass}
+                required
+                value={form.name ?? ""}
+                placeholder="e.g. Bethlehem Store, or Bakkie — Pieter"
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </FormField>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <FormField label="Code (optional)">
+                <input
+                  className={inputClass}
+                  value={form.code ?? ""}
+                  placeholder="BFN-01"
+                  onChange={(e) => setForm({ ...form, code: e.target.value })}
+                />
+              </FormField>
+              <FormField label="Type">
+                <select
+                  className={inputClass}
+                  value={form.site_type ?? "warehouse"}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      site_type: e.target.value as StockSiteType,
+                      // Clearing the vehicle here as well as in the payload,
+                      // so the vehicle picker doesn't keep a stale selection
+                      // hidden behind a type the user has switched away from.
+                      vehicle: e.target.value === "vehicle" ? form.vehicle ?? null : null,
+                    })
+                  }
+                >
+                  {SITE_TYPE_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </FormField>
+            </div>
+
+            {form.site_type === "vehicle" ? (
+              <>
+                <FormField label="Which vehicle">
+                  <select
+                    className={inputClass}
+                    required
+                    value={form.vehicle ?? ""}
+                    onChange={(e) =>
+                      setForm({ ...form, vehicle: e.target.value ? Number(e.target.value) : null })
+                    }
+                  >
+                    <option value="">Choose a vehicle…</option>
+                    {vehicles.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.registration_number} — {v.make} {v.model}
+                        {v.assigned_to_name ? ` (${v.assigned_to_name})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+                <p className="-mt-2 mb-3 text-xs text-[var(--text-muted)]">
+                  The registration and the driver come from Fleet, so this stays right when a bakkie
+                  is re-registered or handed over. One stock site per vehicle.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <FormField label="Contact person">
+                    <input
+                      className={inputClass}
+                      value={form.contact_person ?? ""}
+                      onChange={(e) => setForm({ ...form, contact_person: e.target.value })}
+                    />
+                  </FormField>
+                  <FormField label="Phone">
+                    <input
+                      className={inputClass}
+                      value={form.phone ?? ""}
+                      onChange={(e) => setForm({ ...form, phone: e.target.value })}
+                    />
+                  </FormField>
+                </div>
+                <FormField label="Address">
+                  <textarea
+                    className={inputClass}
+                    rows={2}
+                    value={form.address ?? ""}
+                    onChange={(e) => setForm({ ...form, address: e.target.value })}
+                  />
+                </FormField>
+                <FormField label="At which tower / site (optional)">
+                  <select
+                    className={inputClass}
+                    value={form.network_site ?? ""}
+                    onChange={(e) =>
+                      setForm({ ...form, network_site: e.target.value ? Number(e.target.value) : null })
+                    }
+                  >
+                    <option value="">Not at a tower</option>
+                    {networkSites.map((n) => (
+                      <option key={n.id} value={n.id}>
+                        {n.title}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+                <p className="-mt-2 mb-3 text-xs text-[var(--text-muted)]">
+                  Purely informational — it links this store room to a tower in Networking without
+                  giving the tower's partner rules any say over who can count the stock.
+                </p>
+              </>
+            )}
+
+            <FormField label="Notes">
+              <textarea
+                className={inputClass}
+                rows={2}
+                value={form.notes ?? ""}
+                onChange={(e) => setForm({ ...form, notes: e.target.value })}
+              />
+            </FormField>
+
+            <div className="mt-4 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-2)] p-3">
+              <label className="flex cursor-pointer items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={form.is_default ?? false}
+                  onChange={(e) => setForm({ ...form, is_default: e.target.checked })}
+                />
+                <span className="text-sm">
+                  <span className="font-medium text-[var(--text-primary)]">Default site</span>
+                  <span className="block text-xs text-[var(--text-muted)]">
+                    Where stock is assumed to be when nobody picks a site. Only one site can be the
+                    default — ticking this moves it here.
+                  </span>
+                </span>
+              </label>
+              <label className="mt-3 flex cursor-pointer items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={form.is_active ?? true}
+                  onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+                />
+                <span className="text-sm">
+                  <span className="font-medium text-[var(--text-primary)]">Active</span>
+                  <span className="block text-xs text-[var(--text-muted)]">
+                    Untick to retire a site. It stays on everything already recorded against it, but
+                    can't be chosen again. The default site can't be retired.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setShowModal(false)}>
+                Cancel
+              </button>
+              <button type="submit" disabled={saving} className={btnPrimary}>
+                {saving ? "Saving…" : editingId === null ? "Create site" : "Save changes"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Suppliers
 // ---------------------------------------------------------------------------
 
 const EMPTY_SUPPLIER: Partial<Supplier> = {
   name: "",
+  category: null,
   contact_person: "",
   phone: "",
   email: "",
@@ -740,6 +1476,7 @@ const EMPTY_SUPPLIER: Partial<Supplier> = {
 
 const SUPPLIER_COLUMNS: ColumnDef[] = [
   { key: "name", label: "Name" },
+  { key: "category", label: "Category" },
   { key: "contact_person", label: "Contact person" },
   { key: "phone", label: "Phone" },
   { key: "email", label: "Email" },
@@ -751,6 +1488,7 @@ function SuppliersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: N
   const [ordering, setOrdering] = useState("name");
   const { items, loading, refetch } = useApiList<Supplier>(`/suppliers/?page_size=200&ordering=${ordering}`);
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-suppliers", ["name"]);
+  const { items: categories } = useApiList<SupplierCategory>("/supplier-categories/?page_size=200&ordering=name");
   const [showModal, setShowModal] = useState(false);
   // null = creating a new supplier, an id = editing that one. The same modal
   // serves both, so the VAT fields can't drift between create and edit.
@@ -824,6 +1562,7 @@ function SuppliersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: N
           <THead>
             <tr>
               <SortableTH field="name" ordering={ordering} onSort={toggleSort}>Name</SortableTH>
+              {isVisible("category") && <TH>Category</TH>}
               {isVisible("contact_person") && <TH>Contact person</TH>}
               {isVisible("phone") && <TH>Phone</TH>}
               {isVisible("email") && <TH>Email</TH>}
@@ -835,6 +1574,20 @@ function SuppliersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: N
             {items.map((s) => (
               <TR key={s.id} onClick={() => openEdit(s)}>
                 <TD className="font-medium">{s.name}</TD>
+                {isVisible("category") && (
+                  <TD>
+                    {s.category_name ? (
+                      <span className="text-[var(--text-secondary)]">
+                        {s.category_name}
+                        {s.default_account_name && (
+                          <span className="text-[var(--text-muted)]"> · {s.default_account_name}</span>
+                        )}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--text-muted)]">—</span>
+                    )}
+                  </TD>
+                )}
                 {isVisible("contact_person") && <TD>{s.contact_person || "—"}</TD>}
                 {isVisible("phone") && <TD>{s.phone || "—"}</TD>}
                 {isVisible("email") && <TD>{s.email || "—"}</TD>}
@@ -884,6 +1637,31 @@ function SuppliersTab({ onRegisterNewAction }: { onRegisterNewAction: (action: N
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
               />
             </FormField>
+            <FormField label="Category (optional)">
+              <select
+                className={inputClass}
+                value={form.category == null ? "" : String(form.category)}
+                onChange={(e) =>
+                  setForm({ ...form, category: e.target.value ? Number(e.target.value) : null })
+                }
+              >
+                <option value="">No category</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                    {c.default_account_name ? ` → ${c.default_account_name}` : ""}
+                  </option>
+                ))}
+              </select>
+            </FormField>
+            {/* Said here rather than only in the docs: the instinct on
+                changing a category is to assume the books reorganise
+                themselves, and they deliberately do not. */}
+            <p className="mb-3 -mt-2 text-xs text-[var(--text-muted)]">
+              The category's account pre-fills when you capture an expense from this supplier. Changing it
+              later affects new expenses only — ones already captured keep the account they were saved with,
+              so a VAT period you have already filed cannot move.
+            </p>
             <FormField label="Contact person">
               <input
                 className={inputClass}
@@ -1028,6 +1806,7 @@ const UNIT_COLUMNS: ColumnDef[] = [
   { key: "mac", label: "MAC address" },
   { key: "product", label: "Product" },
   { key: "status", label: "Status" },
+  { key: "site", label: "Location" },
   { key: "supplier", label: "Supplier" },
   { key: "receipt", label: "Supplier invoice" },
   { key: "received", label: "Received" },
@@ -1038,6 +1817,8 @@ function UnitsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
   const [statusFilter, setStatusFilter] = useState("");
   const [productFilter, setProductFilter] = useState("");
   const [supplierFilter, setSupplierFilter] = useState("");
+  const [unitSiteFilter, setUnitSiteFilter] = useState("");
+  const unitSites = useStockSites();
   const [ordering, setOrdering] = useState("serial_number");
   const [products, setProducts] = useState<Product[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
@@ -1058,6 +1839,7 @@ function UnitsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
     statusFilter ? `status=${statusFilter}` : "",
     productFilter ? `product=${productFilter}` : "",
     supplierFilter ? `supplier=${supplierFilter}` : "",
+    unitSiteFilter ? `site=${unitSiteFilter}` : "",
   ]
     .filter(Boolean)
     .join("&");
@@ -1133,7 +1915,13 @@ function UnitsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
             <option key={sup.id} value={sup.id}>{sup.name}</option>
           ))}
         </select>
-        {(search || statusFilter || productFilter || supplierFilter) && (
+        <select className={filterSelectClass} value={unitSiteFilter} onChange={(e) => setUnitSiteFilter(e.target.value)}>
+          <option value="">Any location</option>
+          {unitSites.map((s) => (
+            <option key={s.id} value={s.id}>{siteLabel(s)}</option>
+          ))}
+        </select>
+        {(search || statusFilter || productFilter || supplierFilter || unitSiteFilter) && (
           <button
             type="button"
             className={btnSecondary}
@@ -1142,6 +1930,7 @@ function UnitsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
               setStatusFilter("");
               setProductFilter("");
               setSupplierFilter("");
+              setUnitSiteFilter("");
             }}
           >
             Clear
@@ -1166,6 +1955,7 @@ function UnitsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
               {isVisible("mac") && <SortableTH field="mac_address" ordering={ordering} onSort={toggleSort}>MAC address</SortableTH>}
               {isVisible("product") && <TH>Product</TH>}
               {isVisible("status") && <SortableTH field="status" ordering={ordering} onSort={toggleSort}>Status</SortableTH>}
+              {isVisible("site") && <TH>Location</TH>}
               {isVisible("supplier") && <TH>Supplier</TH>}
               {isVisible("receipt") && <TH>Supplier invoice</TH>}
               {isVisible("received") && <TH>Received</TH>}
@@ -1182,6 +1972,7 @@ function UnitsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAc
                 )}
                 {isVisible("product") && <TD>{u.product_name}</TD>}
                 {isVisible("status") && <TD><StatusBadge status={u.status} /></TD>}
+                {isVisible("site") && <TD>{u.site_name || "—"}</TD>}
                 {isVisible("supplier") && <TD>{u.supplier_name || "—"}</TD>}
                 {isVisible("receipt") && <TD>{u.receipt_invoice_number || "—"}</TD>}
                 {isVisible("received") && <TD>{u.received_on || "—"}</TD>}
@@ -1284,6 +2075,7 @@ const RECEIPT_COLUMNS: ColumnDef[] = [
   { key: "date", label: "Date" },
   { key: "invoice_number", label: "Invoice #" },
   { key: "supplier", label: "Supplier" },
+  { key: "site", label: "Location" },
   { key: "lines", label: "Lines" },
   { key: "total", label: "Total" },
   { key: "vat", label: "VAT" },
@@ -1318,11 +2110,15 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   const [supplierFilter, setSupplierFilter] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  // Stock by location (13 Oct 2026): receipts per warehouse.
+  const [receiptSiteFilter, setReceiptSiteFilter] = useState("");
+  const sites = useStockSites();
+  const [receiptSite, setReceiptSite] = useState("");
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-receipts", ["invoice_number"]);
   const { items, loading, refetch } = useApiList<StockReceipt>(
     `/stock-receipts/?page_size=100&ordering=${ordering}${supplierFilter ? `&supplier=${supplierFilter}` : ""}${
       dateFrom ? `&date_from=${dateFrom}` : ""
-    }${dateTo ? `&date_to=${dateTo}` : ""}`
+    }${dateTo ? `&date_to=${dateTo}` : ""}${receiptSiteFilter ? `&site=${receiptSiteFilter}` : ""}`
   );
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
@@ -1398,6 +2194,7 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
   }
 
   function resetForm() {
+    setReceiptSite("");
     setSupplier("");
     setInvoiceNumber("");
     setInvoiceDate("");
@@ -1415,6 +2212,8 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
     try {
       const payload = {
         supplier: Number(supplier),
+        // Blank = the default site (the backend fills it in).
+        ...(receiptSite ? { site: Number(receiptSite) } : {}),
         invoice_number: invoiceNumber,
         invoice_date: invoiceDate,
         notes,
@@ -1538,17 +2337,24 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
             <option key={s.id} value={s.id}>{s.name}</option>
           ))}
         </select>
+        <select className={filterSelectClass} value={receiptSiteFilter} onChange={(e) => setReceiptSiteFilter(e.target.value)}>
+          <option value="">All locations</option>
+          {sites.map((s) => (
+            <option key={s.id} value={s.id}>{siteLabel(s)}</option>
+          ))}
+        </select>
         <FormField label="Invoice date from">
           <input type="date" className={inputClass} value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
         </FormField>
         <FormField label="Invoice date to">
           <input type="date" className={inputClass} value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
         </FormField>
-        {(supplierFilter || dateFrom || dateTo) && (
+        {(supplierFilter || dateFrom || dateTo || receiptSiteFilter) && (
           <button
             type="button"
             className={`${btnSecondary} mb-3`}
             onClick={() => {
+              setReceiptSiteFilter("");
               setSupplierFilter("");
               setDateFrom("");
               setDateTo("");
@@ -1570,6 +2376,7 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
               {isVisible("date") && <SortableTH field="invoice_date" ordering={ordering} onSort={toggleSort}>Date</SortableTH>}
               <TH>Invoice #</TH>
               {isVisible("supplier") && <SortableTH field="supplier__name" ordering={ordering} onSort={toggleSort}>Supplier</SortableTH>}
+              {isVisible("site") && <TH>Location</TH>}
               {isVisible("lines") && <TH>Lines</TH>}
               {isVisible("total") && <TH>Total incl.</TH>}
               {isVisible("vat") && <TH>VAT</TH>}
@@ -1580,9 +2387,10 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
           <tbody>
             {items.map((r) => (
               <TR key={r.id} onClick={() => setViewing(r)}>
-                {isVisible("date") && <TD>{r.invoice_date}</TD>}
+                {isVisible("date") && <TD>{r.invoice_date ? formatIsoDate(r.invoice_date) : "—"}</TD>}
                 <TD className="font-medium">{r.invoice_number}</TD>
                 {isVisible("supplier") && <TD>{r.supplier_name}</TD>}
+                {isVisible("site") && <TD>{r.site_name || "—"}</TD>}
                 {isVisible("lines") && <TD>{r.lines.length}</TD>}
                 {isVisible("total") && (
                   <TD className="tabular-nums">R {money(parseFloat(r.total_incl_vat))}</TD>
@@ -1639,6 +2447,19 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
                 ))}
               </select>
             </FormField>
+            {sites.length > 0 && (
+              <FormField label="Received into (warehouse / location)">
+                <select
+                  className={inputClass}
+                  value={receiptSite || String(sites.find((x) => x.is_default)?.id ?? "")}
+                  onChange={(e) => setReceiptSite(e.target.value)}
+                >
+                  {sites.map((x) => (
+                    <option key={x.id} value={x.id}>{siteLabel(x)}</option>
+                  ))}
+                </select>
+              </FormField>
+            )}
             <FormField label="Supplier invoice number">
               <input
                 className={inputClass}
@@ -1922,6 +2743,11 @@ function ReceiptsTab({ onRegisterNewAction }: { onRegisterNewAction: (action: Ne
           <p className="mb-1 text-sm">
             <span className="font-medium">Date:</span> {viewing.invoice_date}
           </p>
+          {viewing.site_name && (
+            <p className="mb-1 text-sm">
+              <span className="font-medium">Received into:</span> {viewing.site_name}
+            </p>
+          )}
           {viewing.received_by_name && (
             <p className="mb-1 text-sm">
               <span className="font-medium">Received by:</span> {viewing.received_by_name}
@@ -2050,6 +2876,8 @@ const EMPTY_ISSUE_LINE: IssueLineForm = { product: "", quantity: "1", serial_uni
 
 const ISSUE_COLUMNS: ColumnDef[] = [
   { key: "date", label: "Date" },
+  { key: "from", label: "From" },
+  { key: "to", label: "To" },
   { key: "job", label: "Job / Customer" },
   { key: "issued_to", label: "Issued to" },
   { key: "items", label: "Items" },
@@ -2058,9 +2886,20 @@ const ISSUE_COLUMNS: ColumnDef[] = [
 function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewAction) => void }) {
   const [ordering, setOrdering] = useState("-issued_at");
   const [issuedToFilter, setIssuedToFilter] = useState("");
+  // Stock by location (13 Oct 2026).
+  const sites = useStockSites();
+  const defaultSiteId = String(sites.find((x) => x.is_default)?.id ?? "");
+  const [issueSiteFilter, setIssueSiteFilter] = useState("");
+  const [transfersOnly, setTransfersOnly] = useState(false);
+  const [fromSite, setFromSite] = useState("");
+  const [sendTo, setSendTo] = useState<"person" | "site">("person");
+  const [toSite, setToSite] = useState("");
+  const effectiveFrom = fromSite || defaultSiteId;
   const { hidden: hiddenCols, isVisible, toggle: toggleCol } = useColumnVisibility("inventory-issues", ["date"]);
   const { items, loading, refetch } = useApiList<StockIssue>(
-    `/stock-issues/?page_size=100&ordering=${ordering}${issuedToFilter ? `&issued_to=${issuedToFilter}` : ""}`
+    `/stock-issues/?page_size=100&ordering=${ordering}${issuedToFilter ? `&issued_to=${issuedToFilter}` : ""}${
+      issueSiteFilter ? `&site=${issueSiteFilter}` : ""
+    }${transfersOnly ? "&transfers=true" : ""}`
   );
   const [products, setProducts] = useState<Product[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -2076,12 +2915,21 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api
-      .get<{ results: Product[] }>("/products/?page_size=500&is_active=true")
-      .then((r) => setProducts(r.data.results));
     api.get<{ results: Job[] }>("/jobs/?page_size=200&ordering=-start").then((r) => setJobs(r.data.results));
     api.get<{ results: User[] }>("/staff-users/?page_size=100").then((r) => setStaff(r.data.results));
   }, []);
+
+  // Products with what is on hand AT the location the stock leaves from,
+  // and the serial units sitting there; both reload when it changes.
+  useEffect(() => {
+    api
+      .get<{ results: Product[] }>(
+        `/products/?page_size=500&is_active=true${effectiveFrom ? `&site=${effectiveFrom}` : ""}`
+      )
+      .then((r) => setProducts(r.data.results));
+    setAvailableUnits({});
+    setLines((prev) => prev.map((l) => ({ ...l, serial_unit: "" })));
+  }, [effectiveFrom]);
 
   useEffect(() => {
     onRegisterNewAction({ label: "+ New issue", onClick: () => setShowModal(true) });
@@ -2100,7 +2948,7 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
   async function loadUnitsFor(productId: string) {
     if (availableUnits[productId]) return;
     const res = await api.get<{ results: SerializedUnit[] }>(
-      `/serialized-units/?product=${productId}&status=in_stock&page_size=200`
+      `/serialized-units/?product=${productId}&status=in_stock&page_size=200${effectiveFrom ? `&site=${effectiveFrom}` : ""}`
     );
     setAvailableUnits((prev) => ({ ...prev, [productId]: res.data.results }));
   }
@@ -2126,6 +2974,9 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
   }
 
   function resetForm() {
+    setFromSite("");
+    setSendTo("person");
+    setToSite("");
     setJob("");
     setIssuedTo("");
     setNotes("");
@@ -2139,8 +2990,10 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
     setSaving(true);
     try {
       const payload = {
-        job: job ? Number(job) : null,
+        job: sendTo === "person" && job ? Number(job) : null,
         issued_to: issuedTo ? Number(issuedTo) : null,
+        ...(effectiveFrom ? { from_site: Number(effectiveFrom) } : {}),
+        ...(sendTo === "site" ? { to_site: toSite ? Number(toSite) : null } : {}),
         notes,
         lines: lines.map((l) => {
           const product = productFor(l.product);
@@ -2173,12 +3026,30 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <select className={filterSelectClass} value={issuedToFilter} onChange={(e) => setIssuedToFilter(e.target.value)}>
           <option value="">All staff</option>
-          {staff.map((s) => (
-            <option key={s.id} value={s.id}>{s.first_name || s.username}</option>
+          {[...staff].sort(byStaffName).map((s) => (
+            <option key={s.id} value={s.id}>{staffFullName(s)}</option>
           ))}
         </select>
-        {issuedToFilter && (
-          <button type="button" className={btnSecondary} onClick={() => setIssuedToFilter("")}>
+        <select className={filterSelectClass} value={issueSiteFilter} onChange={(e) => setIssueSiteFilter(e.target.value)}>
+          <option value="">All locations</option>
+          {sites.map((x) => (
+            <option key={x.id} value={x.id}>{siteLabel(x)}</option>
+          ))}
+        </select>
+        <label className="flex items-center gap-1.5 text-sm text-[var(--text-secondary)]">
+          <input type="checkbox" checked={transfersOnly} onChange={(e) => setTransfersOnly(e.target.checked)} />
+          Transfers only
+        </label>
+        {(issuedToFilter || issueSiteFilter || transfersOnly) && (
+          <button
+            type="button"
+            className={btnSecondary}
+            onClick={() => {
+              setIssuedToFilter("");
+              setIssueSiteFilter("");
+              setTransfersOnly(false);
+            }}
+          >
             Clear filters
           </button>
         )}
@@ -2193,6 +3064,8 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
           <THead>
             <tr>
               <SortableTH field="issued_at" ordering={ordering} onSort={toggleSort}>Date</SortableTH>
+              {isVisible("from") && <TH>From</TH>}
+              {isVisible("to") && <TH>To</TH>}
               {isVisible("job") && <TH>Job / Customer</TH>}
               {isVisible("issued_to") && <SortableTH field="issued_to__username" ordering={ordering} onSort={toggleSort}>Issued to</SortableTH>}
               {isVisible("items") && <TH>Items</TH>}
@@ -2201,11 +3074,26 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
           <tbody>
             {items.map((iss) => (
               <TR key={iss.id} onClick={() => setViewing(iss)}>
-                <TD>{new Date(iss.issued_at).toLocaleString()}</TD>
+                <TD>{formatIsoDateTime(iss.issued_at)}</TD>
+                {isVisible("from") && <TD>{iss.from_site_name || "—"}</TD>}
+                {isVisible("to") && (
+                  <TD>
+                    {iss.is_transfer ? (
+                      <>
+                        {iss.to_site_name}
+                        <span className="ml-1.5 text-xs text-[var(--series-1)]">transfer</span>
+                      </>
+                    ) : (
+                      iss.issued_to_name || iss.job_title || "—"
+                    )}
+                  </TD>
+                )}
                 {isVisible("job") && (
                   <TD>
                     {iss.job_title
                       ? `${iss.job_title}${iss.customer_name ? ` (${iss.customer_name})` : ""}`
+                      : iss.is_transfer
+                      ? "—"
                       : "Standalone"}
                   </TD>
                 )}
@@ -2218,11 +3106,50 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
       )}
 
       {showModal && (
-        <Modal title="New stock issue" onClose={() => setShowModal(false)}>
+        <Modal title={sendTo === "site" ? "Move stock to another location" : "New stock issue"} onClose={() => setShowModal(false)}>
           <form onSubmit={handleSubmit}>
             {error && (
               <p className="mb-3 rounded-md bg-[#fbeaea] px-3 py-2 text-sm text-[#b32e2e]">{error}</p>
             )}
+            {sites.length > 0 && (
+              <FormField label="Taken from (warehouse / location)">
+                <select className={inputClass} value={effectiveFrom} onChange={(e) => setFromSite(e.target.value)}>
+                  {sites.map((x) => (
+                    <option key={x.id} value={x.id}>{siteLabel(x)}</option>
+                  ))}
+                </select>
+              </FormField>
+            )}
+            {sites.length > 1 && (
+              <FormField label="Send to">
+                <div className="flex gap-4 text-sm">
+                  <label className="flex items-center gap-1.5">
+                    <input type="radio" checked={sendTo === "person"} onChange={() => setSendTo("person")} />
+                    A technician / job (leaves stock)
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    <input type="radio" checked={sendTo === "site"} onChange={() => setSendTo("site")} />
+                    Another warehouse / location
+                  </label>
+                </div>
+              </FormField>
+            )}
+            {sendTo === "site" && (
+              <FormField label="Move to">
+                <select className={inputClass} required value={toSite} onChange={(e) => setToSite(e.target.value)}>
+                  <option value="">Select a location…</option>
+                  {sites
+                    .filter((x) => String(x.id) !== effectiveFrom)
+                    .map((x) => (
+                      <option key={x.id} value={x.id}>{siteLabel(x)}</option>
+                    ))}
+                </select>
+                <p className="mt-1 text-xs text-[var(--text-muted)]">
+                  The stock stays in stock — it just moves to that location.
+                </p>
+              </FormField>
+            )}
+            {sendTo === "person" && (
             <FormField label="Job (optional — leave blank for standalone)">
               <select className={inputClass} value={job} onChange={(e) => setJob(e.target.value)}>
                 <option value="">No job (standalone)</option>
@@ -2234,12 +3161,13 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
                 ))}
               </select>
             </FormField>
-            <FormField label="Issued to (technician/staff)">
+            )}
+            <FormField label={sendTo === "site" ? "Taken by (optional)" : "Issued to (technician/staff)"}>
               <select className={inputClass} value={issuedTo} onChange={(e) => setIssuedTo(e.target.value)}>
                 <option value="">Select staff…</option>
-                {staff.map((s) => (
+                {[...staff].sort(byStaffName).map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.username}
+                    {staffFullName(s)}
                   </option>
                 ))}
               </select>
@@ -2261,7 +3189,8 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
                       <option value="">Select a product…</option>
                       {products.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.name} ({p.quantity_on_hand} {p.tracking_type === "quantity" ? p.unit : "in stock"})
+                          {p.name} ({p.quantity_on_hand} {p.tracking_type === "quantity" ? p.unit : "in stock"}
+                          {sites.length > 0 ? " here" : ""})
                         </option>
                       ))}
                     </select>
@@ -2274,7 +3203,7 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
                         value={line.serial_unit}
                         onChange={(e) => updateLine(i, { serial_unit: e.target.value })}
                       >
-                        <option value="">{units.length ? "Select a unit…" : "Loading…"}</option>
+                        <option value="">{units.length ? "Select a unit…" : "No units here (or loading…)"}</option>
                         {units.map((u) => (
                           <option key={u.id} value={u.id}>
                             {u.serial_number}
@@ -2323,7 +3252,7 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
                 Cancel
               </button>
               <button type="submit" disabled={saving} className={btnPrimary}>
-                {saving ? "Saving…" : "Issue stock"}
+                {saving ? "Saving…" : sendTo === "site" ? "Move stock" : "Issue stock"}
               </button>
             </div>
           </form>
@@ -2331,7 +3260,17 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
       )}
 
       {viewing && (
-        <Modal title={`Issue #${viewing.id}`} onClose={() => setViewing(null)}>
+        <Modal title={`${viewing.is_transfer ? "Transfer" : "Issue"} #${viewing.id}`} onClose={() => setViewing(null)}>
+          {viewing.from_site_name && (
+            <p className="mb-1 text-sm">
+              <span className="font-medium">From:</span> {viewing.from_site_name}
+            </p>
+          )}
+          {viewing.is_transfer && (
+            <p className="mb-1 text-sm">
+              <span className="font-medium">Moved to:</span> {viewing.to_site_name}
+            </p>
+          )}
           <p className="mb-1 text-sm">
             <span className="font-medium">Job:</span> {viewing.job_title || "Standalone"}
           </p>
@@ -2344,7 +3283,7 @@ function IssuesTab({ onRegisterNewAction }: { onRegisterNewAction: (action: NewA
             <span className="font-medium">Issued to:</span> {viewing.issued_to_name || "—"}
           </p>
           <p className="mb-1 text-sm">
-            <span className="font-medium">Date:</span> {new Date(viewing.issued_at).toLocaleString()}
+            <span className="font-medium">Date:</span> {formatIsoDateTime(viewing.issued_at)}
           </p>
           {viewing.notes && (
             <p className="mb-3 text-sm">
